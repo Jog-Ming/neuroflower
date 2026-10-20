@@ -182,24 +182,32 @@ public final class RoundTrip {
     return bodyStart >= 0 && tailStart >= 0 && tailStart < bodyStart;
   }
 
-  private static int firstOffset(Statement statement) {
+  /** First target offset covered by a statement, or -1. */
+  public static int firstOffset(Statement statement) {
+    int min = -1;
     List<Exprent> exprents = statement.getExprents();
     if (exprents != null) {
       for (Exprent exprent : exprents) {
-        BitSet bits = exprent.bytecode;
-        if (bits != null && !bits.isEmpty()) {
-          return bits.nextSetBit(0);
+        // Wrappers such as yield carry no offsets of their own; the expression they hold does.
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          BitSet bits = inner.bytecode;
+          if (bits != null && !bits.isEmpty()) {
+            int offset = bits.nextSetBit(0);
+            if (min < 0 || offset < min) {
+              min = offset;
+            }
+          }
         }
       }
     } else {
       for (Statement child : statement.getStats()) {
         int offset = firstOffset(child);
-        if (offset >= 0) {
-          return offset;
+        if (offset >= 0 && (min < 0 || offset < min)) {
+          min = offset;
         }
       }
     }
-    return -1;
+    return min;
   }
 
   /** True when the target loads this local into the return, i.e. the source kept the variable. */

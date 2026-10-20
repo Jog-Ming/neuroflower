@@ -2,6 +2,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -42,7 +43,8 @@ public class SwitchExprent extends Exprent {
     boolean isExhaustive = isExhaustive();
 
     buf.append(this.backing.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
-    for (int i = 0; i < this.backing.getCaseStatements().size(); i++) {
+    List<Integer> order = armOrder();
+    for (int i : order) {
       Statement stat = this.backing.getCaseStatements().get(i);
       List<StatEdge> edges = this.backing.getCaseEdges().get(i);
       List<Exprent> values = this.backing.getCaseValues().get(i);
@@ -176,6 +178,59 @@ public class SwitchExprent extends Exprent {
     buf.appendIndent(indent).append("}");
 
     return buf;
+  }
+
+  /**
+   * Javac lays arrow arms out in source order, so the arm whose code starts first was written first.
+   * Vineflower appends default to the cases; put it back where the target laid out its block.
+   * Pattern arms keep their order: moving them past one another changes which pattern dominates.
+   */
+  private List<Integer> armOrder() {
+    int count = this.backing.getCaseStatements().size();
+    List<Integer> order = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+      order.add(i);
+    }
+    if (!RoundTrip.selector("switchorder") || count < 2) {
+      return order;
+    }
+
+    int defaultIndex = -1;
+    int[] offset = new int[count];
+    for (int i = 0; i < count; i++) {
+      offset[i] = RoundTrip.firstOffset(this.backing.getCaseStatements().get(i));
+      if (offset[i] < 0) {
+        return order;
+      }
+      List<StatEdge> edges = this.backing.getCaseEdges().get(i);
+      for (int j = 0; j < edges.size(); j++) {
+        if (edges.get(j) == this.backing.getDefaultEdge()) {
+          if (edges.size() > 1 || defaultIndex >= 0) {
+            return order; // default sharing an arm, or two defaults: leave it alone
+          }
+          defaultIndex = i;
+        } else {
+          List<Exprent> values = this.backing.getCaseValues().get(i);
+          if (j >= values.size() || !(values.get(j) instanceof ConstExprent) && !(values.get(j) instanceof FieldExprent)) {
+            return order; // patterns and other labels have ordering rules of their own
+          }
+        }
+      }
+      if (this.backing.getCaseGuards().size() > i && this.backing.getCaseGuards().get(i) != null) {
+        return order;
+      }
+    }
+    if (defaultIndex < 0) {
+      return order;
+    }
+
+    order.remove(defaultIndex);
+    int rank = 0;
+    while (rank < order.size() && offset[order.get(rank)] < offset[defaultIndex]) {
+      rank++;
+    }
+    order.add(rank, defaultIndex);
+    return order;
   }
 
   private static boolean isEmptyDefault(BasicBlockStatement block, SwitchStatement head) {
