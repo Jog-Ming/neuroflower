@@ -1712,7 +1712,7 @@ public class ClassWriter implements StatementWriter {
     }
 
     // Constructor with an annotation, we dont want to hide this.
-    if (isRecord && RecordHelper.hasAnnotations(structMethod)) {
+    if (RecordHelper.hasAnnotations(structMethod)) {
       return false;
     }
 
