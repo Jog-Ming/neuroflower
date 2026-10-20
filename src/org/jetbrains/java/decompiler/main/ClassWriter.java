@@ -311,6 +311,8 @@ public class ClassWriter implements StatementWriter {
                   simpleLambda = true;
                   MethodWrapper outerWrapper = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
                   DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, methodWrapper);
+                  StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+                  DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, methodWrapper.methodStruct);
                   try {
                     TextBuffer codeBuffer = firstExpr.toJava(indent);
   
@@ -334,6 +336,7 @@ public class ClassWriter implements StatementWriter {
                   }
                   finally {
                     DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, outerWrapper);
+                    DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, outerStruct);
                   }
                 }
               } else if (firstStat instanceof BasicBlockStatement && firstStat.getExprents() != null && firstStat.getExprents().isEmpty()) {
@@ -960,6 +963,8 @@ public class ClassWriter implements StatementWriter {
 
     MethodWrapper outerWrapper = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
     DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, methodWrapper);
+    StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, methodWrapper.methodStruct);
 
     try {
       String method_name = lambdaNode.lambdaInformation.method_name;
@@ -1040,6 +1045,7 @@ public class ClassWriter implements StatementWriter {
     }
     finally {
       DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, outerWrapper);
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, outerStruct);
     }
   }
 
@@ -1075,6 +1081,8 @@ public class ClassWriter implements StatementWriter {
 
     MethodWrapper outerWrapper = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
     DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, methodWrapper);
+    StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, methodWrapper.methodStruct);
 
     try {
       boolean isInterface = cl.hasModifier(CodeConstants.ACC_INTERFACE);
@@ -1372,6 +1380,7 @@ public class ClassWriter implements StatementWriter {
     }
     finally {
       DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, outerWrapper);
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, outerStruct);
     }
 
     // save total lines

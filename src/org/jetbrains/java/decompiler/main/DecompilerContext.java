@@ -25,6 +25,8 @@ public class DecompilerContext {
   public static final Key<ClassWrapper> CURRENT_CLASS_WRAPPER = Key.of("CURRENT_CLASS_WRAPPER");
   public static final Key<ClassesProcessor.ClassNode> CURRENT_CLASS_NODE = Key.of("CURRENT_CLASS_NODE");
   public static final Key<MethodWrapper> CURRENT_METHOD_WRAPPER = Key.of("CURRENT_METHOD_WRAPPER");
+  public static final Key<org.jetbrains.java.decompiler.struct.StructMethod> CURRENT_STRUCT_METHOD =
+    Key.of("CURRENT_STRUCT_METHOD");
   public static final Key<VarProcessor> CURRENT_VAR_PROCESSOR = Key.of("CURRENT_VAR_PROCESSOR");
 
   public final Map<Key<?>, Object> staticProps = new HashMap<>();

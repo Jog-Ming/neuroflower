@@ -177,6 +177,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String TERNARY_CONSTANT_SIMPLIFICATION = "ternary-constant-simplification";
 
+  @Name("Round Trip")
+  @Description("Choose source forms that reproduce the original class file.")
+  @ShortName("rt")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP = "round-trip";
+
   @Name("Pattern Matching")
   @Description("Decompile with if and switch pattern matching enabled.")
   @ShortName("pam")
@@ -450,6 +456,7 @@ public interface IFernflowerPreferences {
     defaults.put(DUMP_CODE_LINES, "0");
     defaults.put(IGNORE_INVALID_BYTECODE, "0");
     defaults.put(VERIFY_ANONYMOUS_CLASSES, "0");
+    defaults.put(ROUND_TRIP, "0");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");
     defaults.put(PATTERN_MATCHING, "1"); // Pattern matching is relatively stable

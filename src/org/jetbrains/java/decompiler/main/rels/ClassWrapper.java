@@ -66,6 +66,7 @@ public class ClassWrapper {
     }
 
     for (StructMethod mt : classStruct.getMethods()) {
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, mt);
       DecompilerContext.getLogger().startMethod(mt.getName() + " " + mt.getDescriptor());
 
       MethodDescriptor md = MethodDescriptor.parseDescriptor(mt, null);

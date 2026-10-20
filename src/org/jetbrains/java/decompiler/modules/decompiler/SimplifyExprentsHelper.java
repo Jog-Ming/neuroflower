@@ -392,6 +392,9 @@ public class SimplifyExprentsHelper {
       exit.getExitType() == ExitExprent.Type.RETURN &&
       exit.getValue() instanceof VarExprent exitValue &&
       assignmentLeft.equals(exitValue)) {
+      if (RoundTrip.targetReturnUsesLocal(exit, assignmentLeft.getIndex())) {
+        return false;
+      }
       // Avoid doing this transform for potential pattern matches, as they should be processed by the pattern matcher first.
       if (stat.getTopParent().mt.getBytecodeVersion().hasIfPatternMatching()
         && stat.getParent() instanceof IfStatement ifst && !ifst.isPatternMatched() && stat.getExprents().indexOf(first) == 0
@@ -1053,6 +1056,10 @@ public class SimplifyExprentsHelper {
               }
             }
           } else if (ifExpr instanceof ExitExprent ifExit && elseExpr instanceof ExitExprent elseExit) {
+
+            if (RoundTrip.hasDistinctReturnInstructions(ifExit, elseExit)) {
+              return false;
+            }
 
             if (ifExit.getExitType() == elseExit.getExitType() && ifExit.getValue() != null && elseExit.getValue() != null &&
               ifExit.getExitType() == ExitExprent.Type.RETURN) {

@@ -467,6 +467,23 @@ public final class SecondaryFunctionsHelper {
         Exprent right = asexpr.getRight();
         Exprent left = asexpr.getLeft();
 
+        if (RoundTrip.enabled() && right instanceof FunctionExprent compound) {
+          Exprent operand = compoundOperand(left, compound);
+          Exprent matching = null;
+          for (Exprent candidate : compound.getLstOperands()) {
+            if (candidate.equals(left)) {
+              matching = candidate;
+              break;
+            }
+          }
+          if (operand != null && matching != null && RoundTrip.isCompoundTarget(left, matching)) {
+            asexpr.setRight(operand);
+            asexpr.setCondType(compound.getFuncType());
+            ret = exprent;
+            break;
+          }
+        }
+
         if (right instanceof FunctionExprent) {
           FunctionExprent func = (FunctionExprent) right;
           if (isSimple(left, null)) {
@@ -542,6 +559,35 @@ public final class SecondaryFunctionsHelper {
     }
 
     return ret;
+  }
+
+  private static Exprent compoundOperand(Exprent left, FunctionExprent function) {
+    List<Exprent> operands = function.getLstOperands();
+    if (operands.size() != 2) {
+      return null;
+    }
+    switch (function.getFuncType()) {
+      case ADD:
+      case AND:
+      case OR:
+      case XOR:
+        // Commutative: `e + x` and `x + e` both compile to `x += e`.
+        if (left.equals(operands.get(1))) {
+          return operands.get(0);
+        }
+        // fall through
+      case SUB:
+      case MUL:
+      case DIV:
+      case REM:
+      case SHL:
+      case SHR:
+      case USHR:
+        if (left.equals(operands.get(0))) {
+          return operands.get(1);
+        }
+    }
+    return null;
   }
 
   // whether `exprent = exprent + ...` can be simplified to `exprent += ...`

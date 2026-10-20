@@ -643,6 +643,12 @@ public final class IfHelper {
 
     if ((ifdirect || ifdirectpath) && (elsedirect || elsedirectpath) && !noifstat && !noelsestat) {  // if - then - else
 
+      // The target ends the then-arm with a return: keep the guard and let the rest follow it.
+      if (RoundTrip.selector("guardmerge") && ifstat.getIfstat() != null && endsWithReturn(ifstat.getIfstat())
+          && !mentionsAssertionsDisabled(ifstat)) {
+        return false;
+      }
+
       SequenceStatement sequence = (SequenceStatement) parent;
 
       // build and cut the new else statement
@@ -882,6 +888,26 @@ public final class IfHelper {
     if (ifSt.iftype == IfStatement.IFTYPE_IFELSE && !ifSt.isPatternMatched()) {
       Statement ifStat = ifSt.getIfstat();
       Statement elseStat = ifSt.getElsestat();
+
+      // Both arms are single exits: the target's layout says which arm the source had first.
+      if (RoundTrip.selector("swap") && ifStat != null && elseStat != null && isExit(ifStat) && isExit(elseStat)) {
+        int ifOffset = firstOffset(ifStat);
+        int elseOffset = firstOffset(elseStat);
+        if (ifOffset >= 0 && elseOffset >= 0 && elseOffset < ifOffset) {
+          StatEdge ifEdge = ifSt.getIfEdge();
+          StatEdge elseEdge = ifSt.getElseEdge();
+          ifEdge.changeDestination(elseStat);
+          elseEdge.changeDestination(ifStat);
+          ifSt.setIfstat(elseStat);
+          ifSt.setElsestat(ifStat);
+          ifSt.setIfEdge(elseEdge);
+          ifSt.setElseEdge(ifEdge);
+          ifSt.setNegated(!ifSt.isNegated());
+          ifSt.getHeadexprentList().set(0, ((IfExprent) ifSt.getHeadexprent().copy()).negateIf());
+          return true;
+        }
+      }
+
       if (ifStat != null && isExit(ifStat)) {
         // TODO: if the same var exprents are found in the if and an if-inside-the-else, try to keep as else if
 
@@ -914,6 +940,56 @@ public final class IfHelper {
     }
 
     return false;
+  }
+
+  // The assertion processor needs the merged form; refusing there would leave a raw $assertionsDisabled read.
+  private static boolean mentionsAssertionsDisabled(Statement stat) {
+    for (Exprent exprent : stat.getStatExprents()) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof FieldExprent field && "$assertionsDisabled".equals(field.getName())) {
+          return true;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (mentionsAssertionsDisabled(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean endsWithReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      if (exprents.isEmpty()) {
+        return false;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && endsWithReturn(children.get(children.size() - 1));
+  }
+
+  private static int firstOffset(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        BitSet offsets = exprent.bytecode;
+        if (offsets != null && !offsets.isEmpty()) {
+          return offsets.nextSetBit(0);
+        }
+      }
+    } else {
+      for (Statement child : stat.getStats()) {
+        int offset = firstOffset(child);
+        if (offset >= 0) {
+          return offset;
+        }
+      }
+    }
+    return -1;
   }
 
   private static boolean isExit(Statement stat) {

@@ -6,6 +6,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.exps;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.plugins.PluginImplementationException;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -634,7 +635,7 @@ public class FunctionExprent extends Exprent {
       case IMM:
         return buf.append(wrapOperandString(lstOperands.get(0), true, indent).append(funcType.operator));
       case CAST:
-        if (!needsCast) {
+        if (!needsCast && !RoundTrip.forceCast(this)) {
           return buf.append(lstOperands.get(0).toJava(indent));
         }
         for (int i = 1; i < lstOperands.size(); i++) {
@@ -708,7 +709,7 @@ public class FunctionExprent extends Exprent {
         }
       }
 
-      if (!needsCast) {
+      if (!needsCast && !RoundTrip.forceCast(this)) {
         return buf.append(lstOperands.get(0).toJava(indent));
       }
 

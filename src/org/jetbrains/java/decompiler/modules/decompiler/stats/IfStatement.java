@@ -3,6 +3,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
@@ -202,6 +203,18 @@ public class IfStatement extends Statement {
     }
 
     Exprent condition = headexprent.get(0);
+    if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
+        && RoundTrip.printAsGuard(ifHead, ifstat)) {
+      IfExprent guard = (IfExprent) ifHead.copy();
+      guard.setCondition(((FunctionExprent) ifHead.getCondition()).getLstOperands().get(0));
+      buf.appendIndent(indent);
+      buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+      buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      return buf;
+    }
+
     buf.appendIndent(indent);
     // Condition can be null in early processing stages
     if (condition != null) {
