@@ -15,6 +15,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
+import org.jetbrains.java.decompiler.struct.gen.VarType;
 
 import java.util.BitSet;
 import java.util.List;
@@ -109,8 +111,60 @@ public final class RoundTrip {
         // `x == null` is false when non-null: the skip branch is ifnonnull.
         return type == FunctionExprent.FunctionType.EQ ? CodeConstants.opc_ifnonnull : CodeConstants.opc_ifnull;
       }
+      if (type == FunctionExprent.FunctionType.INSTANCEOF) {
+        return CodeConstants.opc_ifeq;
+      }
+      if ((type == FunctionExprent.FunctionType.AND || type == FunctionExprent.FunctionType.OR
+          || type == FunctionExprent.FunctionType.XOR) && booleanOperands(function)) {
+        // Non-short-circuit boolean arithmetic: one test after the operation, like a plain value.
+        return CodeConstants.opc_ifeq;
+      }
+      if (function.getLstOperands().size() == 2) {
+        VarType left = function.getLstOperands().get(0).getExprType();
+        VarType right = function.getLstOperands().get(1).getExprType();
+        if (left != null && right != null) {
+          boolean refs = left.typeFamily == TypeFamily.OBJECT && right.typeFamily == TypeFamily.OBJECT;
+          boolean ints = isIntegerFamily(left) && isIntegerFamily(right);
+          switch (type) {
+            case EQ:
+              if (refs) return CodeConstants.opc_if_acmpne;
+              if (ints) return CodeConstants.opc_if_icmpne;
+              break;
+            case NE:
+              if (refs) return CodeConstants.opc_if_acmpeq;
+              if (ints) return CodeConstants.opc_if_icmpeq;
+              break;
+            case LT:
+              if (ints) return CodeConstants.opc_if_icmpge;
+              break;
+            case GE:
+              if (ints) return CodeConstants.opc_if_icmplt;
+              break;
+            case GT:
+              if (ints) return CodeConstants.opc_if_icmple;
+              break;
+            case LE:
+              if (ints) return CodeConstants.opc_if_icmpgt;
+              break;
+          }
+        }
+      }
     }
     return isPlainBoolean(condition) ? CodeConstants.opc_ifeq : 0;
+  }
+
+  private static boolean isIntegerFamily(VarType type) {
+    return type.typeFamily == TypeFamily.INTEGER || type.typeFamily == TypeFamily.BOOLEAN;
+  }
+
+  private static boolean booleanOperands(FunctionExprent function) {
+    for (Exprent operand : function.getLstOperands()) {
+      VarType type = operand.getExprType();
+      if (type == null || type.typeFamily != TypeFamily.BOOLEAN) {
+        return false;
+      }
+    }
+    return !function.getLstOperands().isEmpty();
   }
 
   private static int complement(int opcode) {
@@ -119,6 +173,14 @@ public final class RoundTrip {
       case CodeConstants.opc_ifne -> CodeConstants.opc_ifeq;
       case CodeConstants.opc_ifnull -> CodeConstants.opc_ifnonnull;
       case CodeConstants.opc_ifnonnull -> CodeConstants.opc_ifnull;
+      case CodeConstants.opc_if_icmpeq -> CodeConstants.opc_if_icmpne;
+      case CodeConstants.opc_if_icmpne -> CodeConstants.opc_if_icmpeq;
+      case CodeConstants.opc_if_icmplt -> CodeConstants.opc_if_icmpge;
+      case CodeConstants.opc_if_icmpge -> CodeConstants.opc_if_icmplt;
+      case CodeConstants.opc_if_icmpgt -> CodeConstants.opc_if_icmple;
+      case CodeConstants.opc_if_icmple -> CodeConstants.opc_if_icmpgt;
+      case CodeConstants.opc_if_acmpeq -> CodeConstants.opc_if_acmpne;
+      case CodeConstants.opc_if_acmpne -> CodeConstants.opc_if_acmpeq;
       default -> 0;
     };
   }
