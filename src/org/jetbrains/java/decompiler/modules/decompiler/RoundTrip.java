@@ -169,6 +169,19 @@ public final class RoundTrip {
     return lastEnd >= 0 && lastEnd < bodyStart && returns.get(lastEnd);
   }
 
+  /**
+   * True when the target returns before the body: the source was
+   * {@code if (!C) { return value; } body} rather than {@code if (C) { body } return value;}.
+   */
+  public static boolean returnGuard(Statement body, Statement tail) {
+    if (!selector("retguard")) {
+      return false;
+    }
+    int bodyStart = firstOffset(body);
+    int tailStart = firstOffset(tail);
+    return bodyStart >= 0 && tailStart >= 0 && tailStart < bodyStart;
+  }
+
   private static int firstOffset(Statement statement) {
     List<Exprent> exprents = statement.getExprents();
     if (exprents != null) {

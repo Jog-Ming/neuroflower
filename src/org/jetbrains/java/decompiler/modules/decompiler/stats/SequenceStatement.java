@@ -3,7 +3,12 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.Arrays;
@@ -104,6 +109,29 @@ public class SequenceStatement extends Statement {
 
       Statement st = stats.get(i);
 
+      // `if (C) { body } return X;` where the target returns X first is a guard on !C.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null && endsWithReturn(ifStatement.getIfstat())) {
+        Statement tail = stats.get(i + 1);
+        Exprent exit = singleReturn(tail);
+        if (exit instanceof ExitExprent returnExit && safeReturnValue(returnExit.getValue())
+            && RoundTrip.returnGuard(ifStatement.getIfstat(), tail)) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          head.negateIf();
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(tail, indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          notempty = true;
+          i++;
+          continue;
+        }
+      }
+
       TextBuffer str = ExprProcessor.jmpWrapper(st, indent, false);
 
       if (i > 0 && !str.containsOnlyWhitespaces() && notempty) {
@@ -120,6 +148,40 @@ public class SequenceStatement extends Statement {
     }
 
     return buf;
+  }
+
+  private static Exprent singleReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null && exprents.size() == 1
+        && exprents.get(0) instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN) {
+      return exit;
+    }
+    return null;
+  }
+
+  private static boolean safeReturnValue(Exprent value) {
+    if (value == null) {
+      return true;
+    }
+    for (Exprent exprent : value.getAllExprents(true, true)) {
+      if (exprent instanceof VarExprent var && var.getIndex() != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean endsWithReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      if (exprents.isEmpty()) {
+        return false;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && endsWithReturn(children.get(children.size() - 1));
   }
 
   @Override
