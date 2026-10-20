@@ -125,6 +125,9 @@ public final class RecordHelper {
     members.add(cd);
     StructMethod getter = getGetter(cl, cd);
     if (getter != null) members.add(getter);
+    // FIELD-targeted annotations live only on the backing field; the source put them on the component.
+    StructField field = cl.getField(cd.getName(), cd.getDescriptor());
+    if (field != null) members.add(field);
 
     for (StructMember member : members) {
       for (Key<?> key : ClassWriter.ANNOTATION_ATTRIBUTES) {
