@@ -456,7 +456,7 @@ public interface IFernflowerPreferences {
     defaults.put(DUMP_CODE_LINES, "0");
     defaults.put(IGNORE_INVALID_BYTECODE, "0");
     defaults.put(VERIFY_ANONYMOUS_CLASSES, "0");
-    defaults.put(ROUND_TRIP, "0");
+    defaults.put(ROUND_TRIP, "1");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");
     defaults.put(PATTERN_MATCHING, "1"); // Pattern matching is relatively stable
@@ -470,17 +470,22 @@ public interface IFernflowerPreferences {
     defaults.put(OLD_TRY_DEDUP, "0");
     defaults.put(DECOMPILE_PREVIEW, "1"); // Preview features are useful to decompile in almost all cases
 
-    defaults.put(INCLUDE_ENTIRE_CLASSPATH, "0");
+    // This fork serves one pipeline: decompiled Minecraft, recompiled with javac and compared byte
+    // for byte. The option set that pipeline needs is the default here, so a run passes only paths.
+    defaults.put(INCLUDE_ENTIRE_CLASSPATH, "1");
     defaults.put(INCLUDE_JAVA_RUNTIME, "1");
     defaults.put(EXPLICIT_GENERIC_ARGUMENTS, "0");
     defaults.put(INLINE_SIMPLE_LAMBDAS, "1");
 
-    defaults.put(LOG_LEVEL, IFernflowerLogger.Severity.INFO.name());
+    defaults.put(LOG_LEVEL, IFernflowerLogger.Severity.ERROR.name());
     defaults.put(MAX_PROCESSING_METHOD, "0");
     defaults.put(RENAME_ENTITIES, "0");
     defaults.put(NEW_LINE_SEPARATOR, "1");
-    defaults.put(INDENT_STRING, "   ");
-    defaults.put(PREFERRED_LINE_LENGTH, "160");
+    defaults.put(INDENT_STRING, "    ");
+    // The original sources behind Minecraft's LineNumberTables are not wrapped at a fixed width;
+    // wrapping here moved thousands of line starts away from theirs. Measured on 1.21.11: 3838
+    // byte-identical classes at 160, 3967 with wrapping effectively off.
+    defaults.put(PREFERRED_LINE_LENGTH, "100000");
     defaults.put(BANNER, "");
     // Point users towards reporting bugs if things don't decompile properly
     defaults.put(ERROR_MESSAGE, "Please report this to the Vineflower issue tracker, at https://github.com/Vineflower/vineflower/issues with a copy of the class file (if you have the rights to distribute it!)");
