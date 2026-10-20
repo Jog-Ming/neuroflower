@@ -125,26 +125,35 @@ public final class RoundTrip {
         if (left != null && right != null) {
           boolean refs = left.typeFamily == TypeFamily.OBJECT && right.typeFamily == TypeFamily.OBJECT;
           boolean ints = isIntegerFamily(left) && isIntegerFamily(right);
+          // long/float/double compare through lcmp/fcmp and then branch on the int result.
+          boolean wide = (left.typeFamily == TypeFamily.LONG && right.typeFamily == TypeFamily.LONG)
+            || (left.typeFamily == TypeFamily.FLOAT && right.typeFamily == TypeFamily.FLOAT);
           switch (type) {
             case EQ:
               if (refs) return CodeConstants.opc_if_acmpne;
               if (ints) return CodeConstants.opc_if_icmpne;
+              if (wide) return CodeConstants.opc_ifne;
               break;
             case NE:
               if (refs) return CodeConstants.opc_if_acmpeq;
               if (ints) return CodeConstants.opc_if_icmpeq;
+              if (wide) return CodeConstants.opc_ifeq;
               break;
             case LT:
               if (ints) return CodeConstants.opc_if_icmpge;
+              if (wide) return CodeConstants.opc_ifge;
               break;
             case GE:
               if (ints) return CodeConstants.opc_if_icmplt;
+              if (wide) return CodeConstants.opc_iflt;
               break;
             case GT:
               if (ints) return CodeConstants.opc_if_icmple;
+              if (wide) return CodeConstants.opc_ifle;
               break;
             case LE:
               if (ints) return CodeConstants.opc_if_icmpgt;
+              if (wide) return CodeConstants.opc_ifgt;
               break;
           }
         }
@@ -181,6 +190,10 @@ public final class RoundTrip {
       case CodeConstants.opc_if_icmple -> CodeConstants.opc_if_icmpgt;
       case CodeConstants.opc_if_acmpeq -> CodeConstants.opc_if_acmpne;
       case CodeConstants.opc_if_acmpne -> CodeConstants.opc_if_acmpeq;
+      case CodeConstants.opc_iflt -> CodeConstants.opc_ifge;
+      case CodeConstants.opc_ifge -> CodeConstants.opc_iflt;
+      case CodeConstants.opc_ifgt -> CodeConstants.opc_ifle;
+      case CodeConstants.opc_ifle -> CodeConstants.opc_ifgt;
       default -> 0;
     };
   }
