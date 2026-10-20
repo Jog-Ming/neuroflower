@@ -10,6 +10,7 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.ClasspathHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
@@ -986,7 +987,10 @@ public class InvocationExprent extends Exprent {
     ClassNode currCls = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
     List<StructMethod> matches = getMatchedDescriptors(false);
     boolean ambiguousVararg = isVarargsAmbiguous(getMatchedDescriptors(true));
-    BitSet setAmbiguousParameters = getAmbiguousParameters(matches);
+    BitSet setAmbiguousParameters = new BitSet(lstParameters.size());
+    setAmbiguousParameters.or(getAmbiguousParameters(matches));
+    BitSet lambdaAmbiguous = getLambdaAmbiguousParameters();
+    setAmbiguousParameters.or(lambdaAmbiguous);
 
     // omit 'new Type[] {}' for the last parameter of a vararg method call
     if (lstParameters.size() == descriptor.params.length && isVarArgCall() && !lstParameters.isEmpty()) {
@@ -1128,6 +1132,14 @@ public class InvocationExprent extends Exprent {
       }
     }
 
+    // A cast to a wildcard type cannot be the target of a lambda, and a lambda cast to one does not
+    // satisfy the parameter it was meant to disambiguate. Leave those overloads as they were.
+    for (int i = lambdaAmbiguous.nextSetBit(0); i >= 0; i = lambdaAmbiguous.nextSetBit(i + 1)) {
+      if (i >= types.length || types[i] == null || !types[i].isGeneric()
+          || ExprProcessor.getTypeName(types[i]).contains("?")) {
+        setAmbiguousParameters.clear(i);
+      }
+    }
 
     TextBuffer buf = new TextBuffer();
 
@@ -1468,6 +1480,107 @@ public class InvocationExprent extends Exprent {
       }
     }
     return false;
+  }
+
+  /**
+   * javac judges whether an overload applies to a lambda or method reference by arity and functional
+   * interface, not by the descriptor the target already resolved. Two such overloads are ambiguous
+   * in source even though the target's descriptor names one of them; the original source had to cast
+   * its argument, and printing that cast restores it.
+   */
+  private BitSet getLambdaAmbiguousParameters() {
+    BitSet result = new BitSet(lstParameters.size());
+    if (!RoundTrip.selector("overloadcast")) {
+      return result;
+    }
+    boolean hasLambda = false;
+    for (Exprent param : lstParameters) {
+      if (param instanceof NewExprent && ((NewExprent) param).isLambda()) {
+        hasLambda = true;
+        break;
+      }
+    }
+    StructClass cl = DecompilerContext.getStructContext().getClass(classname);
+    if (!hasLambda || cl == null) {
+      return result;
+    }
+    List<StructMethod> candidates = collectSameNameSameArity(cl);
+    if (candidates.size() < 2) {
+      return result;
+    }
+    for (int i = 0; i < lstParameters.size(); i++) {
+      if (!(lstParameters.get(i) instanceof NewExprent lambda) || !lambda.isLambda()) {
+        continue;
+      }
+      String key = lambda.getLambdaMethodKey();
+      int paren = key.indexOf('(');
+      if (paren < 0) {
+        continue;
+      }
+      int arity = MethodDescriptor.parseDescriptor(key.substring(paren)).params.length;
+      int applicable = 0;
+      for (StructMethod mt : candidates) {
+        MethodDescriptor md = mt.methodDescriptor();
+        if (md.params.length != lstParameters.size()) {
+          continue;
+        }
+        StructClass paramType = DecompilerContext.getStructContext().getClass(md.params[i].value);
+        if (paramType == null) {
+          continue;
+        }
+        StructMethod abstractMethod = ExprProcessor.functionalMethod(paramType);
+        if (abstractMethod != null && abstractMethod.methodDescriptor().params.length == arity) {
+          applicable++;
+        }
+      }
+      if (applicable > 1) {
+        result.set(i);
+      }
+    }
+    return result;
+  }
+
+  /** Same-name, same-arity methods from the receiver's class, or its first ancestor declaring any. */
+  private List<StructMethod> collectSameNameSameArity(StructClass cl) {
+    List<StructMethod> found = new ArrayList<>();
+    Set<String> visited = new HashSet<>();
+    Queue<StructClass> queue = new ArrayDeque<>();
+    queue.add(cl);
+    while (!queue.isEmpty()) {
+      StructClass cls = queue.poll();
+      if (cls == null) {
+        continue;
+      }
+      for (StructMethod mt : cls.getMethods()) {
+        // Bridges and synthetics are not overloads in source; the raw bridge beside a covariant
+        // override would otherwise read as a second, ambiguous overload.
+        if (mt.hasModifier(CodeConstants.ACC_SYNTHETIC) || mt.hasModifier(CodeConstants.ACC_BRIDGE)) {
+          continue;
+        }
+        if (name.equals(mt.getName()) && mt.methodDescriptor().params.length == lstParameters.size()) {
+          found.add(mt);
+        }
+      }
+      if (cls == cl && !found.isEmpty()) {
+        return found;
+      }
+      visited.add(cls.qualifiedName);
+      if (cls.superClass != null && !visited.contains(cls.superClass.value)) {
+        StructClass parent = DecompilerContext.getStructContext().getClass((String) cls.superClass.value);
+        if (parent != null) {
+          queue.add(parent);
+        }
+      }
+      for (String intf : cls.getInterfaceNames()) {
+        if (!visited.contains(intf)) {
+          StructClass parent = DecompilerContext.getStructContext().getClass(intf);
+          if (parent != null) {
+            queue.add(parent);
+          }
+        }
+      }
+    }
+    return found;
   }
 
   private BitSet getAmbiguousParameters(List<StructMethod> matches) {

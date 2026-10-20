@@ -24,6 +24,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.flow.FlattenStatementsHe
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructBootstrapMethodsAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.consts.ConstantPool;
@@ -1235,8 +1236,44 @@ public class ExprProcessor implements CodeConstants {
   private static boolean lambdaNeedsCast(VarType left, NewExprent exprent) {
     if (exprent.isLambda() && !exprent.isMethodReference()) {
       StructClass cls = DecompilerContext.getStructContext().getClass(left.value);
-      return cls == null || cls.getMethod(exprent.getLambdaMethodKey()) == null;
+      if (cls == null || cls.getMethod(exprent.getLambdaMethodKey()) == null) {
+        return true;
+      }
+      // A lambda can only take an interface with one abstract method. The expected type may be a
+      // supertype that declares the same method but is not functional, in which case javac rejects
+      // the bare lambda and the original source cast it to the functional subtype.
+      return RoundTrip.selector("lambdacast") && !isFunctionalInterface(cls);
     }
     return false;
+  }
+
+  /** The single abstract method that makes {@code cls} a functional interface, or null. */
+  public static StructMethod functionalMethod(StructClass cls) {
+    if (!cls.hasModifier(CodeConstants.ACC_INTERFACE)) {
+      return null;
+    }
+    StructMethod found = null;
+    for (StructMethod method : cls.getMethods()) {
+      if (!method.hasModifier(CodeConstants.ACC_ABSTRACT) || method.hasModifier(CodeConstants.ACC_STATIC)) {
+        continue;
+      }
+      // Redeclaring an Object method is not an abstract method for functional-interface purposes.
+      String name = method.getName();
+      String desc = method.getDescriptor();
+      if ((name.equals("equals") && desc.equals("(Ljava/lang/Object;)Z"))
+          || (name.equals("hashCode") && desc.equals("()I"))
+          || (name.equals("toString") && desc.equals("()Ljava/lang/String;"))) {
+        continue;
+      }
+      if (found != null) {
+        return null;
+      }
+      found = method;
+    }
+    return found;
+  }
+
+  private static boolean isFunctionalInterface(StructClass cls) {
+    return functionalMethod(cls) != null;
   }
 }

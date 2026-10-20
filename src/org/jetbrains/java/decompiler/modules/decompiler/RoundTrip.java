@@ -398,16 +398,52 @@ public final class RoundTrip {
       case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
       default -> null;
     };
-    if (head != null) {
-      if (head.bytecode == null || head.bytecode.isEmpty()) {
-        return false;
-      }
+    if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
       // The loop top may load a local the condition exprent does not own, so the target can sit
       // a short load before the exprent's first byte.
       int start = head.bytecode.nextSetBit(0);
-      return target <= start && target >= start - 3;
+      if (target <= start && target >= start - 3) {
+        return true;
+      }
     }
-    return firstOffset(loop.getFirst()) == target;
+    // A for-each continue jumps to the compiler's hasNext block and a for's to the increment; both
+    // live inside the loop but are not owned by the iterable or condition exprent.
+    if (loop.getLooptype() == org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.FOR_EACH) {
+      // A for-each continue jumps into the compiler's hasNext block, which sits before the first
+      // instruction any exprent of the loop covers.
+      int bodyStart = firstOffset(loop.getFirst());
+      return target >= 0 && bodyStart >= 0 && target < bodyStart;
+    }
+    int min = firstOffset(loop);
+    int max = lastOffset(loop);
+    return min >= 0 && max >= min && target >= min && target <= max;
+  }
+
+  /** Last target offset covered by a statement, or -1. */
+  public static int lastOffset(Statement statement) {
+    int max = -1;
+    List<Exprent> exprents = statement.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          BitSet bits = inner.bytecode;
+          if (bits != null && !bits.isEmpty()) {
+            int offset = bits.length() - 1;
+            if (offset > max) {
+              max = offset;
+            }
+          }
+        }
+      }
+    } else {
+      for (Statement child : statement.getStats()) {
+        int offset = lastOffset(child);
+        if (offset > max) {
+          max = offset;
+        }
+      }
+    }
+    return max;
   }
 
   /** First target offset covered by a statement, or -1. */
