@@ -720,7 +720,9 @@ public class MergeHelper {
             holder.getInstance() instanceof VarExprent) {
           VarExprent copy = (VarExprent)initExprents[1].getLeft();
           VarExprent inc = (VarExprent)holder.getInstance();
-          if (copy.getIndex() == inc.getIndex() && copy.getVersion() == inc.getVersion() &&
+          // A regular local used once is still the source's variable; only compiler temporaries fold.
+          boolean keepLocal = RoundTrip.selector("keeplocal") && !copy.isStack();
+          if (!keepLocal && copy.getIndex() == inc.getIndex() && copy.getVersion() == inc.getVersion() &&
               !inc.isVarReferenced(stat.getTopParent(), copy) && !isNextCall(initExprents[1].getRight())) {
             preData.getExprents().remove(initExprents[1]);
             initExprents[1].getBytecodeRange(initExprents[1].getRight().bytecode);
