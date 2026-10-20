@@ -215,6 +215,22 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (C) continue; body`: the loop printed the mirror `if (!C) { body }` as its body.
+    if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
+        && ifHead.getCondition() instanceof FunctionExprent not
+        && not.getFuncType() == FunctionType.BOOL_NOT
+        && getParent() instanceof DoStatement
+        && RoundTrip.printContinueGuard(ifHead, this)) {
+      IfExprent guard = (IfExprent) ifHead.copy();
+      guard.setCondition(not.getLstOperands().get(0));
+      buf.appendIndent(indent);
+      buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      return buf;
+    }
+
     buf.appendIndent(indent);
     // Condition can be null in early processing stages
     if (condition != null) {

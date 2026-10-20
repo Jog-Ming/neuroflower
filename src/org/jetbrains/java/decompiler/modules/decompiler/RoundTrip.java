@@ -20,19 +20,40 @@ import java.util.List;
 /** Target-aware choices for byte-faithful output. Only active with {@code --round-trip=1}. */
 public final class RoundTrip {
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
   /** Remember where a method's void returns are; the instruction sequence is gone by print time. */
   public static void recordMethod(StructMethod method, FullInstructionSequence seq) {
     BitSet returns = new BitSet();
+    java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
       }
+      // `if (C) continue;`: the branch falls through to a backwards goto and jumps past it to the body.
+      if (i + 1 < seq.length() && isConditional(instr.opcode)) {
+        Instruction next = seq.getInstr(i + 1);
+        if (next.opcode == CodeConstants.opc_goto) {
+          int branchTarget = instr.startOffset + instr.operand(0);
+          int gotoTarget = next.startOffset + next.operand(0);
+          if (gotoTarget < next.startOffset && branchTarget > next.startOffset) {
+            // Key by the branch's end; the head exprent's offsets cover the branch instruction.
+            guards.put(instr.startOffset + instr.length, gotoTarget);
+          }
+        }
+      }
     }
     VOID_RETURNS.put(method, returns);
+    CONTINUE_GUARDS.put(method, guards);
+  }
+
+  private static boolean isConditional(int opcode) {
+    return opcode >= CodeConstants.opc_ifeq && opcode <= CodeConstants.opc_if_acmpne
+      || opcode == CodeConstants.opc_ifnull || opcode == CodeConstants.opc_ifnonnull;
   }
 
   public static boolean enabled() {
@@ -180,6 +201,57 @@ public final class RoundTrip {
     int bodyStart = firstOffset(body);
     int tailStart = firstOffset(tail);
     return bodyStart >= 0 && tailStart >= 0 && tailStart < bodyStart;
+  }
+
+  /**
+   * True when the target compiled this if as {@code if (C) continue;} — the condition branches to
+   * the body and the fall-through jumps back to the loop head. The printer's mirror is
+   * {@code if (!C) { body }}, which compiles to the opposite branch with no goto.
+   */
+  public static boolean printContinueGuard(Exprent head, Statement sequence) {
+    if (!selector("continueguard")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
+    BitSet offsets = head.bytecode;
+    if (guards == null || guards.isEmpty() || offsets == null || offsets.isEmpty()) {
+      return false;
+    }
+    Integer target = guards.get(offsets.length());
+    if (target == null) {
+      return false;
+    }
+    Statement loop = sequence.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    return isContinueTarget(doStatement, target);
+  }
+
+  /** The instruction a {@code continue} in this loop jumps to. */
+  private static boolean isContinueTarget(org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    Exprent head = switch (loop.getLooptype()) {
+      case WHILE, DO_WHILE -> loop.getConditionExprent();
+      case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
+      default -> null;
+    };
+    if (head != null) {
+      if (head.bytecode == null || head.bytecode.isEmpty()) {
+        return false;
+      }
+      // The loop top may load a local the condition exprent does not own, so the target can sit
+      // a short load before the exprent's first byte.
+      int start = head.bytecode.nextSetBit(0);
+      return target <= start && target >= start - 3;
+    }
+    return firstOffset(loop.getFirst()) == target;
   }
 
   /** First target offset covered by a statement, or -1. */

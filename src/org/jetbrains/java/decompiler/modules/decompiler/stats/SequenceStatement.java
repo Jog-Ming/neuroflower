@@ -7,6 +7,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -108,6 +109,26 @@ public class SequenceStatement extends Statement {
     for (int i = 0; i < stats.size(); i++) {
 
       Statement st = stats.get(i);
+
+      // `if (C) continue; body` in the source; the decompiler printed its mirror `if (!C) { body }`.
+      if (st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !st.isLabeled()
+          && ifStatement.getIfstat() != null
+          && ifStatement.getHeadexprent().getCondition() instanceof FunctionExprent not
+          && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT
+          && RoundTrip.printContinueGuard(ifStatement.getHeadexprent(), this)) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(not.getLstOperands().get(0));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+        notempty = true;
+        continue;
+      }
 
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
