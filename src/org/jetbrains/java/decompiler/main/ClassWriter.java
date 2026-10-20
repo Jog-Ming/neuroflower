@@ -478,7 +478,8 @@ public class ClassWriter implements StatementWriter {
 
       // methods
       VBStyleCollection<StructMethod, String> methods = cl.getMethods();
-      for (int i = 0; i < methods.size(); i++) {
+      List<Integer> methodOrder = methodWriteOrder(node, methods);
+      for (int i : methodOrder) {
         StructMethod mt = methods.get(i);
         boolean hide;
         if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
@@ -1960,6 +1961,90 @@ public class ClassWriter implements StatementWriter {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Javac numbers lambdas class-wide in source order, but always emits {@code <clinit>} last in the
+   * class file. Its source position is recoverable from the target lambda names: print the static
+   * initializer before the first method whose lambdas are numbered after its own.
+   */
+  private static List<Integer> methodWriteOrder(ClassNode node, VBStyleCollection<StructMethod, String> methods) {
+    List<Integer> order = new ArrayList<>(methods.size());
+    for (int i = 0; i < methods.size(); i++) {
+      order.add(i);
+    }
+    if (!RoundTrip.selector("memberorder")) {
+      return order;
+    }
+    int clinit = -1;
+    for (int i = 0; i < methods.size(); i++) {
+      if (CodeConstants.CLINIT_NAME.equals(methods.get(i).getName())) {
+        clinit = i;
+      }
+    }
+    if (clinit < 0) {
+      return order;
+    }
+    Map<Integer, Integer> minimum = new HashMap<>();
+    int clinitMin = Integer.MAX_VALUE;
+    for (ClassNode nested : node.nested) {
+      ClassNode.LambdaInformation lambda = nested.lambdaInformation;
+      if (lambda == null || lambda.is_method_reference || !node.classStruct.qualifiedName.equals(lambda.content_class_name)) {
+        continue;
+      }
+      int index = lambdaIndex(lambda.content_method_name);
+      if (index < 0) {
+        continue;
+      }
+      String enclosing = lambda.content_method_name.substring("lambda$".length(), lambda.content_method_name.lastIndexOf('$'));
+      int owner = -1;
+      if ("static".equals(enclosing) || CodeConstants.CLINIT_NAME.equals(enclosing)) {
+        owner = clinit;
+      }
+      for (int i = 0; owner < 0 && i < methods.size(); i++) {
+        if (methods.get(i).getName().equals(enclosing)) {
+          owner = i;
+          break;
+        }
+      }
+      if (owner < 0) {
+        continue;
+      }
+      if (owner == clinit) {
+        clinitMin = Math.min(clinitMin, index);
+      } else {
+        minimum.merge(owner, index, Math::min);
+      }
+    }
+    if (clinitMin == Integer.MAX_VALUE) {
+      return order;
+    }
+    int before = -1;
+    for (int i = 0; i < methods.size(); i++) {
+      Integer index = minimum.get(i);
+      if (i != clinit && index != null && index > clinitMin) {
+        before = i;
+        break;
+      }
+    }
+    if (before < 0) {
+      return order;
+    }
+    order.remove(Integer.valueOf(clinit));
+    order.add(order.indexOf(before), clinit);
+    return order;
+  }
+
+  private static int lambdaIndex(String methodName) {
+    int dollar = methodName.lastIndexOf('$');
+    if (dollar < 0) {
+      return -1;
+    }
+    try {
+      return Integer.parseInt(methodName.substring(dollar + 1));
+    } catch (NumberFormatException e) {
+      return -1;
     }
   }
 
