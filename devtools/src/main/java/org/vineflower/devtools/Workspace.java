@@ -39,7 +39,7 @@ public final class Workspace {
   }
 
   public static Workspace load() {
-    String root = System.getenv("NF_ROOT");
+    String root = System.getenv("DEVTOOLS_ROOT");
     return new Workspace(Path.of(root == null ? System.getProperty("user.dir") : root));
   }
 

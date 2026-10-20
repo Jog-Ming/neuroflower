@@ -6,7 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The experimental pipeline's entry point. See ./nf for the wrapper.
+ * The experimental pipeline's entry point. See devtools/cli for the wrapper.
  *
  * <pre>
  *   versions [--refresh]
@@ -178,7 +178,7 @@ public final class Main {
 
   private static void usage() {
     System.out.println("""
-      usage: nf <command> [options]
+      usage: devtools/cli <command> [options]
 
         versions [--refresh]                  list Mojang's versions
         download  <version> [--refresh]       cache the client jar and libraries
