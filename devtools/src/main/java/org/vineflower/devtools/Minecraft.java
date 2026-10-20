@@ -117,7 +117,9 @@ public final class Minecraft {
 
   public List<Path> libraries(String version, boolean refresh) throws IOException, InterruptedException {
     JsonObject metadata = versionJson(version, refresh);
-    Path libs = workspace.versions.resolve(version).resolve("libs");
+    // A _unobfuscated build has the same dependencies as its base release; share one cache.
+    VersionData data = resolve(version, refresh);
+    Path libs = workspace.versions.resolve(data.libraryBase()).resolve("libs");
     List<JsonObject> artifacts = new ArrayList<>();
     if (metadata.has("libraries")) {
       for (JsonElement entry : metadata.getAsJsonArray("libraries")) {
