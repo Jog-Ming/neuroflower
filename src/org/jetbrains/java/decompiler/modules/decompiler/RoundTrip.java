@@ -6,10 +6,12 @@ import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FieldExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructMethod;
@@ -22,6 +24,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -29,10 +33,14 @@ public final class RoundTrip {
   public static void recordMethod(StructMethod method, FullInstructionSequence seq) {
     BitSet returns = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
+      }
+      if (isConditional(instr.opcode)) {
+        branches.put(instr.startOffset + instr.length, instr.opcode);
       }
       // `if (C) continue;`: the branch falls through to a backwards goto and jumps past it to the body.
       if (i + 1 < seq.length() && isConditional(instr.opcode)) {
@@ -49,6 +57,79 @@ public final class RoundTrip {
     }
     VOID_RETURNS.put(method, returns);
     CONTINUE_GUARDS.put(method, guards);
+    BRANCHES.put(method, branches);
+  }
+
+  /**
+   * True when the target branched the other way: the original wrote the negated condition with the
+   * arms swapped. Only plain boolean tests are handled; comparisons and short-circuit conditions
+   * compile to different opcode families and are left alone.
+   */
+  public static boolean swapIfArms(Exprent head) {
+    if (!selector("polarity") || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> branches = BRANCHES.get(method);
+    BitSet offsets = head.bytecode;
+    if (branches == null || offsets == null || offsets.isEmpty()) {
+      return false;
+    }
+    Integer opcode = branches.get(offsets.length());
+    if (opcode == null) {
+      return false;
+    }
+    int expected = lastBranch(ifHead.getCondition());
+    int other = complement(expected);
+    return other != 0 && opcode == other;
+  }
+
+  /**
+   * The branch opcode javac emits after the last test of this condition when the arm is skipped —
+   * the opcode the target would carry had the condition been written this way. `&&` and `||` both
+   * test their right operand last and jump to the else arm when it is false; a negation swaps the
+   * branch. Returns 0 for tests outside the boolean/null families.
+   */
+  private static int lastBranch(Exprent condition) {
+    if (condition instanceof FunctionExprent function) {
+      FunctionExprent.FunctionType type = function.getFuncType();
+      if (type == FunctionExprent.FunctionType.BOOL_NOT) {
+        return complement(lastBranch(function.getLstOperands().get(0)));
+      }
+      if (type == FunctionExprent.FunctionType.BOOLEAN_AND || type == FunctionExprent.FunctionType.BOOLEAN_OR) {
+        java.util.List<Exprent> operands = function.getLstOperands();
+        return lastBranch(operands.get(operands.size() - 1));
+      }
+      if ((type == FunctionExprent.FunctionType.EQ || type == FunctionExprent.FunctionType.NE)
+          && function.getLstOperands().size() == 2
+          && (isNull(function.getLstOperands().get(0)) || isNull(function.getLstOperands().get(1)))) {
+        // `x == null` is false when non-null: the skip branch is ifnonnull.
+        return type == FunctionExprent.FunctionType.EQ ? CodeConstants.opc_ifnonnull : CodeConstants.opc_ifnull;
+      }
+    }
+    return isPlainBoolean(condition) ? CodeConstants.opc_ifeq : 0;
+  }
+
+  private static int complement(int opcode) {
+    return switch (opcode) {
+      case CodeConstants.opc_ifeq -> CodeConstants.opc_ifne;
+      case CodeConstants.opc_ifne -> CodeConstants.opc_ifeq;
+      case CodeConstants.opc_ifnull -> CodeConstants.opc_ifnonnull;
+      case CodeConstants.opc_ifnonnull -> CodeConstants.opc_ifnull;
+      default -> 0;
+    };
+  }
+
+  private static boolean isNull(Exprent exprent) {
+    return exprent instanceof ConstExprent constant && constant.isNull();
+  }
+
+  private static boolean isPlainBoolean(Exprent exprent) {
+    return exprent instanceof InvocationExprent || exprent instanceof VarExprent
+      || exprent instanceof FieldExprent || exprent instanceof ConstExprent;
   }
 
   private static boolean isConditional(int opcode) {

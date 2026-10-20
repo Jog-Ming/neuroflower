@@ -231,6 +231,25 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (C) A else B` and `if (!C) B else A` are the same program in different bytes; the target's
+    // branch opcode says which one was written.
+    if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
+        && condition instanceof IfExprent ifHead && RoundTrip.swapIfArms(ifHead)) {
+      IfExprent head = (IfExprent) ifHead.copy();
+      Exprent cond = head.getCondition();
+      if (cond instanceof FunctionExprent not && not.getFuncType() == FunctionType.BOOL_NOT) {
+        head.setCondition(not.getLstOperands().get(0));
+      } else {
+        head.setCondition(new FunctionExprent(FunctionType.BOOL_NOT, cond, null));
+      }
+      buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
+      buf.appendIndent(indent).append("} else {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      return buf;
+    }
+
     buf.appendIndent(indent);
     // Condition can be null in early processing stages
     if (condition != null) {
