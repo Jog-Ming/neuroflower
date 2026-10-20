@@ -79,9 +79,8 @@ public final class Verifier {
     ExecutorService pool = Executors.newFixedThreadPool(Math.max(1, threads));
     List<Callable<FileResult>> tasks = new ArrayList<>();
     Path compileCache = workspace.cache.resolve("compile");
-    java.util.Set<String> used = java.util.concurrent.ConcurrentHashMap.newKeySet();
     for (Path source : sources) {
-      tasks.add(() -> scoreFile(source, originalClasses, classpath, release, stamp, compileCache, used));
+      tasks.add(() -> scoreFile(source, originalClasses, classpath, release, stamp, compileCache));
     }
 
     long started = System.nanoTime();
@@ -95,9 +94,10 @@ public final class Verifier {
     }
     long elapsed = (System.nanoTime() - started) / 1_000_000;
 
-    // A full-tree run defines the live cache: drop entries from other toolchains or older sources.
+    // Entries are evicted by age, not by whether this run used them: an A/B alternates between
+    // two source sets, and evicting the other side each time would make every run a cold one.
     if (only == null && Files.isDirectory(target)) {
-      pruneCompileCache(compileCache, used);
+      pruneCompileCache(compileCache);
     }
 
     long totalClasses = Files.isDirectory(target) && only == null
@@ -106,12 +106,12 @@ public final class Verifier {
   }
 
   private FileResult scoreFile(Path source, Path originalClasses, List<Path> classpath, int release,
-                               String stamp, Path compileCache, java.util.Set<String> used) throws Exception {
+                               String stamp, Path compileCache) throws Exception {
     byte[] bytes = Files.readAllBytes(source);
     String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + stamp);
-    used.add(key);
     Path cached = compileCache.resolve(key.substring(0, 2)).resolve(key + ".json");
     if (Files.exists(cached)) {
+      Files.setLastModifiedTime(cached, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
       return readCache(source, cached);
     }
 
@@ -347,17 +347,35 @@ public final class Verifier {
     Files.writeString(index, line, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
   }
 
-  private static void pruneCompileCache(Path compileCache, java.util.Set<String> used) throws IOException {
+  /** Keeps entries that were used recently; the cap bounds a very large A/B matrix. */
+  private static void pruneCompileCache(Path compileCache) throws IOException {
     if (!Files.isDirectory(compileCache)) {
       return;
     }
+    long now = System.currentTimeMillis();
+    long maxAge = 14L * 24 * 60 * 60 * 1000;
+    int maxEntries = 50_000;
+    List<Path> entries = new ArrayList<>();
     try (var walk = Files.walk(compileCache)) {
       for (Path path : walk.filter(p -> p.toString().endsWith(".json")).toList()) {
-        String name = path.getFileName().toString();
-        String key = name.substring(0, name.length() - ".json".length());
-        if (!used.contains(key)) {
+        long used = Files.getLastModifiedTime(path).toMillis();
+        if (now - used > maxAge) {
           Files.deleteIfExists(path);
+        } else {
+          entries.add(path);
         }
+      }
+    }
+    if (entries.size() > maxEntries) {
+      entries.sort(java.util.Comparator.comparingLong(p -> {
+        try {
+          return Files.getLastModifiedTime(p).toMillis();
+        } catch (IOException e) {
+          return 0L;
+        }
+      }));
+      for (int i = 0; i < entries.size() - maxEntries; i++) {
+        Files.deleteIfExists(entries.get(i));
       }
     }
   }
