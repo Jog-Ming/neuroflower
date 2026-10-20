@@ -1,0 +1,478 @@
+package org.vineflower.devtools;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import javax.tools.Diagnostic;
+import javax.tools.DiagnosticCollector;
+import javax.tools.FileObject;
+import javax.tools.ForwardingJavaFileManager;
+import javax.tools.JavaCompiler;
+import javax.tools.JavaFileManager;
+import javax.tools.JavaFileObject;
+import javax.tools.SimpleJavaFileObject;
+import javax.tools.StandardJavaFileManager;
+import javax.tools.ToolProvider;
+import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
+import java.net.URI;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.zip.ZipFile;
+
+/**
+ * Compiles a source tree (or one file) against the original jar and reports per-class attribute
+ * matches. Results are cached by source content and toolchain, so an unchanged file is never
+ * compiled twice.
+ */
+public final class Verifier {
+  public record ClassResult(String name, Map<String, Boolean> flags, List<String> details, boolean compiled,
+                            boolean extra) {
+  }
+
+  public record FileResult(String source, List<ClassResult> classes, List<String> errors, boolean cached) {
+  }
+
+  /** One compiler and one file manager per worker: scanning the classpath is the expensive part. */
+  private static final ThreadLocal<JavaCompiler> COMPILER =
+    ThreadLocal.withInitial(ToolProvider::getSystemJavaCompiler);
+  private static final ThreadLocal<StandardJavaFileManager> FILES = ThreadLocal.withInitial(() ->
+    COMPILER.get().getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8));
+
+  /** Bump when the comparison changes: it is part of the cache key, not of the source hash. */
+  private static final String COMPARATOR_VERSION = "2";
+
+  private final Workspace workspace;
+  private final Minecraft minecraft;
+
+  public Verifier(Workspace workspace, Minecraft minecraft) {
+    this.workspace = workspace;
+    this.minecraft = minecraft;
+  }
+
+  public void score(String version, Path target, String only, int threads, boolean json) throws Exception {
+    Path client = minecraft.clientJar(version, false);
+    Path originalClasses = minecraft.extractedClasses(version, false);
+    List<Path> classpath = minecraft.classpath(version, false);
+    int release = releaseOf(client);
+    String stamp = stamp(client, classpath, release);
+
+    List<Path> sources = sources(target, only);
+    if (sources.isEmpty()) {
+      throw new IllegalArgumentException("no sources under " + target + (only == null ? "" : " for " + only));
+    }
+
+    ExecutorService pool = Executors.newFixedThreadPool(Math.max(1, threads));
+    List<Callable<FileResult>> tasks = new ArrayList<>();
+    Path compileCache = workspace.cache.resolve("compile");
+    java.util.Set<String> used = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    for (Path source : sources) {
+      tasks.add(() -> scoreFile(source, originalClasses, classpath, release, stamp, compileCache, used));
+    }
+
+    long started = System.nanoTime();
+    List<FileResult> results = new ArrayList<>();
+    try {
+      for (Future<FileResult> future : pool.invokeAll(tasks)) {
+        results.add(future.get());
+      }
+    } finally {
+      pool.shutdown();
+    }
+    long elapsed = (System.nanoTime() - started) / 1_000_000;
+
+    // A full-tree run defines the live cache: drop entries from other toolchains or older sources.
+    if (only == null && Files.isDirectory(target)) {
+      pruneCompileCache(compileCache, used);
+    }
+
+    long totalClasses = Files.isDirectory(target) && only == null
+      ? countClasses(originalClasses) : 0;
+    report(version, target, results, elapsed, json, totalClasses);
+  }
+
+  private FileResult scoreFile(Path source, Path originalClasses, List<Path> classpath, int release,
+                               String stamp, Path compileCache, java.util.Set<String> used) throws Exception {
+    byte[] bytes = Files.readAllBytes(source);
+    String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + stamp);
+    used.add(key);
+    Path cached = compileCache.resolve(key.substring(0, 2)).resolve(key + ".json");
+    if (Files.exists(cached)) {
+      return readCache(source, cached);
+    }
+
+    DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+    JavaCompiler compiler = COMPILER.get();
+    StandardJavaFileManager files = FILES.get();
+    MemoryOutput memory = new MemoryOutput(files);
+    List<String> options = List.of(
+      "--release", Integer.toString(release),
+      "-g", "-parameters", "-nowarn", "-proc:none", "-implicit:none",
+      "-classpath", join(classpath));
+    boolean ok = compiler.getTask(null, memory, diagnostics, options, null,
+      files.getJavaFileObjects(source)).call();
+
+    List<ClassResult> classes = new ArrayList<>();
+    List<String> errors = new ArrayList<>();
+    if (!ok) {
+      for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+        if (diagnostic.getKind() == Diagnostic.Kind.ERROR && errors.size() < 8) {
+          errors.add(diagnostic.getLineNumber() + ":"
+            + diagnostic.getMessage(Locale.ROOT).split("\n")[0]);
+        }
+      }
+      classes.add(new ClassResult(classNameOf(source), allFalse("not compiled: "
+        + (errors.isEmpty() ? "javac failed" : errors.get(0))), errors, false, false));
+    } else {
+      List<String> names = new ArrayList<>(memory.outputs.keySet());
+      Collections.sort(names);
+      for (String binary : names) {
+        String name = binary.replace('.', '/');
+        Path originalFile = originalClasses.resolve(name + ".class");
+        if (!Files.exists(originalFile)) {
+          classes.add(new ClassResult(name, allFalse("no original class in the jar"), List.of(), true, true));
+          continue;
+        }
+        ClassDiff diff = ClassDiff.compare(Files.readAllBytes(originalFile), memory.outputs.get(binary));
+        classes.add(new ClassResult(diff.name, diff.matches, diff.details, true, false));
+      }
+    }
+    FileResult result = new FileResult(source.toString(), classes, errors, false);
+    writeCache(cached, result);
+    return result;
+  }
+
+  /** Compiles into memory: no per-file output directory, no write and read back. */
+  private static final class MemoryOutput extends ForwardingJavaFileManager<JavaFileManager> {
+    final Map<String, byte[]> outputs = new LinkedHashMap<>();
+
+    MemoryOutput(JavaFileManager delegate) {
+      super(delegate);
+    }
+
+    @Override
+    public JavaFileObject getJavaFileForOutput(JavaFileManager.Location location, String className,
+                                               JavaFileObject.Kind kind,
+                                               FileObject sibling) {
+      return new SimpleJavaFileObject(URI.create("mem:///" + className.replace('.', '/') + kind.extension), kind) {
+        @Override
+        public OutputStream openOutputStream() {
+          return new ByteArrayOutputStream() {
+            @Override
+            public void close() throws IOException {
+              outputs.put(className, toByteArray());
+              super.close();
+            }
+          };
+        }
+      };
+    }
+  }
+
+  private static Map<String, Boolean> allFalse(String detail) {
+    Map<String, Boolean> flags = new LinkedHashMap<>();
+    for (String attribute : ClassDiff.ATTRIBUTES) {
+      flags.put(attribute, false);
+    }
+    return flags;
+  }
+
+  private static String classNameOf(Path source) {
+    String name = source.getFileName().toString();
+    return name.endsWith(".java") ? name.substring(0, name.length() - ".java".length()) : name;
+  }
+
+  private static long countClasses(Path dir) throws IOException {
+    try (var walk = Files.walk(dir)) {
+      return walk.filter(p -> p.toString().endsWith(".class")).count();
+    }
+  }
+
+  private void report(String version, Path target, List<FileResult> results, long elapsed, boolean json,
+                      long totalClasses) throws IOException {
+    int files = results.size();
+    int cached = (int) results.stream().filter(FileResult::cached).count();
+    int classes = 0;
+    int compiled = 0;
+    Map<String, Integer> matches = new LinkedHashMap<>();
+    for (String attribute : ClassDiff.ATTRIBUTES) {
+      matches.put(attribute, 0);
+    }
+    int fully = 0;
+    int extras = 0;
+    int failingFiles = 0;
+    List<String> worst = new ArrayList<>();
+    for (FileResult result : results) {
+      if (!result.errors().isEmpty()) {
+        failingFiles++;
+      }
+      for (ClassResult cls : result.classes()) {
+        if (cls.extra()) {
+          extras++;
+          continue;
+        }
+        if (!cls.compiled()) {
+          continue; // the file did not compile; counted below, not as a class
+        }
+        classes++;
+        compiled++;
+        boolean all = true;
+        for (String attribute : ClassDiff.ATTRIBUTES) {
+          boolean value = cls.flags().getOrDefault(attribute, false);
+          if (value) {
+            matches.merge(attribute, 1, Integer::sum);
+          } else {
+            all = false;
+          }
+        }
+        if (all) {
+          fully++;
+        } else if (worst.size() < 12) {
+          List<String> failed = new ArrayList<>();
+          for (String attribute : ClassDiff.ATTRIBUTES) {
+            if (!cls.flags().getOrDefault(attribute, false)) {
+              failed.add(attribute);
+            }
+          }
+          worst.add(cls.name() + "  " + String.join(",", failed)
+            + (cls.details().isEmpty() ? "" : "  (" + cls.details().get(0) + ")"));
+        }
+      }
+    }
+
+    long missing = totalClasses > 0 ? totalClasses - compiled : 0;
+    System.out.printf(Locale.ROOT,
+      "sources %d (%d cached)  classes %d  compiled %d  missing %d  fully %d  extra %d  in %.1fs%n",
+      files, cached, classes, compiled, Math.max(0, missing), fully, extras, elapsed / 1000.0);
+    System.out.printf(Locale.ROOT, "%-12s %8s %8s%n", "attribute", "match", "rate");
+    for (String attribute : ClassDiff.ATTRIBUTES) {
+      int count = matches.get(attribute);
+      System.out.printf(Locale.ROOT, "%-12s %8d %7.1f%%%n", attribute, count,
+        classes == 0 ? 0.0 : 100.0 * count / classes);
+    }
+    if (failingFiles > 0) {
+      System.out.println("files that did not compile: " + failingFiles);
+    }
+    if (!worst.isEmpty()) {
+      System.out.println("first diverging classes:");
+      for (String line : worst) {
+        System.out.println("  " + line);
+      }
+    }
+
+    appendIndex(version, target, files, cached, classes, compiled, fully, matches, elapsed);
+
+
+    if (json) {
+      JsonObject report = new JsonObject();
+      report.addProperty("version", version);
+      report.addProperty("tree", target.toString());
+      report.addProperty("target", target.toString());
+      report.addProperty("files", files);
+      report.addProperty("cachedFiles", cached);
+      report.addProperty("classes", classes);
+      report.addProperty("compiled", compiled);
+      report.addProperty("jarClasses", totalClasses);
+      report.addProperty("fully", fully);
+      report.addProperty("extraClasses", extras);
+      report.addProperty("elapsedMillis", elapsed);
+      JsonObject attributeJson = new JsonObject();
+      matches.forEach(attributeJson::addProperty);
+      report.add("attributes", attributeJson);
+      JsonArray fileArray = new JsonArray();
+      for (FileResult result : results) {
+        JsonObject fileJson = new JsonObject();
+        fileJson.addProperty("source", result.source());
+        JsonArray classArray = new JsonArray();
+        for (ClassResult cls : result.classes()) {
+          JsonObject classJson = new JsonObject();
+          classJson.addProperty("name", cls.name());
+          classJson.addProperty("compiled", cls.compiled());
+          JsonObject flags = new JsonObject();
+          cls.flags().forEach(flags::addProperty);
+          classJson.add("flags", flags);
+          JsonArray details = new JsonArray();
+          cls.details().forEach(details::add);
+          classJson.add("details", details);
+          classArray.add(classJson);
+        }
+        fileJson.add("classes", classArray);
+        fileArray.add(fileJson);
+      }
+      report.add("files_detail", fileArray);
+      Path reports = workspace.reports;
+      Files.createDirectories(reports);
+      Path path = reports.resolve("score-" + version + "-" + System.currentTimeMillis() + ".json");
+      Workspace.writeJson(path, report);
+      pruneReports(reports, 50);
+      System.out.println("report: " + path);
+    }
+  }
+
+  /** One line per run: small enough to keep forever, enough to compare runs and plot progress. */
+  private void appendIndex(String version, Path target, int files, int cached, int classes, int compiled,
+                           int fully, Map<String, Integer> matches, long elapsed) throws IOException {
+    Path index = workspace.reports.resolve("index.tsv");
+    boolean fresh = !Files.exists(index);
+    StringBuilder line = new StringBuilder();
+    if (fresh) {
+      line.append("epoch\tversion\tclasses\tcompiled\tfully\tcached\tfiles\tmillis");
+      for (String attribute : ClassDiff.ATTRIBUTES) {
+        line.append('\t').append(attribute);
+      }
+      line.append("\ttree\n");
+    }
+    line.append(System.currentTimeMillis()).append('\t').append(version).append('\t')
+      .append(classes).append('\t').append(compiled).append('\t').append(fully).append('\t')
+      .append(cached).append('\t').append(files).append('\t').append(elapsed);
+    for (String attribute : ClassDiff.ATTRIBUTES) {
+      line.append('\t').append(matches.getOrDefault(attribute, 0));
+    }
+    line.append('\t').append(target).append('\n');
+    Files.createDirectories(index.getParent());
+    Files.writeString(index, line, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+  }
+
+  private static void pruneCompileCache(Path compileCache, java.util.Set<String> used) throws IOException {
+    if (!Files.isDirectory(compileCache)) {
+      return;
+    }
+    try (var walk = Files.walk(compileCache)) {
+      for (Path path : walk.filter(p -> p.toString().endsWith(".json")).toList()) {
+        String name = path.getFileName().toString();
+        String key = name.substring(0, name.length() - ".json".length());
+        if (!used.contains(key)) {
+          Files.deleteIfExists(path);
+        }
+      }
+    }
+  }
+
+  private static void pruneReports(Path reports, int keep) throws IOException {
+    try (var list = Files.list(reports)) {
+      List<Path> files = new ArrayList<>(list.filter(p -> p.getFileName().toString().endsWith(".json")).toList());
+      files.sort(java.util.Comparator.comparing((Path p) -> p.getFileName().toString()).reversed());
+      for (int i = keep; i < files.size(); i++) {
+        Files.deleteIfExists(files.get(i));
+      }
+    }
+  }
+
+  private List<Path> sources(Path target, String only) throws IOException {
+    if (Files.isRegularFile(target)) {
+      return List.of(target);
+    }
+    Path root = target;
+    String relative = only == null ? null : only.replace('.', '/') + ".java";
+    try (var walk = Files.walk(root)) {
+      List<Path> list = new ArrayList<>(walk.filter(p -> p.toString().endsWith(".java")).toList());
+      if (relative != null) {
+        String wanted = relative.replace('\\', '/');
+        list.removeIf(p -> !root.relativize(p).toString().replace('\\', '/').endsWith(wanted));
+      }
+      Collections.sort(list);
+      return list;
+    }
+  }
+
+  // ------------------------------------------------------------------ cache and toolchain
+
+  private FileResult readCache(Path source, Path cached) throws IOException {
+    JsonObject json = Workspace.readJson(cached);
+    List<ClassResult> classes = new ArrayList<>();
+    for (JsonElement element : json.getAsJsonArray("classes")) {
+      JsonObject object = element.getAsJsonObject();
+      Map<String, Boolean> flags = new LinkedHashMap<>();
+      object.getAsJsonObject("flags").entrySet()
+        .forEach(e -> flags.put(e.getKey(), e.getValue().getAsBoolean()));
+      List<String> details = new ArrayList<>();
+      object.getAsJsonArray("details").forEach(d -> details.add(d.getAsString()));
+      classes.add(new ClassResult(object.get("name").getAsString(), flags, details,
+        object.get("compiled").getAsBoolean(),
+        object.has("extra") && object.get("extra").getAsBoolean()));
+    }
+    List<String> errors = new ArrayList<>();
+    if (json.has("errors")) {
+      json.getAsJsonArray("errors").forEach(e -> errors.add(e.getAsString()));
+    }
+    return new FileResult(source.toString(), classes, errors, true);
+  }
+
+  private void writeCache(Path cached, FileResult result) throws IOException {
+    JsonObject json = new JsonObject();
+    JsonArray classes = new JsonArray();
+    for (ClassResult cls : result.classes()) {
+      JsonObject object = new JsonObject();
+      object.addProperty("name", cls.name());
+      object.addProperty("compiled", cls.compiled());
+      object.addProperty("extra", cls.extra());
+      JsonObject flags = new JsonObject();
+      cls.flags().forEach(flags::addProperty);
+      object.add("flags", flags);
+      JsonArray details = new JsonArray();
+      cls.details().forEach(details::add);
+      object.add("details", details);
+      classes.add(object);
+    }
+    json.add("classes", classes);
+    JsonArray errors = new JsonArray();
+    result.errors().forEach(errors::add);
+    json.add("errors", errors);
+    Workspace.writeJson(cached, json);
+  }
+
+  private String stamp(Path client, List<Path> classpath, int release) throws IOException {
+    StringBuilder libs = new StringBuilder();
+    for (Path lib : classpath) {
+      if (lib.getFileName().toString().equals("client.jar")) {
+        continue;
+      }
+      libs.append(lib.getFileName()).append(':').append(Files.size(lib)).append(';');
+    }
+    return Workspace.sha256(COMPARATOR_VERSION + "|" + System.getProperty("java.version") + "|"
+      + System.getProperty("java.home") + "|" + release + "|" + Workspace.sha256(client) + "|"
+      + Workspace.sha256(libs.toString()));
+  }
+
+  private static int releaseOf(Path jar) throws IOException {
+    try (ZipFile zip = new ZipFile(jar.toFile())) {
+      var entries = zip.entries();
+      while (entries.hasMoreElements()) {
+        var entry = entries.nextElement();
+        if (entry.getName().endsWith(".class") && !entry.getName().contains("META-INF")) {
+          try (var in = zip.getInputStream(entry)) {
+            byte[] header = in.readNBytes(8);
+            int major = ((header[6] & 0xFF) << 8) | (header[7] & 0xFF);
+            return major - 44;
+          }
+        }
+      }
+    }
+    throw new IOException("no classes in " + jar);
+  }
+
+  private static String join(List<Path> paths) {
+    StringBuilder builder = new StringBuilder();
+    for (Path path : paths) {
+      if (builder.length() > 0) {
+        builder.append(java.io.File.pathSeparatorChar);
+      }
+      builder.append(path);
+    }
+    return builder.toString();
+  }
+}

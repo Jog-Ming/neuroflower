@@ -246,6 +246,7 @@ def allJar = tasks.register('allJar', Jar) {allJar ->
   }
 
   subprojects.each {
+    if (it.name == 'devtools') return // development tooling, not a decompiler plugin
     // Check if gradle.properties has 'does_shadow=true', and use the shadowJar configuration if so
     Task buildTask = it.tasks.named("true".equals(it.does_shadow) ? 'shadowJar' : 'jar').get()
     // Make sure the task is defined as a dependency

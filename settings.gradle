@@ -11,6 +11,8 @@ plugins {
 
 rootProject.name = 'vineflower'
 
+include 'devtools'
+
 [
   'idea-not-null',
   'kotlin',

@@ -23,3 +23,7 @@ bin
 /testData/classes/groovy/
 /testData/classes/kt/
 /testData/classes/scala/
+
+## Experimental pipeline output
+/.dev/
+/devtools/build/

@@ -1,0 +1,438 @@
+package org.vineflower.devtools;
+
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.AnnotationNode;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.IincInsnNode;
+import org.objectweb.asm.tree.InnerClassNode;
+import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.LineNumberNode;
+import org.objectweb.asm.tree.LocalVariableAnnotationNode;
+import org.objectweb.asm.tree.LocalVariableNode;
+import org.objectweb.asm.tree.LookupSwitchInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.MultiANewArrayInsnNode;
+import org.objectweb.asm.tree.ParameterNode;
+import org.objectweb.asm.tree.RecordComponentNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
+import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.VarInsnNode;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Compares one compiled class file with the jar's original and reports which attributes match.
+ *
+ * The comparison is structural, not textual: ASM resolves constant-pool indices to symbolic
+ * references, so {@code code} says whether the instruction streams are the same even when the pool
+ * is permuted, while {@code bytes} stays the strictest check. Reading only -- nothing is written.
+ */
+public final class ClassDiff {
+  public static final List<String> ATTRIBUTES = List.of(
+    "bytes", "members", "code", "lnt", "lvt", "params", "annotations", "signature", "inner", "frames");
+
+  public final String name;
+  public final Map<String, Boolean> matches = new LinkedHashMap<>();
+  public final List<String> details = new ArrayList<>();
+
+  private ClassDiff(String name) {
+    this.name = name;
+    for (String attribute : ATTRIBUTES) {
+      matches.put(attribute, true);
+    }
+  }
+
+  public boolean all() {
+    return matches.values().stream().allMatch(Boolean::booleanValue);
+  }
+
+  public static ClassDiff compare(byte[] originalBytes, byte[] recompiledBytes) {
+    ClassDiff diff = new ClassDiff(className(originalBytes));
+    if (!diff.name.equals(className(recompiledBytes))) {
+      diff.fail("members", "class name differs: " + className(recompiledBytes));
+      return diff;
+    }
+    if (java.util.Arrays.equals(originalBytes, recompiledBytes)) {
+      return diff;
+    }
+    diff.fail("bytes", "raw bytes differ");
+
+    ClassNode original = parse(originalBytes);
+    ClassNode recompiled = parse(recompiledBytes);
+
+    if (original.access != recompiled.access) {
+      diff.fail("members", "access " + original.access + " vs " + recompiled.access);
+    }
+    if (!Objects.equals(original.superName, recompiled.superName)) {
+      diff.fail("members", "super " + original.superName + " vs " + recompiled.superName);
+    }
+    if (!Objects.equals(original.interfaces, recompiled.interfaces)) {
+      diff.fail("members", "interfaces " + original.interfaces + " vs " + recompiled.interfaces);
+    }
+    if (!Objects.equals(original.signature, recompiled.signature)
+      || !signatures(original.fields).equals(signatures(recompiled.fields))
+      || !methodSignatures(original.methods).equals(methodSignatures(recompiled.methods))) {
+      diff.fail("signature", "signature attributes differ");
+    }
+    if (!annotations(original.visibleAnnotations, original.invisibleAnnotations)
+      .equals(annotations(recompiled.visibleAnnotations, recompiled.invisibleAnnotations))
+      || !fieldAnnotations(original.fields).equals(fieldAnnotations(recompiled.fields))
+      || !methodAnnotations(original.methods).equals(methodAnnotations(recompiled.methods))) {
+      diff.fail("annotations", "annotations differ");
+    }
+    if (!members(original).equals(members(recompiled))) {
+      diff.fail("members", "field/method list differs");
+    }
+    if (!inner(original).equals(inner(recompiled))) {
+      diff.fail("inner", "inner/enclosing/nest/record metadata differs");
+    }
+
+    Map<String, MethodNode> originalMethods = byKey(original.methods);
+    Map<String, MethodNode> recompiledMethods = byKey(recompiled.methods);
+    for (Map.Entry<String, MethodNode> entry : originalMethods.entrySet()) {
+      MethodNode ours = recompiledMethods.get(entry.getKey());
+      if (ours == null) {
+        continue; // reported by members
+      }
+      MethodNode theirs = entry.getValue();
+      if (!code(theirs).equals(code(ours))) {
+        diff.fail("code", entry.getKey());
+      }
+      if (!lnt(theirs).equals(lnt(ours))) {
+        diff.fail("lnt", entry.getKey());
+      }
+      if (!lvt(theirs).equals(lvt(ours))) {
+        diff.fail("lvt", entry.getKey());
+      }
+      if (!parameters(theirs).equals(parameters(ours))) {
+        diff.fail("params", entry.getKey());
+      }
+      if (!frames(theirs).equals(frames(ours))) {
+        diff.fail("frames", entry.getKey());
+      }
+    }
+    return diff;
+  }
+
+  private void fail(String attribute, String detail) {
+    matches.put(attribute, false);
+    if (details.size() < 16) {
+      details.add(attribute + ": " + detail);
+    }
+  }
+
+  private static String className(byte[] bytes) {
+    return new ClassReader(bytes).getClassName();
+  }
+
+  private static ClassNode parse(byte[] bytes) {
+    ClassNode node = new ClassNode(Opcodes.ASM9);
+    new ClassReader(bytes).accept(node, ClassReader.EXPAND_FRAMES);
+    return node;
+  }
+
+  private static Map<String, MethodNode> byKey(List<MethodNode> methods) {
+    Map<String, MethodNode> map = new LinkedHashMap<>();
+    for (MethodNode method : methods) {
+      map.put(method.name + method.desc, method);
+    }
+    return map;
+  }
+
+  // ------------------------------------------------------------------ members and metadata
+
+  private static List<String> members(ClassNode node) {
+    List<String> list = new ArrayList<>();
+    for (FieldNode field : node.fields) {
+      list.add("F " + field.name + " " + field.desc + " " + field.access);
+    }
+    for (MethodNode method : node.methods) {
+      list.add("M " + method.name + method.desc + " " + method.access);
+    }
+    return list;
+  }
+
+  private static List<String> signatures(List<FieldNode> fields) {
+    List<String> list = new ArrayList<>();
+    for (FieldNode field : fields) {
+      list.add(field.name + " " + field.signature);
+    }
+    return list;
+  }
+
+  private static List<String> methodSignatures(List<MethodNode> methods) {
+    List<String> list = new ArrayList<>();
+    for (MethodNode method : methods) {
+      list.add(method.name + method.desc + " " + method.signature);
+    }
+    return list;
+  }
+
+  private static String annotations(List<AnnotationNode> visible, List<AnnotationNode> invisible) {
+    return renderAnnotations(visible) + "|" + renderAnnotations(invisible);
+  }
+
+  private static List<String> fieldAnnotations(List<FieldNode> fields) {
+    List<String> list = new ArrayList<>();
+    for (FieldNode field : fields) {
+      list.add(field.name + annotations(field.visibleAnnotations, field.invisibleAnnotations));
+    }
+    return list;
+  }
+
+  private static List<String> methodAnnotations(List<MethodNode> methods) {
+    List<String> list = new ArrayList<>();
+    for (MethodNode method : methods) {
+      list.add(method.name + method.desc + annotations(method.visibleAnnotations, method.invisibleAnnotations)
+        + annotations(method.visibleParameterAnnotations, method.invisibleParameterAnnotations));
+    }
+    return list;
+  }
+
+  private static String annotations(List<AnnotationNode>[] visible, List<AnnotationNode>[] invisible) {
+    StringBuilder builder = new StringBuilder("[");
+    builder.append(renderAnnotationArray(visible)).append('|').append(renderAnnotationArray(invisible));
+    return builder.append(']').toString();
+  }
+
+  private static String renderAnnotationArray(List<AnnotationNode>[] arrays) {
+    if (arrays == null) {
+      return "-";
+    }
+    StringBuilder builder = new StringBuilder();
+    for (List<AnnotationNode> list : arrays) {
+      builder.append(renderAnnotations(list)).append(';');
+    }
+    return builder.toString();
+  }
+
+  private static String renderAnnotations(List<AnnotationNode> nodes) {
+    if (nodes == null || nodes.isEmpty()) {
+      return "";
+    }
+    List<String> rendered = new ArrayList<>();
+    for (AnnotationNode node : nodes) {
+      rendered.add(node.desc + renderValues(node.values));
+    }
+    rendered.sort(String::compareTo);
+    return rendered.toString();
+  }
+
+  private static String renderValues(List<Object> values) {
+    if (values == null || values.isEmpty()) {
+      return "()";
+    }
+    List<String> pairs = new ArrayList<>();
+    for (int i = 0; i + 1 < values.size(); i += 2) {
+      pairs.add(values.get(i) + "=" + renderValue(values.get(i + 1)));
+    }
+    pairs.sort(String::compareTo);
+    return "(" + String.join(",", pairs) + ")";
+  }
+
+  private static String renderValue(Object value) {
+    if (value instanceof AnnotationNode node) {
+      return "@" + node.desc + renderValues(node.values);
+    }
+    if (value instanceof List<?> list) {
+      return list.stream().map(ClassDiff::renderValue).toList().toString();
+    }
+    if (value instanceof Type type) {
+      return type.toString();
+    }
+    return String.valueOf(value);
+  }
+
+  private static String inner(ClassNode node) {
+    StringBuilder builder = new StringBuilder();
+    if (node.innerClasses != null) {
+      for (InnerClassNode inner : node.innerClasses) {
+        builder.append(inner.name).append(' ').append(inner.outerName).append(' ')
+          .append(inner.innerName).append(' ').append(inner.access).append(';');
+      }
+    }
+    builder.append('|').append(node.outerClass).append(' ').append(node.outerMethod)
+      .append(node.outerMethodDesc).append('|').append(node.nestHostClass).append(' ')
+      .append(node.nestMembers).append('|').append(node.permittedSubclasses).append('|');
+    if (node.recordComponents != null) {
+      for (RecordComponentNode component : node.recordComponents) {
+        builder.append(component.name).append(' ').append(component.descriptor).append(' ')
+          .append(component.signature).append(';');
+      }
+    }
+    return builder.toString();
+  }
+
+  // ------------------------------------------------------------------ method bodies
+
+  private static String code(MethodNode method) {
+    StringBuilder builder = new StringBuilder();
+    builder.append(method.maxStack).append('/').append(method.maxLocals).append(':');
+    InsnList instructions = method.instructions;
+    Map<LabelNode, Integer> labels = new HashMap<>();
+    for (AbstractInsnNode insn = instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof LabelNode label) {
+        labels.computeIfAbsent(label, key -> labels.size());
+      }
+    }
+    for (AbstractInsnNode insn = instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof LineNumberNode || insn instanceof FrameNode) {
+        continue;
+      }
+      builder.append(render(insn, labels)).append(';');
+    }
+    if (method.tryCatchBlocks != null) for (TryCatchBlockNode block : method.tryCatchBlocks) {
+      builder.append("tc ").append(label(block.start, labels)).append(' ')
+        .append(label(block.end, labels)).append(' ').append(label(block.handler, labels)).append(' ')
+        .append(block.type).append(';');
+    }
+    return builder.toString();
+  }
+
+  private static int label(LabelNode label, Map<LabelNode, Integer> labels) {
+    return labels.getOrDefault(label, -1);
+  }
+
+  private static String render(AbstractInsnNode insn, Map<LabelNode, Integer> labels) {
+    if (insn instanceof VarInsnNode node) {
+      return "var" + node.getOpcode() + " " + node.var;
+    }
+    if (insn instanceof IntInsnNode node) {
+      return "int" + node.getOpcode() + " " + node.operand;
+    }
+    if (insn instanceof TypeInsnNode node) {
+      return "type" + node.getOpcode() + " " + node.desc;
+    }
+    if (insn instanceof FieldInsnNode node) {
+      return "field" + node.getOpcode() + " " + node.owner + "." + node.name + " " + node.desc;
+    }
+    if (insn instanceof MethodInsnNode node) {
+      return "call" + node.getOpcode() + " " + node.owner + "." + node.name + node.desc + (node.itf ? " itf" : "");
+    }
+    if (insn instanceof InvokeDynamicInsnNode node) {
+      return "indy " + node.name + node.desc + " " + node.bsm.getOwner() + "." + node.bsm.getName()
+        + node.bsm.getDesc() + " " + renderValue(node.bsmArgs);
+    }
+    if (insn instanceof JumpInsnNode node) {
+      return "jump" + node.getOpcode() + " L" + label(node.label, labels);
+    }
+    if (insn instanceof LdcInsnNode node) {
+      return "ldc " + renderValue(node.cst);
+    }
+    if (insn instanceof IincInsnNode node) {
+      return "iinc " + node.var + " " + node.incr;
+    }
+    if (insn instanceof TableSwitchInsnNode node) {
+      StringBuilder builder = new StringBuilder("tswitch " + label(node.dflt, labels) + " ");
+      builder.append(node.min).append(' ').append(node.max);
+      for (LabelNode label : node.labels) {
+        builder.append(" L").append(label(label, labels));
+      }
+      return builder.toString();
+    }
+    if (insn instanceof LookupSwitchInsnNode node) {
+      StringBuilder builder = new StringBuilder("lswitch " + label(node.dflt, labels));
+      for (int i = 0; i < node.keys.size(); i++) {
+        builder.append(' ').append(node.keys.get(i)).append(":L").append(label(node.labels.get(i), labels));
+      }
+      return builder.toString();
+    }
+    if (insn instanceof MultiANewArrayInsnNode node) {
+      return "multianewarray " + node.desc + " " + node.dims;
+    }
+    return "op" + insn.getOpcode();
+  }
+
+  private static String renderValue(org.objectweb.asm.Handle handle) {
+    return handle.getOwner() + "." + handle.getName() + handle.getDesc() + " " + handle.getTag();
+  }
+
+  private static String renderValue(Object[] values) {
+    StringBuilder builder = new StringBuilder();
+    for (Object value : values) {
+      builder.append(renderValue(value)).append(',');
+    }
+    return builder.toString();
+  }
+
+  private static String lnt(MethodNode method) {
+    StringBuilder builder = new StringBuilder();
+    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof LineNumberNode line) {
+        builder.append(line.line).append('@').append(System.identityHashCode(line.start)).append(';');
+      }
+    }
+    // The label identity is not comparable across parses; compare the sequence of line numbers only.
+    return builder.toString().replaceAll("@\\d+", "");
+  }
+
+  private static String lvt(MethodNode method) {
+    if (method.localVariables == null) {
+      return "";
+    }
+    List<String> entries = new ArrayList<>();
+    for (LocalVariableNode local : method.localVariables) {
+      entries.add(local.name + " " + local.desc + " " + local.signature + " " + local.index);
+    }
+    return entries.toString();
+  }
+
+  private static String parameters(MethodNode method) {
+    if (method.parameters == null) {
+      return "";
+    }
+    List<String> entries = new ArrayList<>();
+    for (ParameterNode parameter : method.parameters) {
+      entries.add(parameter.name + " " + parameter.access);
+    }
+    return entries.toString();
+  }
+
+  private static String frames(MethodNode method) {
+    StringBuilder builder = new StringBuilder();
+    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof FrameNode frame) {
+        builder.append(frame.type).append(' ').append(renderFrame(frame.local)).append('|')
+          .append(renderFrame(frame.stack)).append(';');
+      }
+    }
+    return builder.toString();
+  }
+
+  private static String renderFrame(List<Object> values) {
+    if (values == null) {
+      return "-";
+    }
+    List<String> rendered = new ArrayList<>();
+    for (Object value : values) {
+      if (value instanceof String text) {
+        rendered.add(text);
+      } else if (value instanceof Integer tag) {
+        rendered.add(tag.toString());
+      } else if (value instanceof LabelNode) {
+        rendered.add("L");
+      } else {
+        rendered.add(String.valueOf(value));
+      }
+    }
+    return rendered.toString();
+  }
+}
