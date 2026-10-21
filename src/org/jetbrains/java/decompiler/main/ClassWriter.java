@@ -494,9 +494,23 @@ public class ClassWriter implements StatementWriter {
         }
         plan.add(new int[]{1, i, line, sequence++});
       }
+      // The target's NestMembers lists the nested types in reverse declaration order; a member
+      // class without a line table of its own (an annotation type, say) cannot be placed by its
+      // first line and needs this rank to keep the original's declaration order.
+      Map<String, Integer> nestRank = new java.util.HashMap<>();
+      StructNestMembersAttribute nestMembers =
+        cl.getAttribute(StructGeneralAttribute.ATTRIBUTE_NEST_MEMBERS);
+      if (nestMembers != null) {
+        java.util.List<String> names = nestMembers.getClasses(cl.getPool());
+        for (int i = 0; i < names.size(); i++) {
+          nestRank.put(names.get(i), names.size() - 1 - i);
+        }
+      }
       for (int i = 0; i < node.nested.size(); i++) {
         ClassNode inner = node.nested.get(i);
-        plan.add(new int[]{2, i, ordered && inner.type == ClassNode.Type.MEMBER ? classLine(inner) : -1, sequence++});
+        int rank = inner.type == ClassNode.Type.MEMBER && inner.classStruct != null
+          ? nestRank.getOrDefault(inner.classStruct.qualifiedName, Integer.MAX_VALUE) : Integer.MAX_VALUE;
+        plan.add(new int[]{2, i, ordered && inner.type == ClassNode.Type.MEMBER ? classLine(inner) : -1, sequence++, rank});
       }
       if (ordered) {
         // Members with no line of their own stay next to the neighbour that has one.
@@ -563,7 +577,9 @@ public class ClassWriter implements StatementWriter {
             }
           }
         }
-        plan.sort(Comparator.comparingInt((int[] m) -> m[2]).thenComparingInt(m -> m[3]));
+        plan.sort(Comparator.comparingInt((int[] m) -> m[2])
+          .thenComparingInt(m -> m.length > 4 ? m[4] : Integer.MAX_VALUE)
+          .thenComparingInt(m -> m[3]));
       }
 
       boolean enums = !nonEnumFields.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM)
