@@ -653,6 +653,12 @@ public class InvocationExprent extends Exprent {
               // expression (a conditional arm, a diamond argument), and then cannot infer it.
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_WITNESS)
+              && inArgument() && hasWildcardArgs(fparams, genericsMap)) {
+              // A call whose inferred arguments carry wildcards can be beyond javac's inference
+              // from an argument position; the original wrote the witnesses it inferred itself.
+              getGenericArgs(fparams, genericsMap, genericArgs);
+            }
             else if (isGenNew) {
               genericArgs.add(GenericType.DUMMY_VAR);
             }
@@ -997,12 +1003,18 @@ public class InvocationExprent extends Exprent {
     }
   }
 
+  private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
+
+  public static boolean inArgument() {
+    return ARGUMENT.get()[0] > 0;
+  }
+
   public TextBuffer appendParamList(int indent) {
-    NewExprent.enterArgument();
+    ARGUMENT.get()[0]++;
     try {
       return appendParamList0(indent);
     } finally {
-      NewExprent.exitArgument();
+      ARGUMENT.get()[0]--;
     }
   }
 
@@ -2070,6 +2082,32 @@ public class InvocationExprent extends Exprent {
 
   public static boolean inPoly() {
     return POLY.get()[0] > 0;
+  }
+
+  private boolean hasWildcardArgs(List<String> fparams, Map<VarType, VarType> genericsMap) {
+    List<VarType> probe = new java.util.ArrayList<>();
+    getGenericArgs(fparams, genericsMap, probe);
+    for (VarType arg : probe) {
+      if (containsWildcard(arg)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean containsWildcard(VarType type) {
+    if (!(type instanceof GenericType generic)) {
+      return false;
+    }
+    for (VarType argument : generic.getArguments()) {
+      if (argument == null) {
+        return true;
+      }
+      if (containsWildcard(argument)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private boolean hasGenvarArgs(List<String> fparams, Map<VarType, VarType> genericsMap) {

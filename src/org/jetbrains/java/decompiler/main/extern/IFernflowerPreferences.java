@@ -225,6 +225,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
 
+  @Name("Round Trip: Argument Witnesses")
+  @Description("Print explicit type arguments when an inferred argument carries a wildcard in an argument position.")
+  @ShortName("rtaw")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_ARG_WITNESS = "rt-arg-witness";
+
   @Name("Round Trip: Diamond")
   @Description("Print the diamond when a generic constructor has no recovered arguments in a poly context.")
   @ShortName("rtdi")

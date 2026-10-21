@@ -43,6 +43,8 @@ work stands — belong in project memory.
   the form from it instead of re-deriving it from bytecode.
 - **Verify before inventing.** A repair to one declaration is often illegal in terms of another
   (overrides, erasure, raw types). Diff the set of error messages between rounds.
+- **Commits are unsigned; pushing is when they are signed.** Commit with `git commit --no-gpg-sign`;
+  do not change the git configuration. The history is re-signed by the user before it is pushed.
 
 ## devtools/cli
 

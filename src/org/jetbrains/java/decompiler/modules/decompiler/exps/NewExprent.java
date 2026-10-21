@@ -490,7 +490,7 @@ public class NewExprent extends Exprent {
         if (!enumConst || start < constructor.getLstParameters().size()) {
           List<VarType> args = constructor.getGenericArgs();
           if (args.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
-              && inArgument() && hasTypeParameters(newType)) {
+              && InvocationExprent.inArgument() && hasTypeParameters(newType)) {
             // No recovered type arguments, but javac infers them from the context; the original
             // wrote the diamond, and a raw type would break the caller's inference.
             buf.append("<>");
@@ -888,20 +888,6 @@ public class NewExprent extends Exprent {
 
   public void setEnumConst(boolean enumConst) {
     this.enumConst = enumConst;
-  }
-
-  private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
-
-  static void enterArgument() {
-    ARGUMENT.get()[0]++;
-  }
-
-  static void exitArgument() {
-    ARGUMENT.get()[0]--;
-  }
-
-  private static boolean inArgument() {
-    return ARGUMENT.get()[0] > 0;
   }
 
   private static boolean hasTypeParameters(VarType type) {
