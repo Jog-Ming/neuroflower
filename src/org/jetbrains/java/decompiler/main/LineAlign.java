@@ -43,6 +43,17 @@ public final class LineAlign {
   /** The aligned text, or null when the buffer cannot be aligned and must be left as printed. */
   public static String align(TextBuffer buffer, ClassesProcessor.ClassNode root) {
     String text = buffer.convertToStringAndAllowDataDiscard();
+    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CONSTANT_SITES)) {
+      try {
+        // Runs on the printed text before any line edit, so the bytecode positions the buffer
+        // recorded still describe this string. The switch replaces the whole-file constant pass.
+        text = ConstantNames.restore(text, root, buffer.getBytecodePositions(),
+          buffer.getClassRegions());
+      }
+      catch (RuntimeException e) {
+        // A class must not be lost because its constant sites could not be classified.
+      }
+    }
     String separator = DecompilerContext.getNewLineSeparator();
     String[] lines = text.split(java.util.regex.Pattern.quote(separator), -1);
 

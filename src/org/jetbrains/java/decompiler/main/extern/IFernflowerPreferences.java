@@ -219,6 +219,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_CONSTANT_NAMES = "rt-constant-names";
 
+  @Name("Round Trip: Constant Sites")
+  @Description("Attribute each nested class's code to its own pool and bound a constant's site to its pool order.")
+  @ShortName("rtcs")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_CONSTANT_SITES = "rt-constant-sites";
+
   @Name("Round Trip: Member Order")
   @Description("Print fields, methods and member classes in the original source's line order.")
   @ShortName("rtmo")
@@ -552,6 +558,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_SWITCH_ORDER, "1");
     defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
     defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
+    defaults.put(ROUND_TRIP_CONSTANT_SITES, "0");
     defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");

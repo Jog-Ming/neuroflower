@@ -438,7 +438,16 @@ public class NewExprent extends Exprent {
           callLine >= 0 ? callLine : RoundTrip.sourceLine(this));
       }
       else if (!selfReference) {
-        new ClassWriter().writeClass(child, buf, indent);
+        String regionClass = child == null || child.classStruct == null ? null : child.classStruct.qualifiedName;
+        int region = regionClass == null ? -1 : buf.beginRegion(regionClass);
+        try {
+          new ClassWriter().writeClass(child, buf, indent);
+        }
+        finally {
+          if (region >= 0) {
+            buf.endRegion(regionClass, region);
+          }
+        }
       }
     }
     else if (directArrayInit) {

@@ -48,6 +48,8 @@ public class TextBuffer {
   private final StringBuilder myStringBuilder;
   private Map<Integer, Integer> myLineToOffsetMapping = null;
   private final Map<BytecodeMappingKey, Integer> myBytecodeOffsetMapping = new LinkedHashMap<>(); // bytecode offset -> offset in text
+  private final List<ClassRegion> myClassRegions = new ArrayList<>(); // text ranges a nested class was printed into
+  private final Deque<ClassRegion> myOpenClassRegions = new ArrayDeque<>();
   private final DebugTrace myDebugTrace = DecompilerContext.getOption(IFernflowerPreferences.UNIT_TEST_MODE) ? new DebugTrace(this) : null;
 
   public TextBuffer() {
@@ -384,6 +386,49 @@ public class TextBuffer {
     myBytecodeOffsetMapping.keySet().removeIf(key -> key.myClass == null);
   }
 
+  /**
+   * Marks where a nested class's source begins. The printer writes nested classes (member, local
+   * and anonymous) into buffers that are appended into the enclosing class's text, so a pass that
+   * needs to treat a class as a unit has to carry these ranges along with the text.
+   */
+  public int beginRegion(String className) {
+    int start = myStringBuilder.length();
+    myOpenClassRegions.push(new ClassRegion(className, start, start));
+    return start;
+  }
+
+  /** Closes the region {@link #beginRegion} opened; safe to call from a finally block. */
+  public void endRegion(String className, int start) {
+    ClassRegion region = myOpenClassRegions.peek();
+    if (region == null || region.getStart() != start || !region.getClassName().equals(className)) {
+      return;
+    }
+    myOpenClassRegions.pop();
+    region.setEnd(myStringBuilder.length());
+    myClassRegions.add(region);
+  }
+
+  /** The nested-class text ranges recorded so far, in no particular order. */
+  public List<ClassRegion> getClassRegions() {
+    return Collections.unmodifiableList(myClassRegions);
+  }
+
+  /**
+   * Every bytecode offset the printer mapped, grouped by class and method and expressed as the
+   * character offset in the (reformatted) text. Keys without a class are dropped: they are resolved
+   * only when their buffer is appended into a larger one.
+   */
+  public Map<Pair<String, String>, Map<Integer, Integer>> getBytecodePositions() {
+    Map<Pair<String, String>, Map<Integer, Integer>> positions = new LinkedHashMap<>();
+    myBytecodeOffsetMapping.forEach((key, position) -> {
+      if (key.myClass != null && key.myMethod != null) {
+        Map<Integer, Integer> method = positions.computeIfAbsent(Pair.of(key.myClass, key.myMethod), k -> new LinkedHashMap<>());
+        method.putIfAbsent(key.myBytecodeOffset, position);
+      }
+    });
+    return positions;
+  }
+
   public Map<Pair<String, String>, BytecodeMappingTracer> getTracers() {
     List<Integer> newlineOffsets = new ArrayList<>();
     for (int i = myStringBuilder.indexOf(myLineSeparator); i != -1; i = myStringBuilder.indexOf(myLineSeparator, i + 1)) {
@@ -532,6 +577,12 @@ public class TextBuffer {
     reformatGroup(myRootGroup, offsetMapping, 0);
 
     myBytecodeOffsetMapping.replaceAll((key, value) -> value + offsetMapping.get(value));
+    for (ClassRegion region : myClassRegions) {
+      int start = region.myStart;
+      int end = region.myEnd;
+      region.myStart = start + offsetMapping.get(start);
+      region.myEnd = end + offsetMapping.get(end);
+    }
   }
 
   public boolean contentEquals(String string) {
@@ -651,6 +702,12 @@ public class TextBuffer {
 
   public void setLength(int position) {
     myStringBuilder.setLength(position);
+    myClassRegions.removeIf(region -> region.myStart >= position);
+    for (ClassRegion region : myClassRegions) {
+      if (region.myEnd > position) {
+        region.myEnd = position;
+      }
+    }
     if (myLineToOffsetMapping != null) {
       Map<Integer, Integer> newMap = new HashMap<>();
       for (Map.Entry<Integer, Integer> entry : myLineToOffsetMapping.entrySet()) {
@@ -697,6 +754,10 @@ public class TextBuffer {
     myCurrentGroup.myReplacements.addAll(otherRoot.myReplacements);
     myCurrentGroup.myTokens.addAll(otherRoot.myTokens);
     myCurrentGroup.myChildren.addAll(otherRoot.myChildren);
+    int base = myStringBuilder.length();
+    for (ClassRegion region : buffer.myClassRegions) {
+      myClassRegions.add(new ClassRegion(region.myClassName, region.myStart + base, region.myEnd + base));
+    }
     myStringBuilder.append(buffer.myStringBuilder);
     return this;
   }
@@ -706,6 +767,18 @@ public class TextBuffer {
   }
 
   private void shiftMapping(int shiftOffset) {
+    if (shiftOffset != 0) {
+      for (Iterator<ClassRegion> itr = myClassRegions.iterator(); itr.hasNext(); ) {
+        ClassRegion region = itr.next();
+        region.myStart += shiftOffset;
+        region.myEnd += shiftOffset;
+        if (region.myEnd <= 0) {
+          itr.remove();
+        } else if (region.myStart < 0) {
+          region.myStart = 0;
+        }
+      }
+    }
     if (myLineToOffsetMapping != null) {
       Map<Integer, Integer> newMap = new HashMap<>();
       for (Map.Entry<Integer, Integer> entry : myLineToOffsetMapping.entrySet()) {
@@ -827,6 +900,35 @@ public class TextBuffer {
       token.visit(visitor);
     }
     visitor.end();
+  }
+
+  /** A nested class's text range; nested regions are contained in their enclosing region. */
+  public static final class ClassRegion {
+    private final String myClassName;
+    private int myStart;
+    private int myEnd;
+
+    ClassRegion(String className, int start, int end) {
+      myClassName = className;
+      myStart = start;
+      myEnd = end;
+    }
+
+    public String getClassName() {
+      return myClassName;
+    }
+
+    public int getStart() {
+      return myStart;
+    }
+
+    public int getEnd() {
+      return myEnd;
+    }
+
+    private void setEnd(int end) {
+      myEnd = end;
+    }
   }
 
   private static final class BytecodeMappingKey {

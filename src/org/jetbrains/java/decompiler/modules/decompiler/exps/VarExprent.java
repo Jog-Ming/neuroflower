@@ -126,7 +126,16 @@ public class VarExprent extends Exprent implements Pattern {
 
     if (classDef) {
       ClassNode child = DecompilerContext.getClassProcessor().getMapRootClasses().get(varType.value);
-      new ClassWriter().writeClass(child, buffer, indent);
+      String regionClass = child == null || child.classStruct == null ? null : child.classStruct.qualifiedName;
+      int region = regionClass == null ? -1 : buffer.beginRegion(regionClass);
+      try {
+        new ClassWriter().writeClass(child, buffer, indent);
+      }
+      finally {
+        if (region >= 0) {
+          buffer.endRegion(regionClass, region);
+        }
+      }
     } else {
       VarVersionPair varVersion = getVarVersionPair();
 

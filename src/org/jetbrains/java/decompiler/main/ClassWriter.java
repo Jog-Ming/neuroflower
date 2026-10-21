@@ -682,7 +682,13 @@ public class ClassWriter implements StatementWriter {
               buffer.appendLineSeparator();
             }
             TextBuffer clsBuffer = new TextBuffer();
-            writeClass(inner, clsBuffer, indent + 1);
+            int region = clsBuffer.beginRegion(innerCl.qualifiedName);
+            try {
+              writeClass(inner, clsBuffer, indent + 1);
+            }
+            finally {
+              clsBuffer.endRegion(innerCl.qualifiedName, region);
+            }
             haveContent.run();
             buffer.append(clsBuffer);
           }

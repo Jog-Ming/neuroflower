@@ -217,7 +217,10 @@ public class Fernflower implements IDecompiledData {
           String aligned = LineAlign.align(buffer,
             classProcessor.getMapRootClasses().get(cl.qualifiedName));
           if (aligned != null) {
-            return named(aligned, cl);
+            // The site-aware pass already ran inside LineAlign on the unaligned text; the old
+            // whole-file pass must not run a second time over the aligned text.
+            return DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CONSTANT_SITES)
+              ? aligned : named(aligned, cl);
           }
         } catch (RuntimeException e) {
           // A class must not be lost because its line table could not be aligned.
