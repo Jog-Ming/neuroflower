@@ -219,17 +219,27 @@ public final class ConstantNames {
      * arguments, although they are generated first.
      */
     boolean proves(String owner, int start) {
-      Long interned = internedAt == null ? null : internedAt.get(owner);
-      if (interned != null) {
-        long nearest = printedCoordinate(spaces, start);
-        if (nearest != NO_COORDINATE && nearest < interned) {
-          return false;
-        }
+      if (!withinInterned(owner, start)) {
+        return false;
       }
       int[] window = windows == null ? null : windows.get(owner);
       if (window != null && start >= window[0] && start < window[1]) {
         return true;
       }
+      return byCoordinate(owner, start);
+    }
+
+    /**
+     * Whether the generation order alone puts the site in the pool slot, without the looser
+     * printed-line window. Choosing among several constants of one owner needs this: a line
+     * window only proves the owner appeared somewhere on that line, and a frequent value on the
+     * same line proves nothing about which literal the source named.
+     */
+    boolean provesExactly(String owner, int start) {
+      return withinInterned(owner, start) && byCoordinate(owner, start);
+    }
+
+    private boolean byCoordinate(String owner, int start) {
       if (coordinates == null) {
         return false;
       }
@@ -239,6 +249,16 @@ public final class ConstantNames {
       }
       long coordinate = siteCoordinate(spaces, start);
       return coordinate != NO_COORDINATE && coordinate > bounds[0] && coordinate < bounds[1];
+    }
+
+    /** The pool proves the owner's Class entry already exists at this printed position. */
+    private boolean withinInterned(String owner, int start) {
+      Long interned = internedAt == null ? null : internedAt.get(owner);
+      if (interned == null) {
+        return true;
+      }
+      long nearest = printedCoordinate(spaces, start);
+      return nearest == NO_COORDINATE || nearest >= interned;
     }
   }
 
@@ -1340,6 +1360,10 @@ public final class ConstantNames {
       addIntegralSite(start, i, value, kind.equals(VariableType.FLOAT.name()), sites, candidates, imports,
         packageName, own, ownInitializers, placement, deferred, inWindow);
     }
+    if (kind.equals(VariableType.DOUBLE.name())) {
+      addWidenedFloatSite(siteStart, i, value, negative, sites, candidates, imports, packageName, own,
+        ownInitializers, placement, deferred, inWindow);
+    }
     if (negative && value.startsWith("-")) {
       // The source can write a positive constant behind a unary minus; the literal is then the
       // negation of the constant, not a negative constant of its own.
@@ -1535,6 +1559,58 @@ public final class ConstantNames {
   }
 
   /**
+   * Names a float constant at a double literal whose value is exactly that float widened.
+   *
+   * <p>javac widens a float constant used in a double context at the constant expression, so a
+   * source that wrote {@code Owner.NAME} prints as a double literal here while the pool holds the
+   * widened value beside the owner's Class entry. The evidence gates are the integral site's: the
+   * owner's Class entry must be otherwise unexplained, the pool order must place this very site,
+   * and the value interned beside the entry must be this literal. The rewrite casts to double so
+   * the expression keeps the literal's type; a cast of a constant variable folds away.
+   */
+  private static void addWidenedFloatSite(int start, int end, String printed, boolean negative,
+                                          List<Site> sites, Map<String, List<Constant>> candidates,
+                                          List<String> imports, String packageName, String own,
+                                          Map<String, List<int[]>> ownInitializers, Placement placement,
+                                          Map<String, List<Site>> deferred, Set<String> inWindow) {
+    if (placement == null || placement.windows() == null) {
+      return;
+    }
+    double magnitude;
+    try {
+      magnitude = Double.parseDouble(negative && printed.startsWith("-") ? printed.substring(1) : printed);
+    }
+    catch (NumberFormatException e) {
+      return;
+    }
+    float narrowed = (float) magnitude;
+    if ((double) narrowed != magnitude || magnitude == 0.0) {
+      return; // not a value a float constant widens to
+    }
+    String key = VariableType.FLOAT.name() + "|" + Float.toString(narrowed);
+    List<Constant> constants = candidates.get(key);
+    if (constants == null || constants.isEmpty()) {
+      return;
+    }
+    Constant chosen = selectProvable(constants, start, placement, own);
+    if (chosen == null) {
+      return;
+    }
+    String owner = chosen.owner();
+    if (owner.equals(own) || placement.strict().contains(owner)
+        || !placement.windows().containsKey(owner) || !placement.proves(owner, start)) {
+      return;
+    }
+    Double folded = placement.folded().get(owner);
+    double literal = negative ? -magnitude : magnitude;
+    if (folded == null || Double.compare(folded, literal) != 0) {
+      return;
+    }
+    addSite(sites, start, end, key, negative ? "-(double) " : "(double) ", candidates, imports,
+      packageName, own, ownInitializers, placement, deferred, inWindow);
+  }
+
+  /**
    * The int a float or double literal equals exactly, or null when its value is not an exact,
    * non-negative int. A value the literal cannot reproduce would name a different constant.
    */
@@ -1577,22 +1653,38 @@ public final class ConstantNames {
     if (placement == null) {
       return null;
     }
+    // The pool proves which owner was named, not which of its constants: two constants of one
+    // owner with the same value fold to the same pool entry, so either name compiles to the same
+    // bytes. Keep one per owner (its first declaration) and let the owners decide. When the owner
+    // has several constants of the value, only an exact generation-order placement may choose:
+    // the printed-line window admits any literal on the line, frequent values included.
+    List<Constant> distinct = new ArrayList<>();
+    Set<String> owners = new LinkedHashSet<>();
+    Set<String> duplicated = new HashSet<>();
+    for (Constant constant : constants) {
+      if (!owners.add(constant.owner())) {
+        duplicated.add(constant.owner());
+      }
+      else {
+        distinct.add(constant);
+      }
+    }
     // A referenced owner's Class entry came from the field or method reference that also makes it
     // a candidate; naming one of its constants adds nothing to the pool. A pool-unexplained
     // owner's entry exists only because the source named a constant of it, so when the value alone
     // cannot choose, that owner is the one the pool is asking this site to name.
     List<Constant> necessary = new ArrayList<>();
-    for (Constant constant : constants) {
+    for (Constant constant : distinct) {
       if (!constant.owner().equals(own) && !placement.strict().contains(constant.owner())) {
         necessary.add(constant);
       }
     }
-    if (necessary.size() == 1 && placement.proves(necessary.get(0).owner(), position)) {
+    if (necessary.size() == 1 && proven(necessary.get(0), position, placement, duplicated)) {
       return necessary.get(0);
     }
     Constant chosen = null;
-    for (Constant constant : constants) {
-      if (!constant.owner().equals(own) && placement.proves(constant.owner(), position)) {
+    for (Constant constant : distinct) {
+      if (!constant.owner().equals(own) && proven(constant, position, placement, duplicated)) {
         if (chosen != null) {
           return null;
         }
@@ -1600,6 +1692,14 @@ public final class ConstantNames {
       }
     }
     return chosen;
+  }
+
+  /** Whether the placement proves this constant's owner at the site, exactly when it must. */
+  private static boolean proven(Constant constant, int position, Placement placement,
+                                Set<String> duplicated) {
+    return duplicated.contains(constant.owner())
+      ? placement.provesExactly(constant.owner(), position)
+      : placement.proves(constant.owner(), position);
   }
 
   /**
