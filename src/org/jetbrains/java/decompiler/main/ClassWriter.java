@@ -532,6 +532,16 @@ public class ClassWriter implements StatementWriter {
               line = known[1];
             }
           }
+          if (line < 0) {
+            // Declared before every member class that has a line: share the nearest later one,
+            // and the rank order in the sort keeps it in front.
+            for (int[] known : ranked) {
+              if (known[0] > member[4]) {
+                line = known[1];
+                break;
+              }
+            }
+          }
           member[2] = line;
         }
         // Members with no line of their own stay next to the neighbour that has one.
