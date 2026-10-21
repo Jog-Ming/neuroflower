@@ -214,7 +214,8 @@ public class Fernflower implements IDecompiledData {
 
       if (DecompilerContext.getOption(IFernflowerPreferences.LINE_ALIGN)) {
         try {
-          String aligned = LineAlign.align(buffer);
+          String aligned = LineAlign.align(buffer,
+            classProcessor.getMapRootClasses().get(cl.qualifiedName));
           if (aligned != null) {
             return named(aligned, cl);
           }

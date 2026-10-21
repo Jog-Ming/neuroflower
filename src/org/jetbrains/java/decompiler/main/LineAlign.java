@@ -40,7 +40,7 @@ public final class LineAlign {
   }
 
   /** The aligned text, or null when the buffer cannot be aligned and must be left as printed. */
-  public static String align(TextBuffer buffer) {
+  public static String align(TextBuffer buffer, ClassesProcessor.ClassNode root) {
     String text = buffer.convertToStringAndAllowDataDiscard();
     String separator = DecompilerContext.getNewLineSeparator();
     String[] lines = text.split(java.util.regex.Pattern.quote(separator), -1);
@@ -91,7 +91,7 @@ public final class LineAlign {
     // An implicit constructor has no source text to map, yet javac places its one entry on the
     // class declaration's line. Without this constraint the declaration never moves, and every
     // class with a default constructor stays shifted by however far the original header was.
-    addImplicitConstructorConstraints(tracers, lines, shifts, conflicted, entryLines);
+    addImplicitConstructorConstraints(tracers, lines, shifts, conflicted, entryLines, root);
 
     for (int line : conflicted) {
       shifts.remove(line);
@@ -248,29 +248,55 @@ public final class LineAlign {
 
   private static void addImplicitConstructorConstraints(
       Map<Pair<String, String>, BytecodeMappingTracer> tracers, String[] lines,
+      TreeMap<Integer, Integer> shifts, Set<Integer> conflicted, Set<Integer> entryLines,
+      ClassesProcessor.ClassNode root) {
+    if (root != null) {
+      anchorClassLines(root, 0, tracers, lines, shifts, conflicted, entryLines);
+    }
+  }
+
+  private static void anchorClassLines(ClassesProcessor.ClassNode node, int enclosingLine,
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers, String[] lines,
       TreeMap<Integer, Integer> shifts, Set<Integer> conflicted, Set<Integer> entryLines) {
-    Set<String> seen = new HashSet<>();
-    for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> entry : tracers.entrySet()) {
-      String className = entry.getKey().a;
-      if (!seen.add(className)) {
-        continue;
-      }
-      StructClass cls = DecompilerContext.getStructContext().getClass(className);
-      if (cls == null) {
-        continue;
-      }
+    String className = node.classStruct == null ? null : node.classStruct.qualifiedName;
+    int declaration = -1;
+    if (className != null) {
       String simple = className.substring(className.lastIndexOf('/') + 1);
       int dollar = simple.lastIndexOf('$');
       if (dollar >= 0) {
         simple = simple.substring(dollar + 1);
       }
-      if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))) {
+      if (!simple.isEmpty() && Character.isJavaIdentifierStart(simple.charAt(0))) {
+        declaration = classDeclarationLine(lines, simple, enclosingLine, firstMemberLine(className, tracers, lines));
+        if (declaration >= 0) {
+          anchorOne(node.classStruct, className, declaration, tracers, lines, shifts, conflicted, entryLines);
+        }
+      }
+    }
+    int childEnclosing = declaration >= 0 ? declaration : enclosingLine;
+    for (ClassesProcessor.ClassNode nested : node.nested) {
+      anchorClassLines(nested, childEnclosing, tracers, lines, shifts, conflicted, entryLines);
+    }
+  }
+
+  private static int firstMemberLine(String className,
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers, String[] lines) {
+    int first = lines.length + 1;
+    for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> entry : tracers.entrySet()) {
+      if (!className.equals(entry.getKey().a)) {
         continue;
       }
-      int declaration = classDeclarationLine(lines, simple);
-      if (declaration < 0) {
-        continue;
+      for (int line : entry.getValue().getMapping().values()) {
+        first = Math.min(first, line + 1);
       }
+    }
+    return first;
+  }
+
+  private static void anchorOne(StructClass cls, String className, int declaration,
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers, String[] lines,
+      TreeMap<Integer, Integer> shifts, Set<Integer> conflicted, Set<Integer> entryLines) {
+    {
       // A record's generated members (hashCode, equals, toString, accessors) are all attributed to
       // the record declaration line, which no printed construct maps.
       if (cls.getRecordComponents() != null) {
@@ -334,6 +360,16 @@ public final class LineAlign {
     }
   }
 
+  private static void collectNodes(ClassesProcessor.ClassNode node, List<ClassesProcessor.ClassNode> out) {
+    if (node == null) {
+      return;
+    }
+    out.add(node);
+    for (ClassesProcessor.ClassNode nested : node.nested) {
+      collectNodes(nested, out);
+    }
+  }
+
   private static boolean singleLine(StructLineNumberTableAttribute table) {
     int[] raw = table.getRawData();
     int first = raw.length < 2 ? -1 : raw[1];
@@ -345,15 +381,17 @@ public final class LineAlign {
     return first >= 0;
   }
 
-  private static int classDeclarationLine(String[] lines, String simple) {
+  private static int classDeclarationLine(String[] lines, String simple, int enclosing, int beforeMember) {
     java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
       "\\b(?:class|record|enum|interface)\\s+" + java.util.regex.Pattern.quote(simple) + "\\b");
-    for (int i = 0; i < lines.length; i++) {
+    int found = -1;
+    int end = Math.min(lines.length, beforeMember - 1);
+    for (int i = Math.max(0, enclosing); i < end; i++) {
       if (pattern.matcher(lines[i]).find()) {
-        return i + 1;
+        found = i + 1;
       }
     }
-    return -1;
+    return found;
   }
 
   private static StructLineNumberTableAttribute lineTable(String className, String methodKey) {
