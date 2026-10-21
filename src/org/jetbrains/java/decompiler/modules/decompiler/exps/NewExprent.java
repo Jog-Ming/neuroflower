@@ -370,13 +370,13 @@ public class NewExprent extends Exprent {
             GenericClassDescriptor descriptor = child.getWrapper().getClassStruct().getSignature();
             if (descriptor != null) {
               if (descriptor.superinterfaces.isEmpty()) {
-                buf.appendCastTypeName(descriptor.superclass);
+                appendAnonymousSuperType(buf, descriptor.superclass, child);
               } else {
                 if (descriptor.superinterfaces.size() > 1 && !lambda) {
                   DecompilerContext.getLogger().writeMessage("Inconsistent anonymous class signature: " + child.classStruct.qualifiedName,
                     IFernflowerLogger.Severity.WARN);
                 }
-                buf.appendCastTypeName(descriptor.superinterfaces.get(0));
+                appendAnonymousSuperType(buf, descriptor.superinterfaces.get(0), child);
               }
               appendType = false;
             }
@@ -900,6 +900,34 @@ public class NewExprent extends Exprent {
 
   public void setEnumConst(boolean enumConst) {
     this.enumConst = enumConst;
+  }
+
+  /**
+   * Prints the supertype an anonymous class is written against, with a diamond where javac was
+   * given one.
+   *
+   * <p>A capturing anonymous class compiled from explicit type arguments carries a synthetic
+   * constructor signature; one compiled from a diamond carries none. The class's own signature is
+   * the same either way, so the constructor attribute is the only record of which form the original
+   * source used, and printing the arguments where the original had a diamond adds an attribute the
+   * class does not have. A class that captures nothing carries no signature in either form and is
+   * left alone, since there the arguments are also recoverable from the context.
+   */
+  private static void appendAnonymousSuperType(TextBuffer buf, VarType superType, ClassNode node) {
+    if (superType instanceof GenericType && !((GenericType)superType).getArguments().isEmpty()
+        && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+        && node.classStruct != null) {
+      for (StructMethod method : node.classStruct.getMethods()) {
+        if (CodeConstants.INIT_NAME.equals(method.getName()) && !method.getDescriptor().startsWith("()")) {
+          if (method.getSignature() == null) {
+            buf.appendCastTypeName(new VarType(superType.type, superType.arrayDim, superType.value)).append("<>");
+            return;
+          }
+          break;
+        }
+      }
+    }
+    buf.appendCastTypeName(superType);
   }
 
   private static boolean hasTypeParameters(VarType type) {
