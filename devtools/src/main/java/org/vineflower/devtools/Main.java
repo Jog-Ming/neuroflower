@@ -1,5 +1,6 @@
 package org.vineflower.devtools;
 
+import java.util.concurrent.TimeUnit;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
@@ -39,7 +40,7 @@ public final class Main {
     Workspace workspace = Workspace.load();
     Minecraft minecraft = new Minecraft(workspace);
     Decompiler decompiler = new Decompiler(workspace, minecraft)
-      .timeoutMinutes(intFlag(List.of(args), "--timeout", 30));
+      .timeoutMinutes(intFlag(List.of(args), "--timeout", 15));
     String command = args[0];
     List<String> rest = List.of(args).subList(1, args.length);
 
@@ -141,7 +142,7 @@ public final class Main {
       throw new IllegalArgumentException("duplicate version in " + versions);
     }
     int jobs = Math.max(1, Math.min(versions.size(), intFlag(rest, "--jobs", 2)));
-    int timeout = intFlag(rest, "--timeout", 30);
+    int timeout = intFlag(rest, "--timeout", 15);
     int threads = intFlag(rest, "--threads",
       Math.max(1, Runtime.getRuntime().availableProcessors() / jobs));
     boolean noCache = rest.contains("--no-cache");
@@ -169,8 +170,14 @@ public final class Main {
             .redirectErrorStream(true)
             .redirectOutput(log.toFile())
             .start();
-          int status = process.waitFor();
+          boolean finished = process.waitFor(timeout, TimeUnit.MINUTES);
           long seconds = (System.nanoTime() - begin) / 1_000_000_000L;
+          if (!finished) {
+            process.destroyForcibly();
+            process.waitFor();
+            return version + "\tfailed (timed out after " + timeout + "m)\t" + seconds + "s";
+          }
+          int status = process.exitValue();
           return version + "\t" + (status == 0 ? summaryOf(log) : "failed (exit " + status + ")")
             + "\t" + seconds + "s";
         }));
