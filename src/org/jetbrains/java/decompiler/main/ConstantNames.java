@@ -62,7 +62,7 @@ public final class ConstantNames {
   public static String restore(String text, ClassNode root) {
     Set<String> present = new LinkedHashSet<>();
     Set<String> explained = new LinkedHashSet<>();
-    collectPool(root, present, explained);
+    collectPool(root, present, explained, new LinkedHashSet<>());
     Set<String> missing = new LinkedHashSet<>();
     for (String owner : present) {
       String simple = simpleName(owner);
@@ -191,7 +191,7 @@ public final class ConstantNames {
 
   /** What one class's text may name: its candidates and the pool-order window of each owner. */
   private record Rules(Map<String, List<Constant>> candidates, Map<String, int[]> windows,
-                       String own, Map<String, List<int[]>> ownInitializers,
+                       Set<String> strict, String own, Map<String, List<int[]>> ownInitializers,
                        List<String> imports, String packageName) {
   }
 
@@ -259,7 +259,8 @@ public final class ConstantNames {
     Map<Integer, FirstUse> firstUses = firstUses(own);
     Set<String> present = new LinkedHashSet<>();
     Set<String> explained = new LinkedHashSet<>();
-    collectPool(own, present, explained, firstUses);
+    Set<String> referenced = new LinkedHashSet<>();
+    collectPool(own, present, explained, referenced, firstUses);
     Set<String> missing = new LinkedHashSet<>();
     for (String owner : present) {
       String simple = simpleName(owner);
@@ -274,6 +275,7 @@ public final class ConstantNames {
     Map<String, List<Constant>> candidates = new HashMap<>();
     ownCandidates(candidates, own);
     Map<String, int[]> windows = new HashMap<>();
+    Set<String> strict = new HashSet<>();
     Map<String, Integer> classIndices = classIndices(own);
     String nest = nestOf(own.qualifiedName);
     for (String owner : missing) {
@@ -289,10 +291,31 @@ public final class ConstantNames {
         }
       }
     }
+    // A class the pool uses through a field or method names nothing by itself, but the position of
+    // its Class entry still records where javac first entered it: an entry before the first such
+    // use was interned by a folded constant naming, and the pool order bounds that site the same
+    // way. Naming the constant there cannot add a pool entry, so a wrong guess costs text, not
+    // bytes; the window has to be fully bounded for the placement to be trustworthy.
+    for (String owner : referenced) {
+      if (missing.contains(owner) || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)) {
+        continue;
+      }
+      Integer index = classIndices.get(owner);
+      if (index == null) {
+        continue;
+      }
+      int[] window = window(text, own, index, firstUses, positions, true);
+      if (window == null) {
+        continue;
+      }
+      addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      windows.put(owner, window);
+      strict.add(owner);
+    }
     if (candidates.isEmpty()) {
       return null;
     }
-    return new Rules(candidates, windows, own.qualifiedName, ownInitializers(text, spans, own),
+    return new Rules(candidates, windows, strict, own.qualifiedName, ownInitializers(text, spans, own),
       imports, packageName);
   }
 
@@ -378,6 +401,13 @@ public final class ConstantNames {
   private static int[] window(String text, StructClass cls, int index,
                               Map<Integer, FirstUse> firstUses,
                               Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    return window(text, cls, index, firstUses, positions, false);
+  }
+
+  private static int[] window(String text, StructClass cls, int index,
+                              Map<Integer, FirstUse> firstUses,
+                              Map<Pair<String, String>, Map<Integer, Integer>> positions,
+                              boolean requireBoth) {
     FirstUse succ = null;
     for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
       if (entry.getKey() > index && (succ == null || compare(entry.getValue(), succ) < 0)) {
@@ -395,6 +425,9 @@ public final class ConstantNames {
     Integer predPosition = position(cls, pred, positions);
     Integer succPosition = position(cls, succ, positions);
     if (predPosition == null && succPosition == null) {
+      return null;
+    }
+    if (requireBoth && (predPosition == null || succPosition == null)) {
       return null;
     }
     int from = predPosition == null ? 0 : lineStart(text, predPosition);
@@ -438,7 +471,21 @@ public final class ConstantNames {
     }
     for (Map.Entry<String, List<Site>> entry : deferred.entrySet()) {
       if (!inWindow.contains(entry.getKey())) {
-        sites.addAll(entry.getValue());
+        // A referenced owner's window is the only evidence of where the original named it; without
+        // a site inside the window there is nothing to place the name against.
+        if (!rules.strict().contains(entry.getKey())) {
+          sites.addAll(entry.getValue());
+        }
+        continue;
+      }
+      // A site inside the window already interns this owner's Class entry, so naming the owner
+      // again later cannot move it and adds nothing to the pool. A site before the window could
+      // move the entry earlier than the original did, and stays out.
+      int[] window = rules.windows().get(entry.getKey());
+      for (Site site : entry.getValue()) {
+        if (window != null && site.start() >= window[1]) {
+          sites.add(site);
+        }
       }
     }
   }
@@ -454,7 +501,7 @@ public final class ConstantNames {
    * types.
    */
   private static void collectPool(StructClass cls, Set<String> present, Set<String> explained,
-                                  Map<Integer, FirstUse> uses) {
+                                  Set<String> referenced, Map<Integer, FirstUse> uses) {
     if (cls == null) {
       return;
     }
@@ -465,6 +512,7 @@ public final class ConstantNames {
         present.add(primitive.getString());
       } else if (constant instanceof LinkConstant link && link.classname != null) {
         explained.add(link.classname);
+        referenced.add(link.classname);
       }
     }
     for (Integer index : uses.keySet()) {
@@ -597,16 +645,17 @@ public final class ConstantNames {
     }
   }
 
-  private static void collectPool(ClassNode node, Set<String> present, Set<String> explained) {
+  private static void collectPool(ClassNode node, Set<String> present, Set<String> explained,
+                                  Set<String> referenced) {
     if (node == null) {
       return;
     }
     StructClass cls = node.classStruct;
     if (cls != null) {
-      collectPool(cls, present, explained, firstUses(cls));
+      collectPool(cls, present, explained, referenced, firstUses(cls));
     }
     for (ClassNode nested : node.nested) {
-      collectPool(nested, present, explained);
+      collectPool(nested, present, explained, referenced);
     }
   }
 
@@ -648,6 +697,26 @@ public final class ConstantNames {
       }
     }
     return true;
+  }
+
+  /** Whether every class of a nested chain may be named from a file in this package. */
+  private static boolean publiclyNameable(String owner, String packageName) {
+    String name = owner;
+    while (true) {
+      StructClass cls = DecompilerContext.getStructContext().getClass(name);
+      if (cls == null) {
+        return false;
+      }
+      if ((cls.getAccessFlags() & CodeConstants.ACC_PUBLIC) == 0
+          && !packageName.equals(packageOf(name))) {
+        return false;
+      }
+      int dollar = name.lastIndexOf('$');
+      if (dollar < 0) {
+        return true;
+      }
+      name = name.substring(0, dollar);
+    }
   }
 
   private static String simpleName(String internal) {
@@ -939,15 +1008,28 @@ public final class ConstantNames {
       }
     }
     else {
-      printed = name + "." + constant.name();
-      if (key.startsWith("FLOATCAST|")) {
-        printed = "(float) " + printed;
+      boolean nested = constant.owner().contains("$");
+      // A nested class's simple name is in scope only inside its own nest or through an explicit
+      // import; elsewhere it needs its outer class, which a same-package check alone would miss.
+      boolean inScope = nestOf(constant.owner()).equals(nestOf(own))
+        || imports.contains(name)
+        || (!nested && packageName.equals(packageOf(constant.owner())));
+      String qualifier;
+      if (inScope) {
+        qualifier = name;
       }
-      if (!(imports.contains(name) || packageName.equals(packageOf(constant.owner())))) {
-        if (constant.owner().contains("$")) {
+      else if (nested) {
+        if (anonymous(constant.owner()) || !publiclyNameable(constant.owner(), packageName)) {
           return;
         }
-        printed = constant.owner().replace('/', '.') + "." + constant.name();
+        qualifier = constant.owner().replace('/', '.').replace('$', '.');
+      }
+      else {
+        qualifier = constant.owner().replace('/', '.');
+      }
+      printed = qualifier + "." + constant.name();
+      if (key.startsWith("FLOATCAST|")) {
+        printed = "(float) " + printed;
       }
     }
     // A foreign owner's naming site is bounded by where the original interned the owner's Class
