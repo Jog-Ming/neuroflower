@@ -2,9 +2,13 @@
 package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
+import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
+import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.FieldDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
@@ -134,6 +138,47 @@ public class ConstExprent extends Exprent {
   private final Object value;
   private final boolean boolPermitted;
   private boolean wasCondy = false;
+  private static final Map<String, Set<String>> POOL_CLASSES = new java.util.concurrent.ConcurrentHashMap<>();
+
+  /**
+   * Whether one of the printer's named forms may be used here.
+   *
+   * <p>Naming {@code Math.PI}, {@code Double.MAX_VALUE} or {@code Long.MIN_VALUE} folds to the same
+   * literal, but javac still enters the owner's class into the pool at the naming site, and the
+   * class being printed records whether the original did. When its pool has no entry for the owner,
+   * the original wrote the literal and the named form would add a pool entry the class never had.
+   */
+  private static boolean ownerNamedInPool(TextBuffer printed) {
+    if (printed.count("Math.", 0) > 0) {
+      return poolHasClass("java/lang/Math");
+    }
+    if (printed.count("Float.", 0) > 0) {
+      return poolHasClass("java/lang/Float");
+    }
+    if (printed.count("Double.", 0) > 0) {
+      return poolHasClass("java/lang/Double");
+    }
+    return true;
+  }
+
+  private static boolean poolHasClass(String owner) {
+    ClassNode node = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    StructClass cls = node == null ? null : node.classStruct;
+    if (cls == null) {
+      return true; // nothing records the original's form here; keep the printer's own choice
+    }
+    Set<String> names = POOL_CLASSES.computeIfAbsent(cls.qualifiedName, name -> {
+      Set<String> classes = new HashSet<>();
+      for (PooledConstant constant : cls.getPool().getPool()) {
+        if (constant instanceof PrimitiveConstant primitive
+            && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null) {
+          classes.add(primitive.getString());
+        }
+      }
+      return classes;
+    });
+    return names.contains(owner);
+  }
 
   public ConstExprent(int val, boolean boolPermitted, BitSet bytecodeOffsets) {
     this(guessType(val, boolPermitted), val, boolPermitted, bytecodeOffsets);
@@ -268,7 +313,7 @@ public class ConstExprent extends Exprent {
 
         long longVal = (Long)value;
 
-        if (!literal) {
+        if (!literal && poolHasClass("java/lang/Long")) {
           if (longVal == Long.MAX_VALUE) {
             return buf.append(new FieldExprent("MAX_VALUE", "java/lang/Long", true, null, FieldDescriptor.LONG_DESCRIPTOR, bytecode).toJava(0));
           }
@@ -282,10 +327,16 @@ public class ConstExprent extends Exprent {
         float floatVal = (Float)value;
         if (!literal) {
           if (Float.isNaN(floatVal)) {
-            return buf.append(new FieldExprent("NaN", "java/lang/Float", true, null, FieldDescriptor.FLOAT_DESCRIPTOR, bytecode).toJava(0));
+            if (poolHasClass("java/lang/Float")) {
+              return buf.append(new FieldExprent("NaN", "java/lang/Float", true, null, FieldDescriptor.FLOAT_DESCRIPTOR, bytecode).toJava(0));
+            }
+            return buf.append("0.0F / 0.0F");
           }
           else if (UNINLINED_FLOATS.containsKey(floatVal)) {
-            return buf.append(UNINLINED_FLOATS.get(floatVal).apply(bytecode));
+            TextBuffer uninlined = UNINLINED_FLOATS.get(floatVal).apply(bytecode);
+            if (ownerNamedInPool(uninlined)) {
+              return buf.append(uninlined);
+            }
           }
         }
         else {
@@ -307,10 +358,16 @@ public class ConstExprent extends Exprent {
         double doubleVal = (Double)value;
         if (!literal) {
           if (Double.isNaN(doubleVal)) {
-            return buf.append(new FieldExprent("NaN", "java/lang/Double", true, null, FieldDescriptor.DOUBLE_DESCRIPTOR, bytecode).toJava(0));
+            if (poolHasClass("java/lang/Double")) {
+              return buf.append(new FieldExprent("NaN", "java/lang/Double", true, null, FieldDescriptor.DOUBLE_DESCRIPTOR, bytecode).toJava(0));
+            }
+            return buf.append("0.0 / 0.0");
           }
           else if (UNINLINED_DOUBLES.containsKey(doubleVal)) {
-            return buf.append(UNINLINED_DOUBLES.get(doubleVal).apply(bytecode));
+            TextBuffer uninlined = UNINLINED_DOUBLES.get(doubleVal).apply(bytecode);
+            if (ownerNamedInPool(uninlined)) {
+              return buf.append(uninlined);
+            }
           }
 
           // Try to convert the double representation of the value to the float representation, to output the cleanest version of the value.
@@ -320,11 +377,13 @@ public class ConstExprent extends Exprent {
             if (trimFloat(Float.toString(floatRepresentation), floatRepresentation).length() < trimDouble(Double.toString(doubleVal), doubleVal).length()) {
               // Check the uninlined values to see if we have one of those
               if (UNINLINED_FLOATS.containsKey(floatRepresentation)) {
-                return buf.append(UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode));
-              } else {
-                // Return the standard representation if the value is not able to be uninlined
-                return buf.append(trimFloat(Float.toString(floatRepresentation), floatRepresentation)).append("F");
+                TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
+                if (ownerNamedInPool(uninlined)) {
+                  return buf.append(uninlined);
+                }
               }
+              // Return the standard representation if the value is not able to be uninlined
+              return buf.append(trimFloat(Float.toString(floatRepresentation), floatRepresentation)).append("F");
             }
           }
         }
