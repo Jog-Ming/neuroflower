@@ -2,6 +2,7 @@
 package org.jetbrains.java.decompiler.main;
 
 import org.jetbrains.java.decompiler.main.collectors.BytecodeMappingTracer;
+import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
@@ -92,6 +93,11 @@ public final class LineAlign {
     // class declaration's line. Without this constraint the declaration never moves, and every
     // class with a default constructor stays shifted by however far the original header was.
     addImplicitConstructorConstraints(tracers, lines, shifts, conflicted, entryLines, root);
+
+    if (DecompilerContext.getOption(IFernflowerPreferences.ML_BREAKS)
+        || System.getenv("NEUROFLOWER_ML_BREAKS") != null) {
+      logModelAgreement(tracers);
+    }
 
     for (int line : conflicted) {
       shifts.remove(line);
@@ -251,6 +257,79 @@ public final class LineAlign {
       }
     }
     return found;
+  }
+
+  /** How often the model's line-start prediction matches the target's own line table. */
+  private static void logModelAgreement(
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers) {
+    LineBreakModel model = LineBreakModel.current();
+    if (model == null) {
+      System.err.println("ml-breaks: no weights loaded");
+      return;
+    }
+    long agree = 0;
+    long total = 0;
+    for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> entry : tracers.entrySet()) {
+      String className = entry.getKey().a;
+      String methodKey = entry.getKey().b;
+      StructClass cls = DecompilerContext.getStructContext().getClass(className);
+      StructMethod method = cls == null ? null : cls.getMethod(methodKey);
+      StructLineNumberTableAttribute table = method == null ? null
+        : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+      if (method != null && method.getInstructionSequence() == null) {
+        try {
+          method.expandData(cls); // released after decompilation; reparse for inference
+        } catch (java.io.IOException e) {
+          // leave the method out
+        }
+      }
+      org.jetbrains.java.decompiler.code.FullInstructionSequence code =
+        method == null ? null : method.getInstructionSequence();
+      if (table == null || code == null) {
+        if (System.getenv("NEUROFLOWER_ML_DEBUG") != null) {
+          System.err.println("ml-skip " + methodKey + " table " + (table != null) + " code " + (code != null)
+            + " method " + (method != null));
+        }
+        continue;
+      }
+      Map<Integer, Integer> mapping = entry.getValue().getMapping();
+      Integer previousTarget = null;
+      String previousOp = null;
+      int lastLine = -1;
+      int run = -1;
+      int index = 0;
+      for (org.jetbrains.java.decompiler.code.Instruction instruction : code) {
+        Integer printed = mapping.get(instruction.startOffset);
+        int target = table.findLineNumber(instruction.startOffset);
+        if (System.getenv("NEUROFLOWER_ML_DEBUG") != null && index < 3) {
+          System.err.println("ml-instr " + methodKey + " off " + instruction.startOffset
+            + " printed " + printed + " target " + target);
+        }
+        if (printed != null && target >= 0) {
+          if (printed == lastLine) {
+            run++;
+          } else {
+            run = 0;
+            lastLine = printed;
+          }
+          String op = "op:" + instruction.opcode;
+          if (previousTarget != null) {
+            boolean truth = target != previousTarget;
+            boolean predicted = model.startsLine(previousOp, op, index, code.length(), run);
+            if (truth == predicted) {
+              agree++;
+            }
+            total++;
+          }
+          previousTarget = target;
+          previousOp = op;
+        }
+        index++;
+      }
+    }
+    System.err.println("ml-breaks tracers " + tracers.size());
+    System.err.println("ml-breaks agreement " + agree + "/" + total
+      + " (" + (total == 0 ? 0 : (100.0 * agree / total)) + "%)");
   }
 
   private static void addImplicitConstructorConstraints(

@@ -225,6 +225,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
 
+  @Name("ML: Line Breaks")
+  @Description("Run the line-start model and log its agreement with the target's line table.")
+  @ShortName("mlb")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ML_BREAKS = "ml-breaks";
+
   @Name("Round Trip: Argument Witnesses")
   @Description("Print explicit type arguments when an inferred argument carries a wildcard in an argument position.")
   @ShortName("rtaw")
