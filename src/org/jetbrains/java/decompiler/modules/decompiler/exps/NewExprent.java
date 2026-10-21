@@ -431,8 +431,11 @@ public class NewExprent extends Exprent {
         }
         setLambdaGenericTypes();
         Exprent methodObject = constructor == null ? null : constructor.getInstance();
+        // The lambda's line is the line of the call that carries it; the invokeDynamic's own
+        // table entry can interpolate to an earlier line when the call spans lines.
+        int callLine = InvocationExprent.enclosingCallLine();
         new ClassWriter().classLambdaToJava(child, buf, methodObject, indent,
-          RoundTrip.sourceLine(this));
+          callLine >= 0 ? callLine : RoundTrip.sourceLine(this));
       }
       else if (!selfReference) {
         new ClassWriter().writeClass(child, buf, indent);

@@ -1010,6 +1010,12 @@ public class InvocationExprent extends Exprent {
   }
 
   private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
+  private static final ThreadLocal<int[]> CALL_LINE = ThreadLocal.withInitial(() -> new int[]{-1});
+
+  /** The target line of the innermost call whose arguments are being printed, or -1. */
+  public static int enclosingCallLine() {
+    return CALL_LINE.get()[0];
+  }
   private static final ThreadLocal<StructMethod[]> ARGUMENT_AT =
     ThreadLocal.withInitial(() -> new StructMethod[64]);
 
@@ -1028,6 +1034,8 @@ public class InvocationExprent extends Exprent {
   }
 
   public TextBuffer appendParamList(int indent) {
+    int savedCallLine = CALL_LINE.get()[0];
+    CALL_LINE.get()[0] = RoundTrip.sourceLineEnd(this);
     int depth = ++ARGUMENT.get()[0];
     if (depth <= ARGUMENT_AT.get().length) {
       ARGUMENT_AT.get()[depth - 1] = RoundTrip.currentMethod();
@@ -1036,6 +1044,7 @@ public class InvocationExprent extends Exprent {
       return appendParamList0(indent);
     } finally {
       ARGUMENT.get()[0]--;
+      CALL_LINE.get()[0] = savedCallLine;
     }
   }
 
