@@ -299,7 +299,7 @@ public class ConstExprent extends Exprent {
       case SHORT:
       case INT:
         int intVal = (Integer)value;
-        if (!literal) {
+        if (!literal && poolHasClass("java/lang/Integer")) {
           if (intVal == Integer.MAX_VALUE) {
             return buf.append(new FieldExprent("MAX_VALUE", "java/lang/Integer", true, null, FieldDescriptor.INTEGER_DESCRIPTOR, bytecode).toJava(0));
           }
