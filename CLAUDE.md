@@ -53,13 +53,14 @@ work stands — belong in project memory.
 
 ## devtools/cli
 
-The only entry point for the experiment pipeline. Usage:
+The only entry point for the experiment pipeline. A decompiler run is killed after
+`--timeout` minutes (default 30) and its staging tree discarded. Usage:
 
 ```
 devtools/cli versions [--no-cache]                    list Mojang's versions
-devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class] [--options "..."]
+devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class] [--options "..."] [--timeout minutes]
 devtools/cli tree      <version> [--only Class]       print the cached tree path
-devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--options "..."]
+devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--options "..."] [--timeout minutes]
 devtools/cli corpus    <version> --ground-truth <dir> write the class-to-ground-truth corpus
 devtools/cli dataset   <version>                      export per-instruction line alignment for the model
 devtools/cli reports   [--version V] [--limit N]      list past scores

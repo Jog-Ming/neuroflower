@@ -38,7 +38,8 @@ public final class Main {
     }
     Workspace workspace = Workspace.load();
     Minecraft minecraft = new Minecraft(workspace);
-    Decompiler decompiler = new Decompiler(workspace, minecraft);
+    Decompiler decompiler = new Decompiler(workspace, minecraft)
+      .timeoutMinutes(intFlag(List.of(args), "--timeout", 30));
     String command = args[0];
     List<String> rest = List.of(args).subList(1, args.length);
 
@@ -140,6 +141,7 @@ public final class Main {
       throw new IllegalArgumentException("duplicate version in " + versions);
     }
     int jobs = Math.max(1, Math.min(versions.size(), intFlag(rest, "--jobs", 2)));
+    int timeout = intFlag(rest, "--timeout", 30);
     int threads = intFlag(rest, "--threads",
       Math.max(1, Runtime.getRuntime().availableProcessors() / jobs));
     boolean noCache = rest.contains("--no-cache");
@@ -157,7 +159,8 @@ public final class Main {
         futures.add(pool.submit(() -> {
           Path log = workspace.tmp.resolve("score-" + version + ".out");
           List<String> command = new ArrayList<>(List.of(java.toString(), "-jar", jar.toString(),
-            "score", version, "--threads", Integer.toString(threads), "--json"));
+            "score", version, "--threads", Integer.toString(threads), "--json",
+            "--timeout", Integer.toString(timeout)));
           if (noCache) {
             command.add("--no-cache");
           }
@@ -679,7 +682,7 @@ public final class Main {
     for (int i = 0; i < args.size(); i++) {
       String arg = args.get(i);
       if (arg.equals("--threads") || arg.equals("--only") || arg.equals("--jobs")
-          || arg.equals("--options")) {
+          || arg.equals("--options") || arg.equals("--timeout")) {
         i++;
         continue;
       }
@@ -724,7 +727,7 @@ public final class Main {
         versions [--no-cache]                  list Mojang's versions
         decompile <version> [--no-cache] [--threads N] [--only Class]
         tree      <version> [--only Class]    print the cached tree path
-        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes]
                                              several versions run concurrently, --jobs at a time
         corpus    <version> --ground-truth D  write the class-to-ground-truth corpus
         dataset   <version>                   export per-instruction line alignment for the model

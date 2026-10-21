@@ -22,6 +22,13 @@ import java.util.zip.ZipOutputStream;
  * newest few trees are kept and the rest pruned automatically.
  */
 public final class Decompiler {
+  /** How long one decompiler run may take before it is killed; a hang must never cost a whole run. */
+  private int timeoutMinutes = 30;
+
+  public Decompiler timeoutMinutes(int minutes) {
+    this.timeoutMinutes = Math.max(1, minutes);
+    return this;
+  }
   private final Workspace workspace;
   private final Minecraft minecraft;
 
@@ -62,7 +69,11 @@ public final class Decompiler {
       input = subsetJar(version, only);
     }
 
-    Files.createDirectories(src);
+    // The decompiler writes into a staging directory that only becomes the cached tree once it
+    // finishes: a killed run must not leave a half tree that a later run would treat as complete.
+    Path staging = dir.resolve("src.part");
+    deleteTree(staging);
+    Files.createDirectories(staging);
     List<String> command = new ArrayList<>();
     command.add(javaCommand());
     command.add("-Xmx4g");
@@ -72,13 +83,34 @@ public final class Decompiler {
     command.addAll(options);
     command.add("-e=" + join(classpath));
     command.add(input.toString());
-    command.add(src.toString());
+    command.add(staging.toString());
     long started = System.nanoTime();
     Process process = new ProcessBuilder(command).inheritIO().start();
-    int status = process.waitFor();
+    boolean finished;
+    try {
+      finished = process.waitFor(timeoutMinutes, java.util.concurrent.TimeUnit.MINUTES);
+    } catch (InterruptedException e) {
+      process.destroyForcibly();
+      Thread.currentThread().interrupt();
+      deleteTree(staging);
+      throw e;
+    }
     long elapsed = (System.nanoTime() - started) / 1_000_000;
+    if (!finished) {
+      process.destroyForcibly();
+      process.waitFor();
+      deleteTree(staging);
+      throw new IOException("decompiler timed out after " + timeoutMinutes + " minutes");
+    }
+    int status = process.exitValue();
     if (status != 0) {
+      deleteTree(staging);
       throw new IOException("decompiler exited with " + status);
+    }
+    try {
+      Files.move(staging, src, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+      Files.move(staging, src, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
     meta = new JsonObject();
@@ -101,6 +133,17 @@ public final class Decompiler {
     Workspace.writeJson(dir.resolve("meta.json"), meta);
     prune();
     return src;
+  }
+
+  private static void deleteTree(Path path) throws IOException {
+    if (!Files.exists(path)) {
+      return;
+    }
+    try (java.util.stream.Stream<Path> walk = Files.walk(path)) {
+      for (Path entry : walk.sorted(java.util.Comparator.reverseOrder()).toList()) {
+        Files.deleteIfExists(entry);
+      }
+    }
   }
 
   /** The classpath is part of the decompiler's input: missing libraries change its inference. */
