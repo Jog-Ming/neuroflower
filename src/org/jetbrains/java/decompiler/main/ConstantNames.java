@@ -189,14 +189,108 @@ public final class ConstantNames {
     return builder.toString();
   }
 
-  /** What one class's text may name: its candidates and the pool-order window of each owner. */
-  private record Rules(Map<String, List<Constant>> candidates, Map<String, int[]> windows,
+  /** What one class's text may name: its candidates and where the pool order places each owner. */
+  private record Rules(Map<String, List<Constant>> candidates, Placement placement,
                        Set<String> strict, String own, Map<String, List<int[]>> ownInitializers,
                        List<String> imports, String packageName) {
   }
 
+  /**
+   * Where a naming site may lie, in text and in code generation order.
+   *
+   * <p>{@code windows} bounds a site by character offsets; {@code coordinates} bounds it by the
+   * (method, instruction) point at which the printer's position map places it. The coordinate check
+   * is the exact form: javac knows the pool order in generation order, and the text order only
+   * approximates it when an instruction has no printed position.
+   */
+  private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
+                           List<SiteSpace> spaces) {
+    /** Whether this text position lies where the pool order proves the owner was named. */
+    boolean proves(String owner, int start) {
+      int[] window = windows == null ? null : windows.get(owner);
+      if (window != null && start >= window[0] && start < window[1]) {
+        return true;
+      }
+      if (coordinates == null) {
+        return false;
+      }
+      long[] bounds = coordinates.get(owner);
+      if (bounds == null) {
+        return false;
+      }
+      long coordinate = siteCoordinate(spaces, start);
+      return coordinate != NO_COORDINATE && coordinate > bounds[0] && coordinate < bounds[1];
+    }
+  }
+
+  private static final Placement NO_PLACEMENT = new Placement(null, null, List.of());
+
+  /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
+  private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
+  }
+
   /** The first instruction that references a pool entry, in javac's code generation order. */
   private record FirstUse(int order, int offset, String methodKey) {
+  }
+
+  private static final long NO_COORDINATE = Long.MIN_VALUE;
+
+  /** A (generation rank, instruction offset) point packed into one comparable value. */
+  private static long coordinate(int rank, int offset) {
+    return ((long) rank << 32) | (offset & 0xffffffffL);
+  }
+
+  /**
+   * The point a text position occupies in one class's generation order, or {@link #NO_COORDINATE}.
+   *
+   * <p>Only positions the printer recorded can place a site. The literal a name replaces usually
+   * has no position of its own (it is folded before printing), so the point is the greatest offset
+   * printed at or before it, inside the method block whose printed positions bracket the site.
+   */
+  private static long siteCoordinate(List<SiteSpace> spaces, int position) {
+    for (SiteSpace space : spaces) {
+      if (position < space.min || position > space.max) {
+        continue;
+      }
+      int offset = -1;
+      for (Map.Entry<Integer, Integer> entry : space.positions.entrySet()) {
+        if (entry.getValue() <= position && entry.getKey() > offset) {
+          offset = entry.getKey();
+        }
+      }
+      if (offset >= 0) {
+        return coordinate(space.rank, offset);
+      }
+    }
+    return NO_COORDINATE;
+  }
+
+  /**
+   * The exact generation-order bounds of a naming site for pool entry {@code index}: every lower
+   * entry's first use precedes the site and every higher entry's first use follows it. Entries with
+   * no instruction use are absent from {@code firstUses}; they cannot bound anything.
+   *
+   * <p>The class's own, superclass and interface {@code Class} entries are interned when the class
+   * is entered, before any body is generated, so an instruction that uses one says nothing about
+   * the pool order and it is never used as a bound.
+   */
+  private static long[] coordinates(Map<Integer, FirstUse> firstUses, int index, Set<Integer> early) {
+    long pred = Long.MIN_VALUE;
+    long succ = Long.MAX_VALUE;
+    for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
+      int key = entry.getKey();
+      if (key == index || early.contains(key)) {
+        continue;
+      }
+      long point = coordinate(entry.getValue().order(), entry.getValue().offset());
+      if (key < index) {
+        pred = Math.max(pred, point);
+      }
+      else {
+        succ = Math.min(succ, point);
+      }
+    }
+    return new long[]{pred, succ};
   }
 
   private static int compare(FirstUse a, FirstUse b) {
@@ -277,8 +371,10 @@ public final class ConstantNames {
     Map<String, List<Constant>> candidates = new HashMap<>();
     ownCandidates(candidates, own);
     Map<String, int[]> windows = new HashMap<>();
+    Map<String, long[]> coordinates = new HashMap<>();
     Set<String> strict = new HashSet<>();
     Map<String, Integer> classIndices = classIndices(own);
+    Set<Integer> early = earlyClassEntries(own, classIndices);
     String nest = nestOf(own.qualifiedName);
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
@@ -291,6 +387,7 @@ public final class ConstantNames {
         if (window != null) {
           windows.put(owner, window);
         }
+        coordinates.put(owner, coordinates(firstUses, index, early));
       }
     }
     // A class the pool uses through a field or method names nothing by itself, but the position of
@@ -312,13 +409,71 @@ public final class ConstantNames {
       }
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       windows.put(owner, window);
+      coordinates.put(owner, coordinates(firstUses, index, early));
       strict.add(owner);
     }
     if (candidates.isEmpty()) {
       return null;
     }
-    return new Rules(candidates, windows, strict, own.qualifiedName, ownInitializers(text, spans, own),
-      imports, packageName);
+    return new Rules(candidates, new Placement(windows, coordinates, spaces(own, positions, firstUses)),
+      strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
+  }
+
+  /**
+   * The printed positions of this class's method bodies and static initializers, each tagged with
+   * its generation rank. Instance field initializers are printed under a {@code <field-init>} key
+   * that does not name the constructor their offsets belong to, so they are left out.
+   */
+  private static List<SiteSpace> spaces(StructClass own,
+                                        Map<Pair<String, String>, Map<Integer, Integer>> positions,
+                                        Map<Integer, FirstUse> firstUses) {
+    Map<String, Integer> ranks = new HashMap<>();
+    for (FirstUse use : firstUses.values()) {
+      ranks.putIfAbsent(use.methodKey(), use.order());
+    }
+    List<SiteSpace> spaces = new ArrayList<>();
+    for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry : positions.entrySet()) {
+      if (!own.qualifiedName.equals(entry.getKey().a) || entry.getValue().isEmpty()) {
+        continue;
+      }
+      Integer rank = ranks.get(entry.getKey().b);
+      if (rank == null) {
+        continue;
+      }
+      int min = Integer.MAX_VALUE;
+      int max = Integer.MIN_VALUE;
+      for (int position : entry.getValue().values()) {
+        min = Math.min(min, position);
+        max = Math.max(max, position);
+      }
+      spaces.add(new SiteSpace(rank, entry.getValue(), min, max));
+    }
+    return spaces;
+  }
+
+  /**
+   * The pool indices javac enters before generating any body: the class itself and its supertypes.
+   * A use of one of these says nothing about where in the generation order the entry was created.
+   */
+  private static Set<Integer> earlyClassEntries(StructClass own, Map<String, Integer> classIndices) {
+    Set<Integer> early = new HashSet<>();
+    Integer ownIndex = classIndices.get(own.qualifiedName);
+    if (ownIndex != null) {
+      early.add(ownIndex);
+    }
+    if (own.superClass != null && own.superClass.getString() != null) {
+      Integer index = classIndices.get(own.superClass.getString());
+      if (index != null) {
+        early.add(index);
+      }
+    }
+    for (String name : own.getInterfaceNames()) {
+      Integer index = classIndices.get(name);
+      if (index != null) {
+        early.add(index);
+      }
+    }
+    return early;
   }
 
   /** The pool index of each Class entry, keyed by the class name it names. */
@@ -490,7 +645,7 @@ public final class ConstantNames {
     Set<String> inWindow = new HashSet<>();
     for (int[] span : spans) {
       scan(text, span[0], span[1], rules.candidates(), rules.imports(), rules.packageName(),
-        sites, rules.own(), rules.ownInitializers(), rules.windows(), deferred, inWindow);
+        sites, rules.own(), rules.ownInitializers(), rules.placement(), deferred, inWindow);
     }
     for (Map.Entry<String, List<Site>> entry : deferred.entrySet()) {
       if (!inWindow.contains(entry.getKey())) {
@@ -506,7 +661,8 @@ public final class ConstantNames {
       // A site inside the window already interns this owner's Class entry, so naming the owner
       // again later cannot move it and adds nothing to the pool. A site before the window could
       // move the entry earlier than the original did, and stays out.
-      int[] window = rules.windows().get(entry.getKey());
+      int[] window = rules.placement().windows() == null
+        ? null : rules.placement().windows().get(entry.getKey());
       for (Site site : entry.getValue()) {
         if (window != null && site.start() >= window[1]) {
           addSiteOnce(sites, site);
@@ -826,12 +982,12 @@ public final class ConstantNames {
                            String packageName, List<Site> sites, String own,
                            Map<String, List<int[]>> ownInitializers) {
     scan(text, 0, text.length(), candidates, imports, packageName, sites, own, ownInitializers,
-      null, null, null);
+      NO_PLACEMENT, null, null);
   }
 
   private static void scan(String text, int from, int to, Map<String, List<Constant>> candidates,
                            List<String> imports, String packageName, List<Site> sites, String own,
-                           Map<String, List<int[]>> ownInitializers, Map<String, int[]> windows,
+                           Map<String, List<int[]>> ownInitializers, Placement placement,
                            Map<String, List<Site>> deferred, Set<String> inWindow) {
     int i = from;
     while (i < to) {
@@ -855,7 +1011,7 @@ public final class ConstantNames {
           String value = unescape(text.substring(i + 1, end - 1));
           if (value != null && !value.isEmpty()) {
             addSite(sites, i, end, VariableType.STRING + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-              windows, deferred, inWindow);
+              placement, deferred, inWindow);
           }
         }
         i = end;
@@ -867,7 +1023,7 @@ public final class ConstantNames {
           Integer value = charValue(text.substring(i + 1, end - 1));
           if (value != null) {
             addSite(sites, i, end, VariableType.CHAR + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-              windows, deferred, inWindow);
+              placement, deferred, inWindow);
           }
         }
         i = end;
@@ -881,14 +1037,14 @@ public final class ConstantNames {
         String word = text.substring(i, end);
         if (word.equals("true") || word.equals("false")) {
           addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, "", candidates, imports, packageName, own, ownInitializers,
-            windows, deferred, inWindow);
+            placement, deferred, inWindow);
         }
         i = end;
         continue;
       }
       if (Character.isDigit(c) && (i == 0 || !isIdentifierPart(text.charAt(i - 1)))) {
         i = scanNumber(text, i, sites, candidates, imports, packageName, own, ownInitializers,
-          windows, deferred, inWindow);
+          placement, deferred, inWindow);
         continue;
       }
       i++;
@@ -918,7 +1074,7 @@ public final class ConstantNames {
   private static int scanNumber(String text, int start, List<Site> sites,
                                 Map<String, List<Constant>> candidates, List<String> imports,
                                 String packageName, String own, Map<String, List<int[]>> ownInitializers,
-                                Map<String, int[]> windows, Map<String, List<Site>> deferred,
+                                Placement placement, Map<String, List<Site>> deferred,
                                 Set<String> inWindow) {
     int i = start;
     char c = text.charAt(i);
@@ -988,7 +1144,7 @@ public final class ConstantNames {
         if ((asLong == null || asLong.size() != 1)
             && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
           addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number, "",
-            candidates, imports, packageName, own, ownInitializers, windows, deferred, inWindow);
+            candidates, imports, packageName, own, ownInitializers, placement, deferred, inWindow);
         }
       } else if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
         kind = VariableType.DOUBLE.name();
@@ -1007,20 +1163,20 @@ public final class ConstantNames {
     }
     int siteStart = negative ? negativeAt : start;
     addSite(sites, siteStart, i, kind + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-      windows, deferred, inWindow);
+      placement, deferred, inWindow);
     if (kind.equals(VariableType.FLOAT.name())) {
       addSite(sites, siteStart, i, "FLOATCAST|" + value, "", candidates, imports, packageName, own, ownInitializers,
-        windows, deferred, inWindow);
+        placement, deferred, inWindow);
     }
     if (negative && value.startsWith("-")) {
       // The source can write a positive constant behind a unary minus; the literal is then the
       // negation of the constant, not a negative constant of its own.
       String magnitude = value.substring(1);
       addSite(sites, siteStart, i, kind + "|" + magnitude, "-", candidates, imports, packageName, own,
-        ownInitializers, windows, deferred, inWindow);
+        ownInitializers, placement, deferred, inWindow);
       if (kind.equals(VariableType.FLOAT.name())) {
         addSite(sites, siteStart, i, "FLOATCAST|" + magnitude, "-", candidates, imports, packageName, own,
-          ownInitializers, windows, deferred, inWindow);
+          ownInitializers, placement, deferred, inWindow);
       }
       if (kind.equals(VariableType.LONG.name())) {
         try {
@@ -1028,7 +1184,7 @@ public final class ConstantNames {
           List<Constant> asLong = candidates.get(kind + "|" + magnitude);
           if ((asLong == null || asLong.size() != 1) && mag <= Integer.MAX_VALUE) {
             addSite(sites, siteStart, i, VariableType.INT.name() + "|" + mag, "-", candidates, imports,
-              packageName, own, ownInitializers, windows, deferred, inWindow);
+              packageName, own, ownInitializers, placement, deferred, inWindow);
           }
         } catch (NumberFormatException ignored) {
           // a magnitude too large for a positive long has no constant to name
@@ -1041,20 +1197,29 @@ public final class ConstantNames {
   private static void addSite(List<Site> sites, int start, int end, String key, String prefix,
                               Map<String, List<Constant>> candidates, List<String> imports,
                               String packageName, String own, Map<String, List<int[]>> ownInitializers,
-                              Map<String, int[]> windows, Map<String, List<Site>> deferred,
+                              Placement placement, Map<String, List<Site>> deferred,
                               Set<String> inWindow) {
     List<Constant> constants = candidates.get(key);
-    if (constants == null || constants.size() != 1) {
+    if (constants == null || constants.isEmpty()) {
       return;
     }
-    Constant constant = constants.get(0);
-    int[] window = windows == null || constant.owner().equals(own)
-      ? null : windows.get(constant.owner());
-    boolean inside = window != null && start >= window[0] && start < window[1];
+    Constant constant = constants.size() == 1
+      ? constants.get(0) : selectProvable(constants, start, placement, own);
+    if (constant == null) {
+      return;
+    }
+    boolean foreign = !constant.owner().equals(own);
+    int[] window = placement == null || placement.windows() == null || !foreign
+      ? null : placement.windows().get(constant.owner());
+    // The pool order in generation order is exact: the site must fall after every lower entry's
+    // first use and before every higher entry's first use. A text window only approximates it; the
+    // coordinate check places the site by the positions the printer recorded for its method, which
+    // also covers a static field initializer generated in <clinit> but printed at its declaration.
+    boolean placed = foreign && placement != null && placement.proves(constant.owner(), start);
     // A frequent value is only weak evidence where there is no better one. A window means the pool
     // proves this owner was named somewhere, and the value only has to pick among its constants;
     // the site itself is still placed by the window or its fallback below.
-    if (window == null && tooCommon(key)) {
+    if (window == null && !placed && tooCommon(key)) {
       return;
     }
     if (constant.owner().equals(own)) {
@@ -1066,7 +1231,8 @@ public final class ConstantNames {
     }
     String name = simpleName(constant.owner());
     String printed;
-    if (windows != null && constant.owner().equals(own) && anonymous(constant.owner())) {
+    if (placement != null && placement.windows() != null && constant.owner().equals(own)
+        && anonymous(constant.owner())) {
       // Inside its own class the constant needs no qualifier, and an anonymous class has no
       // writable simple name at all (its binary suffix is a number).
       printed = prefix + constant.name();
@@ -1103,7 +1269,7 @@ public final class ConstantNames {
     // entry. The class's own constants are exempt: its Class entry is in the pool regardless, so
     // the pool order says nothing about when the source named one of them.
     if (window != null) {
-      if (!inside) {
+      if (!placed) {
         if (deferred != null) {
           deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>()).add(new Site(start, end, printed));
         }
@@ -1114,6 +1280,30 @@ public final class ConstantNames {
       }
     }
     addSiteOnce(sites, new Site(start, end, printed));
+  }
+
+  /**
+   * The one candidate the pool order proves for this site when several constants share the value.
+   *
+   * <p>A value alone cannot choose between owners, and naming the wrong one adds its class to the
+   * pool at a position the original never had. A window or an exact generation-order placement is
+   * evidence that the owner was named here; two such owners at one site is still a guess.
+   */
+  private static Constant selectProvable(List<Constant> constants, int start, Placement placement,
+                                         String own) {
+    if (placement == null) {
+      return null;
+    }
+    Constant chosen = null;
+    for (Constant constant : constants) {
+      if (!constant.owner().equals(own) && placement.proves(constant.owner(), start)) {
+        if (chosen != null) {
+          return null;
+        }
+        chosen = constant;
+      }
+    }
+    return chosen;
   }
 
   /**
