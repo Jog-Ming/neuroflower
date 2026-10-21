@@ -877,8 +877,9 @@ public class InvocationExprent extends Exprent {
 
         if (buf.length() > 0) {
           // A chain link whose invoke the original put on a later line than the receiver's last
-          // instruction starts a line of its own.
-          if (instance != null && RoundTrip.newlineBetween(instance, this)) {
+          // instruction starts a line of its own. Inside an argument list javac attributes the
+          // invoke to the first argument's line, so the entry proves nothing about the dot there.
+          if (instance != null && !inArgument() && RoundTrip.newlineBetween(instance, this)) {
             buf.appendLineSeparator().appendIndent(indent);
           }
           buf.append(".");
