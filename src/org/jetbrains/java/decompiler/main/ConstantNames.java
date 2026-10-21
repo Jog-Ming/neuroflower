@@ -953,8 +953,18 @@ public final class ConstantNames {
         if (parsed == null) {
           return i;
         }
+        long number = negative ? -parsed : parsed;
         kind = VariableType.LONG.name();
-        value = Long.toString(negative ? -parsed : parsed);
+        value = Long.toString(number);
+        // An int constant used where a long is wanted widens at compile time, so the source can
+        // read `Integer.MAX_VALUE` where the pool holds a long constant. When no long constant
+        // explains the literal, try the int constant of the same value.
+        List<Constant> asLong = candidates.get(kind + "|" + value);
+        if ((asLong == null || asLong.size() != 1)
+            && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
+          addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number,
+            candidates, imports, packageName, own, ownInitializers, windows, deferred, inWindow);
+        }
       } else if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
         kind = VariableType.DOUBLE.name();
         double parsedDouble = Double.parseDouble(digits);
