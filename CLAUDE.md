@@ -53,8 +53,8 @@ work stands — belong in project memory.
 
 ## devtools/cli
 
-The only entry point for the experiment pipeline. A decompiler run is killed after
-`--timeout` minutes (default 30) and its staging tree discarded. Usage:
+The only entry point for the experiment pipeline. Each version runs in its own process and is
+killed after `--timeout` minutes per version (default 15); its staging tree is discarded. Usage:
 
 ```
 devtools/cli versions [--no-cache]                    list Mojang's versions
