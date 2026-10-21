@@ -46,6 +46,10 @@ work stands — belong in project memory.
 - **Commits are unsigned; pushing is batched and signed.** Commit with `git commit --no-gpg-sign`;
   do not change the git configuration. Push about every ten commits, re-signing the branch before
   the push.
+- **When the deterministic routes look exhausted, dispatch research subagents.** A fresh agent with
+  one narrow, evidence-driven question sees what the working context has stopped noticing; give it
+  the files, the measurement, and what is already ruled out, and ask for concrete proposals with
+  the evidence behind them.
 
 ## devtools/cli
 
