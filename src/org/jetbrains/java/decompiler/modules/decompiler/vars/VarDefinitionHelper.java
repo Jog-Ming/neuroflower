@@ -2045,6 +2045,9 @@ public class VarDefinitionHelper {
   }
 
   private static @NotNull String rename(Map<VarInMethod, String> nameMap, String name, Set<VarInMethod> liveVarDefs) {
+    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_VARIABLE_RENAME)) {
+      return name;
+    }
     while (liveVarDefs.stream().map(nameMap::get).anyMatch(name::equals)) {
       name += "x";
     }

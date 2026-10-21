@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Poll a check until it succeeds, with a bounded timeout instead of a blind sleep.
+#
+#   devtools/poll <seconds> <command...>
+#
+# Exits 0 the moment the command succeeds, 124 when the timeout passes, 2 on misuse. A timeout over
+# 300 seconds is capped at 300, with a notice on stderr. The command's output is discarded; run it
+# again yourself when you need it.
+#   devtools/poll 90 grep -q '^fully' .dev/tmp/score.out && tail -5 .dev/tmp/score.out
+set -u
+
+max_seconds=300
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: devtools/poll <seconds> <command...>" >&2
+  exit 2
+fi
+
+seconds="$1"
+shift
+if ! [[ "$seconds" =~ ^[0-9]+$ ]]; then
+  echo "devtools/poll: timeout must be a whole number of seconds" >&2
+  exit 2
+fi
+if [ "$seconds" -gt "$max_seconds" ]; then
+  echo "poll: requested ${seconds}s, capped at ${max_seconds}s" >&2
+  seconds=$max_seconds
+fi
+
+started=$SECONDS
+deadline=$(( $(date +%s) + seconds ))
+while :; do
+  if "$@" >/dev/null 2>&1; then
+    echo "poll: succeeded after $((SECONDS - started))s" >&2
+    exit 0
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "poll: timed out after $((SECONDS - started))s" >&2
+    exit 124
+  fi
+  sleep 1
+done

@@ -350,6 +350,18 @@ public class TextBuffer {
     myBytecodeOffsetMapping.putIfAbsent(new BytecodeMappingKey(bytecodeOffset, null, null), 0);
   }
 
+  /**
+   * Maps an offset to an earlier position of this buffer under a method's key. A constructor's
+   * pc0 belongs to its declaration line, which no printed body expression maps.
+   */
+  public void addBytecodeMappingAt(int textOffset, int bytecodeOffset, String className, String methodKey) {
+    if (myDebugTrace != null) {
+      myDebugTrace.myPreventDeletion = true;
+    }
+    myBytecodeOffsetMapping.putIfAbsent(new BytecodeMappingKey(bytecodeOffset, className, methodKey),
+      textOffset);
+  }
+
   public void addBytecodeMapping(BitSet bytecodeOffsets) {
     if (bytecodeOffsets == null) {
       return;

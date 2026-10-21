@@ -187,6 +187,19 @@ public class Fernflower implements IDecompiledData {
     }
   }
 
+  /** Restores named constants when the pool proves the original wrote one; never compiles. */
+  private String named(String text, StructClass cl) {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CONSTANT_NAMES)) {
+      return text;
+    }
+    try {
+      ClassesProcessor.ClassNode root = classProcessor.getMapRootClasses().get(cl.qualifiedName);
+      return ConstantNames.restore(text, root);
+    } catch (RuntimeException e) {
+      return text;
+    }
+  }
+
   @Override
   public void processClass(final StructClass cl) throws IOException {
       classProcessor.processClass(cl); // unhandled exceptions handled later on
@@ -199,6 +212,17 @@ public class Fernflower implements IDecompiledData {
       buffer.append(DecompilerContext.getProperty(IFernflowerPreferences.BANNER).toString());
       classProcessor.writeClass(cl, buffer);
 
+      if (DecompilerContext.getOption(IFernflowerPreferences.LINE_ALIGN)) {
+        try {
+          String aligned = LineAlign.align(buffer);
+          if (aligned != null) {
+            return named(aligned, cl);
+          }
+        } catch (RuntimeException e) {
+          // A class must not be lost because its line table could not be aligned.
+        }
+      }
+
       if (DecompilerContext.getOption(IFernflowerPreferences.DUMP_TEXT_TOKENS)) {
         buffer.visitTokens(TextTokenVisitor.createVisitor(next -> new TextTokenDumpVisitor(next, buffer)));
       } else {
@@ -210,7 +234,7 @@ public class Fernflower implements IDecompiledData {
         return "$ VF: Unable to decompile class " + cl.qualifiedName;
       }
 
-      return res;
+      return named(res, cl);
     }
     catch (Throwable t) {
       DecompilerContext.getLogger().writeMessage("Class " + cl.qualifiedName + " couldn't be fully decompiled.", t);

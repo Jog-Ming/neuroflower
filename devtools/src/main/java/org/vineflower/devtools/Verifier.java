@@ -15,6 +15,8 @@ import javax.tools.SimpleJavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.OutputStream;
 import java.net.URI;
 import java.io.IOException;
@@ -47,6 +49,9 @@ public final class Verifier {
   public record FileResult(String source, List<ClassResult> classes, List<String> errors, boolean cached) {
   }
 
+  record Compiled(boolean ok, Map<String, byte[]> outputs, List<String> errors) {
+  }
+
   /** One compiler and one file manager per worker: scanning the classpath is the expensive part. */
   private static final ThreadLocal<JavaCompiler> COMPILER =
     ThreadLocal.withInitial(ToolProvider::getSystemJavaCompiler);
@@ -54,7 +59,7 @@ public final class Verifier {
     COMPILER.get().getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8));
 
   /** Bump when the comparison changes: it is part of the cache key, not of the source hash. */
-  private static final String COMPARATOR_VERSION = "2";
+  private static final String COMPARATOR_VERSION = "6";
 
   private final Workspace workspace;
   private final Minecraft minecraft;
@@ -64,7 +69,7 @@ public final class Verifier {
     this.minecraft = minecraft;
   }
 
-  public void score(String version, Path target, String only, int threads, boolean json) throws Exception {
+  public List<FileResult> score(String version, Path target, String only, int threads, boolean json) throws Exception {
     Path client = minecraft.clientJar(version, false);
     Path originalClasses = minecraft.extractedClasses(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
@@ -97,12 +102,16 @@ public final class Verifier {
     // Entries are evicted by age, not by whether this run used them: an A/B alternates between
     // two source sets, and evicting the other side each time would make every run a cold one.
     if (only == null && Files.isDirectory(target)) {
-      pruneCompileCache(compileCache);
+      // Nine versions with ~7k sources each fit at once; a smaller cap makes every sweep a cold
+      // compile for the versions that fell out.
+      pruneCompileCache(compileCache, ".json", 200_000);
+      pruneCompileCache(workspace.cache.resolve("classes"), ".bin", 150_000);
     }
 
     long totalClasses = Files.isDirectory(target) && only == null
       ? countClasses(originalClasses) : 0;
     report(version, target, results, elapsed, json, totalClasses);
+    return results;
   }
 
   private FileResult scoreFile(Path source, Path originalClasses, List<Path> classpath, int release,
@@ -115,30 +124,17 @@ public final class Verifier {
       return readCache(source, cached);
     }
 
-    DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
-    JavaCompiler compiler = COMPILER.get();
-    StandardJavaFileManager files = FILES.get();
-    MemoryOutput memory = new MemoryOutput(files);
-    List<String> options = List.of(
-      "--release", Integer.toString(release),
-      "-g", "-parameters", "-nowarn", "-proc:none", "-implicit:none",
-      "-classpath", join(classpath));
-    boolean ok = compiler.getTask(null, memory, diagnostics, options, null,
-      files.getJavaFileObjects(source)).call();
+    Compiled compiled = compile(source, classpath, release);
 
     List<ClassResult> classes = new ArrayList<>();
     List<String> errors = new ArrayList<>();
-    if (!ok) {
-      for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
-        if (diagnostic.getKind() == Diagnostic.Kind.ERROR && errors.size() < 8) {
-          errors.add(diagnostic.getLineNumber() + ":"
-            + diagnostic.getMessage(Locale.ROOT).split("\n")[0]);
-        }
-      }
+    if (!compiled.ok()) {
+      errors.addAll(compiled.errors());
       classes.add(new ClassResult(classNameOf(source), allFalse("not compiled: "
         + (errors.isEmpty() ? "javac failed" : errors.get(0))), errors, false, false));
     } else {
-      List<String> names = new ArrayList<>(memory.outputs.keySet());
+      Map<String, byte[]> outputs = compiled.outputs();
+      List<String> names = new ArrayList<>(outputs.keySet());
       Collections.sort(names);
       for (String binary : names) {
         String name = binary.replace('.', '/');
@@ -147,7 +143,7 @@ public final class Verifier {
           classes.add(new ClassResult(name, allFalse("no original class in the jar"), List.of(), true, true));
           continue;
         }
-        ClassDiff diff = ClassDiff.compare(Files.readAllBytes(originalFile), memory.outputs.get(binary));
+        ClassDiff diff = ClassDiff.compare(Files.readAllBytes(originalFile), outputs.get(binary));
         classes.add(new ClassResult(diff.name, diff.matches, diff.details, true, false));
       }
     }
@@ -156,8 +152,132 @@ public final class Verifier {
     return result;
   }
 
+  /** One error with the source position javac attributes to it. */
+  public record Problem(long position, long line, long column, String message) {
+  }
+
+  static List<Problem> diagnose(Path source, List<Path> classpath, int release) throws IOException {
+    DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+    JavaCompiler compiler = COMPILER.get();
+    StandardJavaFileManager files = FILES.get();
+    MemoryOutput memory = new MemoryOutput(files);
+    compiler.getTask(null, memory, diagnostics, options(classpath, release), null,
+      files.getJavaFileObjects(source)).call();
+    List<Problem> problems = new ArrayList<>();
+    for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+      if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
+        problems.add(new Problem(diagnostic.getPosition(), diagnostic.getLineNumber(),
+          diagnostic.getColumnNumber(), diagnostic.getMessage(Locale.ROOT)));
+      }
+    }
+    return problems;
+  }
+
+  private static List<String> options(List<Path> classpath, int release) {
+    return List.of(
+      "--release", Integer.toString(release),
+      "-g", "-parameters", "-nowarn", "-proc:none", "-implicit:none",
+      "-classpath", join(classpath));
+  }
+
+  private static final Map<String, String> STAMPS = new java.util.concurrent.ConcurrentHashMap<>();
+  private static Path classCache;
+
+  private static synchronized Path classCache() {
+    if (classCache == null) {
+      classCache = Workspace.load().cache.resolve("classes");
+    }
+    return classCache;
+  }
+
+  /** Identifies the compiler, its flags and the classpath a cached class set belongs to. */
+  private static String compileStamp(List<Path> classpath, int release) {
+    String key = release + "|" + classpath;
+    return STAMPS.computeIfAbsent(key, ignored -> {
+      StringBuilder libs = new StringBuilder();
+      for (Path path : classpath) {
+        try {
+          libs.append(path.getFileName()).append(':').append(Files.size(path)).append(';');
+        } catch (IOException e) {
+          libs.append(path.getFileName()).append(":?;");
+        }
+      }
+      String client = classpath.isEmpty() ? "" : Workspace.sha256(classpath.get(0));
+      return Workspace.sha256(COMPARATOR_VERSION + "|" + System.getProperty("java.version") + "|"
+        + System.getProperty("java.home") + "|" + release + "|" + client + "|" + libs);
+    });
+  }
+
+  /** One file, compiled against the original jar, with its classes kept in memory. */
+  static Compiled compile(Path source, List<Path> classpath, int release) throws IOException {
+    byte[] sourceBytes = Files.readAllBytes(source);
+    String key = Workspace.sha256(
+      Workspace.sha256(sourceBytes) + "|" + compileStamp(classpath, release));
+    Path cached = classCache().resolve(key.substring(0, 2)).resolve(key + ".bin");
+    if (Files.exists(cached)) {
+      try {
+        Compiled compiled = readCompiled(cached);
+        Files.setLastModifiedTime(cached,
+          java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
+        return compiled;
+      } catch (IOException | RuntimeException ignored) {
+        // A truncated entry is simply recompiled.
+      }
+    }
+    DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+    JavaCompiler compiler = COMPILER.get();
+    StandardJavaFileManager files = FILES.get();
+    MemoryOutput memory = new MemoryOutput(files);
+    boolean ok = compiler.getTask(null, memory, diagnostics, options(classpath, release), null,
+      files.getJavaFileObjects(source)).call();
+    List<String> errors = new ArrayList<>();
+    if (!ok) {
+      for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+        if (diagnostic.getKind() == Diagnostic.Kind.ERROR && errors.size() < 8) {
+          errors.add(diagnostic.getLineNumber() + ":"
+            + diagnostic.getMessage(Locale.ROOT).split("\n")[0]);
+        }
+      }
+    }
+    if (ok) {
+      try {
+        Workspace.write(cached, serialize(memory.outputs));
+      } catch (IOException ignored) {
+        // The cache is an optimisation; a failed write must not fail the compile.
+      }
+    }
+    return new Compiled(ok, ok ? memory.outputs : Map.of(), errors);
+  }
+
+  private static byte[] serialize(Map<String, byte[]> outputs) throws IOException {
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (DataOutputStream data = new DataOutputStream(bytes)) {
+      data.writeInt(outputs.size());
+      for (Map.Entry<String, byte[]> entry : outputs.entrySet()) {
+        data.writeUTF(entry.getKey());
+        data.writeInt(entry.getValue().length);
+        data.write(entry.getValue());
+      }
+    }
+    return bytes.toByteArray();
+  }
+
+  private static Compiled readCompiled(Path file) throws IOException {
+    try (DataInputStream data = new DataInputStream(Files.newInputStream(file))) {
+      int count = data.readInt();
+      Map<String, byte[]> outputs = new LinkedHashMap<>();
+      for (int i = 0; i < count; i++) {
+        String name = data.readUTF();
+        byte[] bytes = new byte[data.readInt()];
+        data.readFully(bytes);
+        outputs.put(name, bytes);
+      }
+      return new Compiled(true, outputs, List.of());
+    }
+  }
+
   /** Compiles into memory: no per-file output directory, no write and read back. */
-  private static final class MemoryOutput extends ForwardingJavaFileManager<JavaFileManager> {
+  static final class MemoryOutput extends ForwardingJavaFileManager<JavaFileManager> {
     final Map<String, byte[]> outputs = new LinkedHashMap<>();
 
     MemoryOutput(JavaFileManager delegate) {
@@ -297,11 +417,17 @@ public final class Verifier {
       for (FileResult result : results) {
         JsonObject fileJson = new JsonObject();
         fileJson.addProperty("source", result.source());
+        if (!result.errors().isEmpty()) {
+          JsonArray errorArray = new JsonArray();
+          result.errors().forEach(errorArray::add);
+          fileJson.add("errors", errorArray);
+        }
         JsonArray classArray = new JsonArray();
         for (ClassResult cls : result.classes()) {
           JsonObject classJson = new JsonObject();
           classJson.addProperty("name", cls.name());
           classJson.addProperty("compiled", cls.compiled());
+          classJson.addProperty("extra", cls.extra());
           JsonObject flags = new JsonObject();
           cls.flags().forEach(flags::addProperty);
           classJson.add("flags", flags);
@@ -348,16 +474,15 @@ public final class Verifier {
   }
 
   /** Keeps entries that were used recently; the cap bounds a very large A/B matrix. */
-  private static void pruneCompileCache(Path compileCache) throws IOException {
+  private static void pruneCompileCache(Path compileCache, String suffix, int maxEntries) throws IOException {
     if (!Files.isDirectory(compileCache)) {
       return;
     }
     long now = System.currentTimeMillis();
     long maxAge = 14L * 24 * 60 * 60 * 1000;
-    int maxEntries = 50_000;
     List<Path> entries = new ArrayList<>();
     try (var walk = Files.walk(compileCache)) {
-      for (Path path : walk.filter(p -> p.toString().endsWith(".json")).toList()) {
+      for (Path path : walk.filter(p -> p.toString().endsWith(suffix)).toList()) {
         long used = Files.getLastModifiedTime(path).toMillis();
         if (now - used > maxAge) {
           Files.deleteIfExists(path);
@@ -390,7 +515,7 @@ public final class Verifier {
     }
   }
 
-  private List<Path> sources(Path target, String only) throws IOException {
+  static List<Path> sources(Path target, String only) throws IOException {
     if (Files.isRegularFile(target)) {
       return List.of(target);
     }
@@ -466,7 +591,7 @@ public final class Verifier {
       + Workspace.sha256(libs.toString()));
   }
 
-  private static int releaseOf(Path jar) throws IOException {
+  static int releaseOf(Path jar) throws IOException {
     try (ZipFile zip = new ZipFile(jar.toFile())) {
       var entries = zip.entries();
       while (entries.hasMoreElements()) {

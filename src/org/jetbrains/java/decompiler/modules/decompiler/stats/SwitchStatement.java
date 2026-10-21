@@ -14,6 +14,9 @@ import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
+import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.util.StartEndPair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -131,7 +134,7 @@ public class SwitchStatement extends Statement {
 
     VarType switch_type = headexprent.get(0).getExprType();
 
-    for (int i = 0; i < caseStatements.size(); i++) {
+    for (int i : sourceOrder()) {
 
       Statement stat = caseStatements.get(i);
       List<StatEdge> edges = caseEdges.get(i);
@@ -199,6 +202,64 @@ public class SwitchStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /**
+   * The order the original source wrote the case bodies in. A switch instruction sorts its labels
+   * by value, so the bytecode cannot tell `case 40964:` before `case 40963:`; the target's line
+   * table can, because every body's first instruction carries the line of the statement behind it.
+   */
+  private List<Integer> sourceOrder() {
+    int size = caseStatements.size();
+    List<Integer> order = new ArrayList<>(size);
+    for (int i = 0; i < size; i++) {
+      order.add(i);
+    }
+    boolean debugSwitch = System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null;
+    if (debugSwitch) {
+      System.err.println("switch order called size=" + size + " option="
+        + DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SWITCH_ORDER));
+    }
+    if (size < 2 || !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SWITCH_ORDER)) {
+      return order;
+    }
+    // Pattern labels, guards and `case null` have ordering rules of their own; only a plain
+    // constant switch may be written in an order the switch instruction does not define.
+    if (isPattern() || caseValues.stream().flatMap(List::stream)
+        .anyMatch(v -> v != null && (!(v instanceof ConstExprent) || ((ConstExprent)v).isNull()))) {
+      return order;
+    }
+    StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    if (method == null) {
+      return order;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return order;
+    }
+    int[] lines = new int[size];
+    for (int i = 0; i < size; i++) {
+      Statement stat = caseStatements.get(i);
+      if (stat == null) {
+        return order;
+      }
+      StartEndPair range = stat.getStartEndRange();
+      int line = range == null ? -1 : table.findLineNumber(range.start);
+      if (line < 0) {
+        if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
+          System.err.println("switch order skipped, line " + line + " case " + i + " of " + size);
+        }
+        return order;
+      }
+      lines[i] = line;
+    }
+    order.sort(Comparator.comparingInt(i -> lines[i]));
+    if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
+      System.err.println("switch order " + method.getName() + method.getDescriptor() + " lines "
+        + java.util.Arrays.toString(lines) + " -> " + order);
+    }
+    return order;
   }
 
   @Override

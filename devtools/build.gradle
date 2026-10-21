@@ -4,8 +4,8 @@ plugins {
 
 dependencies {
   implementation 'com.google.code.gson:gson:2.13.2'
-  implementation 'org.ow2.asm:asm:9.7.1'
-  implementation 'org.ow2.asm:asm-tree:9.7.1'
+  implementation 'org.ow2.asm:asm:9.11.1'
+  implementation 'org.ow2.asm:asm-tree:9.11.1'
 }
 
 tasks.named('jar') {
@@ -20,5 +20,17 @@ tasks.named('shadowJar') {
   mergeServiceFiles()
   manifest {
     attributes 'Main-Class': 'org.vineflower.devtools.Main'
+  }
+}
+
+// Prints the installation path of a JDK for -Pjdk=<release>. With the foojay resolver in
+// settings.gradle, Gradle downloads one when no local installation matches.
+tasks.register('provisionJdk') {
+  doLast {
+    int release = project.property('jdk').toString().toInteger()
+    def launcher = javaToolchains.launcherFor {
+      languageVersion = JavaLanguageVersion.of(release)
+    }
+    println launcher.get().metadata.installationPath.asFile.absolutePath
   }
 }

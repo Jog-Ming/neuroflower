@@ -11,6 +11,7 @@ import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
@@ -102,7 +103,13 @@ public class NewExprent extends Exprent {
         else if (newType.arrayDim == 0 && !node.getSignature().fparameters.isEmpty()) {
           GenericClassDescriptor sig = node.getSignature();
           if (constructor != null) {
-            VarType ret = constructor.getInferredExprType(upperBound);
+            InvocationExprent.enterPoly();
+            VarType ret;
+            try {
+              ret = constructor.getInferredExprType(upperBound);
+            } finally {
+              InvocationExprent.exitPoly();
+            }
             return ret.type != CodeType.VOID ? ret : getExprType();
           }
           else {
@@ -382,8 +389,20 @@ public class NewExprent extends Exprent {
       }
 
       if (!lambda && constructor != null) {
-        appendParameters(buf, constructor.getGenericArgs());
-        buf.append('(').append(constructor.appendParamList(indent));
+        List<VarType> args = constructor.getGenericArgs();
+        boolean diamond = args.size() == 1 && args.get(0) == GenericType.DUMMY_VAR;
+        appendParameters(buf, args);
+        buf.append('(');
+        if (diamond) {
+          InvocationExprent.enterPoly();
+        }
+        try {
+          buf.append(constructor.appendParamList(indent));
+        } finally {
+          if (diamond) {
+            InvocationExprent.exitPoly();
+          }
+        }
       }
       else {
         appendParameters(buf, genericArgs);
@@ -402,7 +421,8 @@ public class NewExprent extends Exprent {
         }
         setLambdaGenericTypes();
         Exprent methodObject = constructor == null ? null : constructor.getInstance();
-        new ClassWriter().classLambdaToJava(child, buf, methodObject, indent);
+        new ClassWriter().classLambdaToJava(child, buf, methodObject, indent,
+          RoundTrip.sourceLine(this));
       }
       else if (!selfReference) {
         new ClassWriter().writeClass(child, buf, indent);

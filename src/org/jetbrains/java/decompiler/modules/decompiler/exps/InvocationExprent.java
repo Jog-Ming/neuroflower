@@ -204,6 +204,22 @@ public class InvocationExprent extends Exprent {
     return descriptor.ret;
   }
 
+  /**
+   * The return type as the method declares it, wildcards and type variables intact. Inference
+   * substitutes the upper bound into this type, so it is the only witness that the declared type
+   * was a wildcard instantiation the source had to cast away.
+   */
+  public VarType getDeclaredGenericReturnType() {
+    if (desc == null) {
+      StructClass cl = DecompilerContext.getStructContext().getClass(classname);
+      desc = cl != null ? cl.getMethodRecursive(name, stringDescriptor) : null;
+    }
+    if (desc != null && desc.getSignature() != null && desc.getSignature().returnType != null) {
+      return desc.getSignature().returnType;
+    }
+    return descriptor.ret;
+  }
+
 
   @Override
   public VarType getInferredExprType(VarType upperBound) {
@@ -628,6 +644,13 @@ public class InvocationExprent extends Exprent {
             }
 
             if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)) {
+              getGenericArgs(fparams, genericsMap, genericArgs);
+            }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
+              && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
+              // A call inferred to an enclosing method's or class's type variable can need the
+              // witness in source: javac does not propagate the target type into every poly
+              // expression (a conditional arm, a diamond argument), and then cannot infer it.
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
             else if (isGenNew) {
@@ -1144,9 +1167,20 @@ public class InvocationExprent extends Exprent {
     TextBuffer buf = new TextBuffer();
 
     boolean firstParameter = true;
+    int previousLine = -1;
     if (!lstParameters.isEmpty()) {
       buf.pushNewlineGroup(indent, 1);
-      buf.appendPossibleNewline();
+      int callLine = RoundTrip.sourceLineEnd(this);
+      int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
+      // A later argument line is always a break the source had. An earlier one is normally the
+      // enclosing statement's marker inherited by the argument's pushes, but not when the argument
+      // itself has an entry there: then its own expression started that line.
+      if (callLine >= 0 && firstLine >= 0 && firstLine != callLine
+          && (firstLine > callLine || RoundTrip.lineStartsHere(lstParameters.get(start)))) {
+        buf.appendLineSeparator();
+      } else {
+        buf.appendPossibleNewline();
+      }
       buf.pushNewlineGroup(indent, 0);
     }
 
@@ -1162,12 +1196,25 @@ public class InvocationExprent extends Exprent {
         // 'byte' and 'short' literals need an explicit narrowing type cast when used as a parameter
         ExprProcessor.getCastedExprent(lstParameters.get(i), types[i], buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
 
+        int line = RoundTrip.sourceLine(lstParameters.get(i));
+        // Only a later line is a break the original had; an equal or earlier one is inheritance
+        // from the enclosing statement's marker.
+        boolean forced = !firstParameter && line >= 0 && previousLine >= 0 && line > previousLine;
+
         // the last "new Object[0]" in the vararg call is not printed
         if (buff.length() > 0) {
           if (!firstParameter) {
-            buf.append(",").appendPossibleNewline(" ");
+            buf.append(",");
+            if (forced) {
+              buf.appendLineSeparator();
+            } else {
+              buf.appendPossibleNewline(" ");
+            }
           }
           buf.append(buff);
+        }
+        if (line >= 0) {
+          previousLine = line;
         }
 
         firstParameter = false;
@@ -1176,7 +1223,14 @@ public class InvocationExprent extends Exprent {
 
     if (!lstParameters.isEmpty()) {
       buf.popNewlineGroup();
-      buf.appendPossibleNewline("", true);
+      int callLine = RoundTrip.sourceLineEnd(this);
+      if (previousLine >= 0 && callLine >= 0 && previousLine != callLine
+          && (!RoundTrip.selector("arg-entry")
+              || RoundTrip.lineStartsHere(lstParameters.get(lstParameters.size() - 1)))) {
+        buf.appendLineSeparator();
+      } else {
+        buf.appendPossibleNewline("", true);
+      }
       buf.popNewlineGroup();
     }
 
@@ -1524,6 +1578,16 @@ public class InvocationExprent extends Exprent {
         if (md.params.length != lstParameters.size()) {
           continue;
         }
+        // The erased descriptor hides a type-variable parameter behind Object; read the signature.
+        org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor signature = mt.getSignature();
+        VarType genericParam = signature != null && i < signature.parameterTypes.size()
+          ? signature.parameterTypes.get(i) : md.params[i];
+        if (genericParam.type == CodeType.GENVAR) {
+          // A parameter typed by a type variable can itself be a functional interface, so javac has
+          // no way to choose between this overload and a functional-interface one; the source cast.
+          applicable++;
+          continue;
+        }
         StructClass paramType = DecompilerContext.getStructContext().getClass(md.params[i].value);
         if (paramType == null) {
           continue;
@@ -1829,8 +1893,10 @@ public class InvocationExprent extends Exprent {
     List<VarType> toVerify = (to.type == CodeType.GENVAR) ? named.get(to) : Collections.singletonList(to);
 
     // We need to satisfy all the bounds for the type we are mapping to
-    // The bounds can be satisfied by any of the bounds for the named type
-    return bounds.get(from).stream().allMatch(bound -> toVerify.stream().anyMatch(v -> verifier.apply(v, bound)));
+    // The bounds can be satisfied by any of the bounds for the named type. Inference can add to a
+    // bound list while it is being walked, so iterate a snapshot instead of the live list.
+    return new java.util.ArrayList<>(bounds.get(from))
+      .stream().allMatch(bound -> toVerify.stream().anyMatch(v -> verifier.apply(v, bound)));
   }
 
   private Map<VarType, List<VarType>> getGenericBounds(StructClass mthCls) {
@@ -1977,6 +2043,35 @@ public class InvocationExprent extends Exprent {
 
   public boolean isSyntheticNullCheck() {
     return isSyntheticNullCheck;
+  }
+
+  /**
+   * A poly expression's type comes from its target. javac does not carry the target into every
+   * branch of one, so a call inferred to an enclosing type variable there needs the witness printed.
+   */
+  private static final ThreadLocal<int[]> POLY = ThreadLocal.withInitial(() -> new int[1]);
+
+  public static void enterPoly() {
+    POLY.get()[0]++;
+  }
+
+  public static void exitPoly() {
+    POLY.get()[0]--;
+  }
+
+  private static boolean inPoly() {
+    return POLY.get()[0] > 0;
+  }
+
+  private boolean hasGenvarArgs(List<String> fparams, Map<VarType, VarType> genericsMap) {
+    List<VarType> probe = new java.util.ArrayList<>();
+    getGenericArgs(fparams, genericsMap, probe);
+    for (VarType arg : probe) {
+      if (arg.type == CodeType.GENVAR && arg != GenericType.DUMMY_VAR) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public List<VarType> getGenericArgs() {

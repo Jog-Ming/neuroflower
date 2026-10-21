@@ -1,27 +1,55 @@
 #!/usr/bin/env bash
 # The experimental pipeline's entry point.
 #
-#   ./devtools/cli versions | download <version> | decompile <version> | score <version> |
-#                       class <version> <Class>
-#   ./devtools/cli tree <version> | reports | clean [--all] | cache
+#   ./devtools/cli versions [--no-cache]
+#   ./devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class]
+#   ./devtools/cli tree <version> [--only Class]
+#   ./devtools/cli score <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+#   ./devtools/cli corpus <version> --ground-truth <dir>
+#   ./devtools/cli dataset <version>
+#   ./devtools/cli reports [--version V] [--limit N]
+#   ./devtools/cli clean [--trees] [--compile] [--downloads] [--all]
+#   ./devtools/cli cache
 #
-# Everything the pipeline writes lives under .dev/ and is git-ignored. The devtools jar is rebuilt
-# only when its sources or build file are newer than it; the JDK must be 21 or newer because the
-# verifier compiles Minecraft classes at the target's release.
+# Everything the pipeline writes lives under .dev/ and is git-ignored. Both jars are rebuilt when
+# their sources are newer: the pipeline jar and the decompiler jar a decompile runs. Set
+# DECOMPILER_JAR=/path/to/jar to run a specific decompiler build instead (A/B against an older jar).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar="$root/devtools/build/libs/devtools-all.jar"
+decompiler="$root/build/libs/vineflower-1.13.0+local.jar"
 
+rebuild=""
 if [ ! -f "$jar" ] || [ -n "$(find "$root/devtools/src" "$root/devtools/build.gradle" -newer "$jar" -print -quit 2>/dev/null)" ]; then
-  (cd "$root" && ./gradlew :devtools:shadowJar -q)
+  rebuild=1
+fi
+if [ -z "${DECOMPILER_JAR:-}" ]; then
+  if [ ! -f "$decompiler" ] || [ -n "$(find "$root/src" "$root/plugins" "$root/build.gradle" "$root/settings.gradle" \
+      -newer "$decompiler" -print -quit 2>/dev/null)" ]; then
+    rebuild=1
+  fi
+fi
+if [ -n "$rebuild" ]; then
+  build_started=$SECONDS
+  echo "devtools/cli: building jars" >&2
+  (cd "$root" && ./gradlew :allJar :devtools:shadowJar -q)
+  echo "devtools/cli: built in $((SECONDS - build_started))s" >&2
+fi
+if [ -n "${DECOMPILER_JAR:-}" ]; then
+  echo "devtools/cli: decompiler $DECOMPILER_JAR" >&2
 fi
 
-jdk="${DEVTOOLS_JDK:-$(command -v java)}"
-major="$("$jdk" -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p' | head -1)"
-if [ -z "$major" ] || [ "$major" -lt 21 ]; then
-  echo "devtools/cli: need JDK 21 or newer to run the pipeline (found $jdk); set DEVTOOLS_JDK" >&2
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  java_bin="$JAVA_HOME/bin/java"
+elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java.exe" ]; then
+  java_bin="$JAVA_HOME/bin/java.exe"
+else
+  java_bin="$(command -v java || true)"
+fi
+if [ -z "$java_bin" ]; then
+  echo "devtools/cli: no java found" >&2
   exit 2
 fi
 
-DEVTOOLS_ROOT="$root" exec "$jdk" -jar "$jar" "$@"
+DEVTOOLS_ROOT="$root" exec "$java_bin" -jar "$jar" "$@"

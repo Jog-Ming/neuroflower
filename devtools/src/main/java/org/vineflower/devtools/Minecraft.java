@@ -16,6 +16,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,6 +40,8 @@ public final class Minecraft {
   private static final String SKYRISING_MANIFEST =
     "https://raw.githubusercontent.com/skyrising/mc-versions/master/data/version_manifest.json";
   private static final Duration MAX_AGE = Duration.ofHours(24);
+  /** Version directories are large; keep only the most recently used few. */
+  private static final int MAX_CACHED_VERSIONS = 10;
 
   /** Builds Mojang ships without obfuscation but does not list in its manifest. */
   /** Compile-time-only annotations Minecraft's own metadata does not list. */
@@ -66,23 +69,64 @@ public final class Minecraft {
   }
 
   public VersionData resolve(String version, boolean refresh) throws IOException, InterruptedException {
+    VersionData data;
     String known = UNOBFUSCATED_CLIENTS.get(version);
     if (known != null) {
-      return new VersionData(known, null, baseRelease(version), null);
+      data = new VersionData(known, null, baseRelease(version), null);
+    } else {
+      JsonObject mojang = findMojang(version, refresh);
+      if (mojang != null) {
+        JsonObject client = mojang.getAsJsonObject("downloads").getAsJsonObject("client");
+        data = new VersionData(client.get("url").getAsString(), client.get("sha1").getAsString(), version, mojang);
+      } else {
+        JsonObject skyrising = findSkyrising(version, refresh);
+        if (skyrising == null) {
+          throw new IllegalArgumentException("unknown version '" + version + "' (not in Mojang's manifest or "
+            + "the mc-versions list)");
+        }
+        JsonObject client = skyrising.getAsJsonObject("downloads").getAsJsonObject("client");
+        data = new VersionData(client.get("url").getAsString(), client.get("sha1").getAsString(),
+          baseRelease(version), null);
+      }
     }
-    JsonObject mojang = findMojang(version, refresh);
-    if (mojang != null) {
-      JsonObject client = mojang.getAsJsonObject("downloads").getAsJsonObject("client");
-      return new VersionData(client.get("url").getAsString(), client.get("sha1").getAsString(), version, mojang);
+    touch(version);
+    return data;
+  }
+
+  /** Marks a version as used now, then evicts the least recently used directories past the cap. */
+  private void touch(String version) throws IOException {
+    Path dir = workspace.versions.resolve(version);
+    Files.createDirectories(dir);
+    Workspace.write(dir.resolve(".used"), Long.toString(System.currentTimeMillis()));
+    if (!Files.isDirectory(workspace.versions)) {
+      return;
     }
-    JsonObject skyrising = findSkyrising(version, refresh);
-    if (skyrising != null) {
-      JsonObject client = skyrising.getAsJsonObject("downloads").getAsJsonObject("client");
-      return new VersionData(client.get("url").getAsString(), client.get("sha1").getAsString(),
-        baseRelease(version), null);
+    record Entry(Path dir, long used) {
     }
-    throw new IllegalArgumentException("unknown version '" + version + "' (not in Mojang's manifest or "
-      + "the mc-versions list)");
+    List<Entry> entries = new ArrayList<>();
+    try (Stream<Path> list = Files.list(workspace.versions)) {
+      for (Path path : list.toList()) {
+        if (!Files.isDirectory(path)) {
+          continue;
+        }
+        long used = 0;
+        Path stamp = path.resolve(".used");
+        if (Files.exists(stamp)) {
+          try {
+            used = Long.parseLong(Files.readString(stamp).trim());
+          } catch (RuntimeException | IOException ignored) {
+            // A version without a readable stamp is treated as the oldest.
+          }
+        }
+        entries.add(new Entry(path, used));
+      }
+    }
+    entries.sort(Comparator.comparingLong(Entry::used).reversed());
+    for (int i = MAX_CACHED_VERSIONS; i < entries.size(); i++) {
+      if (!entries.get(i).dir().getFileName().toString().equals(version)) {
+        Decompiler.delete(entries.get(i).dir());
+      }
+    }
   }
 
   private static String baseRelease(String version) {
@@ -187,6 +231,8 @@ public final class Minecraft {
     }
     Decompiler.delete(dir);
     Files.createDirectories(dir);
+    long classes = 0;
+    long bytes = 0;
     try (var zip = new java.util.zip.ZipFile(jar.toFile())) {
       for (var entry : java.util.Collections.list(zip.entries())) {
         String name = entry.getName();
@@ -196,11 +242,19 @@ public final class Minecraft {
         Path target = dir.resolve(name);
         Files.createDirectories(target.getParent());
         try (var in = zip.getInputStream(entry)) {
-          Files.write(target, in.readAllBytes());
+          byte[] content = in.readAllBytes();
+          Files.write(target, content);
+          classes++;
+          bytes += content.length;
         }
       }
     }
     Files.writeString(stamp, hash);
+    // The cache command reports this without walking ten thousand files per version.
+    com.google.gson.JsonObject stats = new com.google.gson.JsonObject();
+    stats.addProperty("classes", classes);
+    stats.addProperty("bytes", bytes);
+    Workspace.writeJson(dir.resolve(".stats.json"), stats);
     return dir;
   }
 

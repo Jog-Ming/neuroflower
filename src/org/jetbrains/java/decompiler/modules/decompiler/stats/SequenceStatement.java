@@ -136,8 +136,10 @@ public class SequenceStatement extends Statement {
           && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
           && ifStatement.getIfstat() != null && endsWithReturn(ifStatement.getIfstat())) {
         Statement tail = stats.get(i + 1);
-        Exprent exit = singleReturn(tail);
-        if (exit instanceof ExitExprent returnExit && safeReturnValue(returnExit.getValue())
+        Exprent exit = singleExit(tail);
+        if (exit instanceof ExitExprent tailExit
+            && (tailExit.getExitType() == ExitExprent.Type.THROW
+                || safeReturnValue(tailExit.getValue()))
             && RoundTrip.returnGuard(ifStatement.getIfstat(), tail)) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
           head.negateIf();
@@ -171,10 +173,12 @@ public class SequenceStatement extends Statement {
     return buf;
   }
 
-  private static Exprent singleReturn(Statement stat) {
+  /** The single return or throw of a statement, or null; a throw moves into a guard unharmed. */
+  private static Exprent singleExit(Statement stat) {
     List<Exprent> exprents = stat.getExprents();
     if (exprents != null && exprents.size() == 1
-        && exprents.get(0) instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN) {
+        && exprents.get(0) instanceof ExitExprent exit
+        && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW)) {
       return exit;
     }
     return null;

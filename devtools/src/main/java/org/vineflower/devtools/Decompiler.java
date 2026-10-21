@@ -9,6 +9,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
@@ -21,9 +22,6 @@ import java.util.zip.ZipOutputStream;
  * newest few trees are kept and the rest pruned automatically.
  */
 public final class Decompiler {
-  /** Everything the fork bakes into its defaults; only the version and thread count matter here. */
-  public static final String OPTIONS = "baked-defaults";
-
   private final Workspace workspace;
   private final Minecraft minecraft;
 
@@ -32,24 +30,30 @@ public final class Decompiler {
     this.minecraft = minecraft;
   }
 
-  public Path tree(String version, int threads, boolean refresh, String only, int keep) throws Exception {
+  /** Trees kept per version; older ones are pruned after each decompile. */
+  private static final int KEEP = 5;
+
+  public Path tree(String version, int threads, boolean noCache, String only,
+                   List<String> options) throws Exception {
     Path devJar = workspace.devJar();
     if (!Files.exists(devJar)) {
       throw new IllegalStateException("decompiler jar missing: " + devJar + " (run ./gradlew :allJar)");
     }
-    Path client = minecraft.clientJar(version, refresh);
-    List<Path> classpath = minecraft.classpath(version, refresh);
-    String key = Workspace.sha256(Workspace.sha256(client) + Workspace.sha256(devJar) + OPTIONS
+    // --refresh re-decompiles the cached jar; it does not re-download what is already here.
+    Path client = minecraft.clientJar(version, false);
+    List<Path> classpath = minecraft.classpath(version, false);
+    String optionKey = options.isEmpty() ? "baked-defaults" : String.join(" ", options);
+    String key = Workspace.sha256(Workspace.sha256(client) + Workspace.sha256(devJar) + optionKey
       + classpathFingerprint(classpath) + (only == null ? "" : "|only=" + only));
     Path dir = workspace.trees.resolve(key);
     Path src = dir.resolve("src");
     JsonObject meta = Files.exists(dir.resolve("meta.json"))
       ? Workspace.readJson(dir.resolve("meta.json")) : new JsonObject();
 
-    if (!refresh && Files.isDirectory(src)) {
+    if (!noCache && Files.isDirectory(src)) {
       meta.addProperty("lastUsed", System.currentTimeMillis());
       Workspace.writeJson(dir.resolve("meta.json"), meta);
-      prune(keep);
+      prune();
       return src;
     }
 
@@ -65,6 +69,7 @@ public final class Decompiler {
     command.add("-jar");
     command.add(devJar.toString());
     command.add("--thread-count=" + threads);
+    command.addAll(options);
     command.add("-e=" + join(classpath));
     command.add(input.toString());
     command.add(src.toString());
@@ -83,16 +88,18 @@ public final class Decompiler {
     meta.addProperty("clientJarSha256", Workspace.sha256(client));
     meta.addProperty("decompilerJar", devJar.toString());
     meta.addProperty("decompilerJarSha256", Workspace.sha256(devJar));
-    meta.addProperty("options", OPTIONS);
+    meta.addProperty("options", optionKey);
     if (only != null) {
       meta.addProperty("only", only);
     }
     meta.addProperty("createdAt", System.currentTimeMillis());
     meta.addProperty("lastUsed", System.currentTimeMillis());
     meta.addProperty("decompileMillis", elapsed);
-    meta.addProperty("sourceFiles", countJava(src));
+    long[] stats = treeStats(src);
+    meta.addProperty("sourceFiles", stats[0]);
+    meta.addProperty("bytes", stats[1]);
     Workspace.writeJson(dir.resolve("meta.json"), meta);
-    prune(keep);
+    prune();
     return src;
   }
 
@@ -109,10 +116,24 @@ public final class Decompiler {
     return Workspace.sha256(builder.toString());
   }
 
-  private static long countJava(Path root) throws IOException {
-    try (var walk = Files.walk(root)) {
-      return walk.filter(p -> p.toString().endsWith(".java")).count();
-    }
+  /** Files and bytes of a decompiled tree, in one directory walk (file attributes come with it). */
+  private static long[] treeStats(Path root) throws IOException {
+    long[] total = new long[2];
+    Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<>() {
+      @Override
+      public java.nio.file.FileVisitResult visitFile(Path file,
+          java.nio.file.attribute.BasicFileAttributes attrs) {
+        total[0]++;
+        total[1] += attrs.size();
+        return java.nio.file.FileVisitResult.CONTINUE;
+      }
+
+      @Override
+      public java.nio.file.FileVisitResult visitFileFailed(Path file, IOException exc) {
+        return java.nio.file.FileVisitResult.CONTINUE;
+      }
+    });
+    return total;
   }
 
   /** A jar with the class and everything named Class$..., so nested and anonymous classes come too. */
@@ -143,47 +164,38 @@ public final class Decompiler {
     return jar;
   }
 
-  public Path subsetSource(String version, String binaryName, int threads) throws Exception {
-    Path tree = tree(version, threads, false, binaryName, 2);
-    String relative = binaryName.replace('.', '/') + ".java";
-    Path source = tree.resolve(relative);
-    if (!Files.exists(source)) {
-      // Nested classes live in the outer class's file; find the file that holds the outer.
-      String outer = binaryName.contains("$") ? binaryName.substring(0, binaryName.indexOf('$')) : binaryName;
-      Path outerSource = tree.resolve(outer.replace('.', '/') + ".java");
-      if (Files.exists(outerSource)) {
-        return outerSource;
-      }
-      throw new IllegalStateException("no source for " + binaryName + " under " + tree);
-    }
-    return source;
-  }
-
-  /** Deletes the oldest cached trees, keeping the newest {@code keep}. */
-  public void prune(int keep) throws IOException {
+  /** Deletes the oldest cached trees, keeping {@link #KEEP} per version. */
+  public void prune() throws IOException {
     if (!Files.isDirectory(workspace.trees)) {
       return;
     }
     record Tree(Path dir, long used) {
     }
-    List<Tree> trees = new ArrayList<>();
+    Map<String, List<Tree>> byVersion = new java.util.LinkedHashMap<>();
     try (var list = Files.list(workspace.trees)) {
       for (Path dir : list.toList()) {
         long used = 0;
+        String version = "unknown";
         Path meta = dir.resolve("meta.json");
         if (Files.exists(meta)) {
           try {
-            used = Workspace.readJson(meta).get("lastUsed").getAsLong();
+            var json = Workspace.readJson(meta);
+            used = json.get("lastUsed").getAsLong();
+            if (json.has("version")) {
+              version = json.get("version").getAsString();
+            }
           } catch (RuntimeException ignored) {
             // A tree without a readable meta is treated as oldest.
           }
         }
-        trees.add(new Tree(dir, used));
+        byVersion.computeIfAbsent(version, k -> new ArrayList<>()).add(new Tree(dir, used));
       }
     }
-    trees.sort(Comparator.comparingLong(Tree::used).reversed());
-    for (int i = keep; i < trees.size(); i++) {
-      delete(trees.get(i).dir());
+    for (List<Tree> trees : byVersion.values()) {
+      trees.sort(Comparator.comparingLong(Tree::used).reversed());
+      for (int i = KEEP; i < trees.size(); i++) {
+        delete(trees.get(i).dir());
+      }
     }
   }
 

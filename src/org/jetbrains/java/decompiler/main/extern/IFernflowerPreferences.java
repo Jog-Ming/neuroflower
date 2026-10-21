@@ -183,6 +183,66 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP = "round-trip";
 
+  @Name("Round Trip: No Generic Casts")
+  @Description("Do not print casts that only reconcile inferred generic arguments.")
+  @ShortName("rtngc")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_NO_GENERIC_CAST = "rt-no-generic-cast";
+
+  @Name("Round Trip: No Variable Rename")
+  @Description("Do not suffix a clashing local variable's name; a variant for per-file selection.")
+  @ShortName("rtnvr")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_NO_VARIABLE_RENAME = "rt-no-variable-rename";
+
+  @Name("Round Trip: Genvar Arguments")
+  @Description("Print explicit type arguments when the inferred argument is an enclosing type variable.")
+  @ShortName("rtga")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_GENVAR_ARGS = "rt-genvar-args";
+
+  @Name("Round Trip: Shared Variable Names")
+  @Description("Give every version of a slot that carries the same name one printed name.")
+  @ShortName("rtsvn")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_SHARED_VAR_NAMES = "rt-shared-var-names";
+
+  @Name("Round Trip: Capture Casts")
+  @Description("Cast an invocation whose declared return type captures a wildcard to the expected type.")
+  @ShortName("rtcc")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_CAPTURE_CAST = "rt-capture-cast";
+
+  @Name("Round Trip: Constant Names")
+  @Description("Name a literal back to the constant the jar's pool shows the original used.")
+  @ShortName("rtcn")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_CONSTANT_NAMES = "rt-constant-names";
+
+  @Name("Round Trip: Member Order")
+  @Description("Print fields, methods and member classes in the original source's line order.")
+  @ShortName("rtmo")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
+
+  @Name("Round Trip: Switch Order")
+  @Description("Print case bodies in the original source's line order, not the switch's key order.")
+  @ShortName("rtswo")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_SWITCH_ORDER = "rt-switch-order";
+
+  @Name("Line Alignment")
+  @Description("Move the printed source onto the original LineNumberTable with padding and joins.")
+  @ShortName("la")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String LINE_ALIGN = "line-align";
+
+  @Name("Round Trip: Clashing Names by Slot")
+  @Description("Apply a clashing name to every version of the variable's slot.")
+  @ShortName("rtcbs")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_CLASHING_BY_SLOT = "rt-clashing-by-slot";
+
   @Name("Pattern Matching")
   @Description("Decompile with if and switch pattern matching enabled.")
   @ShortName("pam")
@@ -457,6 +517,16 @@ public interface IFernflowerPreferences {
     defaults.put(IGNORE_INVALID_BYTECODE, "0");
     defaults.put(VERIFY_ANONYMOUS_CLASSES, "0");
     defaults.put(ROUND_TRIP, "1");
+    defaults.put(ROUND_TRIP_NO_GENERIC_CAST, "0");
+    defaults.put(ROUND_TRIP_NO_VARIABLE_RENAME, "0");
+    defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
+    defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");
+    defaults.put(ROUND_TRIP_GENVAR_ARGS, "1");
+    defaults.put(LINE_ALIGN, "1");
+    defaults.put(ROUND_TRIP_SWITCH_ORDER, "1");
+    defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
+    defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
+    defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");
     defaults.put(PATTERN_MATCHING, "1"); // Pattern matching is relatively stable

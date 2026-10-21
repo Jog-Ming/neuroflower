@@ -282,8 +282,15 @@ public class FunctionExprent extends Exprent {
 
       return getExprType();
     } else if (funcType == FunctionType.TERNARY) {
-      VarType type1 = lstOperands.get(1).getInferredExprType(upperBound);
-      VarType type2 = lstOperands.get(2).getInferredExprType(upperBound);
+      VarType type1;
+      VarType type2;
+      InvocationExprent.enterPoly();
+      try {
+        type1 = lstOperands.get(1).getInferredExprType(upperBound);
+        type2 = lstOperands.get(2).getInferredExprType(upperBound);
+      } finally {
+        InvocationExprent.exitPoly();
+      }
 
       if (type1.type == CodeType.NULL) {
         return type2;
@@ -582,9 +589,13 @@ public class FunctionExprent extends Exprent {
       if (!disableNewlineGroupCreation) {
         buf.pushNewlineGroup(indent, 1);
       }
-      buf.append(leftOperand)
-        .appendPossibleNewline(" ").append(funcType.operator).append(" ")
-        .append(rightOperand);
+      buf.append(leftOperand);
+      if (RoundTrip.newlineBetween(left, right)) {
+        buf.appendLineSeparator().appendIndent(indent + 1).append(funcType.operator).append(" ");
+      } else {
+        buf.appendPossibleNewline(" ").append(funcType.operator).append(" ");
+      }
+      buf.append(rightOperand);
       if (!disableNewlineGroupCreation) {
         buf.popNewlineGroup();
       }
@@ -615,9 +626,13 @@ public class FunctionExprent extends Exprent {
       if (!disableNewlineGroupCreation) {
         buf.pushNewlineGroup(indent, 1);
       }
-      buf.append(wrapOperandString(left, false, indent, true))
-        .appendPossibleNewline(" ").append(funcType.operator).append(" ")
-        .append(wrapOperandString(right, true, indent, true));
+      buf.append(wrapOperandString(left, false, indent, true));
+      if (RoundTrip.newlineBetween(left, right)) {
+        buf.appendLineSeparator().appendIndent(indent + 1).append(funcType.operator).append(" ");
+      } else {
+        buf.appendPossibleNewline(" ").append(funcType.operator).append(" ");
+      }
+      buf.append(wrapOperandString(right, true, indent, true));
       if (!disableNewlineGroupCreation) {
         buf.popNewlineGroup();
       }
@@ -657,11 +672,24 @@ public class FunctionExprent extends Exprent {
         return buf.append(".length");
       case TERNARY:
         buf.pushNewlineGroup(indent, 1);
-        buf.append(wrapOperandString(lstOperands.get(0), true, indent))
-          .appendPossibleNewline(" ").append("? ")
-          .append(wrapOperandString(lstOperands.get(1), true, indent))
-          .appendPossibleNewline(" ").append(": ")
-          .append(wrapOperandString(lstOperands.get(2), true, indent));
+        buf.append(wrapOperandString(lstOperands.get(0), true, indent));
+        if (RoundTrip.newlineBetween(lstOperands.get(0), lstOperands.get(1))) {
+          buf.appendLineSeparator().appendIndent(indent + 1).append("? ");
+        } else {
+          buf.appendPossibleNewline(" ").append("? ");
+        }
+        InvocationExprent.enterPoly();
+        try {
+          buf.append(wrapOperandString(lstOperands.get(1), true, indent));
+          if (RoundTrip.newlineBetween(lstOperands.get(1), lstOperands.get(2))) {
+            buf.appendLineSeparator().appendIndent(indent + 1).append(": ");
+          } else {
+            buf.appendPossibleNewline(" ").append(": ");
+          }
+          buf.append(wrapOperandString(lstOperands.get(2), true, indent));
+        } finally {
+          InvocationExprent.exitPoly();
+        }
         buf.popNewlineGroup();
         return buf;
       case INSTANCEOF:

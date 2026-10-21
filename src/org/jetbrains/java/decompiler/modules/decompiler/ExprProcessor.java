@@ -10,6 +10,7 @@ import org.jetbrains.java.decompiler.code.InstructionSequence;
 import org.jetbrains.java.decompiler.code.MethodProperties;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
+import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.plugins.PluginContext;
 import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdgeType;
@@ -33,6 +34,7 @@ import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.TextUtil;
 
@@ -1006,7 +1008,23 @@ public class ExprProcessor implements CodeConstants {
     boolean doCast = (!leftType.higherEqualInLatticeThan(rightType) && (rightType.equals(VarType.VARTYPE_OBJECT) || leftType.type != CodeType.OBJECT));
     boolean doCastNull = (castNull.cast && rightType.type == CodeType.NULL && !UNDEFINED_TYPE_STRING.equals(getTypeName(leftType)));
     boolean doCastNarrowing = (castNarrowing && isIntConstant(exprent) && isNarrowedIntType(leftType));
-    boolean doCastGenerics = doGenericTypesCast(exprent, leftType, rightType);
+    boolean doCastGenerics = !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
+      && doGenericTypesCast(exprent, leftType, rightType);
+    // Inference substituted the upper bound into the call's type, so the wildcard the method
+    // declared has vanished; the original source had to cast that capture away, and javac elides
+    // the checkcast because the erasures match.
+    if (!doCastGenerics
+        && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CAPTURE_CAST)
+        && exprent instanceof InvocationExprent invocation
+        && needsCaptureCast(leftType, invocation.getDeclaredGenericReturnType())) {
+      doCastGenerics = true;
+    }
+    // A cast whose own type arguments violate the target's bounds cannot appear in a source that
+    // compiled. The inference that produced it is wrong; passing the expression on lets javac infer
+    // again, which is what the original source did.
+    if (doCastGenerics && !doCast && invalidGenericInstantiation(leftType)) {
+      doCastGenerics = false;
+    }
 
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
@@ -1014,6 +1032,8 @@ public class ExprProcessor implements CodeConstants {
       cast = castAlways;
     }
 
+    // A class type variable cannot be named from a static method, so the original source cannot
+    // have had this cast; drop it and let the expression's own type stand.
     boolean castLambda = !cast && exprent instanceof NewExprent && !leftType.equals(rightType) &&
                           lambdaNeedsCast(leftType, (NewExprent)exprent);
 
@@ -1073,6 +1093,75 @@ public class ExprProcessor implements CodeConstants {
     }
   }
 
+  /** A concrete target instantiated from a wildcard declaration: assignable only through a cast. */
+  private static boolean needsCaptureCast(VarType target, VarType declared) {
+    if (!(target instanceof GenericType concrete) || !(declared instanceof GenericType wild)) {
+      return false;
+    }
+    if (concrete.value == null || !concrete.value.equals(wild.value)) {
+      return false;
+    }
+    return !hasWildcard(concrete) && hasWildcard(wild);
+  }
+
+  private static boolean hasWildcard(VarType type) {
+    if (!(type instanceof GenericType generic)) {
+      return false;
+    }
+    if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return true;
+    }
+    for (VarType argument : generic.getArguments()) {
+      // An unbound wildcard is a null argument.
+      if (argument == null || hasWildcard(argument)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Whether some concrete type argument of a generic type is outside its formal bound. */
+  private static boolean invalidGenericInstantiation(VarType type) {
+    if (!(type instanceof GenericType generic) || generic.getArguments().isEmpty()) {
+      return false;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(type.value);
+    if (cls == null) {
+      return false;
+    }
+    GenericClassDescriptor signature = cls.getSignature();
+    if (signature == null) {
+      return false;
+    }
+    List<VarType> arguments = generic.getArguments();
+    for (int i = 0; i < arguments.size() && i < signature.fbounds.size(); i++) {
+      VarType argument = arguments.get(i);
+      if (argument == null || argument.type != CodeType.OBJECT || argument.value == null) {
+        continue;
+      }
+      for (VarType bound : signature.fbounds.get(i)) {
+        if (bound == null || bound.type != CodeType.OBJECT || bound.value == null) {
+          continue;
+        }
+        if (bound.value.equals(argument.value)) {
+          // T extends Comparable<T> cannot be instantiated with a wildcard: `Comparable<?>` is not
+          // a type that satisfies its own bound.
+          if (bound instanceof GenericType bounded && argument instanceof GenericType concrete
+              && bounded.getArguments().stream().anyMatch(a -> a != null && a.type == CodeType.GENVAR)
+              && concrete.getArguments().stream().anyMatch(a -> a == null || (a instanceof GenericType g
+                  && g.getWildcard() != GenericType.WILDCARD_NO))) {
+            return true;
+          }
+          continue;
+        }
+        if (!DecompilerContext.getStructContext().instanceOf(argument.value, bound.value)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // (Obj)expr; -> (Obj<T>)expr;
   public static Exprent narrowGenericCastType(Exprent expr, VarType type) {
     if (type.isGeneric() && expr instanceof FunctionExprent && ((FunctionExprent)expr).getFuncType() == FunctionType.CAST) {
@@ -1083,8 +1172,12 @@ public class ExprProcessor implements CodeConstants {
       if (funcType.value.equals(type.value) && !genType.getArguments().isEmpty()) {
         // Trying to cast to a generic type but the cast isn't generic- invalid!
         if (!funcType.isGeneric()) {
-          ConstExprent cast = ((ConstExprent) func.getLstOperands().get(1));
-          cast.setConstType(type);
+          // ...unless the type arguments cannot satisfy the bounds; the original's raw cast then
+          // stays raw, which is also what javac needs.
+          if (!invalidGenericInstantiation(type)) {
+            ConstExprent cast = ((ConstExprent) func.getLstOperands().get(1));
+            cast.setConstType(type);
+          }
         } else if (genType.equalsExact(funcType) && !func.doesCast()) {
           func.setNeedsCast(true);
         }
@@ -1101,6 +1194,14 @@ public class ExprProcessor implements CodeConstants {
   private static boolean doGenericTypesCast(Exprent ex, VarType left, VarType right) {
     Map<VarType, List<VarType>> named = ex.getNamedGenerics();
     if (left == null || right == null) {
+      return false;
+    }
+    // A cast is a source form the original wrote to make a call typecheck. Casts to a type whose
+    // *direct* type argument is a wildcard (EntityType<? extends Mob>) are real and needed. An
+    // invented one instead carries the wildcard one level deeper (App<Mu<? extends X>, T>), where
+    // javac's inference already handles the argument and the cast can name an out-of-scope variable.
+    if (left instanceof GenericType generic && generic.getWildcard() == GenericType.WILDCARD_NO
+      && hasDeepWildcard(generic)) {
       return false;
     }
 
@@ -1131,6 +1232,32 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
+    return false;
+  }
+
+  /** True when a wildcard sits below the type's direct arguments, not in them. */
+  private static boolean hasDeepWildcard(GenericType type) {
+    for (VarType argument : type.getArguments()) {
+      if (!(argument instanceof GenericType generic)
+        || generic.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
+      }
+      if (containsWildcard(generic)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean containsWildcard(GenericType type) {
+    if (type.getWildcard() != GenericType.WILDCARD_NO) {
+      return true;
+    }
+    for (VarType argument : type.getArguments()) {
+      if (argument instanceof GenericType generic && containsWildcard(generic)) {
+        return true;
+      }
+    }
     return false;
   }
 

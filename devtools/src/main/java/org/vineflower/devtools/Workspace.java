@@ -43,7 +43,16 @@ public final class Workspace {
     return new Workspace(Path.of(root == null ? System.getProperty("user.dir") : root));
   }
 
+  /**
+   * The Vineflower fork jar a decompile runs: this build by default, or the one named by
+   * {@code DECOMPILER_JAR} for a deliberate A/B against another build. The tree cache keys on the
+   * jar's hash, so two builds never share a tree. This is the decompiler, not the devtools jar.
+   */
   public Path devJar() {
+    String override = System.getenv("DECOMPILER_JAR");
+    if (override != null && !override.isBlank()) {
+      return Path.of(override);
+    }
     return root.resolve("build/libs/vineflower-1.13.0+local.jar");
   }
 

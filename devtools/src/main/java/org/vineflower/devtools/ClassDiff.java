@@ -114,10 +114,12 @@ public final class ClassDiff {
       }
       MethodNode theirs = entry.getValue();
       if (!code(theirs).equals(code(ours))) {
-        diff.fail("code", entry.getKey());
+        diff.fail("code", entry.getKey() + " " + firstInstructionDifference(theirs, ours));
       }
-      if (!lnt(theirs).equals(lnt(ours))) {
-        diff.fail("lnt", entry.getKey());
+      List<Integer> originalLines = lnt(theirs);
+      List<Integer> ourLines = lnt(ours);
+      if (!originalLines.equals(ourLines)) {
+        diff.fail("lnt", entry.getKey() + " " + lntSummary(originalLines, ourLines));
       }
       if (!lvt(theirs).equals(lvt(ours))) {
         diff.fail("lvt", entry.getKey());
@@ -143,7 +145,7 @@ public final class ClassDiff {
     return new ClassReader(bytes).getClassName();
   }
 
-  private static ClassNode parse(byte[] bytes) {
+  static ClassNode parse(byte[] bytes) {
     ClassNode node = new ClassNode(Opcodes.ASM9);
     new ClassReader(bytes).accept(node, ClassReader.EXPAND_FRAMES);
     return node;
@@ -283,18 +285,23 @@ public final class ClassDiff {
 
   // ------------------------------------------------------------------ method bodies
 
-  private static String code(MethodNode method) {
+  static String code(MethodNode method) {
     StringBuilder builder = new StringBuilder();
     builder.append(method.maxStack).append('/').append(method.maxLocals).append(':');
     InsnList instructions = method.instructions;
+    // Number a label by the position of the next real instruction, not by label order: the debug
+    // table and stack-map frames add labels, and their count must not make equal code unequal.
     Map<LabelNode, Integer> labels = new HashMap<>();
+    int position = 0;
     for (AbstractInsnNode insn = instructions.getFirst(); insn != null; insn = insn.getNext()) {
       if (insn instanceof LabelNode label) {
-        labels.computeIfAbsent(label, key -> labels.size());
+        labels.putIfAbsent(label, position);
+      } else if (!(insn instanceof LineNumberNode) && !(insn instanceof FrameNode)) {
+        position++;
       }
     }
     for (AbstractInsnNode insn = instructions.getFirst(); insn != null; insn = insn.getNext()) {
-      if (insn instanceof LineNumberNode || insn instanceof FrameNode) {
+      if (insn instanceof LineNumberNode || insn instanceof FrameNode || insn instanceof LabelNode) {
         continue;
       }
       builder.append(render(insn, labels)).append(';');
@@ -305,6 +312,46 @@ public final class ClassDiff {
         .append(block.type).append(';');
     }
     return builder.toString();
+  }
+
+  /** The first instruction where two equal-length sequences diverge, rendered compactly. */
+  private static String firstInstructionDifference(MethodNode original, MethodNode recompiled) {
+    List<String> a = renderedInstructions(original);
+    List<String> b = renderedInstructions(recompiled);
+    int limit = Math.min(a.size(), b.size());
+    for (int i = 0; i < limit; i++) {
+      if (!a.get(i).equals(b.get(i))) {
+        return "at " + i + ": " + clip(a.get(i)) + " vs " + clip(b.get(i));
+      }
+    }
+    if (a.size() != b.size()) {
+      return "length " + a.size() + " vs " + b.size();
+    }
+    return "max stack/locals differ";
+  }
+
+  private static List<String> renderedInstructions(MethodNode method) {
+    List<String> out = new ArrayList<>();
+    Map<LabelNode, Integer> labels = new HashMap<>();
+    int position = 0;
+    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof LabelNode label) {
+        labels.putIfAbsent(label, position);
+      } else if (!(insn instanceof LineNumberNode) && !(insn instanceof FrameNode)) {
+        position++;
+      }
+    }
+    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (!(insn instanceof LineNumberNode) && !(insn instanceof FrameNode)
+          && !(insn instanceof LabelNode)) {
+        out.add(render(insn, labels));
+      }
+    }
+    return out;
+  }
+
+  private static String clip(String text) {
+    return text.length() > 60 ? text.substring(0, 60) + "…" : text;
   }
 
   private static int label(LabelNode label, Map<LabelNode, Integer> labels) {
@@ -373,15 +420,42 @@ public final class ClassDiff {
     return builder.toString();
   }
 
-  private static String lnt(MethodNode method) {
-    StringBuilder builder = new StringBuilder();
+  static List<Integer> lnt(MethodNode method) {
+    List<Integer> lines = new ArrayList<>();
     for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
       if (insn instanceof LineNumberNode line) {
-        builder.append(line.line).append('@').append(System.identityHashCode(line.start)).append(';');
+        lines.add(line.line);
       }
     }
-    // The label identity is not comparable across parses; compare the sequence of line numbers only.
-    return builder.toString().replaceAll("@\\d+", "");
+    return lines;
+  }
+
+  /** Whether the divergence is one offset for the whole method, which a padding pass can solve. */
+  private static String lntSummary(List<Integer> original, List<Integer> ours) {
+    if (original.size() != ours.size()) {
+      return "entries " + original.size() + " vs " + ours.size();
+    }
+    if (original.isEmpty()) {
+      return "entries differ";
+    }
+    int first = original.get(0) - ours.get(0);
+    boolean constant = true;
+    int min = Integer.MAX_VALUE;
+    int max = Integer.MIN_VALUE;
+    java.util.Set<Integer> distinct = new java.util.TreeSet<>();
+    for (int i = 0; i < original.size(); i++) {
+      int delta = original.get(i) - ours.get(i);
+      distinct.add(delta);
+      min = Math.min(min, delta);
+      max = Math.max(max, delta);
+      if (delta != first) {
+        constant = false;
+      }
+    }
+    if (constant) {
+      return "constant shift " + first;
+    }
+    return "deltas " + min + ".." + max + " (" + distinct.size() + " distinct)";
   }
 
   private static String lvt(MethodNode method) {

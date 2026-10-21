@@ -15,6 +15,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 
@@ -217,6 +219,80 @@ public final class RoundTrip {
   }
 
   /** For bisecting a suspect transform: {@code RT_OFF=name1,name2} turns these off. */
+  /** The target's source line for the first instruction the exprent owns, or -1. */
+  public static int sourceLine(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return -1;
+    }
+    return lineAt(method, exprent.bytecode.nextSetBit(0));
+  }
+
+  /** The target's source line for the instruction at the exprent's last offset, or -1. */
+  public static int sourceLineEnd(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return -1;
+    }
+    return lineAt(method, exprent.bytecode.previousSetBit(Integer.MAX_VALUE));
+  }
+
+  /**
+   * Whether the target's line table has an entry exactly at the expression's first instruction.
+   * javac only marks lines where an AST node's position sits, so an argument that merely inherits
+   * the enclosing statement's line has no entry of its own; a break there is layout the original
+   * never had.
+   */
+  public static boolean lineStartsHere(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return false;
+    }
+    StructLineNumberTableAttribute lnt =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (lnt == null) {
+      return false;
+    }
+    int offset = exprent.bytecode.nextSetBit(0);
+    return lnt.findLineNumber(offset) != (offset <= 0 ? -1 : lnt.findLineNumber(offset - 1));
+  }
+
+  /** Whether the target's line table has an entry exactly at the expression's last instruction. */
+  public static boolean lineStartsAtEnd(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return false;
+    }
+    StructLineNumberTableAttribute lnt =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (lnt == null) {
+      return false;
+    }
+    int offset = exprent.bytecode.previousSetBit(Integer.MAX_VALUE);
+    return lnt.findLineNumber(offset) != (offset <= 0 ? -1 : lnt.findLineNumber(offset - 1));
+  }
+
+  /** Whether the original source started the second expression on a later line than the first ended. */
+  public static boolean newlineBetween(Exprent before, Exprent after) {
+    int end = sourceLineEnd(before);
+    int start = sourceLine(after);
+    return end >= 0 && start >= 0 && start > end;
+  }
+
+  /** The target's source line for a method's first instruction. */
+  public static int methodLine(StructMethod method) {
+    if (method == null) {
+      return -1;
+    }
+    return lineAt(method, 0);
+  }
+
+  private static int lineAt(StructMethod method, int offset) {
+    StructLineNumberTableAttribute lnt =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    return lnt == null ? -1 : lnt.findLineNumber(offset);
+  }
+
   public static boolean selector(String name) {
     if (!enabled()) {
       return false;

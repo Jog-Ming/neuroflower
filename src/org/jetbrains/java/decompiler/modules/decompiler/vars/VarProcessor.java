@@ -2,7 +2,9 @@
 package org.jetbrains.java.decompiler.modules.decompiler.vars;
 
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.collectors.VarNamesCollector;
+import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -115,8 +117,22 @@ public class VarProcessor {
 
   public void refreshVarNames(VarNamesCollector vc) {
     Map<VarVersionPair, String> tempVarNames = new HashMap<>(mapVarNames);
+    Map<String, String> shared = new HashMap<>();
     for (Entry<VarVersionPair, String> ent : tempVarNames.entrySet()) {
-      mapVarNames.put(ent.getKey(), vc.getFreeName(ent.getValue()));
+      String name;
+      if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SHARED_VAR_NAMES)) {
+        // Two versions of one slot that carry the same name are one source variable; renaming the
+        // second to name + "x" leaves its declaration and its use spelled differently.
+        String key = ent.getKey().var + "|" + ent.getValue();
+        name = shared.get(key);
+        if (name == null) {
+          name = vc.getFreeName(ent.getValue());
+          shared.put(key, name);
+        }
+      } else {
+        name = vc.getFreeName(ent.getValue());
+      }
+      mapVarNames.put(ent.getKey(), name);
     }
   }
 
@@ -151,7 +167,18 @@ public class VarProcessor {
   }
 
   public @Nullable String getClashingName(VarVersionPair pair) {
-    return this.clashingNames.get(pair);
+    String name = this.clashingNames.get(pair);
+    if (name != null || !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CLASHING_BY_SLOT)) {
+      return name;
+    }
+    // A clashing name is recorded for one version of a slot; a declaration and its uses can carry
+    // different versions, and printing only one of them the renamed form leaves the other undefined.
+    for (Entry<VarVersionPair, String> entry : this.clashingNames.entrySet()) {
+      if (entry.getKey().var == pair.var) {
+        return entry.getValue();
+      }
+    }
+    return null;
   }
 
   public void setClashingName(VarVersionPair pair, String name) {

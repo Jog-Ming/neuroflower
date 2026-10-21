@@ -11,6 +11,7 @@ import org.jetbrains.java.decompiler.api.plugin.pass.PassContext;
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.ExceptionHandler;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.InstructionSequence;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
 import org.jetbrains.java.decompiler.main.decompiler.CancelationManager;
@@ -174,7 +175,8 @@ public class ClassWriter implements StatementWriter {
     }
   }
 
-  public void classLambdaToJava(ClassNode node, TextBuffer buffer, Exprent method_object, int indent) {
+  public void classLambdaToJava(ClassNode node, TextBuffer buffer, Exprent method_object, int indent,
+                                int creationLine) {
     ClassWrapper wrapper = node.getWrapper();
     if (wrapper == null) {
       return;
@@ -315,12 +317,20 @@ public class ClassWriter implements StatementWriter {
                   DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, methodWrapper.methodStruct);
                   try {
                     TextBuffer codeBuffer = firstExpr.toJava(indent);
-  
+
+                    // The target's lambda body may start on a later line than the expression
+                    // that creates the lambda; an expression lambda prints inline otherwise.
+                    boolean breakBody = creationLine >= 0
+                      && RoundTrip.methodLine(methodWrapper.methodStruct) > creationLine;
+
                     if (firstExpr instanceof ExitExprent)
                       codeBuffer.setStart(6); // skip return
-                    else
+                    else if (!breakBody)
                       codeBuffer.prepend(" ");
-  
+                    if (breakBody) {
+                      buffer.appendLineSeparator();
+                    }
+
                     codeBuffer.addBytecodeMapping(root.getDummyExit().bytecode);
                     buffer.append(codeBuffer, node.classStruct.qualifiedName, InterpreterUtil.makeUniqueKey(methodWrapper.methodStruct.getName(), methodWrapper.methodStruct.getDescriptor()));
                   }
@@ -424,11 +434,10 @@ public class ClassWriter implements StatementWriter {
       String methodToDecompile = (String) DecompilerContext.getProperty(IFernflowerPreferences.METHOD_TO_DECOMPILE);
 
       // fields
+      List<StructRecordComponent> components = methodToDecompile.isEmpty() ? cl.getRecordComponents() : null;
+      List<StructField> nonEnumFields = new ArrayList<>();
       if (methodToDecompile.isEmpty()) {
-        List<StructRecordComponent> components = cl.getRecordComponents();
-
         List<StructField> enumFields = new ArrayList<>();
-        List<StructField> nonEnumFields = new ArrayList<>();
 
         for (StructField fd : cl.getFields()) {
           boolean isEnum = fd.hasModifier(CodeConstants.ACC_ENUM) && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM);
@@ -453,77 +462,180 @@ public class ClassWriter implements StatementWriter {
         if (enums) {
           buffer.append(';').appendLineSeparator();
         }
-
-        for (StructField fd : nonEnumFields) {
-          boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
-            wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
-          if (hide) continue;
-
-          if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
-            components.stream().anyMatch(c -> c.getName().equals(fd.getName()) && c.getDescriptor().equals(fd.getDescriptor()))) {
-            // Record component field: skip it
-            continue;
-          }
-
-          if (enums) {
-            // Add an extra line break between enums and non-enum fields
-            buffer.appendLineSeparator();
-            enums = false;
-          }
-
-          haveContent.run();
-          writeField(buffer, indent, fd, wrapper);
-        }
       }
 
-      // methods
       VBStyleCollection<StructMethod, String> methods = cl.getMethods();
       List<Integer> methodOrder = methodWriteOrder(node, methods);
+
+      // The class file lists every member class last, but the source may have declared it between
+      // two methods, and a member's first line in the target's table says where. Printing in that
+      // order is what lets javac reproduce the original line table and nesting order.
+      List<int[]> plan = new ArrayList<>();
+      java.util.Set<Integer> blockSequences = new java.util.HashSet<>();
+      boolean ordered = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_MEMBER_ORDER);
+      int sequence = 0;
+      for (int i = 0; i < nonEnumFields.size(); i++) {
+        plan.add(new int[]{0, i, ordered ? fieldLine(wrapper, cl, nonEnumFields.get(i)) : -1, sequence++});
+      }
       for (int i : methodOrder) {
         StructMethod mt = methods.get(i);
-        boolean hide;
-        if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
-          hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
-                 mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
-                 wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
-        } else {
-          hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
-                 (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
-        }
-        if (hide) continue;
-
-        TextBuffer methodBuffer = new TextBuffer();
-        boolean methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
-        if (!methodSkipped) {
-          if (hasContent.get()) {
-            buffer.appendLineSeparator();
+        int line = ordered ? methodLine(mt) : -1;
+        boolean enumBlock = false;
+        if (ordered && !"off".equals(System.getenv("NEUROFLOWER_ENUMBLOCK"))
+            && CodeConstants.CLINIT_NAME.equals(mt.getName())) {
+          int block = staticBlockLine(wrapper, cl);
+          if (block >= 0) {
+            line = block;
+            enumBlock = true;
           }
-          haveContent.run();
-          buffer.append(methodBuffer);
         }
+        if (enumBlock) {
+          blockSequences.add(sequence);
+        }
+        plan.add(new int[]{1, i, line, sequence++});
+      }
+      for (int i = 0; i < node.nested.size(); i++) {
+        ClassNode inner = node.nested.get(i);
+        plan.add(new int[]{2, i, ordered && inner.type == ClassNode.Type.MEMBER ? classLine(inner) : -1, sequence++});
+      }
+      if (ordered) {
+        // Members with no line of their own stay next to the neighbour that has one.
+        int carried = -1;
+        for (int[] member : plan) {
+          if (member[2] < 0) {
+            member[2] = carried;
+          } else {
+            carried = member[2];
+          }
+        }
+        carried = Integer.MAX_VALUE;
+        for (int i = plan.size() - 1; i >= 0; i--) {
+          int[] member = plan.get(i);
+          if (member[2] < 0) {
+            member[2] = carried;
+          } else {
+            carried = member[2];
+          }
+        }
+        // Fields keep their declaration order: a forward reference from an initializer to a later
+        // field is illegal, and their own lines are only as trustworthy as their initializers.
+        int previousField = -1;
+        int lastField = -1;
+        for (int[] member : plan) {
+          if (member[0] != 0) {
+            continue;
+          }
+          if (previousField >= 0) {
+            member[2] = Math.max(member[2], previousField);
+          }
+          previousField = member[2];
+          lastField = Math.max(lastField, member[2]);
+        }
+        // A constructor or static block re-inlines the fields' initializers, so its first line
+        // belongs to a field that was lifted out of it. It must stay after every field, unless it
+        // is an enum's static block that provably precedes them.
+        String ctorMode = System.getenv("NEUROFLOWER_CTORLINE");
+        boolean ctorLine = !"off".equals(ctorMode);
+        int firstField = Integer.MAX_VALUE;
+        if (ctorLine) {
+          for (int[] member : plan) {
+            if (member[0] == 0 && member[2] >= 0) {
+              firstField = Math.min(firstField, member[2]);
+            }
+          }
+        }
+        if (lastField >= 0) {
+          for (int[] member : plan) {
+            if (member[0] == 1) {
+              StructMethod mt = methods.get(member[1]);
+              if (CodeConstants.INIT_NAME.equals(mt.getName()) || CodeConstants.CLINIT_NAME.equals(mt.getName())) {
+                boolean scoped = "all".equals(ctorMode) || CodeConstants.INIT_NAME.equals(mt.getName());
+                boolean realLine = ctorLine && scoped && member[2] >= 0 && member[2] < firstField;
+                if (!blockSequences.contains(member[3]) && !realLine) {
+                  member[2] = Math.max(member[2], lastField);
+                }
+              }
+            }
+          }
+        }
+        plan.sort(Comparator.comparingInt((int[] m) -> m[2]).thenComparingInt(m -> m[3]));
       }
 
-      // member classes
-      for (ClassNode inner : node.nested) {
-        if (inner.type == ClassNode.Type.MEMBER) {
-          StructClass innerCl = inner.classStruct;
-          boolean hide;
-          if (methodToDecompile.isEmpty()) {
-            boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
-            hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
-                   wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
-          } else {
-            hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
-          }
-          if (hide) continue;
+      boolean enums = !nonEnumFields.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM)
+        && cl.getFields().stream().anyMatch(fd -> fd.hasModifier(CodeConstants.ACC_ENUM));
+      for (int[] member : plan) {
+        switch (member[0]) {
+          case 0 -> {
+            StructField fd = nonEnumFields.get(member[1]);
+            boolean hide = fd.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+              wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor()));
+            if (hide) continue;
 
-          if (hasContent.get()) {
-            buffer.appendLineSeparator();
+            if (components != null && fd.getAccessFlags() == (CodeConstants.ACC_FINAL | CodeConstants.ACC_PRIVATE) &&
+              components.stream().anyMatch(c -> c.getName().equals(fd.getName()) && c.getDescriptor().equals(fd.getDescriptor()))) {
+              // Record component field: skip it
+              continue;
+            }
+
+            if (enums) {
+              // Add an extra line break between enums and non-enum fields
+              buffer.appendLineSeparator();
+              enums = false;
+            }
+
+            haveContent.run();
+            writeField(buffer, indent, fd, wrapper);
           }
-          TextBuffer clsBuffer = new TextBuffer();
-          writeClass(inner, clsBuffer, indent + 1);
-          haveContent.run();
-          buffer.append(clsBuffer);
+          case 1 -> {
+            int i = member[1];
+            StructMethod mt = methods.get(i);
+            boolean hide;
+            if (methodToDecompile.isEmpty() || (node.type != ClassNode.Type.ROOT && node.type != ClassNode.Type.MEMBER)) {
+              hide = mt.isSynthetic() && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                     mt.hasModifier(CodeConstants.ACC_BRIDGE) && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_BRIDGE) ||
+                     wrapper.getHiddenMembers().contains(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+            } else {
+              hide = !methodToDecompile.equals(cl.qualifiedName + "." + mt.getName() + mt.getDescriptor()) &&
+                     (node.type != ClassNode.Type.ROOT || !methodToDecompile.equals(mt.getName() + mt.getDescriptor()));
+            }
+            if (hide) continue;
+
+            TextBuffer methodBuffer = new TextBuffer();
+            boolean methodSkipped = !writeMethod(node, mt, i, methodBuffer, indent + 1);
+            if (!methodSkipped) {
+              if (hasContent.get()) {
+                buffer.appendLineSeparator();
+              }
+              haveContent.run();
+              buffer.append(methodBuffer);
+            }
+          }
+          case 2 -> {
+            ClassNode inner = node.nested.get(member[1]);
+            if (inner.type != ClassNode.Type.MEMBER) {
+              continue;
+            }
+            StructClass innerCl = inner.classStruct;
+            boolean hide;
+            if (methodToDecompile.isEmpty()) {
+              boolean isSynthetic = (inner.access & CodeConstants.ACC_SYNTHETIC) != 0 || innerCl.isSynthetic();
+              hide = isSynthetic && DecompilerContext.getOption(IFernflowerPreferences.REMOVE_SYNTHETIC) ||
+                     wrapper.getHiddenMembers().contains(innerCl.qualifiedName);
+            } else {
+              hide = !methodToDecompile.startsWith(innerCl.qualifiedName + ".");
+            }
+            if (hide) continue;
+
+            if (hasContent.get()) {
+              buffer.appendLineSeparator();
+            }
+            TextBuffer clsBuffer = new TextBuffer();
+            writeClass(inner, clsBuffer, indent + 1);
+            haveContent.run();
+            buffer.append(clsBuffer);
+          }
+          default -> {
+          }
         }
       }
 
@@ -846,8 +958,24 @@ public class ClassWriter implements StatementWriter {
 
   private void writeField(TextBuffer buffer, int indent, StructField fd, ClassWrapper wrapper) {
     TextBuffer fieldBuffer = new TextBuffer();
-    writeField(wrapper, wrapper.getClassStruct(), fd, fieldBuffer, indent + 1);
-    String initializer = fd.hasModifier(CodeConstants.ACC_STATIC) ? "<clinit> ()V" : "<init> ()V";
+    // A static field's initializer, and every enum constant, lives in <clinit>; printing it needs
+    // that method's line table for its argument and chain breaks. Fields are written outside any
+    // method's context, where the previous method would otherwise supply the wrong lines.
+    StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    StructMethod clinit = fd.hasModifier(CodeConstants.ACC_STATIC)
+      ? wrapper.getClassStruct().getMethod(CodeConstants.CLINIT_NAME, "()V") : null;
+    if (clinit != null) {
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, clinit);
+    }
+    try {
+      writeField(wrapper, wrapper.getClassStruct(), fd, fieldBuffer, indent + 1);
+    } finally {
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, outerStruct);
+    }
+    // An instance initializer's offsets belong to whichever constructor it was lifted out of; the
+    // key names the field so the line aligner can recover that constructor from the table alone.
+    String initializer = fd.hasModifier(CodeConstants.ACC_STATIC)
+      ? "<clinit> ()V" : "<field-init " + fd.getName() + ">";
     buffer.append(fieldBuffer, wrapper.getClassStruct().qualifiedName, initializer);
   }
 
@@ -927,16 +1055,25 @@ public class ClassWriter implements StatementWriter {
       if (isEnum && initializer instanceof NewExprent) {
         NewExprent expr = (NewExprent)initializer;
         expr.setEnumConst(true);
+        // The constant's construction runs in <clinit> but belongs to the constant's own line;
+        // the synthetic values()/$values() methods are anchored to that same first line.
+        if (expr.bytecode != null) {
+          buffer.addBytecodeMapping(expr.bytecode);
+        }
         buffer.append(expr.toJava(indent));
       }
       else {
+        // A lifted initializer keeps the offsets of the method it came from; its instructions
+        // belong to this declaration's line, both in a constructor and in <clinit>.
+        if (initializer.bytecode != null) {
+          buffer.addBytecodeMapping(initializer.bytecode);
+        }
         buffer.append(" = ");
 
         if (initializer instanceof ConstExprent) {
           ((ConstExprent) initializer).adjustConstType(fieldType);
         }
 
-        // FIXME: special case field initializer. Can map to more than one method (constructor) and bytecode instruction.
         ExprProcessor.getCastedExprent(initializer, descriptor == null ? fieldType : descriptor.type, buffer, indent, false);
       }
     }
@@ -1091,6 +1228,7 @@ public class ClassWriter implements StatementWriter {
       boolean isEnum = cl.hasModifier(CodeConstants.ACC_ENUM) && DecompilerContext.getOption(IFernflowerPreferences.DECOMPILE_ENUM);
       boolean isDeprecated = mt.hasAttribute(StructGeneralAttribute.ATTRIBUTE_DEPRECATED);
       boolean clInit = false, init = false, dInit = false;
+      int declStart = -1;
 
       MethodDescriptor md = MethodDescriptor.parseDescriptor(mt, node);
 
@@ -1176,6 +1314,7 @@ public class ClassWriter implements StatementWriter {
       buffer.appendIndent(indent);
 
       if (CodeConstants.INIT_NAME.equals(name)) {
+        declStart = buffer.length();
         // Enum constructors are implicitly private
         if (isEnum) {
           flags &= ~CodeConstants.ACC_PRIVATE;
@@ -1360,6 +1499,12 @@ public class ClassWriter implements StatementWriter {
               TextBuffer code = root.toJava(indent + 1);
               code.addBytecodeMapping(root.getDummyExit().bytecode);
               hideMethod = code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt));
+              // javac puts a constructor's pc0 on its declaration line unless the body opens with
+              // an explicit this(...)/super(...) call, which makes the call's line pc0's instead.
+              if (init && declStart >= 0 && !startsWithDelegation(root)) {
+                buffer.addBytecodeMappingAt(declStart, 0, cl.qualifiedName,
+                  InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+              }
               buffer.append(code, cl.qualifiedName, InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
             }
           }
@@ -1729,7 +1874,59 @@ public class ClassWriter implements StatementWriter {
       }
     }
 
-    return true;
+    // An explicit empty constructor is indistinguishable from a hidden default one except in the
+    // line table: javac gives its implicit `return` an entry of its own, on the closing brace's
+    // line. A default constructor's last entry always starts a field initializer.
+    return !explicitEmptyConstructor(structMethod, wrapper);
+  }
+
+  /** Whether the constructor body opens with this(...) or super(...). */
+  private static boolean startsWithDelegation(RootStatement root) {
+    Statement first = root == null ? null : root.getFirst();
+    if (!(first instanceof BasicBlockStatement) || first.getExprents() == null
+        || first.getExprents().isEmpty()) {
+      return false;
+    }
+    Exprent exprent = first.getExprents().get(0);
+    return exprent instanceof InvocationExprent
+      && ((InvocationExprent)exprent).getFunctype() == InvocationExprent.Type.INIT;
+  }
+
+  private static boolean explicitEmptyConstructor(StructMethod method, ClassWrapper wrapper) {
+    StructLineNumberTableAttribute lines =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (lines == null) {
+      return false;
+    }
+    int[] raw = lines.getRawData();
+    if (raw.length < 4) {
+      return false;
+    }
+    int lastPc = raw[raw.length - 2];
+    int lastLine = raw[raw.length - 1];
+    java.util.Set<Integer> fieldLines = new java.util.HashSet<>();
+    for (Exprent initializer : wrapper.getDynamicFieldInitializers()) {
+      if (initializer.bytecode == null) {
+        continue;
+      }
+      for (int offset = initializer.bytecode.nextSetBit(0); offset >= 0;
+           offset = initializer.bytecode.nextSetBit(offset + 1)) {
+        if (offset == lastPc) {
+          return false; // the last entry starts an initializer instruction
+        }
+        int line = lines.findLineNumber(offset);
+        if (line >= 0) {
+          fieldLines.add(line);
+        }
+      }
+    }
+    boolean explicit = !fieldLines.contains(lastLine);
+    if (System.getenv("NEUROFLOWER_CTOR_DEBUG") != null) {
+      System.err.println("ctor " + method.getClassQualifiedName() + method.getDescriptor()
+        + " lastPc " + lastPc + " lastLine " + lastLine + " fieldLines " + fieldLines
+        + " explicit " + explicit);
+    }
+    return explicit;
   }
 
   private static Map.Entry<VarType, GenericFieldDescriptor> getFieldTypeData(StructField fd) {
@@ -1969,6 +2166,105 @@ public class ClassWriter implements StatementWriter {
    * class file. Its source position is recoverable from the target lambda names: print the static
    * initializer before the first method whose lambdas are numbered after its own.
    */
+  /** The original source line a method starts on, from its own line table. */
+  private static int methodLine(StructMethod method) {
+    return lineAt(method, 0);
+  }
+
+  private static int lineAt(StructMethod method, int offset) {
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    return table == null ? -1 : table.findLineNumber(offset);
+  }
+
+  /**
+   * The line an enum's static block starts on, or -1. The compiler puts every enum constant's
+   * construction at the head of {@code <clinit>}, so pc0 is the enum header, not the block; the
+   * block is the first line table entry after the constants that still precedes the fields.
+   */
+  private static int staticBlockLine(ClassWrapper wrapper, StructClass cl) {
+    if ((cl.getAccessFlags() & CodeConstants.ACC_ENUM) == 0) {
+      return -1;
+    }
+    StructMethod clinit = cl.getMethod(CodeConstants.CLINIT_NAME, "()V");
+    StructLineNumberTableAttribute table = clinit == null ? null
+      : clinit.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    // The constants are constructed in declaration order, then the constant array is assembled
+    // and attributed to the enum declaration line — the one step back in the table. The entry
+    // after it is the first statement outside the header. It is a static block only when it
+    // precedes every field initializer; a field line there would be an illegal forward move.
+    int[] raw = table.getRawData();
+    for (int i = 2; i + 3 < raw.length; i += 2) {
+      if (raw[i + 1] < raw[i - 1]) {
+        return raw[i + 3];
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The original source line a field is declared on. Only a lifted initializer knows it: the
+   * initializer's offsets live in a constructor (or {@code <clinit>}), and in the constructor that
+   * owns them every offset carries the field's line.
+   */
+  private static int fieldLine(ClassWrapper wrapper, StructClass cl, StructField fd) {
+    String key = InterpreterUtil.makeUniqueKey(fd.getName(), fd.getDescriptor());
+    boolean isStatic = fd.hasModifier(CodeConstants.ACC_STATIC);
+    Exprent initializer = isStatic
+      ? wrapper.getStaticFieldInitializers().getWithKey(key)
+      : wrapper.getDynamicFieldInitializers().getWithKey(key);
+    if (initializer == null || initializer.bytecode == null || initializer.bytecode.isEmpty()) {
+      return -1;
+    }
+    if (isStatic) {
+      StructMethod clinit = cl.getMethod(CodeConstants.CLINIT_NAME, "()V");
+      return clinit == null ? -1 : lineAt(clinit, initializer.bytecode.nextSetBit(0));
+    }
+    int found = -1;
+    for (StructMethod method : cl.getMethods()) {
+      if (!CodeConstants.INIT_NAME.equals(method.getName())) {
+        continue;
+      }
+      int line = -1;
+      boolean consistent = true;
+      for (int offset = initializer.bytecode.nextSetBit(0); offset >= 0;
+           offset = initializer.bytecode.nextSetBit(offset + 1)) {
+        int candidate = lineAt(method, offset);
+        if (candidate < 0) {
+          continue;
+        }
+        if (line < 0) {
+          line = candidate;
+        } else if (line != candidate) {
+          consistent = false;
+          break;
+        }
+      }
+      if (consistent && line >= 0) {
+        if (found >= 0 && found != line) {
+          return -1;
+        }
+        found = line;
+      }
+    }
+    return found;
+  }
+
+  /** The first line any of a member class's methods starts on. */
+  private static int classLine(ClassNode node) {
+    int line = -1;
+    for (StructMethod method : node.classStruct.getMethods()) {
+      int candidate = methodLine(method);
+      if (candidate >= 0 && (line < 0 || candidate < line)) {
+        line = candidate;
+      }
+    }
+    return line;
+  }
+
   private static List<Integer> methodWriteOrder(ClassNode node, VBStyleCollection<StructMethod, String> methods) {
     List<Integer> order = new ArrayList<>(methods.size());
     for (int i = 0; i < methods.size(); i++) {
