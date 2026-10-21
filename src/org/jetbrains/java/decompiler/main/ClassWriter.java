@@ -513,6 +513,27 @@ public class ClassWriter implements StatementWriter {
         plan.add(new int[]{2, i, ordered && inner.type == ClassNode.Type.MEMBER ? classLine(inner) : -1, sequence++, rank});
       }
       if (ordered) {
+        // A member class with no line table of its own is placed next to the member class the
+        // original declared just before it, which the target's NestMembers names.
+        java.util.List<int[]> ranked = new java.util.ArrayList<>(); // {rank, known line}
+        for (int[] member : plan) {
+          if (member[0] == 2 && member.length > 4 && member[4] != Integer.MAX_VALUE && member[2] >= 0) {
+            ranked.add(new int[]{member[4], member[2]});
+          }
+        }
+        ranked.sort(Comparator.comparingInt(a -> a[0]));
+        for (int[] member : plan) {
+          if (member[0] != 2 || member[2] >= 0 || member.length <= 4 || member[4] == Integer.MAX_VALUE) {
+            continue;
+          }
+          int line = -1;
+          for (int[] known : ranked) {
+            if (known[0] < member[4]) {
+              line = known[1];
+            }
+          }
+          member[2] = line;
+        }
         // Members with no line of their own stay next to the neighbour that has one.
         int carried = -1;
         for (int[] member : plan) {
