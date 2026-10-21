@@ -132,6 +132,24 @@ public class SwitchStatement extends Statement {
 
     buf.append(headexprent.get(0).toJava(indent)).append(" {").appendLineSeparator();
 
+    // Two arms that define the same local name share the switch's block scope, and Java forbids a
+    // nested block from shadowing an enclosing local; the target's names say they were distinct
+    // variables, so the source braced the arms.
+    Set<Statement> braced = new HashSet<>(this.scopedCaseStatements);
+    Map<String, List<Statement>> definitions = new HashMap<>();
+    for (Statement caseStat : caseStatements) {
+      Set<String> names = new HashSet<>();
+      collectCaseNames(caseStat, names, null);
+      for (String name : names) {
+        definitions.computeIfAbsent(name, key -> new ArrayList<>()).add(caseStat);
+      }
+    }
+    for (List<Statement> arms : definitions.values()) {
+      if (arms.size() > 1) {
+        braced.addAll(arms);
+      }
+    }
+
     VarType switch_type = headexprent.get(0).getExprType();
 
     for (int i : sourceOrder()) {
@@ -144,7 +162,7 @@ public class SwitchStatement extends Statement {
       for (int j = 0; j < edges.size(); j++) {
         if (edges.get(j) == defaultEdge) {
           buf.appendIndent(indent + 1).append("default:");
-          if (this.scopedCaseStatements.contains(stat) && j == edges.size() - 1) {
+          if (braced.contains(stat) && j == edges.size() - 1) {
             buf.append(" {");
           }
 
@@ -179,7 +197,7 @@ public class SwitchStatement extends Statement {
           }
 
           buf.append(":");
-          if (this.scopedCaseStatements.contains(stat) && j == edges.size() - 1) {
+          if (braced.contains(stat) && j == edges.size() - 1) {
             buf.append(" {");
           }
           buf.appendLineSeparator();
@@ -188,7 +206,7 @@ public class SwitchStatement extends Statement {
 
       buf.append(ExprProcessor.jmpWrapper(stat, indent + 2, false));
 
-      if (this.scopedCaseStatements.contains(stat)) {
+      if (braced.contains(stat)) {
         buf.appendIndent(indent + 1);
         buf.append("}");
         buf.appendLineSeparator();
@@ -209,6 +227,29 @@ public class SwitchStatement extends Statement {
    * by value, so the bytecode cannot tell `case 40964:` before `case 40963:`; the target's line
    * table can, because every body's first instruction carries the line of the statement behind it.
    */
+  private static void collectCaseNames(Statement stat, Set<String> names, SwitchStatement inner) {
+    if (stat instanceof SwitchStatement) {
+      inner = (SwitchStatement) stat; // an inner switch scopes its own arms
+    }
+    if (inner == null) {
+      if (stat.getExprents() != null) {
+        for (Exprent exprent : stat.getExprents()) {
+          for (Exprent nested : exprent.getAllExprents(true, true)) {
+            if (nested instanceof VarExprent var && var.isDefinition()) {
+              String name = var.getName();
+              if (name != null) {
+                names.add(name);
+              }
+            }
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      collectCaseNames(child, names, inner);
+    }
+  }
+
   private List<Integer> sourceOrder() {
     int size = caseStatements.size();
     List<Integer> order = new ArrayList<>(size);

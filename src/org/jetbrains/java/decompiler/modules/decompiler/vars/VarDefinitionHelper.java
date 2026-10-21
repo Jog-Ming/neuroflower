@@ -1595,6 +1595,7 @@ public class VarDefinitionHelper {
     seenMethods.add(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
 
     iterateClashingNames(root, mt, varDefinitions, liveVarDefs, new HashSet<>(), nameMap, seenMethods);
+
   }
 
   private void iterateClashingNames(Statement stat, StructMethod mt, Map<Statement, Set<VarInMethod>> varDefinitions,
