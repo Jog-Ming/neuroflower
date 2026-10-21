@@ -361,8 +361,11 @@ public final class LineAlign {
         if (bridge && !singleLine(table)) {
           continue; // a bridge spanning several lines is not anchored to the declaration
         }
-        entryLines.add(declaration);
-        add(shifts, conflicted, declaration, target - declaration);
+        int anchor = bridge
+          ? classDeclarationTop(lines, declaration, 0)
+          : declaration;
+        entryLines.add(anchor);
+        add(shifts, conflicted, anchor, target - anchor);
       }
     }
   }
@@ -399,6 +402,26 @@ public final class LineAlign {
       }
     }
     return found;
+  }
+
+  /** The first line of the declaration block, annotations included; javac anchors bridges there. */
+  private static int classDeclarationTop(String[] lines, int declaration, int enclosing) {
+    if (declaration < 0) {
+      return -1;
+    }
+    int top = declaration;
+    for (int i = declaration - 2; i >= enclosing; i--) {
+      String text = lines[i].trim();
+      if (text.isEmpty() || text.equals(PADDING)) {
+        continue;
+      }
+      if (text.startsWith("@")) {
+        top = i + 1;
+        continue;
+      }
+      break;
+    }
+    return top;
   }
 
   private static StructLineNumberTableAttribute lineTable(String className, String methodKey) {
