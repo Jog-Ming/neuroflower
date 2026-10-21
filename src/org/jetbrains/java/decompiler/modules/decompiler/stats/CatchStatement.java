@@ -191,6 +191,16 @@ public class CatchStatement extends Statement {
 
       VarExprent var = vars.get(i - 1);
 
+      // A rename for a lambda clash reaches the uses (which lose their lvt) but not this
+      // declaration. The renamed form extends the lvt name; a synthetic varN from the processor
+      // does not, and there the lvt is the right name.
+      String mapped = var.getProcessor() == null ? null
+        : var.getProcessor().getVarName(var.getVarVersionPair());
+      if (mapped != null && var.getLVT() != null && !mapped.equals(var.getLVT().getName())
+          && mapped.startsWith(var.getLVT().getName())) {
+        var.setLVT(null);
+      }
+
       validateType(exception_types, var.getVarType());
 
       // Temporarily set variable as not a definition, since we just wrote the type above
