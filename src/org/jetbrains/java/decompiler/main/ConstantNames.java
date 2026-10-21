@@ -1436,10 +1436,14 @@ public final class ConstantNames {
       key = VariableType.LONG.name() + "|" + asLong;
       constants = candidates.get(key);
     }
-    if (constants == null || constants.size() != 1) {
+    if (constants == null || constants.isEmpty()) {
       return;
     }
-    String owner = constants.get(0).owner();
+    Constant chosen = selectProvable(constants, start, placement, own);
+    if (chosen == null) {
+      return;
+    }
+    String owner = chosen.owner();
     // An owner whose Class entry the class file already explains is no evidence that a constant
     // was named; a referenced owner's window marks its field or method use, not a constant site.
     // The site itself must lie in the proven placement: unlike a literal of the constant's own
@@ -1458,8 +1462,11 @@ public final class ConstantNames {
     if (folded == null || Double.compare(folded, literal) != 0) {
       return;
     }
-    addSite(sites, start, end, key, "", candidates, imports, packageName, own, ownInitializers,
-      placement, deferred, inWindow);
+    // The literal was a float or double, and an integral constant is not: a bare name would turn
+    // `intExpr / NAME` into an integer division. The cast keeps the literal's type, and a cast of a
+    // constant variable is itself a constant expression, so the compiled value is unchanged.
+    addSite(sites, start, end, key, single ? "(float) " : "(double) ", candidates, imports,
+      packageName, own, ownInitializers, placement, deferred, inWindow);
   }
 
   /**
@@ -1504,6 +1511,19 @@ public final class ConstantNames {
                                          String own) {
     if (placement == null) {
       return null;
+    }
+    // A referenced owner's Class entry came from the field or method reference that also makes it
+    // a candidate; naming one of its constants adds nothing to the pool. A pool-unexplained
+    // owner's entry exists only because the source named a constant of it, so when the value alone
+    // cannot choose, that owner is the one the pool is asking this site to name.
+    List<Constant> necessary = new ArrayList<>();
+    for (Constant constant : constants) {
+      if (!constant.owner().equals(own) && !placement.strict().contains(constant.owner())) {
+        necessary.add(constant);
+      }
+    }
+    if (necessary.size() == 1 && placement.proves(necessary.get(0).owner(), start)) {
+      return necessary.get(0);
     }
     Constant chosen = null;
     for (Constant constant : constants) {
