@@ -684,7 +684,7 @@ public final class RoundTrip {
     return out;
   }
 
-  private static StructMethod currentMethod() {
+  public static StructMethod currentMethod() {
     StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
     if (method != null) {
       return method;

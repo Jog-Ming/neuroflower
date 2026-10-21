@@ -879,7 +879,7 @@ public class InvocationExprent extends Exprent {
           // A chain link whose invoke the original put on a later line than the receiver's last
           // instruction starts a line of its own. Inside an argument list javac attributes the
           // invoke to the first argument's line, so the entry proves nothing about the dot there.
-          if (instance != null && !inArgument() && RoundTrip.newlineBetween(instance, this)) {
+          if (instance != null && !insideOwnArgumentList() && RoundTrip.newlineBetween(instance, this)) {
             buf.appendLineSeparator().appendIndent(indent);
           }
           buf.append(".");
@@ -1010,13 +1010,28 @@ public class InvocationExprent extends Exprent {
   }
 
   private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
+  private static final ThreadLocal<StructMethod[]> ARGUMENT_AT =
+    ThreadLocal.withInitial(() -> new StructMethod[64]);
 
   public static boolean inArgument() {
     return ARGUMENT.get()[0] > 0;
   }
 
+  /**
+   * Whether the printer is inside the argument list of the method it is printing. A lambda body
+   * switches the current method, so a call written there is not subject to the enclosing call's
+   * argument-line attribution.
+   */
+  public static boolean insideOwnArgumentList() {
+    int depth = ARGUMENT.get()[0];
+    return depth > 0 && ARGUMENT_AT.get()[depth - 1] == RoundTrip.currentMethod();
+  }
+
   public TextBuffer appendParamList(int indent) {
-    ARGUMENT.get()[0]++;
+    int depth = ++ARGUMENT.get()[0];
+    if (depth <= ARGUMENT_AT.get().length) {
+      ARGUMENT_AT.get()[depth - 1] = RoundTrip.currentMethod();
+    }
     try {
       return appendParamList0(indent);
     } finally {
