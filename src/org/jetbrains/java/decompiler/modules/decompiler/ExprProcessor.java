@@ -848,15 +848,18 @@ public class ExprProcessor implements CodeConstants {
              (expr instanceof VarExprent && ((VarExprent)expr).isClassDef()));
   }
 
-  public static void addDeletedGotoInstructionMapping(Statement stat, TextBuffer buffer) {
+  public static int addDeletedGotoInstructionMapping(Statement stat, TextBuffer buffer) {
     if (stat instanceof BasicBlockStatement) {
       BasicBlock block = ((BasicBlockStatement)stat).getBlock();
       List<Integer> offsets = block.getInstrOldOffsets();
       if (!offsets.isEmpty() &&
           offsets.size() > block.getSeq().length()) { // some instructions have been deleted, but we still have offsets
-        buffer.addBytecodeMapping(offsets.get(offsets.size() - 1)); // add the last offset
+        int last = offsets.get(offsets.size() - 1);
+        buffer.addBytecodeMapping(last); // add the last offset
+        return last;
       }
     }
+    return -1;
   }
 
   public static TextBuffer jmpWrapper(Statement stat, int indent, boolean semicolon) {
@@ -866,15 +869,23 @@ public class ExprProcessor implements CodeConstants {
     if (lstSuccs.size() == 1) {
       StatEdge edge = lstSuccs.get(0);
       if (edge.getType() != StatEdge.TYPE_REGULAR && edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)) {
-        buf.appendIndent(indent);
+        int jumpOffset = addDeletedGotoInstructionMapping(stat, buf);
+        // The target starts no line at the jump when the source ended the previous statement with
+        // `break;`/`continue;` on the same line; keep it there.
+        boolean join = jumpOffset >= 0 && !RoundTrip.lineStartsAt(jumpOffset)
+          && buf.length() >= DecompilerContext.getNewLineSeparator().length();
+        if (join) {
+          buf.setLength(buf.length() - DecompilerContext.getNewLineSeparator().length());
+          buf.append(" ");
+        } else {
+          buf.appendIndent(indent);
+        }
 
         switch (edge.getType()) {
           case StatEdge.TYPE_BREAK:
-            addDeletedGotoInstructionMapping(stat, buf);
             buf.append("break");
             break;
           case StatEdge.TYPE_CONTINUE:
-            addDeletedGotoInstructionMapping(stat, buf);
             buf.append("continue");
         }
 

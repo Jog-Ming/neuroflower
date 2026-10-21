@@ -293,6 +293,22 @@ public final class RoundTrip {
     return lnt == null ? -1 : lnt.findLineNumber(offset);
   }
 
+  /** True when the target's table starts a source line at this bytecode offset. */
+  public static boolean lineStartsAt(int offset) {
+    StructMethod method = currentMethod();
+    if (method == null || offset <= 0) {
+      return true;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return true;
+    }
+    int here = table.findLineNumber(offset);
+    int before = table.findLineNumber(offset - 1);
+    return here < 0 || before < 0 || here != before;
+  }
+
   public static boolean selector(String name) {
     if (!enabled()) {
       return false;
