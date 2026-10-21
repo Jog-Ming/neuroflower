@@ -508,7 +508,15 @@ public final class Verifier {
   private static void pruneReports(Path reports, int keep) throws IOException {
     try (var list = Files.list(reports)) {
       List<Path> files = new ArrayList<>(list.filter(p -> p.getFileName().toString().endsWith(".json")).toList());
-      files.sort(java.util.Comparator.comparing((Path p) -> p.getFileName().toString()).reversed());
+      // Newest first by modification time: sorting the names put every 26.x report ahead of
+      // 1.21.x, so the main version's reports were the ones pruned.
+      files.sort(java.util.Comparator.comparingLong((Path p) -> {
+        try {
+          return java.nio.file.Files.getLastModifiedTime(p).toMillis();
+        } catch (IOException e) {
+          return 0L;
+        }
+      }).reversed());
       for (int i = keep; i < files.size(); i++) {
         Files.deleteIfExists(files.get(i));
       }
