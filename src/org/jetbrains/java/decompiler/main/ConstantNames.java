@@ -68,7 +68,7 @@ public final class ConstantNames {
       String simple = simpleName(owner);
       // A class the file already accounts for is no evidence that the source named one of its
       // constants.
-      if (!simple.isEmpty() && !text.contains(simple) && !explained.contains(owner)) {
+      if (!simple.isEmpty() && !mentions(text, simple) && !explained.contains(owner)) {
         missing.add(owner);
       }
     }
@@ -268,13 +268,21 @@ public final class ConstantNames {
    * printed at or before it, inside the method block whose printed positions bracket the site.
    */
   private static long siteCoordinate(List<SiteSpace> spaces, int position) {
-    for (SiteSpace space : spaces) {
-      if (position < space.min || position > space.max) {
-        continue;
-      }
+    SiteSpace space = innermost(spaces, position);
+    if (space != null) {
+      int bestPosition = Integer.MIN_VALUE;
       int offset = -1;
       for (Map.Entry<Integer, Integer> entry : space.positions.entrySet()) {
-        if (entry.getValue() <= position && entry.getKey() > offset) {
+        int printed = entry.getValue();
+        if (printed > position) {
+          continue;
+        }
+        // The nearest printed item before the site, and at one position the instruction that
+        // starts there (the lowest offset). A lambda body records its synthetic exit at the body
+        // start with a high offset; taking the highest offset instead would mistake it for the
+        // item nearest the site.
+        if (printed > bestPosition || (printed == bestPosition && (offset < 0 || entry.getKey() < offset))) {
+          bestPosition = printed;
           offset = entry.getKey();
         }
       }
@@ -283,6 +291,26 @@ public final class ConstantNames {
       }
     }
     return NO_COORDINATE;
+  }
+
+  /**
+   * The printed method block a text position belongs to.
+   *
+   * <p>A lambda body is printed inside the expression that creates it, so the creating method's
+   * printed range encloses the lambda's. A position inside the lambda belongs to the lambda's own
+   * generation order, not the enclosing method's: the innermost range containing it.
+   */
+  private static SiteSpace innermost(List<SiteSpace> spaces, int position) {
+    SiteSpace best = null;
+    for (SiteSpace space : spaces) {
+      if (position < space.min || position > space.max) {
+        continue;
+      }
+      if (best == null || space.max - space.min < best.max - best.min) {
+        best = space;
+      }
+    }
+    return best;
   }
 
   /**
@@ -297,10 +325,8 @@ public final class ConstantNames {
    * {@link #siteCoordinate} admits a window.
    */
   private static long printedCoordinate(List<SiteSpace> spaces, int position) {
-    for (SiteSpace space : spaces) {
-      if (position < space.min || position > space.max) {
-        continue;
-      }
+    SiteSpace space = innermost(spaces, position);
+    if (space != null) {
       int bestPosition = Integer.MIN_VALUE;
       int offset = -1;
       for (Map.Entry<Integer, Integer> entry : space.positions.entrySet()) {
@@ -327,14 +353,17 @@ public final class ConstantNames {
    *
    * <p>The class's own, superclass and interface {@code Class} entries are interned when the class
    * is entered, before any body is generated, so an instruction that uses one says nothing about
-   * the pool order and it is never used as a bound.
+   * the pool order and it is never used as a bound. {@code folded} is the value entry javac entered
+   * together with this {@code Class} entry; its first use is the naming site itself, so it cannot
+   * bound the site from above.
    */
-  private static long[] coordinates(Map<Integer, FirstUse> firstUses, int index, Set<Integer> early) {
+  private static long[] coordinates(Map<Integer, FirstUse> firstUses, int index, Set<Integer> early,
+                                    int folded) {
     long pred = Long.MIN_VALUE;
     long succ = Long.MAX_VALUE;
     for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
       int key = entry.getKey();
-      if (key == index || early.contains(key)) {
+      if (key == index || key == folded || early.contains(key)) {
         continue;
       }
       long point = coordinate(entry.getValue().order(), entry.getValue().offset());
@@ -418,7 +447,7 @@ public final class ConstantNames {
       // A class the file already accounts for is no evidence that the source named one of its
       // constants. The text test reads this class's own spans: its host prints into the same file,
       // so a name used there says nothing about this class's pool.
-      if (!simple.isEmpty() && !selfText.contains(simple) && !explained.contains(owner)) {
+      if (!simple.isEmpty() && !mentions(selfText, simple) && !explained.contains(owner)) {
         missing.add(owner);
       }
     }
@@ -449,7 +478,10 @@ public final class ConstantNames {
         if (window != null) {
           windows.put(owner, window);
         }
-        coordinates.put(owner, coordinates(firstUses, index, early));
+        // This owner's Class entry exists only because the source named one of its constants
+        // (nothing else in the class file explains it), and javac entered the folded value right
+        // after the Class and its name. That value's use is the naming site, so it cannot bound it.
+        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
       }
     }
     // A class the pool uses through a field or method names nothing by itself, but the position of
@@ -471,7 +503,7 @@ public final class ConstantNames {
       }
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       windows.put(owner, window);
-      coordinates.put(owner, coordinates(firstUses, index, early));
+      coordinates.put(owner, coordinates(firstUses, index, early, -1));
       strict.add(owner);
     }
     if (candidates.isEmpty()) {
@@ -551,6 +583,35 @@ public final class ConstantNames {
       }
     }
     return early;
+  }
+
+  /**
+   * The folded value javac entered together with the {@code Class} entry at {@code index}, or -1.
+   *
+   * <p>When the source names {@code Owner.NAME} and the constant folds, javac enters the owner's
+   * {@code Class} entry, its name UTF8 and then the constant's value, in that order. A Class entry
+   * created for a field or method reference is followed by a NameAndType instead. The value is the
+   * pool's record of the very site the name stood at, so its first use is that site.
+   */
+  private static int foldedNeighbor(StructClass cls, int index) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    if (index + 2 >= pool.size()) {
+      return -1;
+    }
+    if (!(pool.get(index) instanceof PrimitiveConstant owner)
+        || owner.type != CodeConstants.CONSTANT_Class
+        || owner.index != index + 1) {
+      return -1;
+    }
+    if (!(pool.get(index + 2) instanceof PrimitiveConstant value)) {
+      return -1;
+    }
+    return switch (value.type) {
+      case CodeConstants.CONSTANT_Integer, CodeConstants.CONSTANT_Float,
+           CodeConstants.CONSTANT_Long, CodeConstants.CONSTANT_Double,
+           CodeConstants.CONSTANT_String -> index + 2;
+      default -> -1;
+    };
   }
 
   /** The pool index of each Class entry, keyed by the class name it names. */
@@ -1314,8 +1375,12 @@ public final class ConstantNames {
     if (constants == null || constants.isEmpty()) {
       return;
     }
+    // A quoted literal is printed by enclosing a buffer whose mapping sits at its content start,
+    // so the recorded position of the instruction is one past the opening quote.
+    int anchor = key.startsWith(VariableType.STRING.name() + "|")
+      || key.startsWith(VariableType.CHAR.name() + "|") ? start + 1 : start;
     Constant constant = constants.size() == 1
-      ? constants.get(0) : selectProvable(constants, start, placement, own);
+      ? constants.get(0) : selectProvable(constants, anchor, placement, own);
     if (constant == null) {
       return;
     }
@@ -1326,7 +1391,7 @@ public final class ConstantNames {
     // first use and before every higher entry's first use. A text window only approximates it; the
     // coordinate check places the site by the positions the printer recorded for its method, which
     // also covers a static field initializer generated in <clinit> but printed at its declaration.
-    boolean placed = foreign && placement != null && placement.proves(constant.owner(), start);
+    boolean placed = foreign && placement != null && placement.proves(constant.owner(), anchor);
     // A frequent value is only weak evidence where there is no better one. A window means the pool
     // proves this owner was named somewhere, and the value only has to pick among its constants;
     // the site itself is still placed by the window or its fallback below.
@@ -1507,7 +1572,7 @@ public final class ConstantNames {
    * pool at a position the original never had. A window or an exact generation-order placement is
    * evidence that the owner was named here; two such owners at one site is still a guess.
    */
-  private static Constant selectProvable(List<Constant> constants, int start, Placement placement,
+  private static Constant selectProvable(List<Constant> constants, int position, Placement placement,
                                          String own) {
     if (placement == null) {
       return null;
@@ -1522,12 +1587,12 @@ public final class ConstantNames {
         necessary.add(constant);
       }
     }
-    if (necessary.size() == 1 && placement.proves(necessary.get(0).owner(), start)) {
+    if (necessary.size() == 1 && placement.proves(necessary.get(0).owner(), position)) {
       return necessary.get(0);
     }
     Constant chosen = null;
     for (Constant constant : constants) {
-      if (!constant.owner().equals(own) && placement.proves(constant.owner(), start)) {
+      if (!constant.owner().equals(own) && placement.proves(constant.owner(), position)) {
         if (chosen != null) {
           return null;
         }
@@ -1659,5 +1724,24 @@ public final class ConstantNames {
 
   private static boolean isIdentifierPart(char c) {
     return Character.isJavaIdentifierPart(c);
+  }
+
+  /**
+   * Whether the text uses this simple name as an identifier.
+   *
+   * <p>A name embedded in a longer identifier is a different name: {@code EntityType} and
+   * {@code nextSpawnData} say nothing about {@code Entity} or {@code SpawnData}, and a pool entry
+   * for the latter is still unexplained evidence that the source named one of its constants.
+   */
+  private static boolean mentions(String text, String simple) {
+    for (int i = text.indexOf(simple); i >= 0; i = text.indexOf(simple, i + 1)) {
+      boolean before = i == 0 || !isIdentifierPart(text.charAt(i - 1));
+      int end = i + simple.length();
+      boolean after = end >= text.length() || !isIdentifierPart(text.charAt(end));
+      if (before && after) {
+        return true;
+      }
+    }
+    return false;
   }
 }
