@@ -474,7 +474,9 @@ public final class ConstantNames {
         // A referenced owner's window is the only evidence of where the original named it; without
         // a site inside the window there is nothing to place the name against.
         if (!rules.strict().contains(entry.getKey())) {
-          sites.addAll(entry.getValue());
+          for (Site site : entry.getValue()) {
+            addSiteOnce(sites, site);
+          }
         }
         continue;
       }
@@ -484,7 +486,7 @@ public final class ConstantNames {
       int[] window = rules.windows().get(entry.getKey());
       for (Site site : entry.getValue()) {
         if (window != null && site.start() >= window[1]) {
-          sites.add(site);
+          addSiteOnce(sites, site);
         }
       }
     }
@@ -829,7 +831,7 @@ public final class ConstantNames {
         if (!text.startsWith("\"\"\"", i) && end - 1 > i) {
           String value = unescape(text.substring(i + 1, end - 1));
           if (value != null && !value.isEmpty()) {
-            addSite(sites, i, end, VariableType.STRING + "|" + value, candidates, imports, packageName, own, ownInitializers,
+            addSite(sites, i, end, VariableType.STRING + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
               windows, deferred, inWindow);
           }
         }
@@ -841,7 +843,7 @@ public final class ConstantNames {
         if (end - 1 > i) {
           Integer value = charValue(text.substring(i + 1, end - 1));
           if (value != null) {
-            addSite(sites, i, end, VariableType.CHAR + "|" + value, candidates, imports, packageName, own, ownInitializers,
+            addSite(sites, i, end, VariableType.CHAR + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
               windows, deferred, inWindow);
           }
         }
@@ -855,7 +857,7 @@ public final class ConstantNames {
         }
         String word = text.substring(i, end);
         if (word.equals("true") || word.equals("false")) {
-          addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, candidates, imports, packageName, own, ownInitializers,
+          addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, "", candidates, imports, packageName, own, ownInitializers,
             windows, deferred, inWindow);
         }
         i = end;
@@ -962,7 +964,7 @@ public final class ConstantNames {
         List<Constant> asLong = candidates.get(kind + "|" + value);
         if ((asLong == null || asLong.size() != 1)
             && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
-          addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number,
+          addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number, "",
             candidates, imports, packageName, own, ownInitializers, windows, deferred, inWindow);
         }
       } else if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
@@ -981,16 +983,39 @@ public final class ConstantNames {
       return i;
     }
     int siteStart = negative ? negativeAt : start;
-    addSite(sites, siteStart, i, kind + "|" + value, candidates, imports, packageName, own, ownInitializers,
+    addSite(sites, siteStart, i, kind + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
       windows, deferred, inWindow);
     if (kind.equals(VariableType.FLOAT.name())) {
-      addSite(sites, siteStart, i, "FLOATCAST|" + value, candidates, imports, packageName, own, ownInitializers,
+      addSite(sites, siteStart, i, "FLOATCAST|" + value, "", candidates, imports, packageName, own, ownInitializers,
         windows, deferred, inWindow);
+    }
+    if (negative && value.startsWith("-")) {
+      // The source can write a positive constant behind a unary minus; the literal is then the
+      // negation of the constant, not a negative constant of its own.
+      String magnitude = value.substring(1);
+      addSite(sites, siteStart, i, kind + "|" + magnitude, "-", candidates, imports, packageName, own,
+        ownInitializers, windows, deferred, inWindow);
+      if (kind.equals(VariableType.FLOAT.name())) {
+        addSite(sites, siteStart, i, "FLOATCAST|" + magnitude, "-", candidates, imports, packageName, own,
+          ownInitializers, windows, deferred, inWindow);
+      }
+      if (kind.equals(VariableType.LONG.name())) {
+        try {
+          long mag = Long.parseLong(magnitude);
+          List<Constant> asLong = candidates.get(kind + "|" + magnitude);
+          if ((asLong == null || asLong.size() != 1) && mag <= Integer.MAX_VALUE) {
+            addSite(sites, siteStart, i, VariableType.INT.name() + "|" + mag, "-", candidates, imports,
+              packageName, own, ownInitializers, windows, deferred, inWindow);
+          }
+        } catch (NumberFormatException ignored) {
+          // a magnitude too large for a positive long has no constant to name
+        }
+      }
     }
     return i;
   }
 
-  private static void addSite(List<Site> sites, int start, int end, String key,
+  private static void addSite(List<Site> sites, int start, int end, String key, String prefix,
                               Map<String, List<Constant>> candidates, List<String> imports,
                               String packageName, String own, Map<String, List<int[]>> ownInitializers,
                               Map<String, int[]> windows, Map<String, List<Site>> deferred,
@@ -1020,7 +1045,7 @@ public final class ConstantNames {
     if (windows != null && constant.owner().equals(own) && anonymous(constant.owner())) {
       // Inside its own class the constant needs no qualifier, and an anonymous class has no
       // writable simple name at all (its binary suffix is a number).
-      printed = constant.name();
+      printed = prefix + constant.name();
       if (key.startsWith("FLOATCAST|")) {
         printed = "(float) " + printed;
       }
@@ -1045,7 +1070,7 @@ public final class ConstantNames {
       else {
         qualifier = constant.owner().replace('/', '.');
       }
-      printed = qualifier + "." + constant.name();
+      printed = prefix + qualifier + "." + constant.name();
       if (key.startsWith("FLOATCAST|")) {
         printed = "(float) " + printed;
       }
@@ -1064,7 +1089,23 @@ public final class ConstantNames {
         inWindow.add(constant.owner());
       }
     }
-    sites.add(new Site(start, end, printed));
+    addSiteOnce(sites, new Site(start, end, printed));
+  }
+
+  /**
+   * Adds a rewrite unless the same span already has one.
+   *
+   * <p>A second replacement at one span would run against text the first already changed, and its
+   * end offset, computed on the original text, would then cut into unrelated source.
+   */
+  private static void addSiteOnce(List<Site> sites, Site site) {
+    for (int i = sites.size() - 1; i >= 0; i--) {
+      Site existing = sites.get(i);
+      if (existing.start() == site.start() && existing.end() == site.end()) {
+        return;
+      }
+    }
+    sites.add(site);
   }
 
   /**
