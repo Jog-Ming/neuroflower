@@ -1361,17 +1361,13 @@ public class ExprProcessor implements CodeConstants {
   }
 
   private static boolean lambdaNeedsCast(VarType left, NewExprent exprent) {
-    if (exprent.isLambda() && !exprent.isMethodReference()) {
-      StructClass cls = DecompilerContext.getStructContext().getClass(left.value);
-      if (cls == null || cls.getMethod(exprent.getLambdaMethodKey()) == null) {
-        return true;
-      }
-      // A lambda can only take an interface with one abstract method. The expected type may be a
-      // supertype that declares the same method but is not functional, in which case javac rejects
-      // the bare lambda and the original source cast it to the functional subtype.
-      return RoundTrip.selector("lambdacast") && !isFunctionalInterface(cls);
+    if (!exprent.isLambda() && !exprent.isMethodReference()) {
+      return false;
     }
-    return false;
+    // The invokedynamic names the interface javac built the lambda for, and it comes from the
+    // target itself: when it is not the expected type, the source must have cast to it, or javac
+    // would have built the lambda for the expected type instead.
+    return RoundTrip.selector("lambdacast");
   }
 
   /** The single abstract method that makes {@code cls} a functional interface, or null. */
