@@ -57,14 +57,32 @@ public final class ConstantNames {
         missing.add(owner);
       }
     }
-    if (missing.isEmpty()) {
-      return text;
-    }
-
     List<String> imports = imports(text);
     String packageName = packageName(text);
     String nest = root == null || root.classStruct == null ? "" : root.classStruct.qualifiedName;
     Map<String, List<Constant>> candidates = new HashMap<>();
+    // A class's own constant is a candidate too: naming it interns the class into the pool at the
+    // site of the first use, which the original's pool order records.
+    StructClass own = root == null ? null : root.classStruct;
+    if (own != null) {
+      for (StructField field : own.getFields()) {
+        if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+            != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+          continue;
+        }
+        PrimitiveConstant value = constantValue(own, field);
+        VariableType kind = value == null ? null : kind(field.getDescriptor());
+        if (value == null || kind == null || value.value == null) {
+          continue;
+        }
+        String printed = kind == VariableType.BOOLEAN && value.value instanceof Integer flag
+          ? Boolean.toString(flag != 0) : String.valueOf(value.value);
+        candidate(candidates, kind + "|" + printed, new Constant(own.qualifiedName, field.getName(), kind));
+      }
+    }
+    if (missing.isEmpty() && candidates.isEmpty()) {
+      return text;
+    }
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
         continue; // present for a lambda/indy bootstrap, never a source-named constant owner
@@ -123,7 +141,9 @@ public final class ConstantNames {
     }
 
     List<Site> sites = new ArrayList<>();
-    scan(text, candidates, imports, packageName, sites);
+    Map<String, List<int[]>> ownInitializers = own == null ? Map.of() : ownInitializers(text, own);
+    scan(text, candidates, imports, packageName, sites, own == null ? "" : own.qualifiedName,
+      ownInitializers);
     if (sites.isEmpty()) {
       return text;
     }
@@ -164,6 +184,16 @@ public final class ConstantNames {
     for (ClassNode nested : node.nested) {
       collectPool(nested, present, referenced);
     }
+  }
+
+  private static PrimitiveConstant constantValue(StructClass cls, StructField field) {
+    StructConstantValueAttribute attribute =
+      field.getAttribute(StructGeneralAttribute.ATTRIBUTE_CONSTANT_VALUE);
+    if (attribute == null) {
+      return null;
+    }
+    PrimitiveConstant value = cls.getPool().getPrimitiveConstant(attribute.getIndex());
+    return value == null || value.value == null ? null : value;
   }
 
   private static VariableType kind(String descriptor) {
@@ -227,8 +257,35 @@ public final class ConstantNames {
 
   // ------------------------------------------------------------------ literal scanning
 
+  /** The text ranges of a class's own constant declarations; a constant cannot name itself. */
+  private static Map<String, List<int[]>> ownInitializers(String text, StructClass own) {
+    Map<String, List<int[]>> ranges = new HashMap<>();
+    for (StructField field : own.getFields()) {
+      if (constantValue(own, field) == null) {
+        continue;
+      }
+      java.util.regex.Matcher matcher = java.util.regex.Pattern
+        .compile("\\b" + java.util.regex.Pattern.quote(field.getName()) + "\\s*=")
+        .matcher(text);
+      while (matcher.find()) {
+        int depth = 0;
+        int i = matcher.end();
+        while (i < text.length()) {
+          char c = text.charAt(i);
+          if (c == '(' || c == '[' || c == '{') depth++;
+          else if (c == ')' || c == ']' || c == '}') { if (depth == 0) break; depth--; }
+          else if (c == ';' && depth == 0) break;
+          i++;
+        }
+        ranges.computeIfAbsent(field.getName(), k -> new ArrayList<>()).add(new int[]{matcher.start(), i});
+      }
+    }
+    return ranges;
+  }
+
   private static void scan(String text, Map<String, List<Constant>> candidates, List<String> imports,
-                           String packageName, List<Site> sites) {
+                           String packageName, List<Site> sites, String own,
+                           Map<String, List<int[]>> ownInitializers) {
     int i = 0;
     while (i < text.length()) {
       char c = text.charAt(i);
@@ -250,7 +307,7 @@ public final class ConstantNames {
         if (!text.startsWith("\"\"\"", i) && end - 1 > i) {
           String value = unescape(text.substring(i + 1, end - 1));
           if (value != null && !value.isEmpty()) {
-            addSite(sites, i, end, VariableType.STRING + "|" + value, candidates, imports, packageName);
+            addSite(sites, i, end, VariableType.STRING + "|" + value, candidates, imports, packageName, own, ownInitializers);
           }
         }
         i = end;
@@ -261,7 +318,7 @@ public final class ConstantNames {
         if (end - 1 > i) {
           Integer value = charValue(text.substring(i + 1, end - 1));
           if (value != null) {
-            addSite(sites, i, end, VariableType.CHAR + "|" + value, candidates, imports, packageName);
+            addSite(sites, i, end, VariableType.CHAR + "|" + value, candidates, imports, packageName, own, ownInitializers);
           }
         }
         i = end;
@@ -274,13 +331,13 @@ public final class ConstantNames {
         }
         String word = text.substring(i, end);
         if (word.equals("true") || word.equals("false")) {
-          addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, candidates, imports, packageName);
+          addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, candidates, imports, packageName, own, ownInitializers);
         }
         i = end;
         continue;
       }
       if (Character.isDigit(c) && (i == 0 || !isIdentifierPart(text.charAt(i - 1)))) {
-        i = scanNumber(text, i, sites, candidates, imports, packageName);
+        i = scanNumber(text, i, sites, candidates, imports, packageName, own, ownInitializers);
         continue;
       }
       i++;
@@ -309,7 +366,7 @@ public final class ConstantNames {
 
   private static int scanNumber(String text, int start, List<Site> sites,
                                 Map<String, List<Constant>> candidates, List<String> imports,
-                                String packageName) {
+                                String packageName, String own, Map<String, List<int[]>> ownInitializers) {
     int i = start;
     char c = text.charAt(i);
     boolean hex = c == '0' && i + 1 < text.length()
@@ -386,21 +443,28 @@ public final class ConstantNames {
       return i;
     }
     int siteStart = negative ? negativeAt : start;
-    addSite(sites, siteStart, i, kind + "|" + value, candidates, imports, packageName);
+    addSite(sites, siteStart, i, kind + "|" + value, candidates, imports, packageName, own, ownInitializers);
     if (kind.equals(VariableType.FLOAT.name())) {
-      addSite(sites, siteStart, i, "FLOATCAST|" + value, candidates, imports, packageName);
+      addSite(sites, siteStart, i, "FLOATCAST|" + value, candidates, imports, packageName, own, ownInitializers);
     }
     return i;
   }
 
   private static void addSite(List<Site> sites, int start, int end, String key,
                               Map<String, List<Constant>> candidates, List<String> imports,
-                              String packageName) {
+                              String packageName, String own, Map<String, List<int[]>> ownInitializers) {
     List<Constant> constants = candidates.get(key);
     if (constants == null || constants.size() != 1 || tooCommon(key)) {
       return;
     }
     Constant constant = constants.get(0);
+    if (constant.owner().equals(own)) {
+      for (int[] range : ownInitializers.getOrDefault(constant.name(), List.of())) {
+        if (start >= range[0] && start < range[1]) {
+          return; // a constant cannot be named inside its own initializer
+        }
+      }
+    }
     String name = simpleName(constant.owner());
     String printed = name + "." + constant.name();
     if (key.startsWith("FLOATCAST|")) {
