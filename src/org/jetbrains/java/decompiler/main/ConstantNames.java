@@ -107,6 +107,15 @@ public final class ConstantNames {
           ? Boolean.toString(flag != 0) : String.valueOf(value.value);
         String key = kind + "|" + printed;
         candidate(candidates, key, new Constant(owner, field.getName(), kind));
+        // A double constant used where the source needed a float is written `(float) Owner.NAME`;
+        // the printed literal is the float whose value only the double constant reproduces.
+        if (kind == VariableType.DOUBLE && value.value instanceof Double number) {
+          float narrowed = (float) (double) number;
+          if ((double) narrowed != (double) number) {
+            candidate(candidates, "FLOATCAST|" + Float.toString(narrowed),
+              new Constant(owner, field.getName(), VariableType.DOUBLE));
+          }
+        }
       }
     }
     if (candidates.isEmpty()) {
@@ -376,7 +385,11 @@ public final class ConstantNames {
     } catch (NumberFormatException e) {
       return i;
     }
-    addSite(sites, negative ? negativeAt : start, i, kind + "|" + value, candidates, imports, packageName);
+    int siteStart = negative ? negativeAt : start;
+    addSite(sites, siteStart, i, kind + "|" + value, candidates, imports, packageName);
+    if (kind.equals(VariableType.FLOAT.name())) {
+      addSite(sites, siteStart, i, "FLOATCAST|" + value, candidates, imports, packageName);
+    }
     return i;
   }
 
@@ -390,6 +403,9 @@ public final class ConstantNames {
     Constant constant = constants.get(0);
     String name = simpleName(constant.owner());
     String printed = name + "." + constant.name();
+    if (key.startsWith("FLOATCAST|")) {
+      printed = "(float) " + printed;
+    }
     if (!(imports.contains(name) || packageName.equals(packageOf(constant.owner())))) {
       if (constant.owner().contains("$")) {
         return;
