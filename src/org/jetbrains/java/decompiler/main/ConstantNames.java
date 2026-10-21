@@ -257,6 +257,8 @@ public final class ConstantNames {
     String selfText = self.toString();
 
     Map<Integer, FirstUse> firstUses = firstUses(own);
+    List<Map.Entry<Integer, FirstUse>> orderedUses = new ArrayList<>(firstUses.entrySet());
+    orderedUses.sort((a, b) -> compare(a.getValue(), b.getValue()));
     Set<String> present = new LinkedHashSet<>();
     Set<String> explained = new LinkedHashSet<>();
     Set<String> referenced = new LinkedHashSet<>();
@@ -285,7 +287,7 @@ public final class ConstantNames {
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       Integer index = classIndices.get(owner);
       if (index != null) {
-        int[] window = window(text, own, index, firstUses, positions);
+        int[] window = window(text, own, index, orderedUses, positions, false);
         if (window != null) {
           windows.put(owner, window);
         }
@@ -304,7 +306,7 @@ public final class ConstantNames {
       if (index == null) {
         continue;
       }
-      int[] window = window(text, own, index, firstUses, positions, true);
+      int[] window = window(text, own, index, orderedUses, positions, true);
       if (window == null) {
         continue;
       }
@@ -393,41 +395,48 @@ public final class ConstantNames {
    * The text range a naming site that interns pool entry {@code index} must fall in.
    *
    * <p>The class was entered into the pool at that site, so the site lies after the last use of a
-   * lower-index entry and before the first use of a higher-index one. Uses are compared in code
-   * generation order; only lower-index uses that come before the higher-index bound count, since a
-   * low-index entry may have been interned in an earlier stage but first used later. Both bounds are
-   * widened to the whole printed line, because a line is the finest text unit the printer proves.
+   * lower-index entry and before the first use of a higher-index one, both taken in generation
+   * order. Uses without a printed position (folded constants, initializers) cannot bracket anything
+   * and are skipped rather than failing the window. Both bounds are widened to the whole printed
+   * line, because a line is the finest text unit the printer proves.
    */
   private static int[] window(String text, StructClass cls, int index,
-                              Map<Integer, FirstUse> firstUses,
-                              Map<Pair<String, String>, Map<Integer, Integer>> positions) {
-    return window(text, cls, index, firstUses, positions, false);
-  }
-
-  private static int[] window(String text, StructClass cls, int index,
-                              Map<Integer, FirstUse> firstUses,
+                              List<Map.Entry<Integer, FirstUse>> ordered,
                               Map<Pair<String, String>, Map<Integer, Integer>> positions,
                               boolean requireBoth) {
     FirstUse succ = null;
-    for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
-      if (entry.getKey() > index && (succ == null || compare(entry.getValue(), succ) < 0)) {
-        succ = entry.getValue();
+    Integer succPosition = null;
+    for (Map.Entry<Integer, FirstUse> entry : ordered) {
+      if (entry.getKey() > index) {
+        Integer p = position(cls, entry.getValue(), positions);
+        if (p != null) {
+          succ = entry.getValue();
+          succPosition = p;
+          break;
+        }
       }
     }
     FirstUse pred = null;
-    for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
-      FirstUse use = entry.getValue();
-      if (entry.getKey() < index && (succ == null || compare(use, succ) < 0)
-          && (pred == null || compare(use, pred) > 0)) {
-        pred = use;
+    Integer predPosition = null;
+    for (int i = ordered.size() - 1; i >= 0; i--) {
+      Map.Entry<Integer, FirstUse> entry = ordered.get(i);
+      if (entry.getKey() >= index) {
+        continue;
+      }
+      if (succ != null && compare(entry.getValue(), succ) >= 0) {
+        continue; // generated after the upper bound, so not a lower bound
+      }
+      Integer p = position(cls, entry.getValue(), positions);
+      if (p != null) {
+        pred = entry.getValue();
+        predPosition = p;
+        break;
       }
     }
-    Integer predPosition = position(cls, pred, positions);
-    Integer succPosition = position(cls, succ, positions);
-    if (predPosition == null && succPosition == null) {
+    if (requireBoth && (predPosition == null || succPosition == null)) {
       return null;
     }
-    if (requireBoth && (predPosition == null || succPosition == null)) {
+    if (predPosition == null && succPosition == null) {
       return null;
     }
     int from = predPosition == null ? 0 : lineStart(text, predPosition);
@@ -444,6 +453,20 @@ public final class ConstantNames {
       return null;
     }
     Map<Integer, Integer> method = positions.get(Pair.of(cls.qualifiedName, use.methodKey()));
+    if (method != null && method.containsKey(use.offset())) {
+      return method.get(use.offset());
+    }
+    // A static field initializer is printed at its declaration but generated inside <clinit>, and
+    // the printer records its positions under a field-initializer key rather than <clinit>.
+    if (use.methodKey().startsWith(CodeConstants.CLINIT_NAME)) {
+      for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry : positions.entrySet()) {
+        if (cls.qualifiedName.equals(entry.getKey().a)
+            && entry.getKey().b.startsWith("<field-init ")
+            && entry.getValue().containsKey(use.offset())) {
+          return entry.getValue().get(use.offset());
+        }
+      }
+    }
     return method == null ? null : method.get(use.offset());
   }
 
@@ -1028,9 +1051,10 @@ public final class ConstantNames {
     int[] window = windows == null || constant.owner().equals(own)
       ? null : windows.get(constant.owner());
     boolean inside = window != null && start >= window[0] && start < window[1];
-    // A frequent value is only weak evidence where there is no better one; the pool window says
-    // this owner was named at this point, and the value then only has to pick among its constants.
-    if (!inside && tooCommon(key)) {
+    // A frequent value is only weak evidence where there is no better one. A window means the pool
+    // proves this owner was named somewhere, and the value only has to pick among its constants;
+    // the site itself is still placed by the window or its fallback below.
+    if (window == null && tooCommon(key)) {
       return;
     }
     if (constant.owner().equals(own)) {
