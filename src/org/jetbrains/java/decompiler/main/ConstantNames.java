@@ -275,6 +275,26 @@ public final class ConstantNames {
     }
   }
 
+  /** The '-' of a unary minus directly before this literal, or -1 for a binary minus. */
+  private static int unaryMinusAt(String text, int start) {
+    int i = start - 1;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    if (i < 0 || text.charAt(i) != '-') {
+      return -1;
+    }
+    int before = i - 1;
+    while (before >= 0 && Character.isWhitespace(text.charAt(before))) {
+      before--;
+    }
+    if (before < 0) {
+      return i;
+    }
+    char c = text.charAt(before);
+    return Character.isLetterOrDigit(c) || c == '_' || c == ')' || c == ']' || c == '"' || c == '\'' ? -1 : i;
+  }
+
   private static int scanNumber(String text, int start, List<Site> sites,
                                 Map<String, List<Constant>> candidates, List<String> imports,
                                 String packageName) {
@@ -313,6 +333,8 @@ public final class ConstantNames {
         break;
       }
     }
+    int negativeAt = unaryMinusAt(text, start);
+    boolean negative = negativeAt >= 0;
     String digits = text.substring(start, i).replace("_", "");
     char suffix = hex || i >= text.length() ? '\0' : text.charAt(i);
     String kind;
@@ -321,11 +343,13 @@ public final class ConstantNames {
       if (suffix == 'f' || suffix == 'F') {
         i++;
         kind = VariableType.FLOAT.name();
-        value = Float.toString(Float.parseFloat(digits));
+        float parsedFloat = Float.parseFloat(digits);
+        value = Float.toString(negative ? -parsedFloat : parsedFloat);
       } else if (suffix == 'd' || suffix == 'D') {
         i++;
         kind = VariableType.DOUBLE.name();
-        value = Double.toString(Double.parseDouble(digits));
+        double parsedDouble = Double.parseDouble(digits);
+        value = Double.toString(negative ? -parsedDouble : parsedDouble);
       } else if (suffix == 'l' || suffix == 'L') {
         i++;
         Long parsed = parseLong(digits);
@@ -333,22 +357,23 @@ public final class ConstantNames {
           return i;
         }
         kind = VariableType.LONG.name();
-        value = Long.toString(parsed);
+        value = Long.toString(negative ? -parsed : parsed);
       } else if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
         kind = VariableType.DOUBLE.name();
-        value = Double.toString(Double.parseDouble(digits));
+        double parsedDouble = Double.parseDouble(digits);
+        value = Double.toString(negative ? -parsedDouble : parsedDouble);
       } else {
         Long parsed = parseLong(digits);
         if (parsed == null) {
           return i;
         }
         kind = VariableType.INT.name();
-        value = Long.toString(parsed);
+        value = Long.toString(negative ? -parsed : parsed);
       }
     } catch (NumberFormatException e) {
       return i;
     }
-    addSite(sites, start, i, kind + "|" + value, candidates, imports, packageName);
+    addSite(sites, negative ? negativeAt : start, i, kind + "|" + value, candidates, imports, packageName);
     return i;
   }
 
