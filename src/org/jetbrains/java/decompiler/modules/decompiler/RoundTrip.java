@@ -642,6 +642,32 @@ public final class RoundTrip {
     return (instr.opcode - CodeConstants.opc_istore_0) % 4;
   }
 
+  /**
+   * The start/end pairs of the target's scopes for a local slot with this name, in order. Two
+   * entries mean the source declared the name twice in disjoint blocks.
+   */
+  public static java.util.List<int[]> localScopes(int index, String name) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return java.util.List.of();
+    }
+    org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute table =
+      method.getAttribute(org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return java.util.List.of();
+    }
+    java.util.List<int[]> out = new java.util.ArrayList<>();
+    for (org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable var
+        : table.matchingVars(index).toList()) {
+      if (name == null || !name.equals(var.getName())) {
+        continue;
+      }
+      out.add(new int[]{var.getStart(), var.getEnd()});
+    }
+    out.sort(java.util.Comparator.comparingInt(a -> a[0]));
+    return out;
+  }
+
   private static StructMethod currentMethod() {
     StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
     if (method != null) {

@@ -5,6 +5,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
@@ -13,6 +14,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Arrays;
 import java.util.List;
 
@@ -107,9 +109,12 @@ public class SequenceStatement extends Statement {
 
     boolean notempty = false;
 
+
     for (int i = 0; i < stats.size(); i++) {
 
       Statement st = stats.get(i);
+
+
 
       // `if (C) continue; body` in the source; the decompiler printed its mirror `if (!C) { body }`.
       if (st instanceof IfStatement ifStatement
@@ -191,6 +196,7 @@ public class SequenceStatement extends Statement {
 
       notempty = !str.containsOnlyWhitespaces();
     }
+
 
     if (islabeled) {
       buf.appendIndent(indent-1).append("}").appendLineSeparator();

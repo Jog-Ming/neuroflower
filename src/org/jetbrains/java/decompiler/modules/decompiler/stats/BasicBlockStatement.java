@@ -84,9 +84,114 @@ public final class BasicBlockStatement extends Statement {
       tb.appendIndent(indent).append("label").append(id).append(':').append("// $VF: Invalid label!").appendLineSeparator();
     }
 
-    tb.append(ExprProcessor.listToJava(exprents, indent));
+    if ("off".equals(System.getenv("NEUROFLOWER_BLOCKSCOPES"))) {
+      tb.append(ExprProcessor.listToJava(exprents, indent));
+      return tb;
+    }
+
+    // The target's local variable table says when the source declared the same name again in a
+    // disjoint block: the second store reopens the variable, the statements between the scopes are
+    // wrapped in a block, and the store prints as a declaration.
+    int size = exprents.size();
+    boolean[] openAt = new boolean[size];
+    boolean[] closeBefore = new boolean[size + 1];
+    planBlockScopes(openAt, closeBefore);
+    boolean changed = closeBefore[size];
+    for (int i = 0; i < size && !changed; i++) {
+      changed = openAt[i] || closeBefore[i];
+    }
+    if (!changed) {
+      tb.append(ExprProcessor.listToJava(exprents, indent));
+      return tb;
+    }
+    for (int i = 0; i < size; i++) {
+      if (closeBefore[i]) {
+        tb.appendIndent(indent).append("}").appendLineSeparator();
+      }
+      if (openAt[i]) {
+        tb.appendIndent(indent).append("{").appendLineSeparator();
+      }
+      tb.append(ExprProcessor.listToJava(List.of(exprents.get(i)), indent));
+    }
+    if (closeBefore[size]) {
+      tb.appendIndent(indent).append("}").appendLineSeparator();
+    }
     return tb;
   }
+
+  private void planBlockScopes(boolean[] openAt, boolean[] closeBefore) {
+    Object wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    if (wrapper instanceof org.jetbrains.java.decompiler.main.rels.MethodWrapper current
+        && current.methodStruct.getClassQualifiedName().contains("$")) {
+      return; // anonymous, local and member classes carry generated scopes of their own
+    }
+    List<int[]> windows = new ArrayList<>();
+    for (int i = 0; i < exprents.size(); i++) {
+      Exprent exprent = exprents.get(i);
+      if (!(exprent instanceof AssignmentExprent assignment)
+          || !(assignment.getLeft() instanceof VarExprent left)
+          || left.getIndex() == 0 || left.isDefinition() || exprent.bytecode == null) {
+        continue; // only a plain assignment can reopen a source variable
+      }
+      List<int[]> scopes = org.jetbrains.java.decompiler.modules.decompiler.RoundTrip
+        .localScopes(left.getIndex(), left.getName());
+      if (scopes.size() < 2) {
+        continue;
+      }
+      for (int k = 1; k < scopes.size(); k++) {
+        int scopeStart = scopes.get(k)[0];
+        if (!exprent.bytecode.get(scopeStart) && !exprent.bytecode.get(scopeStart - 1)) {
+          continue;
+        }
+        int[] earlier = scopes.get(k - 1);
+        int open = -1;
+        for (int j = i; j >= 0; j--) {
+          java.util.BitSet bits = exprents.get(j).bytecode;
+          if (bits != null && (bits.get(earlier[0]) || bits.get(earlier[0] - 1))) {
+            open = j;
+            break;
+          }
+        }
+        if (open < 0) {
+          continue;
+        }
+        int close = exprents.size();
+        for (int j = open + 1; j <= i; j++) {
+          java.util.BitSet bits = exprents.get(j).bytecode;
+          if (bits != null && !bits.isEmpty() && bits.nextSetBit(0) >= earlier[1]) {
+            close = j;
+            break;
+          }
+        }
+        if (close > open) {
+          windows.add(new int[]{open, close});
+          left.setDefinition(true);
+        }
+        break;
+      }
+    }
+    windows.sort(java.util.Comparator.comparingInt(a -> a[0]));
+    int mergedStart = -1;
+    int mergedEnd = -1;
+    for (int[] window : windows) {
+      if (mergedStart < 0) {
+        mergedStart = window[0];
+        mergedEnd = window[1];
+      } else if (window[0] < mergedEnd) {
+        mergedEnd = Math.max(mergedEnd, window[1]);
+      } else {
+        openAt[mergedStart] = true;
+        closeBefore[mergedEnd] = true;
+        mergedStart = window[0];
+        mergedEnd = window[1];
+      }
+    }
+    if (mergedStart >= 0) {
+      openAt[mergedStart] = true;
+      closeBefore[mergedEnd] = true;
+    }
+  }
+
 
   @Override
   public Statement getSimpleCopy() {
