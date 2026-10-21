@@ -391,7 +391,17 @@ public class NewExprent extends Exprent {
       if (!lambda && constructor != null) {
         List<VarType> args = constructor.getGenericArgs();
         boolean diamond = args.size() == 1 && args.get(0) == GenericType.DUMMY_VAR;
-        appendParameters(buf, args);
+        if (args.isEmpty() && DecompilerContext.getOption(
+              org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+            && hasTypeParameters(newType)) {
+          // No type arguments were recovered, but javac can infer them from the context; the
+          // original wrote `new Foo<>()`, and the raw type would break the caller's inference.
+          buf.append("<>");
+          args = List.of(GenericType.DUMMY_VAR);
+          diamond = false;
+        } else {
+          appendParameters(buf, args);
+        }
         buf.append('(');
         if (diamond) {
           InvocationExprent.enterPoly();
@@ -478,7 +488,15 @@ public class NewExprent extends Exprent {
       if (constructor != null) {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
-          appendParameters(buf, constructor.getGenericArgs());
+          List<VarType> args = constructor.getGenericArgs();
+          if (args.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+              && inArgument() && hasTypeParameters(newType)) {
+            // No recovered type arguments, but javac infers them from the context; the original
+            // wrote the diamond, and a raw type would break the caller's inference.
+            buf.append("<>");
+          } else {
+            appendParameters(buf, args);
+          }
           buf.append('(').append(constructor.appendParamList(indent)).append(')');
         }
       }
@@ -870,6 +888,28 @@ public class NewExprent extends Exprent {
 
   public void setEnumConst(boolean enumConst) {
     this.enumConst = enumConst;
+  }
+
+  private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
+
+  static void enterArgument() {
+    ARGUMENT.get()[0]++;
+  }
+
+  static void exitArgument() {
+    ARGUMENT.get()[0]--;
+  }
+
+  private static boolean inArgument() {
+    return ARGUMENT.get()[0] > 0;
+  }
+
+  private static boolean hasTypeParameters(VarType type) {
+    if (type == null || !type.equals(VarType.VARTYPE_OBJECT)) {
+      var node = DecompilerContext.getStructContext().getClass(type.value);
+      return node != null && node.getSignature() != null && !node.getSignature().fparameters.isEmpty();
+    }
+    return false;
   }
 
   public boolean isMethodReference() {
