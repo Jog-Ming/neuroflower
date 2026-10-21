@@ -53,6 +53,14 @@ public final class LineAlign {
       return null;
     }
 
+    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SAME_LINE_JOIN)) {
+      String joined = joinSameTargetLines(text, separator, lines, tracers);
+      if (joined != null) {
+        text = joined;
+        lines = text.split(java.util.regex.Pattern.quote(separator), -1);
+      }
+    }
+
     TreeMap<Integer, Integer> shifts = new TreeMap<>();
     Set<Integer> conflicted = new HashSet<>();
     Set<Integer> entryLines = new HashSet<>();
@@ -201,6 +209,94 @@ public final class LineAlign {
       return text;
     }
     return aligned;
+  }
+
+  /**
+   * Joins two printed lines that the original's table puts on the same source line.
+   *
+   * <p>Each line carries the bytecode offsets the printer wrote its statements from, and the
+   * original's table gives each offset its source line. Two adjacent lines whose offsets all map to
+   * one and the same line can only mean the original wrote those statements on one line; the join
+   * is proven by the table rather than guessed from a missing entry. Only offsets of one method are
+   * joined, so two lambdas that happen to share a target line stay apart.
+   */
+  private static String joinSameTargetLines(String text, String separator, String[] lines,
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers) {
+    Map<Integer, Integer> target = new java.util.HashMap<>();
+    Map<Integer, String> owner = new java.util.HashMap<>();
+    Set<Integer> mixed = new HashSet<>();
+    for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> tracerEntry : tracers.entrySet()) {
+      String methodKey = tracerEntry.getKey().b;
+      if (methodKey.startsWith("<field-init ")) {
+        continue;
+      }
+      StructLineNumberTableAttribute table = lineTable(tracerEntry.getKey().a, methodKey);
+      if (table == null) {
+        continue;
+      }
+      for (Map.Entry<Integer, Integer> entry : tracerEntry.getValue().getMapping().entrySet()) {
+        int line = entry.getValue() + 1;
+        int source = table.findLineNumber(entry.getKey());
+        if (source < 0 || line < 1 || line > lines.length) {
+          continue;
+        }
+        Integer previous = target.putIfAbsent(line, source);
+        if (previous != null && previous != source) {
+          mixed.add(line);
+        }
+        String method = owner.putIfAbsent(line, methodKey);
+        if (method != null && !method.equals(methodKey)) {
+          mixed.add(line);
+        }
+      }
+    }
+    java.util.TreeSet<Integer> joins = new java.util.TreeSet<>();
+    for (int line = 2; line <= lines.length; line++) {
+      Integer here = target.get(line);
+      Integer above = target.get(line - 1);
+      if (here == null || above == null || !here.equals(above)
+          || mixed.contains(line) || mixed.contains(line - 1)
+          || !owner.get(line).equals(owner.get(line - 1))) {
+        continue;
+      }
+      if (mergeableWithEvidence(lines, line)) {
+        joins.add(line);
+      }
+    }
+    if (joins.isEmpty()) {
+      return null;
+    }
+    List<String> edited = new ArrayList<>(List.of(lines));
+    for (int line : joins.descendingSet()) {
+      edited.set(line - 2, edited.get(line - 2) + " " + edited.get(line - 1).trim());
+      edited.remove(line - 1);
+    }
+    for (BytecodeMappingTracer tracer : tracers.values()) {
+      for (Map.Entry<Integer, Integer> entry : tracer.getMapping().entrySet()) {
+        int line = entry.getValue() + 1;
+        int removed = joins.headSet(line, true).size();
+        entry.setValue(line - removed - 1);
+      }
+    }
+    if (debug) {
+      System.err.println("same-target joins " + joins.size());
+    }
+    return String.join(separator, edited);
+  }
+
+  /** A line that may be joined onto the one above: no comment, no blank, not in a text block. */
+  private static boolean mergeableWithEvidence(String[] lines, int lineNumber) {
+    int index = lineNumber - 1;
+    if (index <= 0 || index >= lines.length) {
+      return false;
+    }
+    if (insideTextBlock(lines, index) || insideTextBlock(lines, index - 1)) {
+      return false;
+    }
+    if (lines[index - 1].contains("//") || lines[index - 1].contains("/*") || lines[index].contains("*/")) {
+      return false;
+    }
+    return !lines[index].trim().isEmpty();
   }
 
   private static String normalized(String text, String separator) {
