@@ -306,14 +306,15 @@ public final class LineAlign {
         }
       }
       for (StructMethod method : cls.getMethods()) {
-        if (!"<init>".equals(method.getName())) {
+        boolean bridge = (method.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_BRIDGE) != 0;
+        if (!"<init>".equals(method.getName()) && !bridge) {
           continue;
         }
         BytecodeMappingTracer tracer = tracers.get(
           Pair.of(className, org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(
             method.getName(), method.getDescriptor())));
         if (tracer != null && !tracer.getMapping().isEmpty()) {
-          continue; // an explicit constructor carries its own constraints
+          continue; // an explicit member carries its own constraints
         }
         StructLineNumberTableAttribute table =
           method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
@@ -324,10 +325,24 @@ public final class LineAlign {
         if (target < 0) {
           continue;
         }
+        if (bridge && !singleLine(table)) {
+          continue; // a bridge spanning several lines is not anchored to the declaration
+        }
         entryLines.add(declaration);
         add(shifts, conflicted, declaration, target - declaration);
       }
     }
+  }
+
+  private static boolean singleLine(StructLineNumberTableAttribute table) {
+    int[] raw = table.getRawData();
+    int first = raw.length < 2 ? -1 : raw[1];
+    for (int i = 3; i < raw.length; i += 2) {
+      if (raw[i] != first) {
+        return false;
+      }
+    }
+    return first >= 0;
   }
 
   private static int classDeclarationLine(String[] lines, String simple) {
