@@ -259,7 +259,9 @@ public final class ConstantNames {
       String simple = simpleName(owner);
       // A class the pool references through a field or method is already in the pool for that
       // reason; its presence is no evidence that the source named one of its constants.
-      if (!simple.isEmpty() && !selfText.contains(simple) && !referenced.contains(owner)) {
+      // The containment test looks at the whole printed file: a nested class's name appears in
+      // its own region, but it is just as visible from the host's.
+      if (!simple.isEmpty() && !text.contains(simple) && !referenced.contains(owner)) {
         missing.add(owner);
       }
     }
@@ -579,6 +581,20 @@ public final class ConstantNames {
     };
   }
 
+  /** An anonymous class's binary name ends in a number, so no qualified form can be written. */
+  private static boolean anonymous(String owner) {
+    int dollar = owner.lastIndexOf('$');
+    if (dollar < 0 || dollar + 1 >= owner.length()) {
+      return false;
+    }
+    for (int i = dollar + 1; i < owner.length(); i++) {
+      if (!Character.isDigit(owner.charAt(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   private static String simpleName(String internal) {
     String name = internal.substring(internal.lastIndexOf('/') + 1);
     int dollar = name.lastIndexOf('$');
@@ -858,15 +874,26 @@ public final class ConstantNames {
       }
     }
     String name = simpleName(constant.owner());
-    String printed = name + "." + constant.name();
-    if (key.startsWith("FLOATCAST|")) {
-      printed = "(float) " + printed;
-    }
-    if (!(imports.contains(name) || packageName.equals(packageOf(constant.owner())))) {
-      if (constant.owner().contains("$")) {
-        return;
+    String printed;
+    if (windows != null && constant.owner().equals(own) && anonymous(constant.owner())) {
+      // Inside its own class the constant needs no qualifier, and an anonymous class has no
+      // writable simple name at all (its binary suffix is a number).
+      printed = constant.name();
+      if (key.startsWith("FLOATCAST|")) {
+        printed = "(float) " + printed;
       }
-      printed = constant.owner().replace('/', '.') + "." + constant.name();
+    }
+    else {
+      printed = name + "." + constant.name();
+      if (key.startsWith("FLOATCAST|")) {
+        printed = "(float) " + printed;
+      }
+      if (!(imports.contains(name) || packageName.equals(packageOf(constant.owner())))) {
+        if (constant.owner().contains("$")) {
+          return;
+        }
+        printed = constant.owner().replace('/', '.') + "." + constant.name();
+      }
     }
     // A foreign owner's naming site is bounded by where the original interned the owner's Class
     // entry. The class's own constants are exempt: its Class entry is in the pool regardless, so

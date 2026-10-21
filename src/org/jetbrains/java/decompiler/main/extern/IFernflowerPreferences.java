@@ -558,7 +558,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_SWITCH_ORDER, "1");
     defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
     defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
-    defaults.put(ROUND_TRIP_CONSTANT_SITES, "0");
+    defaults.put(ROUND_TRIP_CONSTANT_SITES, "1");
     defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");
