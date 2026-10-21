@@ -159,7 +159,10 @@ public final class ConstantNames {
 
   private static VariableType kind(String descriptor) {
     return switch (descriptor) {
-      case "I", "S", "B" -> VariableType.INT;
+      // A byte or short constant folded into an int literal changes the expression's type when it
+      // is named (Pair.of(5) infers Integer, Pair.of(BYTE_CONST) infers Byte), so those owners are
+      // never candidates for a plain integer literal.
+      case "I" -> VariableType.INT;
       case "C" -> VariableType.CHAR;
       case "Z" -> VariableType.BOOLEAN;
       case "J" -> VariableType.LONG;
