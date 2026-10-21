@@ -204,7 +204,8 @@ public final class ConstantNames {
    * approximates it when an instruction has no printed position.
    */
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
-                           List<SiteSpace> spaces) {
+                           List<SiteSpace> spaces, Set<String> strict,
+                           Map<String, Double> folded) {
     /** Whether this text position lies where the pool order proves the owner was named. */
     boolean proves(String owner, int start) {
       int[] window = windows == null ? null : windows.get(owner);
@@ -223,7 +224,7 @@ public final class ConstantNames {
     }
   }
 
-  private static final Placement NO_PLACEMENT = new Placement(null, null, List.of());
+  private static final Placement NO_PLACEMENT = new Placement(null, null, List.of(), Set.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -375,6 +376,13 @@ public final class ConstantNames {
     Set<String> strict = new HashSet<>();
     Map<String, Integer> classIndices = classIndices(own);
     Set<Integer> early = earlyClassEntries(own, classIndices);
+    Map<String, Double> folded = new HashMap<>();
+    for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
+      Double value = foldedValue(own, entry.getValue());
+      if (value != null) {
+        folded.put(entry.getKey(), value);
+      }
+    }
     String nest = nestOf(own.qualifiedName);
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
@@ -415,7 +423,8 @@ public final class ConstantNames {
     if (candidates.isEmpty()) {
       return null;
     }
-    return new Rules(candidates, new Placement(windows, coordinates, spaces(own, positions, firstUses)),
+    return new Rules(candidates,
+      new Placement(windows, coordinates, spaces(own, positions, firstUses), strict, folded),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -488,6 +497,36 @@ public final class ConstantNames {
       }
     }
     return indices;
+  }
+
+  /**
+   * The value of the float or double constant the pool holds immediately after the Class entry at
+   * {@code index}, or null when the next entry is not one.
+   *
+   * <p>When the source named an inlined constant in a float or double context, javac enters the
+   * owner's Class entry and then the folded constant right after it. That neighbouring constant is
+   * the pool's record of the value the original named there, and a float or double literal whose
+   * value differs did not come from that constant. A sibling entry of another kind in between means
+   * the Class entry was interned by something else, so nothing is proven.
+   */
+  private static Double foldedValue(StructClass cls, int index) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = index + 1; i < pool.size(); i++) {
+      if (!(pool.get(i) instanceof PrimitiveConstant primitive)) {
+        return null;
+      }
+      if (primitive.type == CodeConstants.CONSTANT_Utf8) {
+        continue; // the Class entry's own name follows it
+      }
+      if (primitive.type == CodeConstants.CONSTANT_Float && primitive.value instanceof Float value) {
+        return (double) value;
+      }
+      if (primitive.type == CodeConstants.CONSTANT_Double && primitive.value instanceof Double value) {
+        return value;
+      }
+      return null;
+    }
+    return null;
   }
 
   /**
@@ -1168,6 +1207,10 @@ public final class ConstantNames {
       addSite(sites, siteStart, i, "FLOATCAST|" + value, "", candidates, imports, packageName, own, ownInitializers,
         placement, deferred, inWindow);
     }
+    if (!negative && (kind.equals(VariableType.FLOAT.name()) || kind.equals(VariableType.DOUBLE.name()))) {
+      addIntegralSite(start, i, value, kind.equals(VariableType.FLOAT.name()), sites, candidates, imports,
+        packageName, own, ownInitializers, placement, deferred, inWindow);
+    }
     if (negative && value.startsWith("-")) {
       // The source can write a positive constant behind a unary minus; the literal is then the
       // negation of the constant, not a negative constant of its own.
@@ -1280,6 +1323,106 @@ public final class ConstantNames {
       }
     }
     addSiteOnce(sites, new Site(start, end, printed));
+  }
+
+  /**
+   * Names an integral int or long constant at a float or double literal whose value is exactly
+   * that integer.
+   *
+   * <p>javac widens an integral constant to float or double at the constant expression, so a source
+   * that wrote {@code Owner.NAME} prints as a float or double literal here. The rewrite is only
+   * evidence-backed when the owner's Class entry is otherwise unexplained (it is in the pool only
+   * because the source named the constant), the pool order places this very site where that owner
+   * was named, the value is not a common one, and it selects exactly one of its constants. An int
+   * constant is tried first, as the literal scanned; a long constant is used only when no int
+   * constant has the value.
+   */
+  private static void addIntegralSite(int start, int end, String printed, boolean single,
+                                      List<Site> sites, Map<String, List<Constant>> candidates,
+                                      List<String> imports, String packageName, String own,
+                                      Map<String, List<int[]>> ownInitializers, Placement placement,
+                                      Map<String, List<Site>> deferred, Set<String> inWindow) {
+    if (placement == null || placement.windows() == null) {
+      return;
+    }
+    String key;
+    List<Constant> constants;
+    Integer asInt = integralInt(printed, single);
+    if (asInt != null) {
+      key = VariableType.INT.name() + "|" + asInt;
+      constants = candidates.get(key);
+      if (constants == null) {
+        Long asLong = integralLong(printed, single);
+        if (asLong == null) {
+          return;
+        }
+        key = VariableType.LONG.name() + "|" + asLong;
+        constants = candidates.get(key);
+      }
+    }
+    else {
+      Long asLong = integralLong(printed, single);
+      if (asLong == null) {
+        return;
+      }
+      key = VariableType.LONG.name() + "|" + asLong;
+      constants = candidates.get(key);
+    }
+    if (constants == null || constants.size() != 1) {
+      return;
+    }
+    String owner = constants.get(0).owner();
+    // An owner whose Class entry the class file already explains is no evidence that a constant
+    // was named; a referenced owner's window marks its field or method use, not a constant site.
+    // The site itself must lie in the proven placement: unlike a literal of the constant's own
+    // kind, an int named where a float was printed cannot fall back to a loose window, because a
+    // wrong site here both mistypes the expression and moves the owner's Class entry.
+    // A small value is coincidence evidence even inside a window.
+    if (owner.equals(own) || placement.strict().contains(owner)
+        || !placement.windows().containsKey(owner) || !placement.proves(owner, start)
+        || tooCommon(key)) {
+      return;
+    }
+    // The constant javac interned beside the owner's Class entry is the pool's own record of the
+    // value the source named there; a literal of another value did not come from this constant.
+    Double folded = placement.folded().get(owner);
+    double literal = single ? (double) Float.parseFloat(printed) : Double.parseDouble(printed);
+    if (folded == null || Double.compare(folded, literal) != 0) {
+      return;
+    }
+    addSite(sites, start, end, key, "", candidates, imports, packageName, own, ownInitializers,
+      placement, deferred, inWindow);
+  }
+
+  /**
+   * The int a float or double literal equals exactly, or null when its value is not an exact,
+   * non-negative int. A value the literal cannot reproduce would name a different constant.
+   */
+  private static Integer integralInt(String printed, boolean single) {
+    try {
+      double value = single ? Float.parseFloat(printed) : Double.parseDouble(printed);
+      if (value < 0 || value > Integer.MAX_VALUE || value != Math.rint(value)) {
+        return null;
+      }
+      int integral = (int) value;
+      return (single ? (float) integral == value : (double) integral == value) ? integral : null;
+    } catch (NumberFormatException e) {
+      return null;
+    }
+  }
+
+  /** The long a float or double literal equals exactly, or null when its value is not one. */
+  private static Long integralLong(String printed, boolean single) {
+    try {
+      double value = single ? Float.parseFloat(printed) : Double.parseDouble(printed);
+      if (value < 0 || value >= 9.223372036854775808E18 || value != Math.rint(value)) {
+        return null;
+      }
+      long integral = (long) value;
+      return (double) integral == value ? integral : null;
+    } catch (NumberFormatException e) {
+      return null;
+    }
   }
 
   /**
