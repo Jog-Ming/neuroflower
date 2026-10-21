@@ -9,7 +9,12 @@ import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructConstantValueAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructEnclosingMethodAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructExceptionsAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructInnerClassesAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructNestHostAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructNestMembersAttribute;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
@@ -56,14 +61,14 @@ public final class ConstantNames {
   /** The text with named constants restored, or the same text when nothing is provable. */
   public static String restore(String text, ClassNode root) {
     Set<String> present = new LinkedHashSet<>();
-    Set<String> referenced = new LinkedHashSet<>();
-    collectPool(root, present, referenced);
+    Set<String> explained = new LinkedHashSet<>();
+    collectPool(root, present, explained);
     Set<String> missing = new LinkedHashSet<>();
     for (String owner : present) {
       String simple = simpleName(owner);
-      // A class the pool references through a field or method is already in the pool for that
-      // reason; its presence is no evidence that the source named one of its constants.
-      if (!simple.isEmpty() && !text.contains(simple) && !referenced.contains(owner)) {
+      // A class the file already accounts for is no evidence that the source named one of its
+      // constants.
+      if (!simple.isEmpty() && !text.contains(simple) && !explained.contains(owner)) {
         missing.add(owner);
       }
     }
@@ -251,17 +256,17 @@ public final class ConstantNames {
     }
     String selfText = self.toString();
 
+    Map<Integer, FirstUse> firstUses = firstUses(own);
     Set<String> present = new LinkedHashSet<>();
-    Set<String> referenced = new LinkedHashSet<>();
-    collectPool(own, present, referenced);
+    Set<String> explained = new LinkedHashSet<>();
+    collectPool(own, present, explained, firstUses);
     Set<String> missing = new LinkedHashSet<>();
     for (String owner : present) {
       String simple = simpleName(owner);
-      // A class the pool references through a field or method is already in the pool for that
-      // reason; its presence is no evidence that the source named one of its constants.
-      // The containment test looks at the whole printed file: a nested class's name appears in
-      // its own region, but it is just as visible from the host's.
-      if (!simple.isEmpty() && !text.contains(simple) && !referenced.contains(owner)) {
+      // A class the file already accounts for is no evidence that the source named one of its
+      // constants. The text test reads this class's own spans: its host prints into the same file,
+      // so a name used there says nothing about this class's pool.
+      if (!simple.isEmpty() && !selfText.contains(simple) && !explained.contains(owner)) {
         missing.add(owner);
       }
     }
@@ -270,7 +275,6 @@ public final class ConstantNames {
     ownCandidates(candidates, own);
     Map<String, int[]> windows = new HashMap<>();
     Map<String, Integer> classIndices = classIndices(own);
-    Map<Integer, FirstUse> firstUses = firstUses(own);
     String nest = nestOf(own.qualifiedName);
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
@@ -439,16 +443,74 @@ public final class ConstantNames {
     }
   }
 
-  private static void collectPool(StructClass cls, Set<String> present, Set<String> referenced) {
+  /**
+   * Splits a class's pool into the classes it names and the classes whose entry it explains.
+   *
+   * <p>A {@code Class} entry is evidence that the source named one of that class's constants only
+   * when nothing else in the class file accounts for it. Field and method references, instruction
+   * operands, catch and throws clauses, the class's own hierarchy and the nesting attributes all
+   * put a {@code Class} entry into the pool without any constant being named, and the jar's own
+   * {@code InnerClasses} and {@code NestMembers} entries explain every one of the class's nested
+   * types.
+   */
+  private static void collectPool(StructClass cls, Set<String> present, Set<String> explained,
+                                  Map<Integer, FirstUse> uses) {
     if (cls == null) {
       return;
     }
-    for (PooledConstant constant : cls.getPool().getPool()) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (PooledConstant constant : pool) {
       if (constant instanceof PrimitiveConstant primitive && primitive.type == CodeConstants.CONSTANT_Class
           && primitive.getString() != null) {
         present.add(primitive.getString());
       } else if (constant instanceof LinkConstant link && link.classname != null) {
-        referenced.add(link.classname);
+        explained.add(link.classname);
+      }
+    }
+    for (Integer index : uses.keySet()) {
+      if (index != null && index > 0 && index < pool.size()
+          && pool.get(index) instanceof PrimitiveConstant primitive
+          && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null) {
+        explained.add(primitive.getString());
+      }
+    }
+    if (cls.superClass != null && cls.superClass.getString() != null) {
+      explained.add(cls.superClass.getString());
+    }
+    for (String name : cls.getInterfaceNames()) {
+      explained.add(name);
+    }
+    StructInnerClassesAttribute inner = cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
+    if (inner != null) {
+      for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
+        if (entry.innerName != null) {
+          explained.add(entry.innerName);
+        }
+        if (entry.enclosingName != null) {
+          explained.add(entry.enclosingName);
+        }
+      }
+    }
+    StructNestHostAttribute host = cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_NEST_HOST);
+    if (host != null) {
+      explained.add(host.getHostClass(cls.getPool()));
+    }
+    StructNestMembersAttribute members = cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_NEST_MEMBERS);
+    if (members != null) {
+      explained.addAll(members.getClasses(cls.getPool()));
+    }
+    StructEnclosingMethodAttribute enclosing =
+      cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_ENCLOSING_METHOD);
+    if (enclosing != null) {
+      explained.add(enclosing.getClassName());
+    }
+    for (StructMethod method : cls.getMethods()) {
+      StructExceptionsAttribute exceptions =
+        method.getAttribute(StructGeneralAttribute.ATTRIBUTE_EXCEPTIONS);
+      if (exceptions != null) {
+        for (int i = 0; i < exceptions.getThrowsExceptions().size(); i++) {
+          explained.add(exceptions.getExcClassname(i, cls.getPool()));
+        }
       }
     }
   }
@@ -535,23 +597,16 @@ public final class ConstantNames {
     }
   }
 
-  private static void collectPool(ClassNode node, Set<String> present, Set<String> referenced) {
+  private static void collectPool(ClassNode node, Set<String> present, Set<String> explained) {
     if (node == null) {
       return;
     }
     StructClass cls = node.classStruct;
     if (cls != null) {
-      for (PooledConstant constant : cls.getPool().getPool()) {
-        if (constant instanceof PrimitiveConstant primitive && primitive.type == CodeConstants.CONSTANT_Class
-            && primitive.getString() != null) {
-          present.add(primitive.getString());
-        } else if (constant instanceof LinkConstant link && link.classname != null) {
-          referenced.add(link.classname);
-        }
-      }
+      collectPool(cls, present, explained, firstUses(cls));
     }
     for (ClassNode nested : node.nested) {
-      collectPool(nested, present, referenced);
+      collectPool(nested, present, explained);
     }
   }
 
