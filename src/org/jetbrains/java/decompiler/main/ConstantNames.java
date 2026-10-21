@@ -205,9 +205,27 @@ public final class ConstantNames {
    */
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
-                           Map<String, Double> folded) {
-    /** Whether this text position lies where the pool order proves the owner was named. */
+                           Map<String, Double> folded, Map<String, Long> internedAt) {
+    /**
+     * Whether this text position lies where the pool order proves the owner was named.
+     *
+     * <p>Before a window or a coordinate can prove a site, one contradiction can exclude it. When
+     * the owner's {@code Class} entry sits after a pool entry that references the owner, javac
+     * entered the Class as that reference's operand while generating it, not through a naming: a
+     * naming would have been resolved first and interned the Class before the reference. The
+     * reference's own instruction is then the earliest point at which the Class exists, so a site
+     * printed before it would move the entry earlier than the original had it. Within one call this
+     * is exactly the case of a literal in an argument: the call's name is printed before its
+     * arguments, although they are generated first.
+     */
     boolean proves(String owner, int start) {
+      Long interned = internedAt == null ? null : internedAt.get(owner);
+      if (interned != null) {
+        long nearest = printedCoordinate(spaces, start);
+        if (nearest != NO_COORDINATE && nearest < interned) {
+          return false;
+        }
+      }
       int[] window = windows == null ? null : windows.get(owner);
       if (window != null && start >= window[0] && start < window[1]) {
         return true;
@@ -224,7 +242,8 @@ public final class ConstantNames {
     }
   }
 
-  private static final Placement NO_PLACEMENT = new Placement(null, null, List.of(), Set.of(), Map.of());
+  private static final Placement NO_PLACEMENT =
+    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -256,6 +275,41 @@ public final class ConstantNames {
       int offset = -1;
       for (Map.Entry<Integer, Integer> entry : space.positions.entrySet()) {
         if (entry.getValue() <= position && entry.getKey() > offset) {
+          offset = entry.getKey();
+        }
+      }
+      if (offset >= 0) {
+        return coordinate(space.rank, offset);
+      }
+    }
+    return NO_COORDINATE;
+  }
+
+  /**
+   * The generation point of the item printed nearest before this text position, or
+   * {@link #NO_COORDINATE}.
+   *
+   * <p>Text order, not bytecode order, picks that item: a call's name and invoke are printed before
+   * its arguments although the arguments are generated first, so an argument's offset can be lower
+   * than the offset printed at the call. At one printed position the lowest offset is the
+   * instruction that starts there; higher offsets are bytes inside it. This is the position the
+   * source occupies at the site, so it can contradict the pool order even where the looser
+   * {@link #siteCoordinate} admits a window.
+   */
+  private static long printedCoordinate(List<SiteSpace> spaces, int position) {
+    for (SiteSpace space : spaces) {
+      if (position < space.min || position > space.max) {
+        continue;
+      }
+      int bestPosition = Integer.MIN_VALUE;
+      int offset = -1;
+      for (Map.Entry<Integer, Integer> entry : space.positions.entrySet()) {
+        int printed = entry.getValue();
+        if (printed > position) {
+          continue;
+        }
+        if (printed > bestPosition || (printed == bestPosition && (offset < 0 || entry.getKey() < offset))) {
+          bestPosition = printed;
           offset = entry.getKey();
         }
       }
@@ -423,8 +477,22 @@ public final class ConstantNames {
     if (candidates.isEmpty()) {
       return null;
     }
+    // A Class entry that follows its own first field or method reference was entered as that
+    // reference's operand; the reference's instruction is where the Class first exists.
+    Map<String, Long> internedAt = new HashMap<>();
+    List<PooledConstant> pool = own.getPool().getPool();
+    for (int i = 1; i < pool.size(); i++) {
+      if (!(pool.get(i) instanceof LinkConstant link) || link.classname == null) {
+        continue;
+      }
+      Integer classIndex = classIndices.get(link.classname);
+      FirstUse use = firstUses.get(i);
+      if (classIndex != null && i < classIndex && use != null && !internedAt.containsKey(link.classname)) {
+        internedAt.put(link.classname, coordinate(use.order(), use.offset()));
+      }
+    }
     return new Rules(candidates,
-      new Placement(windows, coordinates, spaces(own, positions, firstUses), strict, folded),
+      new Placement(windows, coordinates, spaces(own, positions, firstUses), strict, folded, internedAt),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
