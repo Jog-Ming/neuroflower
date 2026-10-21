@@ -432,7 +432,54 @@ public final class RoundTrip {
     }
     int bodyStart = firstOffset(body);
     int tailStart = firstOffset(tail);
-    return bodyStart >= 0 && tailStart >= 0 && tailStart < bodyStart;
+    if (bodyStart < 0 || tailStart < 0) {
+      return false;
+    }
+    // The original's line table says which shape it wrote: a guard puts the exit's line before the
+    // body's, while `if (C) { body } exit;` puts it after, whatever order the blocks compile in.
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table != null) {
+      int bodyLine = table.findLineNumber(bodyStart);
+      int tailLine = table.findLineNumber(tailStart);
+      if (System.getenv("NEUROFLOWER_RETGUARD_DEBUG") != null) {
+        System.err.println("retguard " + method.getName() + " bodyStart " + bodyStart + " line " + bodyLine
+          + " tailStart " + tailStart + " line " + tailLine);
+      }
+      if (bodyLine >= 0 && tailLine >= 0) {
+        return tailLine < bodyLine;
+      }
+    }
+    return tailStart < bodyStart;
+  }
+
+  /**
+   * True when the target's table puts the exit's line after the following statement's, so the
+   * source wrote {@code body; exit;} rather than the guard the bytecode's block order suggests.
+   */
+  public static boolean exitAfterBody(Statement exitStatement, Statement body) {
+    if (!selector("exitlast")) {
+      return false;
+    }
+    int exitStart = firstOffset(exitStatement);
+    int bodyStart = firstOffset(body);
+    if (exitStart < 0 || bodyStart < 0) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int exitLine = table.findLineNumber(exitStart);
+    int bodyLine = table.findLineNumber(bodyStart);
+    if (System.getenv("NEUROFLOWER_RETGUARD_DEBUG") != null) {
+      System.err.println("exitlast " + method.getName() + " exit " + exitStart + "@" + exitLine
+        + " body " + bodyStart + "@" + bodyLine);
+    }
+    return exitLine >= 0 && bodyLine >= 0 && exitLine > bodyLine;
   }
 
   /**

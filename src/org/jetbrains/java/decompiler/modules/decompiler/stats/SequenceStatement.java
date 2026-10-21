@@ -12,6 +12,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -155,6 +156,31 @@ public class SequenceStatement extends Statement {
         }
       }
 
+      // The mirror: the bytecode put `return X` before the rest, but the target's table puts its
+      // line last, so the source wrote `if (!C) { rest } return X;`.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled()
+          && ifStatement.getIfstat() != null && stats.get(i + 1).getExprents() != null
+          && !stats.get(i + 1).getExprents().isEmpty()) {
+        Exprent exit = singleExit(ifStatement.getIfstat());
+        if (exit instanceof ExitExprent headExit && headExit.getExitType() == ExitExprent.Type.RETURN
+            && !writesAny(stats.subList(i + 1, stats.size()), readLocals(headExit.getValue()))
+            && RoundTrip.exitAfterBody(ifStatement.getIfstat(), stats.get(i + 1))) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          head.negateIf();
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(
+            new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          notempty = true;
+          break;
+        }
+      }
+
       TextBuffer str = ExprProcessor.jmpWrapper(st, indent, false);
 
       if (i > 0 && !str.containsOnlyWhitespaces() && notempty) {
@@ -182,6 +208,55 @@ public class SequenceStatement extends Statement {
       return exit;
     }
     return null;
+  }
+
+  private static java.util.Set<Integer> readLocals(Exprent value) {
+    java.util.Set<Integer> indexes = new java.util.HashSet<>();
+    if (value != null) {
+      for (Exprent exprent : value.getAllExprents(true, true)) {
+        if (exprent instanceof VarExprent var && var.getIndex() != 0) {
+          indexes.add(var.getIndex());
+        }
+      }
+    }
+    return indexes;
+  }
+
+  /** True when any of the statements assigns one of the given local slots. */
+  private static boolean writesAny(List<Statement> statements, java.util.Set<Integer> indexes) {
+    if (indexes.isEmpty()) {
+      return false;
+    }
+    for (Statement statement : statements) {
+      for (Exprent exprent : allExprents(statement)) {
+        if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assignment
+            && assignment.getLeft() instanceof VarExprent left && indexes.contains(left.getIndex())) {
+          return true;
+        }
+        if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent function
+            && (function.getFuncType() == FunctionExprent.FunctionType.IPP
+                || function.getFuncType() == FunctionExprent.FunctionType.PPI
+                || function.getFuncType() == FunctionExprent.FunctionType.IMM
+                || function.getFuncType() == FunctionExprent.FunctionType.MMI)
+            && function.getLstOperands().get(0) instanceof VarExprent target
+            && indexes.contains(target.getIndex())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static List<Exprent> allExprents(Statement statement) {
+    List<Exprent> out = new ArrayList<>();
+    if (statement.getExprents() != null) {
+      out.addAll(statement.getExprents());
+    }
+    out.addAll(statement.getStatExprents());
+    for (Statement child : statement.getStats()) {
+      out.addAll(allExprents(child));
+    }
+    return out;
   }
 
   private static boolean safeReturnValue(Exprent value) {
