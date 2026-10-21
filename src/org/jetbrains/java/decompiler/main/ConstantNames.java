@@ -986,10 +986,18 @@ public final class ConstantNames {
                               Map<String, int[]> windows, Map<String, List<Site>> deferred,
                               Set<String> inWindow) {
     List<Constant> constants = candidates.get(key);
-    if (constants == null || constants.size() != 1 || tooCommon(key)) {
+    if (constants == null || constants.size() != 1) {
       return;
     }
     Constant constant = constants.get(0);
+    int[] window = windows == null || constant.owner().equals(own)
+      ? null : windows.get(constant.owner());
+    boolean inside = window != null && start >= window[0] && start < window[1];
+    // A frequent value is only weak evidence where there is no better one; the pool window says
+    // this owner was named at this point, and the value then only has to pick among its constants.
+    if (!inside && tooCommon(key)) {
+      return;
+    }
     if (constant.owner().equals(own)) {
       for (int[] range : ownInitializers.getOrDefault(constant.name(), List.of())) {
         if (start >= range[0] && start < range[1]) {
@@ -1035,18 +1043,15 @@ public final class ConstantNames {
     // A foreign owner's naming site is bounded by where the original interned the owner's Class
     // entry. The class's own constants are exempt: its Class entry is in the pool regardless, so
     // the pool order says nothing about when the source named one of them.
-    if (windows != null && !constant.owner().equals(own)) {
-      int[] window = windows.get(constant.owner());
-      if (window != null) {
-        if (start < window[0] || start >= window[1]) {
-          if (deferred != null) {
-            deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>()).add(new Site(start, end, printed));
-          }
-          return;
+    if (window != null) {
+      if (!inside) {
+        if (deferred != null) {
+          deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>()).add(new Site(start, end, printed));
         }
-        if (inWindow != null) {
-          inWindow.add(constant.owner());
-        }
+        return;
+      }
+      if (inWindow != null) {
+        inWindow.add(constant.owner());
       }
     }
     sites.add(new Site(start, end, printed));
