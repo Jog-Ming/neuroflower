@@ -107,10 +107,13 @@ public final class Decompiler {
       deleteTree(staging);
       throw new IOException("decompiler exited with " + status);
     }
+    // A --no-cache run replaces an earlier tree of the same key; the old directory must go
+    // before the staging one can take its name.
+    deleteTree(src);
     try {
       Files.move(staging, src, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-      Files.move(staging, src, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    } catch (java.nio.file.AtomicMoveNotSupportedException | java.nio.file.FileAlreadyExistsException e) {
+      Files.move(staging, src);
     }
 
     meta = new JsonObject();
