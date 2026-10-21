@@ -998,6 +998,15 @@ public class InvocationExprent extends Exprent {
   }
 
   public TextBuffer appendParamList(int indent) {
+    NewExprent.enterArgument();
+    try {
+      return appendParamList0(indent);
+    } finally {
+      NewExprent.exitArgument();
+    }
+  }
+
+  private TextBuffer appendParamList0(int indent) {
     List<VarVersionPair> mask = null;
     boolean isEnum = false;
     if (functype == Type.INIT) {
@@ -2059,7 +2068,7 @@ public class InvocationExprent extends Exprent {
     POLY.get()[0]--;
   }
 
-  private static boolean inPoly() {
+  public static boolean inPoly() {
     return POLY.get()[0] > 0;
   }
 

@@ -225,6 +225,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
 
+  @Name("Round Trip: Diamond")
+  @Description("Print the diamond when a generic constructor has no recovered arguments in a poly context.")
+  @ShortName("rtdi")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_DIAMOND = "rt-diamond";
+
   @Name("Round Trip: Switch Order")
   @Description("Print case bodies in the original source's line order, not the switch's key order.")
   @ShortName("rtswo")
@@ -519,6 +525,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP, "1");
     defaults.put(ROUND_TRIP_NO_GENERIC_CAST, "0");
     defaults.put(ROUND_TRIP_NO_VARIABLE_RENAME, "0");
+    defaults.put(ROUND_TRIP_DIAMOND, "1");
     defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
     defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");
     defaults.put(ROUND_TRIP_GENVAR_ARGS, "1");
