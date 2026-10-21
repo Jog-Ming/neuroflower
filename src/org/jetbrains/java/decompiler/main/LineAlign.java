@@ -103,6 +103,8 @@ public final class LineAlign {
     List<int[]> inserts = new ArrayList<>();
     List<Integer> removals = new ArrayList<>();
     List<Integer> joins = new ArrayList<>();
+
+
     int previous = 0;
     int previousIndex = -1;
     for (Map.Entry<Integer, Integer> entry : shifts.entrySet()) {
@@ -128,7 +130,8 @@ public final class LineAlign {
         }
         for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
           // A join moves line i onto line i-1, so neither may be a line another edit deletes.
-          if (joinable(lines, i, entryLines) && !removals.contains(i) && !removals.contains(i - 1)) {
+          if (joinable(lines, i, entryLines) && !removals.contains(i) && !removals.contains(i - 1)
+              && !joins.contains(i)) {
             joins.add(i);
             need--;
           }
@@ -147,8 +150,12 @@ public final class LineAlign {
         + " conflicts " + conflicted.size()
         + " inserts " + inserts.stream().map(a -> a[0] + "+" + a[1]).toList()
         + " removals " + removals.size() + " joins " + joins.size());
-      if (System.getenv("NEUROFLOWER_LINEALIGN_DUMP") != null) {
-        for (int i = 205; i <= Math.min(240, lines.length); i++) {
+      String dump = System.getenv("NEUROFLOWER_LINEALIGN_DUMP");
+      if (dump != null) {
+        String[] range = dump.split(",");
+        int from = range.length > 0 ? Integer.parseInt(range[0].trim()) : 205;
+        int to = range.length > 1 ? Integer.parseInt(range[1].trim()) : from + 35;
+        for (int i = Math.max(1, from); i <= Math.min(to, lines.length); i++) {
           System.err.println("L" + i + " shift=" + shifts.get(i) + " | " + lines[i - 1]);
         }
       }
