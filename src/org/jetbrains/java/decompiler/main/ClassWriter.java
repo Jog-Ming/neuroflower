@@ -537,10 +537,12 @@ public class ClassWriter implements StatementWriter {
         String ctorMode = System.getenv("NEUROFLOWER_CTORLINE");
         boolean ctorLine = !"off".equals(ctorMode);
         int firstField = Integer.MAX_VALUE;
+        java.util.Set<Integer> fieldLineValues = new java.util.HashSet<>();
         if (ctorLine) {
           for (int[] member : plan) {
             if (member[0] == 0 && member[2] >= 0) {
               firstField = Math.min(firstField, member[2]);
+              fieldLineValues.add(member[2]);
             }
           }
         }
@@ -550,7 +552,10 @@ public class ClassWriter implements StatementWriter {
               StructMethod mt = methods.get(member[1]);
               if (CodeConstants.INIT_NAME.equals(mt.getName()) || CodeConstants.CLINIT_NAME.equals(mt.getName())) {
                 boolean scoped = "all".equals(ctorMode) || CodeConstants.INIT_NAME.equals(mt.getName());
-                boolean realLine = ctorLine && scoped && member[2] >= 0 && member[2] < firstField;
+                // A lifted initializer's line is one of the field lines; a genuine declaration
+                // line that merely precedes a later field must not be dragged after it.
+                boolean realLine = ctorLine && scoped && member[2] >= 0
+                  && (member[2] < firstField || !fieldLineValues.contains(member[2]));
                 if (!blockSequences.contains(member[3]) && !realLine) {
                   member[2] = Math.max(member[2], lastField);
                 }
@@ -2171,6 +2176,15 @@ public class ClassWriter implements StatementWriter {
     return lineAt(method, 0);
   }
 
+  private static int maxLine(StructLineNumberTableAttribute table) {
+    int[] raw = table.getRawData();
+    int max = -1;
+    for (int i = 1; i < raw.length; i += 2) {
+      max = Math.max(max, raw[i]);
+    }
+    return max;
+  }
+
   private static int lineAt(StructMethod method, int offset) {
     StructLineNumberTableAttribute table =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
@@ -2221,7 +2235,18 @@ public class ClassWriter implements StatementWriter {
     }
     if (isStatic) {
       StructMethod clinit = cl.getMethod(CodeConstants.CLINIT_NAME, "()V");
-      return clinit == null ? -1 : lineAt(clinit, initializer.bytecode.nextSetBit(0));
+      if (clinit == null) {
+        return -1;
+      }
+      int line = lineAt(clinit, initializer.bytecode.nextSetBit(0));
+      // The initializer's offset set can carry offsets of an anonymous class's methods, which
+      // land outside <clinit>'s own line range; such a line would drag every constructor with it.
+      StructLineNumberTableAttribute table =
+        clinit.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+      if (line >= 0 && table != null && line > maxLine(table)) {
+        return -1;
+      }
+      return line;
     }
     int found = -1;
     for (StructMethod method : cl.getMethods()) {
