@@ -114,10 +114,6 @@ public final class RoundTrip {
       return false;
     }
     Integer opcode = branches.get(offsets.length());
-    if (System.getenv("NEUROFLOWER_POLARITY_DEBUG") != null) {
-      System.err.println("polarity " + method.getName() + " len " + offsets.length() + " opcode " + opcode
-        + " expected " + lastBranch(ifHead.getCondition()));
-    }
     if (opcode == null) {
       return false;
     }

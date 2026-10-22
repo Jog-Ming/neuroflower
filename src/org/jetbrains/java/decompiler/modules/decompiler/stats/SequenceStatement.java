@@ -168,7 +168,12 @@ public class SequenceStatement extends Statement {
       // line last, so the source wrote `if (!C) { rest } return X;`.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
-          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled()
+          // A pattern variable may only move into the matched arm, which needs the condition to
+          // start as a negation so the printed guard is the positive pattern.
+          && (!ifStatement.isPatternMatched()
+              || ifStatement.getHeadexprent().getCondition() instanceof FunctionExprent patternNot
+                 && patternNot.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT)
+          && !ifStatement.isLabeled()
           && ifStatement.getIfstat() != null
           && !(stats.get(i + 1).getExprents() != null && stats.get(i + 1).getExprents().isEmpty())) {
         Exprent exit = singleExit(ifStatement.getIfstat());
