@@ -2,6 +2,8 @@
 package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassWriter;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
@@ -22,6 +24,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
@@ -33,6 +36,7 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 import org.jetbrains.java.decompiler.util.collections.ListStack;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
+import java.io.IOException;
 import java.util.*;
 
 public class NewExprent extends Exprent {
@@ -513,10 +517,14 @@ public class NewExprent extends Exprent {
     else if (newType.arrayDim == 0) {
       if (!enumConst) {
         TextBuffer enclosing = null;
+        boolean implicitEnclosing = constructor != null
+          && implicitEnclosingInstance(newType.value, constructor.getLstParameters());
 
         if (constructor != null) {
+          // Evaluate the qualified form as before even when the source wrote the implicit one:
+          // its printing seeds types the surrounding expressions rely on.
           enclosing = getQualifiedNewInstance(newType.value, constructor.getLstParameters(), indent);
-          if (enclosing != null) {
+          if (enclosing != null && !implicitEnclosing) {
             buf.append(enclosing).append('.');
           }
         }
@@ -526,11 +534,11 @@ public class NewExprent extends Exprent {
         String typename = ExprProcessor.getTypeName(newType);
         if (enclosing == null) {
           String qualified = qualifiedInnerNewType(newType);
-          if (qualified != null) {
+          if (qualified != null && !implicitEnclosing) {
             typename = qualified;
           }
         }
-        else {
+        else if (!implicitEnclosing) {
           ClassNode newNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
           if (newNode != null) {
             typename = newNode.simpleName;
@@ -661,6 +669,77 @@ public class NewExprent extends Exprent {
     }
 
     return null;
+  }
+
+  /**
+   * True when the creation's enclosing instance is a lexically enclosing {@code this} and the
+   * target did not null-check it. javac emits {@code dup; Objects.requireNonNull; pop} after the
+   * enclosing expression of a qualified creation inside a nested class, and nothing for the
+   * implicit form, so the absence of that check is the source's unqualified {@code new Inner()}.
+   */
+  private boolean implicitEnclosingInstance(String classname, List<Exprent> lstParams) {
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(classname);
+    if (node == null || node.type == ClassNode.Type.ROOT || node.type == ClassNode.Type.LOCAL
+        || (node.access & CodeConstants.ACC_STATIC) != 0 || lstParams.isEmpty()
+        || !(lstParams.get(0) instanceof VarExprent enclosing)) {
+      return false;
+    }
+    ClassNode current = (ClassNode) DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    if (current == null) {
+      return false;
+    }
+    String owner = enclosing.getProcessor().getThisVars().get(new VarVersionPair(enclosing));
+    if (owner == null || current.classStruct.qualifiedName.equals(owner)) {
+      // Not a captured outer instance; the printer already leaves the current class's own this
+      // unqualified.
+      return false;
+    }
+    return !enclosingInstanceChecked(this);
+  }
+
+  /** True when the target emitted the null check javac gives a qualified member-class creation. */
+  private static boolean enclosingInstanceChecked(Exprent creation) {
+    StructMethod method = RoundTrip.currentMethod();
+    if (method == null || creation.bytecode == null || creation.bytecode.isEmpty()) {
+      return true;
+    }
+    StructClass cl = DecompilerContext.getStructContext().getClass(method.getClassQualifiedName());
+    if (cl == null) {
+      return true;
+    }
+    boolean hadData = method.getInstructionSequence() != null;
+    try {
+      method.expandData(cl);
+      FullInstructionSequence seq = method.getInstructionSequence();
+      if (seq == null) {
+        return true;
+      }
+      Integer index = seq.offsetToIndex().get(creation.bytecode.nextSetBit(0));
+      if (index == null) {
+        return true;
+      }
+      for (int i = index; i < Math.min(seq.length(), index + 32); i++) {
+        Instruction ins = seq.getInstr(i);
+        if (ins.opcode == CodeConstants.opc_invokespecial) {
+          return false;
+        }
+        if (ins.opcode == CodeConstants.opc_invokestatic) {
+          LinkConstant target = cl.getPool().getLinkConstant(ins.operand(0));
+          if (target != null && "java/util/Objects".equals(target.classname)
+              && "requireNonNull".equals(target.elementname)) {
+            return true;
+          }
+        }
+      }
+      return true;
+    } catch (IOException e) {
+      return true;
+    } finally {
+      // The method's data was released before printing; leave it that way.
+      if (!hadData) {
+        method.releaseResources();
+      }
+    }
   }
 
   private static VarType getLambdaReturnType(ClassNode node, StructMethod desc, VarType upperBound, Map<VarType, VarType> genericsMap) {
