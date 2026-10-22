@@ -649,6 +649,12 @@ public class InvocationExprent extends Exprent {
 
             if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)) {
               getGenericArgs(fparams, genericsMap, genericArgs);
+              if (genericArgs.isEmpty() && !isNew
+                && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+                // The printer's inference has no value for some type variable; an argument's
+                // recorded metafactory type may still prove what the source passed.
+                tryDemandWitness(fparams, bounds);
+              }
             }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
               && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
@@ -2173,17 +2179,8 @@ public class InvocationExprent extends Exprent {
     if (fparams.isEmpty() || !isInvocationInstance) {
       return false;
     }
-    List<VarType> witness = new ArrayList<>(fparams.size());
-    getGenericArgs(fparams, genericsMap, witness);
-    if (witness.size() != fparams.size()) {
-      return false;
-    }
-    for (VarType arg : witness) {
-      if (!isConcreteType(arg)) {
-        return false;
-      }
-    }
-    if (!recordedArgumentConstraint(fparams)) {
+    List<VarType> witness = demandWitness(fparams);
+    if (witness == null) {
       return false;
     }
     if (!erasureMatchesDescriptor(fparams, witness, bounds)) {
@@ -2195,6 +2192,128 @@ public class InvocationExprent extends Exprent {
     genericArgs.clear();
     genericArgs.addAll(witness);
     return true;
+  }
+
+  /**
+   * The type arguments the class file proves for this call: the printer's own inference when a
+   * recorded argument agrees with it, else the recorded metafactory type itself when it settles
+   * a type variable the printer's inference placed elsewhere. Null when nothing is proven.
+   */
+  private List<VarType> demandWitness(List<String> fparams) {
+    if (recordedArgumentConstraint(fparams)) {
+      List<VarType> witness = new ArrayList<>(fparams.size());
+      getGenericArgs(fparams, genericsMap, witness);
+      if (witness.size() == fparams.size() && allConcreteTypes(witness)) {
+        return witness;
+      }
+    }
+    Map<VarType, VarType> settled = recordedSettledTypes(fparams);
+    if (settled.isEmpty()) {
+      return null;
+    }
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType value = settled.get(GenericType.parse("T" + fp + ";"));
+      if (!isConcreteType(value)) {
+        return null;
+      }
+      witness.add(value);
+    }
+    return witness;
+  }
+
+  private static boolean allConcreteTypes(List<VarType> types) {
+    for (VarType type : types) {
+      if (!isConcreteType(type)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Type variables a functional argument's recorded metafactory instantiated type settles to a
+   * concrete value. The instantiated method type is the ground target type javac used, so its
+   * return type is the value of the variable feeding the return position, provided that variable
+   * is the only one in a covariant position of the declared parameter type. The recorded return
+   * must widen the implementation's return: only then does it prove the source constrained the
+   * variable, because plain inference from the argument would have produced the narrower
+   * implementation type.
+   */
+  private Map<VarType, VarType> recordedSettledTypes(List<String> fparams) {
+    Map<VarType, VarType> settled = new HashMap<>();
+    if (desc == null || desc.getSignature() == null || fparams.isEmpty()) {
+      return settled;
+    }
+    Set<VarType> methodVars = fparamTypes(fparams);
+    List<VarType> parameterTypes = desc.getSignature().parameterTypes;
+    int count = Math.min(parameterTypes.size(), lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      Exprent argument = lstParameters.get(i);
+      if (!(argument instanceof NewExprent lambda) || !lambda.isLambda()) {
+        continue;
+      }
+      Set<VarType> covariant = new HashSet<>();
+      Set<VarType> other = new HashSet<>();
+      collectVariance(parameterTypes.get(i), true, covariant, other);
+      covariant.removeAll(other);
+      covariant.retainAll(methodVars);
+      if (covariant.size() != 1) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+      if (node == null) {
+        continue;
+      }
+      VarType instantiatedRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
+      VarType implRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor).ret;
+      if (instantiatedRet == null || implRet == null || instantiatedRet.equals(implRet)) {
+        continue;
+      }
+      if (instantiatedRet.type != CodeType.OBJECT || implRet.type != CodeType.OBJECT
+          || instantiatedRet.arrayDim != 0 || implRet.arrayDim != 0
+          || !DecompilerContext.getStructContext().instanceOf(implRet.value, instantiatedRet.value)
+          || !isConcreteType(instantiatedRet)) {
+        continue;
+      }
+      VarType variable = covariant.iterator().next();
+      VarType prior = settled.putIfAbsent(variable, instantiatedRet);
+      if (prior != null && !sameType(prior, instantiatedRet)) {
+        return new HashMap<>();
+      }
+    }
+    return settled;
+  }
+
+  /**
+   * Collect the type variables of a declared type by position: those under a covariant
+   * ({@code ? extends}) wildcard, and everyone else. A variable not under such a wildcard could
+   * feed either the function's parameter or its return, so it cannot be told apart.
+   */
+  private static void collectVariance(VarType type, boolean covariant,
+                                      Set<VarType> covariantVars, Set<VarType> otherVars) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR) {
+      (covariant ? covariantVars : otherVars).add(type);
+      return;
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (argument == null) {
+          continue;
+        }
+        int wildcard = argument instanceof GenericType ? ((GenericType) argument).getWildcard() : GenericType.WILDCARD_NO;
+        if (wildcard == GenericType.WILDCARD_EXTENDS) {
+          collectVariance(argument, covariant, covariantVars, otherVars);
+        } else if (wildcard == GenericType.WILDCARD_UNBOUND) {
+          continue;
+        } else {
+          collectVariance(argument, false, covariantVars, otherVars);
+        }
+      }
+    }
   }
 
   /**
