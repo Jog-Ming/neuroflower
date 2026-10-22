@@ -220,12 +220,16 @@ public class CatchStatement extends Statement {
           && getParent() != null
           && (getParent().type == StatementType.SEQUENCE || getParent().type == StatementType.ROOT)) {
         int scopeEnd = catchScopeEnd(stat);
-        if (scopeEnd > 0) {
+        // javac omits the parameter's entry exactly when the catch block was empty, so every
+        // handler statement was written after the closing brace in the original source.
+        int emptyStart = scopeEnd > 0 ? -1 : emptyCatchBodyStart(stat, var.getIndex());
+        if (scopeEnd > 0 || emptyStart >= 0) {
+          int boundary = scopeEnd > 0 ? scopeEnd : emptyStart;
           List<Exprent> exprents = stat.getExprents();
           int split = exprents.size();
           while (split > 0) {
             Exprent last = exprents.get(split - 1);
-            if (last.bytecode == null || last.bytecode.isEmpty() || last.bytecode.nextSetBit(0) < scopeEnd) {
+            if (last.bytecode == null || last.bytecode.isEmpty() || last.bytecode.nextSetBit(0) < boundary) {
               break;
             }
             split--;
@@ -270,6 +274,52 @@ public class CatchStatement extends Statement {
     }
     return lvt.matchingVars(block.getInstruction(0).operand(0), body)
       .findFirst().map(StructLocalVariableTableAttribute.LocalVariable::getEnd).orElse(-1);
+  }
+
+  /**
+   * The handler's first offset when the table has no entry for the catch parameter. javac writes
+   * that entry for every non-empty catch body, so its absence marks an originally empty body.
+   */
+  private static int emptyCatchBodyStart(Statement handler, int varIndex) {
+    BasicBlock block = handler.getBasichead() == null ? null : handler.getBasichead().getBlock();
+    if (block == null || block.getSeq().length() < 2 || block.getInstruction(0).opcode != CodeConstants.opc_astore) {
+      return -1;
+    }
+    StructMethod mt = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    StructLocalVariableTableAttribute lvt = mt == null ? null : mt.getLocalVariableAttr();
+    if (lvt == null) {
+      return -1;
+    }
+    int body = block.getOldOffset(1);
+    if (body < 0) {
+      return -1;
+    }
+    int slot = block.getInstruction(0).operand(0);
+    if (lvt.matchingVars(slot, body).findFirst().isPresent()) {
+      return -1;
+    }
+    // A try-with-resources close handler stores its throwable the same way but uses it, and javac
+    // writes no entry for it either. Only a body that never touches the variable was empty.
+    if (handler.getExprents() != null) {
+      for (Exprent exprent : handler.getExprents()) {
+        if (usesVar(exprent, varIndex)) {
+          return -1;
+        }
+      }
+    }
+    return body;
+  }
+
+  private static boolean usesVar(Exprent exprent, int index) {
+    if (exprent instanceof VarExprent var && var.getIndex() == index) {
+      return true;
+    }
+    for (Exprent child : exprent.getAllExprents()) {
+      if (usesVar(child, index)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private void validateType(List<String> exTypes, VarType exVarType) {
