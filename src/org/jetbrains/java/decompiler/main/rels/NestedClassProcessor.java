@@ -18,6 +18,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatemen
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.Statements;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarTypeProcessor.FinalType;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
@@ -156,6 +157,10 @@ public class NestedClassProcessor {
     // method whose table says nothing about names inherited from further out: those are the
     // enclosing classes' names, and a name the content method does not use cannot clash there.
     boolean contentMethod = parent.type == ClassNode.Type.LAMBDA || parent.type == ClassNode.Type.ANONYMOUS;
+    // A field initializer is written in the class body; the constructor's or static block's table
+    // is not the lexical scope of the lambdas it holds, and the printer emits them at the field.
+    boolean initializer = isClassScopeInitializer(parent, enclosingMethod, lambda_class_type, sites);
+    boolean noEnclosingScope = contentMethod || initializer;
 
     // this pointer
     if (!is_static_lambda_content && DecompilerContext.getOption(IFernflowerPreferences.LAMBDA_TO_ANONYMOUS_CLASS)) {
@@ -190,7 +195,7 @@ public class NestedClassProcessor {
       // The table states the original scope: the enclosing variable only reaches into the lambda
       // where its range covers the instruction that creates it. Everywhere else the source reused
       // the name legally, so the local keeps the name the table gives it.
-      if (usedBefore.contains(name) && !"this".equals(name)
+      if (usedBefore.contains(name) && !"this".equals(name) && !noEnclosingScope
           && inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites, contentMethod)) {
         name = enclosingCollector.getFreeName(name);
         mapNewNames.put(local, name);
@@ -236,7 +241,7 @@ public class NestedClassProcessor {
               }
               else if (!mapNewNames.containsKey(varVersion)) {
                 String paramName = varProc.getVarName(varVersion);
-                if (inScopeAtLambda(parent.classStruct, enclosingMethod, paramName, sites, contentMethod)) {
+                if (!noEnclosingScope && inScopeAtLambda(parent.classStruct, enclosingMethod, paramName, sites, contentMethod)) {
                   paramName = enclosingCollector.getFreeName(paramName);
                 } else {
                   // Out of scope: the name is the object's own. Another parameter of this lambda
@@ -328,6 +333,93 @@ public class NestedClassProcessor {
     }
     // The table uses the name only outside the sites, so the source had left that scope.
     return !named && !contentMethod;
+  }
+
+  /**
+   * Whether every creation site of this lambda lies inside a field initializer that the printer
+   * lifts to the field declaration. The extractor's shape is mirrored without touching the tree:
+   * a constructor's initializers follow the super/this call while their field indices increase,
+   * a static block's are assignments to own static fields, and the value reads no local except
+   * the enclosing instance (so it can be printed at class scope).
+   */
+  private static boolean isClassScopeInitializer(ClassNode parent, MethodWrapper enclosingMethod,
+                                                 VarType lambdaType, List<Integer> sites) {
+    if (sites.isEmpty() || enclosingMethod.root == null) {
+      return false;
+    }
+    String name = enclosingMethod.methodStruct.getName();
+    boolean isInit = CodeConstants.INIT_NAME.equals(name);
+    boolean isClinit = CodeConstants.CLINIT_NAME.equals(name);
+    if (!isInit && !isClinit) {
+      return false;
+    }
+    Statement first = Statements.findFirstData(enclosingMethod.root);
+    if (first == null || first.getExprents() == null || first.getExprents().isEmpty()) {
+      return false;
+    }
+    List<Exprent> exprents = first.getExprents();
+    Set<Integer> offsets = new HashSet<>();
+    if (isInit) {
+      if (!(exprents.get(0) instanceof InvocationExprent inv)
+          || !Statements.isInvocationInitConstructor(inv, enclosingMethod, parent.getWrapper(), false)) {
+        return false;
+      }
+      int prevField = 0;
+      for (int i = 1; i < exprents.size(); i++) {
+        if (!(exprents.get(i) instanceof AssignmentExprent assign) || !(assign.getLeft() instanceof FieldExprent field)) {
+          break;
+        }
+        if (field.isStatic() || !field.getClassname().equals(parent.classStruct.qualifiedName)
+            || !parent.classStruct.hasField(field.getName(), field.getDescriptor().descriptorString)) {
+          break;
+        }
+        int index = parent.classStruct.getFields()
+          .getIndexByKey(InterpreterUtil.makeUniqueKey(field.getName(), field.getDescriptor().descriptorString));
+        if (index < prevField || !independentInitializer(assign.getRight(), enclosingMethod)) {
+          break;
+        }
+        prevField = index;
+        collectLambdaSites(assign.getRight(), lambdaType, offsets);
+      }
+    } else {
+      for (Exprent exprent : exprents) {
+        if (!(exprent instanceof AssignmentExprent assign) || !(assign.getLeft() instanceof FieldExprent field)) {
+          continue;
+        }
+        if (!field.isStatic() || !field.getClassname().equals(parent.classStruct.qualifiedName)
+            || !parent.classStruct.hasField(field.getName(), field.getDescriptor().descriptorString)
+            || !independentInitializer(assign.getRight(), enclosingMethod)) {
+          continue;
+        }
+        collectLambdaSites(assign.getRight(), lambdaType, offsets);
+      }
+    }
+    return !offsets.isEmpty() && offsets.containsAll(sites);
+  }
+
+  private static boolean independentInitializer(Exprent value, MethodWrapper method) {
+    for (Exprent exprent : value.getAllExprents(true, true)) {
+      if (exprent.type == Exprent.Type.VAR) {
+        VarVersionPair pair = new VarVersionPair((VarExprent)exprent);
+        if (!method.varproc.getExternalVars().contains(pair)) {
+          String varName = method.varproc.getVarName(pair);
+          if (varName == null || !varName.equals("this") && !varName.endsWith(".this")) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  private static void collectLambdaSites(Exprent value, VarType lambdaType, Set<Integer> offsets) {
+    for (Exprent exprent : value.getAllExprents(true, true)) {
+      if (exprent instanceof NewExprent newExpr && newExpr.isLambda()
+          && lambdaType.equals(newExpr.getNewType())
+          && exprent.bytecode != null && !exprent.bytecode.isEmpty()) {
+        offsets.add(exprent.bytecode.nextSetBit(0));
+      }
+    }
   }
 
   private static void checkNotFoundClasses(ClassNode root, ClassNode node) {
