@@ -2,6 +2,7 @@
 package org.jetbrains.java.decompiler.main;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.code.ExceptionHandler;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
 import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
@@ -213,7 +214,8 @@ public final class ConstantNames {
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
-                           List<int[]> spans, Set<String> prefix, Set<String> inherited) {
+                           List<int[]> spans, Set<String> prefix, Set<String> inherited,
+                           Map<String, PairSite> pairs) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -336,7 +338,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of());
+      List.of(), null, Set.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -527,7 +529,8 @@ public final class ConstantNames {
     }
     String selfText = self.toString();
 
-    Map<Integer, FirstUse> firstUses = firstUses(own);
+    Set<String> catchTypes = new HashSet<>();
+    Map<Integer, FirstUse> firstUses = firstUses(own, catchTypes);
     List<Map.Entry<Integer, FirstUse>> orderedUses = new ArrayList<>(firstUses.entrySet());
     orderedUses.sort((a, b) -> compare(a.getValue(), b.getValue()));
     Set<String> present = new LinkedHashSet<>();
@@ -562,6 +565,7 @@ public final class ConstantNames {
     String nest = nestOf(own.qualifiedName);
     Map<String, Long> namingAt = new HashMap<>();
     Set<String> lexical = new HashSet<>();
+    Set<String> claimed = new HashSet<>(); // owners another rule already places sites for
     // An enclosing class whose Class entry opens the pool was named with the simple name while
     // the class's names were resolved, before any generated code. The nesting attributes explain
     // that Class entry, so the missing and referenced tests never see the owner; visit every
@@ -570,6 +574,7 @@ public final class ConstantNames {
       Integer index = classIndices.get(ancestor);
       if (index != null && opensPool(own, index, early, firstUses)) {
         lexical.add(ancestor);
+        claimed.add(ancestor);
         addOwnerCandidates(candidates, ancestor, nest, packageName, imports);
       }
     }
@@ -580,6 +585,7 @@ public final class ConstantNames {
       }
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       inheritedNames.addAll(addInheritedCandidates(candidates, owner, packageName, imports));
+      claimed.add(owner);
       Integer index = classIndices.get(owner);
       if (index != null) {
         if (opensPool(own, index, early, firstUses) && own.qualifiedName.startsWith(owner + "$")) {
@@ -626,6 +632,7 @@ public final class ConstantNames {
         // and the pool order places nothing around it, so no window is needed; the ordering
         // guard in the site pass keeps it ahead of every other name in the class.
         lexical.add(owner);
+        claimed.add(owner);
         addOwnerCandidates(candidates, owner, nest, packageName, imports);
         continue;
       }
@@ -633,9 +640,24 @@ public final class ConstantNames {
         continue;
       }
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      claimed.add(owner);
       windows.put(owner, window);
       coordinates.put(owner, coordinates(firstUses, index, early, -1));
       strict.add(owner);
+    }
+    // A free-standing Class+name pair immediately before a reference the code generation entered
+    // is a folded-constant naming: the attribute writers run after all code, and a reference's own
+    // Class operand would put its name and descriptor between the pair and the reference. Owners
+    // no other rule already places are offered the pool's record of where they were named.
+    Map<String, PairSite> pairs = pairSites(own, text, firstUses, catchTypes, early, positions);
+    Map<String, PairSite> activePairs = new HashMap<>();
+    for (Map.Entry<String, PairSite> entry : pairs.entrySet()) {
+      String owner = entry.getKey();
+      if (claimed.contains(owner) || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)) {
+        continue;
+      }
+      addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      activePairs.put(owner, entry.getValue());
     }
     if (candidates.isEmpty()) {
       return null;
@@ -656,7 +678,7 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames),
+        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -901,6 +923,10 @@ public final class ConstantNames {
    * {@code <clinit>} last. The instruction's offset orders the uses inside one method.
    */
   private static Map<Integer, FirstUse> firstUses(StructClass cls) {
+    return firstUses(cls, null);
+  }
+
+  private static Map<Integer, FirstUse> firstUses(StructClass cls, Set<String> catchTypes) {
     Map<Integer, FirstUse> first = new HashMap<>();
     VBStyleCollection<StructMethod, String> methods = cls.getMethods();
     int count = methods.size();
@@ -919,6 +945,13 @@ public final class ConstantNames {
       FullInstructionSequence code = method.getInstructionSequence();
       if (code == null) {
         continue;
+      }
+      if (catchTypes != null && code.exceptionTable() != null) {
+        for (ExceptionHandler handler : code.exceptionTable().getHandlers()) {
+          if (handler.exceptionClass() != null) {
+            catchTypes.add(handler.exceptionClass()); // a catch type is a Class entry with no use
+          }
+        }
       }
       String methodKey = InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor());
       for (Instruction instruction : code) {
@@ -1111,6 +1144,192 @@ public final class ConstantNames {
     return remaining.isEmpty();
   }
 
+  /** A folded-constant naming the pool records as a free-standing Class+name pair. */
+  private record PairSite(int classIndex, long successor, int open, int close,
+                          Set<String> pooled) {
+    /** Whether naming a constant of this value enters no pool entry the original did not have. */
+    boolean valueAvailable(String key) {
+      if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
+        return true; // a boolean folds to an immediate
+      }
+      try {
+        if (key.startsWith(VariableType.INT.name() + "|")) {
+          long value = Long.parseLong(key.substring(VariableType.INT.name().length() + 1));
+          return (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) || pooled.contains(key);
+        }
+        if (key.startsWith(VariableType.CHAR.name() + "|")) {
+          long value = Long.parseLong(key.substring(VariableType.CHAR.name().length() + 1));
+          return (value >= 0 && value <= Short.MAX_VALUE) || pooled.contains(key);
+        }
+      }
+      catch (NumberFormatException e) {
+        return false;
+      }
+      return pooled.contains(key);
+    }
+  }
+
+  /**
+   * The owners the pool records as named by a folded constant in an argument list.
+   *
+   * <p>javac enters a named folded constant's owner as a bare {@code Class} entry with its name,
+   * then whatever entry it creates next. An owner no instruction uses and no attribute explains
+   * can only have been named by a constant; a name written in a method body is entered while the
+   * code around it is generated, and javac's attribute writers run after all code. So when the
+   * entry right after the pair is a reference the generation enters at one instruction, the pair
+   * was entered by a naming immediately before that instruction, inside its argument list.
+   */
+  private static Map<String, PairSite> pairSites(StructClass cls, String text,
+                                                 Map<Integer, FirstUse> firstUses,
+                                                 Set<String> catchTypes,
+                                                 Set<Integer> early,
+                                                 Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    Map<String, PairSite> pairs = new HashMap<>();
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i + 2 < pool.size(); i++) {
+      if (!(pool.get(i) instanceof PrimitiveConstant entry)
+          || entry.type != CodeConstants.CONSTANT_Class
+          || entry.getString() == null || entry.index != i + 1) {
+        continue;
+      }
+      String owner = entry.getString();
+      if (owner.equals(cls.qualifiedName) || early.contains(i) || catchTypes.contains(owner)
+          || firstUses.containsKey(i)) {
+        continue; // the class is entered as itself, a catch type or an instruction operand
+      }
+      if (!(pool.get(i + 2) instanceof LinkConstant link)
+          || (link.type != CodeConstants.CONSTANT_Methodref
+              && link.type != CodeConstants.CONSTANT_InterfaceMethodref)
+          || owner.equals(link.classname)) {
+        continue; // no reference follows the pair, or the pair is that reference's operand
+      }
+      FirstUse use = firstUses.get(i + 2);
+      if (use == null) {
+        continue;
+      }
+      long point = coordinate(use.order(), use.offset());
+      if (coordinates(firstUses, i, early, -1)[1] != point) {
+        continue; // a higher entry was created before this reference; the pair is not its naming
+      }
+      Integer printed = position(cls, use, positions);
+      if (printed == null) {
+        continue;
+      }
+      int open = nextOpenParen(text, printed);
+      if (open < 0) {
+        continue;
+      }
+      int close = matchingParen(text, open);
+      if (close < 0) {
+        continue;
+      }
+      pairs.putIfAbsent(owner, new PairSite(i, point, open, close, pooledKeys(cls, i)));
+    }
+    return pairs;
+  }
+
+  /** The first '(' printed after this position that belongs to a call on the same statement. */
+  private static int nextOpenParen(String text, int from) {
+    int limit = Math.min(text.length(), Math.max(0, from) + 200);
+    for (int i = Math.max(0, from); i < limit; i++) {
+      char c = text.charAt(i);
+      if (c == '(') {
+        return i;
+      }
+      if (c == ';' || c == '{' || c == '}' || c == '=' || c == '\n') {
+        return -1;
+      }
+      if (c == '"' || c == '\'') {
+        i = skipQuoted(text, i, c) - 1;
+      }
+      else if (c == '/' && i + 1 < text.length()) {
+        char next = text.charAt(i + 1);
+        if (next == '/') {
+          return -1;
+        }
+        if (next == '*') {
+          int end = text.indexOf("*/", i + 2);
+          if (end < 0) {
+            return -1;
+          }
+          i = end + 1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** The ')' closing the '(' at {@code open}, skipping text inside literals and comments. */
+  private static int matchingParen(String text, int open) {
+    int depth = 0;
+    for (int i = open; i < text.length(); i++) {
+      char c = text.charAt(i);
+      if (c == '"' || c == '\'') {
+        i = skipQuoted(text, i, c) - 1;
+        continue;
+      }
+      if (c == '/' && i + 1 < text.length()) {
+        char next = text.charAt(i + 1);
+        if (next == '/') {
+          int end = text.indexOf('\n', i);
+          if (end < 0) {
+            return -1;
+          }
+          i = end;
+          continue;
+        }
+        if (next == '*') {
+          int end = text.indexOf("*/", i + 2);
+          if (end < 0) {
+            return -1;
+          }
+          i = end + 1;
+          continue;
+        }
+      }
+      if (c == '(') {
+        depth++;
+      }
+      else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The literal keys whose values the pool already holds below {@code classIndex}.
+   *
+   * <p>A naming enters the folded value right after the Class and name unless an equal value is
+   * already in the pool. Reproducing the naming at a site whose value is not there would insert
+   * it in front of the pair, so such a site cannot be the original's.
+   */
+  private static Set<String> pooledKeys(StructClass cls, int classIndex) {
+    Set<String> keys = new HashSet<>();
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i < classIndex && i < pool.size(); i++) {
+      if (!(pool.get(i) instanceof PrimitiveConstant primitive) || primitive.value == null) {
+        continue;
+      }
+      switch (primitive.type) {
+        case CodeConstants.CONSTANT_Integer -> {
+          keys.add(VariableType.INT.name() + "|" + primitive.value);
+          keys.add(VariableType.CHAR.name() + "|" + primitive.value);
+        }
+        case CodeConstants.CONSTANT_Long -> keys.add(VariableType.LONG.name() + "|" + primitive.value);
+        case CodeConstants.CONSTANT_Float -> keys.add(VariableType.FLOAT.name() + "|" + primitive.value);
+        case CodeConstants.CONSTANT_Double -> keys.add(VariableType.DOUBLE.name() + "|" + primitive.value);
+        case CodeConstants.CONSTANT_String -> keys.add(VariableType.STRING.name() + "|" + primitive.value);
+        default -> {
+        }
+      }
+    }
+    return keys;
+  }
+
   private static int lineStart(String text, int position) {
     int newline = position <= 0 ? -1 : text.lastIndexOf('\n', position - 1);
     return newline < 0 ? 0 : newline + 1;
@@ -1136,6 +1355,9 @@ public final class ConstantNames {
         sites, rules.own(), rules.ownInitializers(), rules.placement(), deferred, inWindow);
     }
     for (Map.Entry<String, List<Site>> entry : deferred.entrySet()) {
+      if (rules.placement().pairs() != null && rules.placement().pairs().containsKey(entry.getKey())) {
+        continue; // a pair owner is placed by the reference its Class pair precedes
+      }
       if (!inWindow.contains(entry.getKey())) {
         // A referenced owner's window is the only evidence of where the original named it; without
         // a site inside the window there is nothing to place the name against.
@@ -1160,6 +1382,51 @@ public final class ConstantNames {
         }
       }
     }
+    if (rules.placement().pairs() == null) {
+      return;
+    }
+    for (Map.Entry<String, PairSite> entry : rules.placement().pairs().entrySet()) {
+      PairSite pair = entry.getValue();
+      if (hasSiteFor(sites, entry.getKey())) {
+        continue; // one naming per class reproduces the pair; later names enter nothing
+      }
+      List<Site> candidates = deferred.get(entry.getKey());
+      if (candidates == null) {
+        continue;
+      }
+      Site best = null;
+      long bestCoordinate = NO_COORDINATE;
+      for (Site site : candidates) {
+        if (site.start() <= pair.open() || site.start() >= pair.close()) {
+          continue; // outside the call's argument list
+        }
+        long coordinate = siteCoordinate(rules.placement().spaces(), site.start());
+        if (coordinate == NO_COORDINATE) {
+          continue;
+        }
+        if ((coordinate >>> 32) != (pair.successor() >>> 32)
+            || (coordinate & 0xffffffffL) >= (pair.successor() & 0xffffffffL)) {
+          continue; // another method, or after the reference was generated
+        }
+        if (best == null || coordinate > bestCoordinate) {
+          best = site;
+          bestCoordinate = coordinate;
+        }
+      }
+      if (best != null) {
+        addSiteOnce(sites, best);
+      }
+    }
+  }
+
+  /** Whether some site already names this owner in the class text. */
+  private static boolean hasSiteFor(List<Site> sites, String owner) {
+    for (Site site : sites) {
+      if (owner.equals(site.owner())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // -------------------------------------------------------- constant expressions
@@ -2885,6 +3152,19 @@ public final class ConstantNames {
         printed = "(float) " + printed;
       }
     }
+    // A pair owner's site is the argument generation of the reference the pair precedes. The
+    // literal must not carry a pool value of its own unless one already sits below the pair, and
+    // the latest matching literal before the reference is the one whose naming keeps the pool
+    // order (nothing is entered between it and the reference).
+    PairSite pair = placement == null || placement.pairs() == null
+      ? null : placement.pairs().get(constant.owner());
+    if (pair != null) {
+      if (pair.valueAvailable(key) && deferred != null) {
+        deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>())
+          .add(new Site(start, end, printed, constant.owner()));
+      }
+      return;
+    }
     // A foreign owner's naming site is bounded by where the original interned the owner's Class
     // entry. The class's own constants are exempt: its Class entry is in the pool regardless, so
     // the pool order says nothing about when the source named one of them.
@@ -3073,6 +3353,17 @@ public final class ConstantNames {
                                          String own) {
     if (placement == null) {
       return null;
+    }
+    // A pair owner's Class entry was entered inside this very argument list, so where its pair
+    // covers the site the value belongs to it: another owner sharing the value only touches the
+    // line through an unrelated first use.
+    if (placement.pairs() != null && !placement.pairs().isEmpty()) {
+      for (Constant constant : constants) {
+        PairSite pair = placement.pairs().get(constant.owner());
+        if (pair != null && position > pair.open() && position < pair.close()) {
+          return constant;
+        }
+      }
     }
     // The pool proves which owner was named, not which of its constants: two constants of one
     // owner with the same value fold to the same pool entry, so either name compiles to the same
