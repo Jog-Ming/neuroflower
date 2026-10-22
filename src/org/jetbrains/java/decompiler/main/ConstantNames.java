@@ -170,6 +170,7 @@ public final class ConstantNames {
       scanClass(text, rootSpans, rootRules, sites);
     }
     expressionSites(text, rootSpans, root, sites);
+    initializerSites(text, rootSpans, root, sites);
     for (Map.Entry<String, List<int[]>> entry : spansByClass.entrySet()) {
       ClassNode node = byName.get(entry.getKey());
       if (node == null) {
@@ -180,6 +181,7 @@ public final class ConstantNames {
         scanClass(text, entry.getValue(), classRules, sites);
       }
       expressionSites(text, entry.getValue(), node, sites);
+      initializerSites(text, entry.getValue(), node, sites);
     }
     if (sites.isEmpty()) {
       return text;
@@ -1181,6 +1183,277 @@ public final class ConstantNames {
       }
       addSiteOnce(sites, placed);
       last = placed.start();
+    }
+  }
+
+  /**
+   * Names a constant of the class itself in an instance field initializer the pool records.
+   *
+   * <p>javac enters the class's own {@code Class} entry and its name when it resolves a constant
+   * named in an initializer, before it enters the field reference of the assignment. When the
+   * class opens no pool prefix, no instruction uses its {@code Class} entry, and that entry and
+   * its name sit immediately before the class's first field reference, the only construct that can
+   * have interned them there is such a naming, and the first field reference is the assignment the
+   * initializer belongs to. Its printed literal is the folded value, so a constant of the class
+   * with exactly that value reproduces the pool.
+   *
+   * <p>Byte and short constants count here: an initializer is an assignment context, where a
+   * narrow constant widens silently, unlike a method argument where naming it would change the
+   * expression's type. Small values are not dismissed as coincidence either: the pool proves the
+   * naming, and the value only chooses among the class's own constants.
+   */
+  private static void initializerSites(String text, List<int[]> spans, ClassNode node, List<Site> sites) {
+    StructClass own = node == null ? null : node.classStruct;
+    if (own == null || (own.getAccessFlags() & CodeConstants.ACC_INTERFACE) != 0) {
+      return;
+    }
+    if (prefixOwners(own).contains(own.qualifiedName)) {
+      return; // a constant field initializer already accounts for the class entry
+    }
+    Integer classIndex = classIndices(own).get(own.qualifiedName);
+    if (classIndex == null) {
+      return;
+    }
+    List<PooledConstant> pool = own.getPool().getPool();
+    int first = -1;
+    for (int i = 1; i < pool.size(); i++) {
+      if (pool.get(i) instanceof LinkConstant link && own.qualifiedName.equals(link.classname)) {
+        first = i;
+        break;
+      }
+    }
+    if (first < 0 || classIndex != first - 2) {
+      return;
+    }
+    if (!(pool.get(first) instanceof LinkConstant reference)
+        || reference.type != CodeConstants.CONSTANT_Fieldref || reference.elementname == null) {
+      return;
+    }
+    Map<Integer, FirstUse> uses = firstUses(own);
+    FirstUse classUse = uses.get(classIndex);
+    FirstUse fieldUse = uses.get(first);
+    if (classUse != null && (fieldUse == null || compare(classUse, fieldUse) < 0)) {
+      // A generated construct uses the Class entry before the field reference exists.
+      return;
+    }
+    StructField target = null;
+    for (StructField field : own.getFields()) {
+      if (field.getName().equals(reference.elementname)) {
+        target = field;
+        break;
+      }
+    }
+    if (target == null || (target.getAccessFlags() & CodeConstants.ACC_STATIC) != 0) {
+      return;
+    }
+    String targetKind = target.getDescriptor();
+    if (!targetKind.equals("I") && !targetKind.equals("J") && !targetKind.equals("F")
+        && !targetKind.equals("D") && !targetKind.equals("C") && !targetKind.equals("Z")
+        && !targetKind.equals("Ljava/lang/String;")) {
+      return;
+    }
+    Map<String, List<String>> sources = ownInitializerSources(own, targetKind);
+    if (sources.isEmpty()) {
+      return;
+    }
+    int[] range = initializerRange(text, spans, target.getName());
+    if (range == null || occupied(sites, range)) {
+      return;
+    }
+    int equals = text.indexOf('=', range[0]);
+    if (equals < 0 || equals >= range[1]) {
+      return;
+    }
+    String key = literalKey(text.substring(equals + 1, range[1]).trim());
+    List<String> names = key == null ? null : sources.get(key);
+    if (names == null || names.isEmpty()) {
+      return;
+    }
+    sites.add(new Site(equals + 1, range[1], " " + names.get(0), own.qualifiedName));
+  }
+
+  /**
+   * The constants of the class that may be named in an initializer of a field of this type,
+   * keyed like the literal scanner's values.
+   */
+  private static Map<String, List<String>> ownInitializerSources(StructClass own, String target) {
+    Map<String, List<String>> sources = new HashMap<>();
+    for (StructField field : own.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant value = constantValue(own, field);
+      if (value == null || value.value == null) {
+        continue;
+      }
+      String descriptor = field.getDescriptor();
+      if (!assignmentWidens(target, descriptor)) {
+        continue;
+      }
+      for (String key : valueKeys(descriptor, value.value)) {
+        sources.computeIfAbsent(key, k -> new ArrayList<>()).add(field.getName());
+      }
+    }
+    return sources;
+  }
+
+  /** Whether a constant of the source type may be assigned to a field of the target type. */
+  private static boolean assignmentWidens(String target, String source) {
+    return switch (target) {
+      case "I" -> source.equals("I") || source.equals("C") || source.equals("B") || source.equals("S");
+      case "J" -> source.equals("J") || source.equals("I") || source.equals("C")
+        || source.equals("B") || source.equals("S");
+      case "F" -> source.equals("F") || source.equals("J") || source.equals("I") || source.equals("C")
+        || source.equals("B") || source.equals("S");
+      case "D" -> source.equals("D") || source.equals("F") || source.equals("J") || source.equals("I")
+        || source.equals("C") || source.equals("B") || source.equals("S");
+      case "C" -> source.equals("C");
+      default -> target.equals(source);
+    };
+  }
+
+  /** The literal keys a constant of this descriptor and value answers to. */
+  private static List<String> valueKeys(String descriptor, Object value) {
+    if (!(value instanceof Number number)) {
+      return descriptor.equals("Ljava/lang/String;") && value instanceof String text
+        ? List.of(VariableType.STRING.name() + "|" + text) : List.of();
+    }
+    return switch (descriptor) {
+      case "B", "S", "I" -> {
+        int v = number.intValue();
+        yield List.of(VariableType.INT.name() + "|" + v, VariableType.LONG.name() + "|" + v);
+      }
+      case "C" -> {
+        int v = number.intValue();
+        yield List.of(VariableType.CHAR.name() + "|" + v, VariableType.INT.name() + "|" + v);
+      }
+      case "J" -> List.of(VariableType.LONG.name() + "|" + number.longValue());
+      case "F" -> List.of(VariableType.FLOAT.name() + "|" + Float.toString(number.floatValue()));
+      case "D" -> List.of(VariableType.DOUBLE.name() + "|" + Double.toString(number.doubleValue()));
+      case "Z" -> List.of(VariableType.BOOLEAN.name() + "|" + (number.intValue() != 0));
+      default -> List.of();
+    };
+  }
+
+  /**
+   * The text range of a field's declaration initializer, or null when the field is not printed
+   * with one. Only a declaration counts: the name must follow a type on its line, and a field
+   * assignment in a method body is written with a receiver.
+   */
+  private static int[] initializerRange(String text, List<int[]> spans, String name) {
+    java.util.regex.Matcher matcher = java.util.regex.Pattern
+      .compile("\\b" + java.util.regex.Pattern.quote(name) + "\\s*=").matcher(text);
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      while (matcher.find()) {
+        int start = matcher.start();
+        int before = start - 1;
+        while (before >= span[0] && (text.charAt(before) == ' ' || text.charAt(before) == '\t')) {
+          before--;
+        }
+        if (before < span[0]) {
+          continue;
+        }
+        char c = text.charAt(before);
+        if (!Character.isJavaIdentifierPart(c) && c != '>' && c != ']') {
+          continue;
+        }
+        int i = matcher.end();
+        int depth = 0;
+        while (i < span[1]) {
+          char ch = text.charAt(i);
+          if (ch == '(' || ch == '[' || ch == '{') {
+            depth++;
+          }
+          else if (ch == ')' || ch == ']' || ch == '}') {
+            if (depth == 0) {
+              break;
+            }
+            depth--;
+          }
+          else if (ch == ';' && depth == 0) {
+            break;
+          }
+          i++;
+        }
+        return new int[]{start, i};
+      }
+    }
+    return null;
+  }
+
+  /** The literal key of an initializer that is one literal, or null for anything else. */
+  private static String literalKey(String literal) {
+    if (literal.isEmpty()) {
+      return null;
+    }
+    if (literal.charAt(0) == '"') {
+      int end = skipQuoted(literal, 0, '"');
+      String value = end == literal.length() ? unescape(literal.substring(1, end - 1)) : null;
+      return value == null ? null : VariableType.STRING.name() + "|" + value;
+    }
+    if (literal.charAt(0) == '\'') {
+      int end = skipQuoted(literal, 0, '\'');
+      Integer value = end == literal.length() ? charValue(literal.substring(1, end - 1)) : null;
+      return value == null ? null : VariableType.CHAR.name() + "|" + value;
+    }
+    if (literal.equals("true") || literal.equals("false")) {
+      return VariableType.BOOLEAN.name() + "|" + literal;
+    }
+    boolean negative = literal.charAt(0) == '-';
+    String body = negative ? literal.substring(1) : literal;
+    if (body.isEmpty()) {
+      return null;
+    }
+    char suffix = body.charAt(body.length() - 1);
+    char last = Character.toLowerCase(suffix);
+    if (last == 'f' || last == 'd' || last == 'l') {
+      body = body.substring(0, body.length() - 1);
+    }
+    else {
+      suffix = '\0';
+    }
+    boolean hex = body.startsWith("0x") || body.startsWith("0X") || body.startsWith("0b") || body.startsWith("0B");
+    if (!hex) {
+      for (int i = 0; i < body.length(); i++) {
+        char c = body.charAt(i);
+        if (!Character.isDigit(c) && c != '.' && c != 'e' && c != 'E' && c != '+' && c != '-' && c != '_') {
+          return null;
+        }
+      }
+    }
+    else {
+      for (int i = 2; i < body.length(); i++) {
+        char c = body.charAt(i);
+        if (Character.digit(c, 16) < 0 && c != '_') {
+          return null;
+        }
+      }
+    }
+    String digits = body.replace("_", "");
+    try {
+      if (last == 'f') {
+        float v = Float.parseFloat(digits);
+        return VariableType.FLOAT.name() + "|" + Float.toString(negative ? -v : v);
+      }
+      if (last == 'd') {
+        double v = Double.parseDouble(digits);
+        return VariableType.DOUBLE.name() + "|" + Double.toString(negative ? -v : v);
+      }
+      if (last == 'l') {
+        Long v = parseLong(digits);
+        return v == null ? null : VariableType.LONG.name() + "|" + (negative ? -v : v);
+      }
+      if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
+        double v = Double.parseDouble(digits);
+        return VariableType.DOUBLE.name() + "|" + Double.toString(negative ? -v : v);
+      }
+      Long v = parseLong(digits);
+      return v == null ? null : VariableType.INT.name() + "|" + (negative ? -v : v);
+    }
+    catch (NumberFormatException e) {
+      return null;
     }
   }
 
