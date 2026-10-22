@@ -239,6 +239,23 @@ public final class ConstantNames {
       return withinInterned(owner, start) && byCoordinate(owner, start);
     }
 
+    /**
+     * Whether the generation order places this site outside the owner's pool-order bounds.
+     *
+     * <p>A naming site must fall after every lower pool entry's first use and before every higher
+     * one's, so a printed position beyond either bound cannot be the site that interned the
+     * owner's {@code Class} entry. An unplaceable site (a field initializer, or a method the
+     * printer mapped no instruction in) is not contradicted: the pool says nothing about it.
+     */
+    boolean contradicts(String owner, int start) {
+      long[] bounds = coordinates == null ? null : coordinates.get(owner);
+      if (bounds == null) {
+        return false;
+      }
+      long coordinate = siteCoordinate(spaces, start);
+      return coordinate != NO_COORDINATE && (coordinate <= bounds[0] || coordinate >= bounds[1]);
+    }
+
     private boolean byCoordinate(String owner, int start) {
       if (coordinates == null) {
         return false;
@@ -544,7 +561,7 @@ public final class ConstantNames {
       }
     }
     return new Rules(candidates,
-      new Placement(windows, coordinates, spaces(own, positions, firstUses), strict, folded, internedAt),
+      new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -554,12 +571,8 @@ public final class ConstantNames {
    * that does not name the constructor their offsets belong to, so they are left out.
    */
   private static List<SiteSpace> spaces(StructClass own,
-                                        Map<Pair<String, String>, Map<Integer, Integer>> positions,
-                                        Map<Integer, FirstUse> firstUses) {
-    Map<String, Integer> ranks = new HashMap<>();
-    for (FirstUse use : firstUses.values()) {
-      ranks.putIfAbsent(use.methodKey(), use.order());
-    }
+                                        Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    Map<String, Integer> ranks = methodRanks(own);
     List<SiteSpace> spaces = new ArrayList<>();
     for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry : positions.entrySet()) {
       if (!own.qualifiedName.equals(entry.getKey().a) || entry.getValue().isEmpty()) {
@@ -567,7 +580,7 @@ public final class ConstantNames {
       }
       Integer rank = ranks.get(entry.getKey().b);
       if (rank == null) {
-        continue;
+        continue; // a field initializer or another key that names no method body
       }
       int min = Integer.MAX_VALUE;
       int max = Integer.MIN_VALUE;
@@ -578,6 +591,29 @@ public final class ConstantNames {
       spaces.add(new SiteSpace(rank, entry.getValue(), min, max));
     }
     return spaces;
+  }
+
+  /**
+   * The generation rank of every method body, keyed like the printer's position map.
+   *
+   * <p>javac generates constructors first, then the other methods in class-file order, and
+   * {@code <clinit>} last. The rank must come from the class's method list rather than from the
+   * pool's first uses: a method that only repeats references introduced earlier holds no first use,
+   * yet its body still has a place in the generation order, and a site in it must still be
+   * comparable with a bound placed in another method.
+   */
+  private static Map<String, Integer> methodRanks(StructClass cls) {
+    Map<String, Integer> ranks = new HashMap<>();
+    VBStyleCollection<StructMethod, String> methods = cls.getMethods();
+    int count = methods.size();
+    for (int i = 0; i < count; i++) {
+      StructMethod method = methods.get(i);
+      int rank = CodeConstants.INIT_NAME.equals(method.getName()) ? i
+        : CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i
+        : count + i;
+      ranks.put(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()), rank);
+    }
+    return ranks;
   }
 
   /**
@@ -826,7 +862,9 @@ public final class ConstantNames {
   /**
    * Scans one class's own text. A site outside the pool-order window of its owner is held back;
    * when an owner's window turns out to contain no site at all, the window was too narrow (a bound
-   * may have been placed in the wrong text order) and all of that owner's sites are allowed again.
+   * may have been placed in the wrong text order) and that owner's sites are allowed again, except
+   * where the generation order contradicts them: a site whose printed position lies outside the
+   * pool-order bounds is not where the owner's Class entry can have been entered.
    */
   private static void scanClass(String text, List<int[]> spans, Rules rules, List<Site> sites) {
     Map<String, List<Site>> deferred = new HashMap<>();
@@ -841,7 +879,9 @@ public final class ConstantNames {
         // a site inside the window there is nothing to place the name against.
         if (!rules.strict().contains(entry.getKey())) {
           for (Site site : entry.getValue()) {
-            addSiteOnce(sites, site);
+            if (!rules.placement().contradicts(entry.getKey(), site.start())) {
+              addSiteOnce(sites, site);
+            }
           }
         }
         continue;
