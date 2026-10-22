@@ -203,8 +203,20 @@ public class IfStatement extends Statement {
     }
 
     Exprent condition = headexprent.get(0);
-    Exprent guardCondition = ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
-      ? RoundTrip.guardCondition(ifHead, ifstat) : null;
+    // An empty arm prints as `if (C) { ; } else { body }`; when the target returns between the
+    // condition and the body, the source wrote the guard `if (C) { return; } body`.
+    Statement guardBody;
+    if (elsestat == null) {
+      guardBody = ifstat;
+    } else if (RoundTrip.printsNothing(ifstat)) {
+      guardBody = elsestat;
+    } else if (RoundTrip.printsNothing(elsestat)) {
+      guardBody = ifstat;
+    } else {
+      guardBody = null;
+    }
+    Exprent guardCondition = guardBody != null && condition instanceof IfExprent ifHead
+      ? RoundTrip.guardCondition(ifHead, guardBody) : null;
     if (guardCondition != null) {
       IfExprent guard = (IfExprent) ((IfExprent) condition).copy();
       guard.setCondition(guardCondition);
@@ -212,7 +224,7 @@ public class IfStatement extends Statement {
       buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
       buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
       buf.appendIndent(indent).append("}").appendLineSeparator();
-      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      buf.append(ExprProcessor.jmpWrapper(guardBody, indent, false));
       return buf;
     }
 

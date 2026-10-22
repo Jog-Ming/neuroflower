@@ -116,6 +116,26 @@ public final class RoundTrip {
     return exitLine >= 0 && bodyLine >= 0 && exitLine < bodyLine ? exit : -1;
   }
 
+  /** True when this statement would print no text at all (an empty arm or block). */
+  public static boolean printsNothing(Statement statement) {
+    if (statement == null) {
+      return true;
+    }
+    if (!statement.getVarDefinitions().isEmpty()) {
+      return false;
+    }
+    List<Exprent> exprents = statement.getExprents();
+    if (exprents != null) {
+      return exprents.isEmpty();
+    }
+    for (Statement child : statement.getStats()) {
+      if (!printsNothing(child)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /**
    * True when the target's line table puts this if's else arm before its then arm, so the source
    * wrote the arms in the other order with the negated condition.
@@ -128,6 +148,10 @@ public final class RoundTrip {
     StructLineNumberTableAttribute table = method == null ? null
       : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
     if (table == null) {
+      return false;
+    }
+    // A block that prints nothing has no line of its own; its offset belongs to the branch.
+    if (printsNothing(thenArm) || printsNothing(elseArm)) {
       return false;
     }
     int thenStart = firstOffset(thenArm);
