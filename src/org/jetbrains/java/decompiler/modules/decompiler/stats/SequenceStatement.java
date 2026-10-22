@@ -143,16 +143,15 @@ public class SequenceStatement extends Statement {
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
-          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
           && ifStatement.getIfstat() != null && endsWithReturn(ifStatement.getIfstat())) {
         Statement tail = stats.get(i + 1);
         Exprent exit = singleExit(tail);
         if (exit instanceof ExitExprent tailExit
-            && (tailExit.getExitType() == ExitExprent.Type.THROW
-                || safeReturnValue(tailExit.getValue()))
+            && !writesAny(java.util.Collections.singletonList(ifStatement.getIfstat()), readLocals(tailExit.getValue()))
             && RoundTrip.returnGuard(ifStatement.getIfstat(), tail)) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
-          head.negateIf();
+          head.setCondition(RoundTrip.negateCondition(head.getCondition()));
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
