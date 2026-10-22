@@ -169,14 +169,14 @@ public class SequenceStatement extends Statement {
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isPatternMatched() && !ifStatement.isLabeled()
-          && ifStatement.getIfstat() != null && stats.get(i + 1).getExprents() != null
-          && !stats.get(i + 1).getExprents().isEmpty()) {
+          && ifStatement.getIfstat() != null
+          && !(stats.get(i + 1).getExprents() != null && stats.get(i + 1).getExprents().isEmpty())) {
         Exprent exit = singleExit(ifStatement.getIfstat());
         if (exit instanceof ExitExprent headExit && headExit.getExitType() == ExitExprent.Type.RETURN
             && !writesAny(stats.subList(i + 1, stats.size()), readLocals(headExit.getValue()))
             && RoundTrip.exitAfterBody(ifStatement.getIfstat(), stats.get(i + 1))) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
-          head.negateIf();
+          head.setCondition(RoundTrip.negateCondition(head.getCondition()));
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
