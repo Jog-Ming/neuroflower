@@ -167,6 +167,7 @@ public final class ConstantNames {
     if (rootRules != null) {
       scanClass(text, rootSpans, rootRules, sites);
     }
+    expressionSites(text, rootSpans, root, sites);
     for (Map.Entry<String, List<int[]>> entry : spansByClass.entrySet()) {
       ClassNode node = byName.get(entry.getKey());
       if (node == null) {
@@ -176,6 +177,7 @@ public final class ConstantNames {
       if (classRules != null) {
         scanClass(text, entry.getValue(), classRules, sites);
       }
+      expressionSites(text, entry.getValue(), node, sites);
     }
     if (sites.isEmpty()) {
       return text;
@@ -994,6 +996,444 @@ public final class ConstantNames {
         }
       }
     }
+  }
+
+  // -------------------------------------------------------- constant expressions
+
+  /** A constant field of the class itself: its declaration, kind and folded value. */
+  private record FieldConstant(StructField field, VariableType kind, Object value) {
+  }
+
+  private enum Op { ADD, SUB, MUL, DIV, SHL, SHR, AND, OR, XOR }
+
+  /**
+   * Rewrites one constant initializer of a class whose own {@code Class} entry opens the pool.
+   *
+   * <p>javac visits the fields before it generates any method body, and a constant expression that
+   * names a constant of the class itself interns the class's own {@code Class} entry right there;
+   * the entry {@code this_class} writes later finds it already present. No generated construct can
+   * put the own entry at index 1: the constructor's super call is always entered first. So an own
+   * {@code Class} entry at index 1 proves the original source named one of this class's constants
+   * in a field initializer. The folded value is all that survives, so any expression over another
+   * of the class's constants that folds to the field's exact value reproduces the pool; one such
+   * rewrite per class is enough, because later names of the class add no entry.
+   *
+   * <p>The sites are added after the literal scan, so the literals introduced here are never taken
+   * as evidence for another constant's naming site.
+   */
+  private static void expressionSites(String text, List<int[]> spans, ClassNode node, List<Site> sites) {
+    StructClass own = node == null ? null : node.classStruct;
+    if (own == null || (own.getAccessFlags() & CodeConstants.ACC_INTERFACE) != 0) {
+      return;
+    }
+    Integer ownIndex = classIndices(own).get(own.qualifiedName);
+    if (ownIndex == null || ownIndex != 1) {
+      return;
+    }
+    List<FieldConstant> constants = new ArrayList<>();
+    for (StructField field : own.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant constant = constantValue(own, field);
+      VariableType kind = constant == null ? null : kind(field.getDescriptor());
+      if (constant == null || kind == null || constant.value == null) {
+        continue;
+      }
+      constants.add(new FieldConstant(field, kind, constant.value));
+    }
+    if (constants.size() < 2) {
+      return;
+    }
+    Map<String, List<int[]>> initializers = ownInitializers(text, spans, own);
+    for (int i = 1; i < constants.size(); i++) {
+      FieldConstant target = constants.get(i);
+      List<int[]> ranges = initializers.get(target.field().getName());
+      if (ranges == null || ranges.isEmpty()) {
+        continue;
+      }
+      int[] range = ranges.get(0);
+      boolean used = false;
+      for (Site site : sites) {
+        if (site.start() < range[1] && site.end() > range[0]) {
+          used = true;
+          break;
+        }
+      }
+      if (used) {
+        continue; // a naming site already rewrites this initializer; leave it alone
+      }
+      for (int j = 0; j < i; j++) {
+        String expression = constantExpression(target, constants.get(j));
+        if (expression == null) {
+          continue;
+        }
+        int equals = text.indexOf('=', range[0]);
+        if (equals < 0 || equals >= range[1]) {
+          break;
+        }
+        sites.add(new Site(equals + 1, range[1], " " + expression));
+        return;
+      }
+    }
+  }
+
+  /** An expression over {@code source} that folds to {@code target}'s exact value, or null. */
+  private static String constantExpression(FieldConstant target, FieldConstant source) {
+    VariableType t = target.kind();
+    VariableType s = source.kind();
+    String name = source.field().getName();
+    if (!numeric(t) || !numeric(s)) {
+      return t == s && target.value().equals(source.value()) ? name : null;
+    }
+    if (foldsTo(source.value(), s, target)) {
+      return name;
+    }
+    VariableType u = s == VariableType.CHAR ? VariableType.INT : s;
+    if (foldsTo(negate(source.value(), u), u, target)) {
+      return "-" + name;
+    }
+    if ((s == VariableType.INT || s == VariableType.CHAR || s == VariableType.LONG)
+        && foldsTo(complement(source.value(), u), u, target)) {
+      return "~" + name;
+    }
+    return binaryExpression(target, source);
+  }
+
+  /**
+   * A binary expression over the source constant and a literal solved from the target value.
+   *
+   * <p>The operand types are promoted as javac promotes them, so a float target multiplied by an
+   * int constant is a float expression, and every solved literal is checked by folding the whole
+   * expression in that promoted type. A literal that only verifies rounded is preferred integral,
+   * which keeps the common {@code 180.0F / PI} shape.
+   */
+  private static String binaryExpression(FieldConstant target, FieldConstant source) {
+    VariableType p = promote(source.kind(), target.kind());
+    if (p == null || !assignmentAllowed(p, target.kind())) {
+      return null;
+    }
+    Object converted = convert(source.value(), source.kind(), p);
+    if (converted == null) {
+      return null;
+    }
+    String name = source.field().getName();
+    if (p == VariableType.INT || p == VariableType.LONG) {
+      long g = ((Number) converted).longValue();
+      Object expected = convert(target.value(), target.kind(), p);
+      if (expected == null) {
+        return null;
+      }
+      long v = ((Number) expected).longValue();
+      int width = p == VariableType.LONG ? 64 : 32;
+      // The bit-mask idiom first: (1 << BITS) - 1 reads like the field it defines.
+      long mask = wrap((1L << ((int) g & (width - 1))) - 1L, p);
+      if (mask == v) {
+        return p == VariableType.LONG ? "(1L << " + name + ") - 1L" : "(1 << " + name + ") - 1";
+      }
+      if (g != 0 && holds(Op.MUL, g, wrap(v / g, p), p, target, true)) {
+        return name + " * " + integral(wrap(v / g, p), p);
+      }
+      if (v != 0 && wrap(g / v, p) != 0
+          && holds(Op.DIV, g, wrap(g / v, p), p, target, true)) {
+        return name + " / " + integral(wrap(g / v, p), p);
+      }
+      if (g != 0 && holds(Op.DIV, wrap(v * g, p), g, p, target, true)) {
+        return integral(wrap(v * g, p), p) + " / " + name;
+      }
+      for (int shift = 0; shift < width; shift++) {
+        if (holds(Op.SHL, g, shift, p, target, true)) {
+          return name + " << " + shift;
+        }
+      }
+      if (g >= 0 && g < width) {
+        if (holds(Op.SHL, wrap(v >>> g, p), g, p, target, true)) {
+          return integral(wrap(v >>> g, p), p) + " << " + name;
+        }
+        if (holds(Op.SHR, wrap(v << g, p), g, p, target, true)) {
+          return integral(wrap(v << g, p), p) + " >> " + name;
+        }
+      }
+      if (holds(Op.ADD, g, wrap(v - g, p), p, target, true)) {
+        return name + " + " + integral(wrap(v - g, p), p);
+      }
+      if (holds(Op.SUB, g, wrap(g - v, p), p, target, true)) {
+        return name + " - " + integral(wrap(g - v, p), p);
+      }
+      if (holds(Op.SUB, wrap(v + g, p), g, p, target, true)) {
+        return integral(wrap(v + g, p), p) + " - " + name;
+      }
+      if (holds(Op.OR, g, v, p, target, true)) {
+        return name + " | " + integral(v, p);
+      }
+      if (holds(Op.AND, g, v | ~g, p, target, true)) {
+        return name + " & " + integral(v | ~g, p);
+      }
+      if (holds(Op.XOR, g, g ^ v, p, target, true)) {
+        return name + " ^ " + integral(g ^ v, p);
+      }
+      return null;
+    }
+    // A floating-point expression: solve in the target's own precision.
+    double g = ((Number) converted).doubleValue();
+    Object expected = convert(target.value(), target.kind(), p);
+    if (expected == null || !Double.isFinite(g)) {
+      return null;
+    }
+    double v = ((Number) expected).doubleValue();
+    if (!Double.isFinite(v)) {
+      return null;
+    }
+    // The value a literal must have for each shape, scored by how round it reads: an integral
+    // literal first (180.0F / PI, MAX_FOOD * 1F), then one that only checks out rounded, then
+    // the exact quotient. Ties go to the smaller magnitude, then to the earlier shape.
+    List<FpCandidate> candidates = new ArrayList<>();
+    if (g != 0.0) {
+      candidates.add(new FpCandidate(Op.MUL, v / g, false, name));
+      candidates.add(new FpCandidate(Op.DIV, v * g, true, name));
+    }
+    if (v != 0.0) {
+      candidates.add(new FpCandidate(Op.DIV, g / v, false, name));
+    }
+    candidates.add(new FpCandidate(Op.ADD, v - g, false, name));
+    candidates.add(new FpCandidate(Op.SUB, g - v, false, name));
+    candidates.add(new FpCandidate(Op.SUB, v + g, true, name));
+    FpCandidate best = null;
+    int bestScore = Integer.MAX_VALUE;
+    double bestMagnitude = Double.MAX_VALUE;
+    for (FpCandidate candidate : candidates) {
+      if (!Double.isFinite(candidate.solved())) {
+        continue;
+      }
+      int score;
+      double chosen;
+      if (Math.rint(candidate.solved()) == candidate.solved()
+          && verifyFp(candidate, g, candidate.solved(), p, target)) {
+        score = 0;
+        chosen = candidate.solved();
+      }
+      else if (verifyFp(candidate, g, Math.rint(candidate.solved()), p, target)) {
+        score = 1;
+        chosen = Math.rint(candidate.solved());
+      }
+      else if (verifyFp(candidate, g, candidate.solved(), p, target)) {
+        score = 2;
+        chosen = candidate.solved();
+      }
+      else {
+        continue;
+      }
+      if (score < bestScore || (score == bestScore && Math.abs(chosen) < bestMagnitude)) {
+        best = new FpCandidate(candidate.op(), chosen, candidate.solvedLeft(), name);
+        bestScore = score;
+        bestMagnitude = Math.abs(chosen);
+      }
+    }
+    if (best == null) {
+      return null;
+    }
+    String text = fp(best.solved(), p);
+    return best.solvedLeft() ? text + " " + symbol(best.op()) + " " + name
+      : name + " " + symbol(best.op()) + " " + text;
+  }
+
+  /** One solved floating-point shape: the constant stands opposite a solved literal. */
+  private record FpCandidate(Op op, double solved, boolean solvedLeft, String name) {
+  }
+
+  private static boolean verifyFp(FpCandidate candidate, double constant, double solved,
+                                  VariableType p, FieldConstant target) {
+    return candidate.solvedLeft()
+      ? holdsFp(candidate.op(), solved, constant, p, target, true)
+      : holdsFp(candidate.op(), constant, solved, p, target, true);
+  }
+
+  private static String symbol(Op op) {
+    return switch (op) {
+      case ADD -> "+";
+      case SUB -> "-";
+      case MUL -> "*";
+      case DIV -> "/";
+      case SHL -> "<<";
+      case SHR -> ">>";
+      default -> "";
+    };
+  }
+
+  private static boolean holds(Op op, long left, long right, VariableType p,
+                               FieldConstant target, boolean usable) {
+    if (!usable) {
+      return false;
+    }
+    Object result = evaluate(op, left, right, p);
+    return result != null && foldsTo(result, p, target);
+  }
+
+  private static boolean holdsFp(Op op, double left, double right, VariableType p,
+                                 FieldConstant target, boolean usable) {
+    if (!usable) {
+      return false;
+    }
+    double result;
+    if (p == VariableType.FLOAT) {
+      float a = (float) left;
+      float b = (float) right;
+      result = switch (op) {
+        case ADD -> a + b;
+        case SUB -> a - b;
+        case MUL -> a * b;
+        case DIV -> a / b;
+        default -> Double.NaN;
+      };
+    }
+    else {
+      result = switch (op) {
+        case ADD -> left + right;
+        case SUB -> left - right;
+        case MUL -> left * right;
+        case DIV -> left / right;
+        default -> Double.NaN;
+      };
+    }
+    if (!Double.isFinite(result)) {
+      return false;
+    }
+    // The cast keeps the conditional from promoting both branches to double.
+    Object boxed = p == VariableType.FLOAT
+      ? (Object) Float.valueOf((float) result) : (Object) Double.valueOf(result);
+    return foldsTo(boxed, p, target);
+  }
+
+  private static Object evaluate(Op op, long left, long right, VariableType p) {
+    if (p == VariableType.INT) {
+      int a = (int) left;
+      int b = (int) right;
+      return switch (op) {
+        case ADD -> a + b;
+        case SUB -> a - b;
+        case MUL -> a * b;
+        case DIV -> a / b;
+        case SHL -> a << b;
+        case SHR -> a >> b;
+        case AND -> a & b;
+        case OR -> a | b;
+        case XOR -> a ^ b;
+      };
+    }
+    return switch (op) {
+      case ADD -> left + right;
+      case SUB -> left - right;
+      case MUL -> left * right;
+      case DIV -> left / right;
+      case SHL -> left << right;
+      case SHR -> left >> right;
+      case AND -> left & right;
+      case OR -> left | right;
+      case XOR -> left ^ right;
+    };
+  }
+
+  /** Whether the value folds, through the assignment conversion, to the target's exact value. */
+  private static boolean foldsTo(Object value, VariableType from, FieldConstant target) {
+    if (value == null || !assignmentAllowed(from, target.kind())) {
+      return false;
+    }
+    Object converted = convert(value, from, target.kind());
+    return converted != null && converted.equals(target.value());
+  }
+
+  private static boolean numeric(VariableType kind) {
+    return kind == VariableType.INT || kind == VariableType.CHAR || kind == VariableType.LONG
+      || kind == VariableType.FLOAT || kind == VariableType.DOUBLE;
+  }
+
+  /** Binary numeric promotion: char widens to int, then the wider of the two types wins. */
+  private static VariableType promote(VariableType a, VariableType b) {
+    if (!numeric(a) || !numeric(b)) {
+      return null;
+    }
+    VariableType left = a == VariableType.CHAR ? VariableType.INT : a;
+    VariableType right = b == VariableType.CHAR ? VariableType.INT : b;
+    return rank(left) >= rank(right) ? left : right;
+  }
+
+  private static int rank(VariableType kind) {
+    return switch (kind) {
+      case INT -> 0;
+      case LONG -> 1;
+      case FLOAT -> 2;
+      case DOUBLE -> 3;
+      default -> -1;
+    };
+  }
+
+  /** Whether an expression of type {@code from} is assignable to a field of type {@code to}. */
+  private static boolean assignmentAllowed(VariableType from, VariableType to) {
+    if (from == to) {
+      return true;
+    }
+    return switch (to) {
+      case LONG -> from == VariableType.INT || from == VariableType.CHAR;
+      case FLOAT -> from == VariableType.INT || from == VariableType.CHAR || from == VariableType.LONG;
+      case DOUBLE -> from == VariableType.INT || from == VariableType.CHAR
+        || from == VariableType.LONG || from == VariableType.FLOAT;
+      case INT -> from == VariableType.CHAR;
+      case CHAR -> from == VariableType.INT;
+      default -> false;
+    };
+  }
+
+  /** The value an expression of type {@code from} has after assignment to type {@code to}. */
+  private static Object convert(Object value, VariableType from, VariableType to) {
+    if (from == to) {
+      return value;
+    }
+    if (from == VariableType.FLOAT) {
+      return to == VariableType.DOUBLE ? Double.valueOf(((Float) value).doubleValue()) : null;
+    }
+    if (from != VariableType.INT && from != VariableType.CHAR && from != VariableType.LONG) {
+      return null;
+    }
+    long integral = ((Number) value).longValue();
+    if (to == VariableType.CHAR && (integral < Character.MIN_VALUE || integral > Character.MAX_VALUE)) {
+      return null;
+    }
+    return switch (to) {
+      case INT, CHAR -> Integer.valueOf((int) integral);
+      case LONG -> Long.valueOf(integral);
+      case FLOAT -> Float.valueOf((float) integral);
+      case DOUBLE -> Double.valueOf((double) integral);
+      default -> null;
+    };
+  }
+
+  private static Object negate(Object value, VariableType type) {
+    return switch (type) {
+      case INT -> Integer.valueOf(-((Number) value).intValue());
+      case LONG -> Long.valueOf(-((Number) value).longValue());
+      case FLOAT -> Float.valueOf(-((Float) value));
+      case DOUBLE -> Double.valueOf(-((Double) value));
+      default -> null;
+    };
+  }
+
+  private static Object complement(Object value, VariableType type) {
+    return type == VariableType.LONG
+      ? Long.valueOf(~((Number) value).longValue())
+      : Integer.valueOf(~((Number) value).intValue());
+  }
+
+  private static long wrap(long value, VariableType p) {
+    return p == VariableType.INT ? (int) value : value;
+  }
+
+  private static String integral(long value, VariableType p) {
+    return p == VariableType.INT ? Integer.toString((int) value) : value + "L";
+  }
+
+  private static String fp(double value, VariableType p) {
+    return p == VariableType.FLOAT ? Float.toString((float) value) + "F" : Double.toString(value);
   }
 
   /**
