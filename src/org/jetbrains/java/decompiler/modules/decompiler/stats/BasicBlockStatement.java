@@ -8,6 +8,7 @@ import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.util.StartEndPair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -78,6 +79,9 @@ public final class BasicBlockStatement extends Statement {
 
   @Override
   public TextBuffer toJava(int indent) {
+    if (varDefinitions.isEmpty() && RoundTrip.isConsumedGuardExit(this)) {
+      return new TextBuffer();
+    }
     TextBuffer tb = ExprProcessor.listToJava(varDefinitions, indent);
     boolean islabeled = isLabeled();
     if (islabeled) {

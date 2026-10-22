@@ -26,6 +26,10 @@ import java.util.List;
 /** Target-aware choices for byte-faithful output. Only active with {@code --round-trip=1}. */
 public final class RoundTrip {
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Instruction end offset by start offset; the live sequence is released before printing. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Returns already printed as guard exits; the same instruction must not print a second time. */
+  private static final java.util.Map<StructMethod, java.util.Set<Integer>> CONSUMED_GUARD_EXITS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
@@ -38,8 +42,10 @@ public final class RoundTrip {
     BitSet returns = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
+      ends.put(instr.startOffset, instr.startOffset + instr.length);
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
       }
@@ -62,6 +68,7 @@ public final class RoundTrip {
     VOID_RETURNS.put(method, returns);
     CONTINUE_GUARDS.put(method, guards);
     BRANCHES.put(method, branches);
+    INSTRUCTION_ENDS.put(method, ends);
   }
 
   /**
@@ -397,45 +404,147 @@ public final class RoundTrip {
   }
 
   /**
-   * True when {@code if (!C) { body }} corresponds to a target that returns when C holds, i.e. the
-   * source was the guard {@code if (C) { return; } body}. The early return sits between the condition
-   * and the body in the target's instruction sequence.
+   * The condition to print for {@code if (C) { return; } body} when the target's instructions and
+   * line table prove the source wrote the exit first. The early return sits between the condition
+   * and the body in the target's instruction sequence; when the printed condition is the negated
+   * mirror rather than a NOT, the line table must also put the exit's line before the body's.
+   * Returns null when the shape is the mirror or the target cannot prove the direction.
    */
-  public static boolean printAsGuard(Exprent head, Statement body) {
+  public static Exprent guardCondition(Exprent head, Statement body) {
     if (!selector("guardprint") || !(head instanceof IfExprent ie)) {
-      return false;
+      return null;
     }
     Exprent condition = ie.getCondition();
-    if (!(condition instanceof FunctionExprent function) || function.getFuncType() != FunctionExprent.FunctionType.BOOL_NOT) {
-      return false;
-    }
     StructMethod method = currentMethod();
     if (method == null) {
-      return false;
+      return null;
     }
     BitSet returns = VOID_RETURNS.get(method);
     BitSet offsets = head.bytecode;
     int bodyStart = firstOffset(body);
-    if (returns == null || returns.isEmpty() || offsets == null || offsets.isEmpty()) {
-      return false;
-    }
-    FullInstructionSequence seq = method.getInstructionSequence();
-    if (seq == null) {
-      return false;
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (returns == null || returns.isEmpty() || offsets == null || offsets.isEmpty() || ends == null) {
+      return null;
     }
     int lastStart = -1;
     int lastEnd = -1;
     for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
-      Integer index = seq.offsetToIndex().get(offset);
-      if (index != null) {
-        Instruction instr = seq.getInstr(index);
-        if (instr.startOffset > lastStart) {
-          lastStart = instr.startOffset;
-          lastEnd = instr.startOffset + instr.length;
-        }
+      Integer end = ends.get(offset);
+      if (end != null && offset > lastStart) {
+        lastStart = offset;
+        lastEnd = end;
       }
     }
-    return lastEnd >= 0 && lastEnd < bodyStart && returns.get(lastEnd);
+    if (!(lastEnd >= 0 && lastEnd < bodyStart && returns.get(lastEnd))) {
+      return null;
+    }
+    if (condition instanceof FunctionExprent function && function.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT) {
+      markGuardExit(method, lastEnd);
+      return function.getLstOperands().get(0);
+    }
+    // A negated condition of the printer's own making: only the target's line table can say whether
+    // the source wrote the exit first or the body first.
+    StructLineNumberTableAttribute table = method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return null;
+    }
+    int exitLine = table.findLineNumber(lastEnd);
+    int bodyLine = table.findLineNumber(bodyStart);
+    if (exitLine < 0 || bodyLine < 0 || exitLine >= bodyLine) {
+      return null;
+    }
+    markGuardExit(method, lastEnd);
+    return negateCondition(condition);
+  }
+
+  private static void markGuardExit(StructMethod method, int offset) {
+    CONSUMED_GUARD_EXITS.computeIfAbsent(method, key -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(offset);
+  }
+
+  /**
+   * True when this statement is a single exit already printed as a guard: the guard made the rest of
+   * the sequence unconditional, so the same return instruction must not be printed again.
+   */
+  public static boolean isConsumedGuardExit(Statement statement) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Set<Integer> consumed = CONSUMED_GUARD_EXITS.get(method);
+    if (consumed == null || consumed.isEmpty()) {
+      return false;
+    }
+    List<Exprent> exprents = statement.getExprents();
+    if (exprents == null || exprents.size() != 1 || !(exprents.get(0) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit)) {
+      return false;
+    }
+    if (exit.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+        && exit.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.THROW) {
+      return false;
+    }
+    BitSet offsets = exit.bytecode;
+    if (offsets == null) {
+      return false;
+    }
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      if (consumed.contains(offset)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The logical negation of a condition as an expression to print. Comparisons flip their operator
+   * (except float/double, where NaN breaks the equivalence), boolean junctions swap under De Morgan,
+   * and anything else keeps a {@code !}.
+   */
+  public static Exprent negateCondition(Exprent condition) {
+    if (condition instanceof FunctionExprent function) {
+      FunctionExprent.FunctionType type = function.getFuncType();
+      java.util.List<Exprent> operands = function.getLstOperands();
+      if (type == FunctionExprent.FunctionType.BOOL_NOT && operands.size() == 1) {
+        return operands.get(0).copy();
+      }
+      if ((type == FunctionExprent.FunctionType.BOOLEAN_AND || type == FunctionExprent.FunctionType.BOOLEAN_OR)
+          && !operands.isEmpty()) {
+        FunctionExprent.FunctionType flipped = type == FunctionExprent.FunctionType.BOOLEAN_AND
+          ? FunctionExprent.FunctionType.BOOLEAN_OR : FunctionExprent.FunctionType.BOOLEAN_AND;
+        java.util.List<Exprent> negated = new java.util.ArrayList<>();
+        for (Exprent operand : operands) {
+          negated.add(negateCondition(operand));
+        }
+        return new FunctionExprent(flipped, negated, function.bytecode);
+      }
+      FunctionExprent.FunctionType opposite = oppositeComparison(type);
+      if (opposite != null && operands.size() == 2 && comparableWithoutNaN(operands)) {
+        java.util.List<Exprent> flipped = new java.util.ArrayList<>();
+        flipped.add(operands.get(0).copy());
+        flipped.add(operands.get(1).copy());
+        return new FunctionExprent(opposite, flipped, function.bytecode);
+      }
+    }
+    return new FunctionExprent(FunctionExprent.FunctionType.BOOL_NOT, condition.copy(), condition.bytecode);
+  }
+
+  private static FunctionExprent.FunctionType oppositeComparison(FunctionExprent.FunctionType type) {
+    return switch (type) {
+      case EQ -> FunctionExprent.FunctionType.NE;
+      case NE -> FunctionExprent.FunctionType.EQ;
+      case LT -> FunctionExprent.FunctionType.GE;
+      case GE -> FunctionExprent.FunctionType.LT;
+      case GT -> FunctionExprent.FunctionType.LE;
+      case LE -> FunctionExprent.FunctionType.GT;
+      default -> null;
+    };
+  }
+
+  private static boolean comparableWithoutNaN(java.util.List<Exprent> operands) {
+    VarType left = operands.get(0).getExprType();
+    VarType right = operands.get(1).getExprType();
+    return left != null && right != null
+      && left.typeFamily != TypeFamily.FLOAT && left.typeFamily != TypeFamily.DOUBLE
+      && right.typeFamily != TypeFamily.FLOAT && right.typeFamily != TypeFamily.DOUBLE;
   }
 
   /**

@@ -203,10 +203,11 @@ public class IfStatement extends Statement {
     }
 
     Exprent condition = headexprent.get(0);
-    if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
-        && RoundTrip.printAsGuard(ifHead, ifstat)) {
-      IfExprent guard = (IfExprent) ifHead.copy();
-      guard.setCondition(((FunctionExprent) ifHead.getCondition()).getLstOperands().get(0));
+    Exprent guardCondition = ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
+      ? RoundTrip.guardCondition(ifHead, ifstat) : null;
+    if (guardCondition != null) {
+      IfExprent guard = (IfExprent) ((IfExprent) condition).copy();
+      guard.setCondition(guardCondition);
       buf.appendIndent(indent);
       buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
       buf.appendIndent(indent + 1).append("return;").appendLineSeparator();

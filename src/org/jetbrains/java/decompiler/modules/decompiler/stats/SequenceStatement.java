@@ -114,6 +114,10 @@ public class SequenceStatement extends Statement {
 
       Statement st = stats.get(i);
 
+      // A guard printed this exit already; the rest of the sequence became unconditional.
+      if (RoundTrip.isConsumedGuardExit(st)) {
+        continue;
+      }
 
 
       // `if (C) continue; body` in the source; the decompiler printed its mirror `if (!C) { body }`.
