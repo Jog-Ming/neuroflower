@@ -2492,12 +2492,13 @@ public class InvocationExprent extends Exprent {
     if (((GenericType) ret).getArguments().size() != classParams.size()) {
       return false;
     }
-    // Only a variable the printer could not print is in demand.
+    // A variable the printer could not print is in demand. A variable it did print is in demand
+    // too when the outer call's recorded value settles every type variable of this call through
+    // an invariant position: the printer's value there came from the surrounding target, which
+    // javac does not hand a receiver, so the source must have written the same types itself.
     List<VarType> probe = new ArrayList<>();
     getGenericArgs(fparams, genericsMap, probe);
-    if (!probe.isEmpty()) {
-      return false;
-    }
+    boolean printerComplete = probe.size() == fparams.size();
     Map<VarType, VarType> partial = new HashMap<>();
     for (String fp : fparams) {
       VarType variable = GenericType.parse("T" + fp + ";");
@@ -2514,6 +2515,59 @@ public class InvocationExprent extends Exprent {
     if (receiverArgs.size() != classParams.size()) {
       return false;
     }
+    Map<VarType, VarType> bindings = bindRecordedLambdaValues(outer, receiverArgs, classParams, fparams);
+    if (bindings == null) {
+      return false;
+    }
+    if (bindings.isEmpty()) {
+      if (!printerComplete) {
+        return false;
+      }
+      // The printer's values already filled every position, so the substituted comparison bound
+      // nothing. Bind the unsubstituted pattern instead: the class file's recorded value then
+      // supplies the witness, and it must agree with every value the printer inferred.
+      List<VarType> rawArgs = ((GenericType) ret).getArguments();
+      if (rawArgs.size() != classParams.size()) {
+        return false;
+      }
+      bindings = bindRecordedLambdaValues(outer, rawArgs, classParams, fparams);
+      if (bindings == null || bindings.isEmpty()) {
+        return false;
+      }
+      for (int i = 0; i < fparams.size(); i++) {
+        VarType value = bindings.get(GenericType.parse("T" + fparams.get(i) + ";"));
+        if (value == null || !sameType(value, probe.get(i))) {
+          return false;
+        }
+      }
+    }
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType value = bindings.get(variable);
+      if (value == null) {
+        value = genericsMap.get(variable);
+      }
+      if (!isPrintableWitness(value)) {
+        return false;
+      }
+      witness.add(value);
+    }
+    if (!erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /**
+   * Bind a receiver's type arguments to the values the outer call's recorded functional
+   * arguments return. Returns null on a contradiction between two records, so the caller can
+   * reject the whole witness rather than picking one.
+   */
+  private static Map<VarType, VarType> bindRecordedLambdaValues(InvocationExprent outer,
+      List<VarType> receiverArgs, List<String> classParams, List<String> fparams) {
     Map<VarType, VarType> bindings = new HashMap<>();
     List<VarType> declared = outer.desc.getSignature().parameterTypes;
     int count = Math.min(declared.size(), outer.lstParameters.size());
@@ -2537,31 +2591,11 @@ public class InvocationExprent extends Exprent {
           continue;
         }
         if (!bindRecordedValue(receiverArgs.get(index), recorded, fparams, bindings)) {
-          return false;
+          return null;
         }
       }
     }
-    if (bindings.isEmpty()) {
-      return false;
-    }
-    List<VarType> witness = new ArrayList<>(fparams.size());
-    for (String fp : fparams) {
-      VarType variable = GenericType.parse("T" + fp + ";");
-      VarType value = bindings.get(variable);
-      if (value == null) {
-        value = genericsMap.get(variable);
-      }
-      if (!isPrintableWitness(value)) {
-        return false;
-      }
-      witness.add(value);
-    }
-    if (!erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
-      return false;
-    }
-    genericArgs.clear();
-    genericArgs.addAll(witness);
-    return true;
+    return bindings;
   }
 
   /**
