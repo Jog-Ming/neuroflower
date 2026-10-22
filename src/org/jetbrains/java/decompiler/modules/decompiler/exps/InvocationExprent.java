@@ -329,7 +329,20 @@ public class InvocationExprent extends Exprent {
                   // }
                   // the result of "Collections.unmodifiableCollection" *should* be a collection of type T, not of type S.
                   // S is not part of the hierarchy, so we cannot capture it as the upper bound.
-                  if (to.type == CodeType.GENVAR && named.containsKey(from) && bounds.containsKey(from) && bounds.get(from).contains(VarType.VARTYPE_OBJECT) && !bounds.containsKey(to)) {
+                  //
+                  // A type variable the invoked method declares itself and takes as a whole parameter
+                  // (of(T value)) is a fresh variable: the same name in the caller's scope is a
+                  // different variable, so the collision below is spurious and the target's variable
+                  // is what the call was instantiated with. javac then rejects that argument, and the
+                  // source cast it. When the variable only sits nested inside a parameter type
+                  // (Collection<? extends T>), the source suppressed the target typing with a cast on
+                  // the call instead, so the mapping must stay rejected here.
+                  boolean directParameter = fparams.contains(from.value) && desc.getSignature() != null
+                    && desc.getSignature().parameterTypes.stream()
+                      .anyMatch(p -> p instanceof GenericType g && g.type == CodeType.GENVAR
+                        && g.getWildcard() == GenericType.WILDCARD_NO && g.value.equals(from.value));
+                  if (!directParameter
+                    && to.type == CodeType.GENVAR && named.containsKey(from) && bounds.containsKey(from) && bounds.get(from).contains(VarType.VARTYPE_OBJECT) && !bounds.containsKey(to)) {
                     if (!named.get(to).contains(from)) {
                       ok = false;
                     }
