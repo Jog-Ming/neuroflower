@@ -1412,6 +1412,7 @@ public class ClassWriter implements StatementWriter {
       if (methodWrapper.decompileError == null) {
         if (root != null) { // check for existence
           try {
+            ReturnedVariable.restore(root);
             TextBuffer childBuf = root.toJava(indent);
             childBuf.addBytecodeMapping(root.getDummyExit().bytecode);
             buffer.append(childBuf, classWrapper.getClassStruct().qualifiedName, InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));

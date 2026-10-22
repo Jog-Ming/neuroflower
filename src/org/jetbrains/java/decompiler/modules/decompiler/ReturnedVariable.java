@@ -83,6 +83,12 @@ public final class ReturnedVariable {
       return false;
     }
     LocalVariable lvt = var.getLVT();
-    return lvt != null && lvt.getVersion().var == slot;
+    if (lvt != null) {
+      return lvt.getVersion().var == slot;
+    }
+    // Lambda parameters carry no LocalVariableTable entry; their slot is the original index.
+    VarProcessor processor = var.getProcessor();
+    Integer original = processor == null ? null : processor.getVarOriginalIndex(var.getIndex());
+    return (original != null ? original : var.getIndex()) == slot;
   }
 }
