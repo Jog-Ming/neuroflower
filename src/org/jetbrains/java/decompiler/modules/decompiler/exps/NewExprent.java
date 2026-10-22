@@ -461,6 +461,12 @@ public class NewExprent extends Exprent {
         }
         setLambdaGenericTypes();
         Exprent methodObject = constructor == null ? null : constructor.getInstance();
+        if (methodObject == null && constructor != null && child != null
+            && child.lambdaInformation.is_content_method_static && !constructor.getLstParameters().isEmpty()) {
+          // A static lambda bridge takes the captured receiver as its first parameter; a method
+          // reference bound to it prints that value as the reference's qualifier.
+          methodObject = constructor.getLstParameters().get(0);
+        }
         if (methodObject != null && isMethodReference()) {
           forceRecordedReceiverType(methodObject);
         }

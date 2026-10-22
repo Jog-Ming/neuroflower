@@ -11,6 +11,7 @@ import org.jetbrains.java.decompiler.api.plugin.pass.PassContext;
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.ExceptionHandler;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.code.InstructionSequence;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
@@ -224,6 +225,15 @@ public class ClassWriter implements StatementWriter {
         MethodDescriptor md_content = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor);
         MethodDescriptor md_lambda = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
 
+        // javac compiles a method reference whose inference depends on the call site's target into a
+        // synthetic bridge whose declared parameters differ from the functional method's. A lambda's
+        // parameters are congruent with the functional method's, so the mismatch is a `::` in the
+        // source; the bridge body forwards its parameters to one method, which is the reference.
+        if (!lambdaToAnonymous
+            && writeLambdaMethodReference(node, cl, mt, method_object, buffer, indent, md_content, md_lambda)) {
+          return;
+        }
+
         boolean simpleLambda = false;
         boolean written = false;
 
@@ -374,6 +384,183 @@ public class ClassWriter implements StatementWriter {
     }
 
     DecompilerContext.getLogger().endWriteClass();
+  }
+
+  /**
+   * Writes the method reference javac compiled into this synthetic lambda bridge, or returns
+   * false. javac creates such a bridge when the source wrote {@code ::} and the reference's
+   * inference needed the call site's target: the bridge declares the referenced method's parameter
+   * types, which differ from the functional method's, while a lambda's parameters are congruent
+   * with the functional method's. The bridge body must forward every declared parameter, in order,
+   * to exactly one invocation; that invocation is the reference.
+   */
+  private boolean writeLambdaMethodReference(ClassNode node, StructClass cl, StructMethod mt,
+                                             Exprent methodObject, TextBuffer buffer, int indent,
+                                             MethodDescriptor md_content, MethodDescriptor md_lambda) {
+    if (!RoundTrip.selector("methodrefbridge") || !node.lambdaInformation.is_content_method_static) {
+      return false;
+    }
+    int prefix = md_content.params.length - md_lambda.params.length;
+    if (prefix < 0 || prefix > 1) {
+      return false;
+    }
+    if (prefix == 1 && methodObject == null) {
+      // A bound reference's qualifier is the captured receiver; without it the text is unknown.
+      return false;
+    }
+    boolean differs = false;
+    for (int i = 0; i < md_lambda.params.length; i++) {
+      if (!md_content.params[prefix + i].equals(md_lambda.params[i])) {
+        differs = true;
+        break;
+      }
+    }
+    if (!differs) {
+      return false;
+    }
+    FullInstructionSequence seq;
+    try {
+      mt.expandData(cl);
+      seq = mt.getInstructionSequence();
+    } catch (IOException e) {
+      return false;
+    }
+    if (seq == null || seq.isEmpty()) {
+      return false;
+    }
+    int index = 0;
+    int paramIndex = 0;
+    int slot = 0;
+    boolean sawLoad = false;
+    String receiverCast = null;
+    while (index < seq.length()) {
+      Instruction ins = seq.getInstr(index);
+      Integer load = loadSlot(ins);
+      if (load != null) {
+        if (paramIndex >= md_content.params.length || load != slot) {
+          return false;
+        }
+        slot += md_content.params[paramIndex].stackSize;
+        paramIndex++;
+        sawLoad = true;
+        index++;
+      } else if (ins.opcode == CodeConstants.opc_checkcast && sawLoad) {
+        // The reference's declared parameter type narrows a forwarded value; the cast belongs to
+        // the reference, not to the printed text.
+        if (paramIndex == 1) {
+          receiverCast = cl.getPool().getPrimitiveConstant(ins.operand(0)).getString();
+        }
+        index++;
+      } else {
+        break;
+      }
+    }
+    if (paramIndex != md_content.params.length || index >= seq.length()) {
+      return false;
+    }
+    Instruction call = seq.getInstr(index);
+    boolean staticCall = call.opcode == CodeConstants.opc_invokestatic;
+    if (!staticCall && call.opcode != CodeConstants.opc_invokevirtual
+        && call.opcode != CodeConstants.opc_invokeinterface
+        && call.opcode != CodeConstants.opc_invokespecial) {
+      return false;
+    }
+    LinkConstant target = cl.getPool().getLinkConstant(call.operand(0));
+    if (target == null || target.elementname == null || target.descriptor == null) {
+      return false;
+    }
+    MethodDescriptor md_target = MethodDescriptor.parseDescriptor(target.descriptor);
+    int passed = staticCall ? md_content.params.length : md_content.params.length - 1;
+    if (passed < 0 || md_target.params.length != passed) {
+      return false;
+    }
+    // A static bridge with a capture that calls a static method forwards captured values into
+    // arguments, which is a lambda body, not a reference.
+    if (staticCall && prefix > 0) {
+      return false;
+    }
+    // The printed `::` must be applicable where the bridge was: every instantiated functional
+    // parameter has to be passable to the referenced method's parameter, and an unbound receiver
+    // to the type the body casts it to. A wildcard-erased lambda with a cast is not a reference.
+    // An unbound reference spends its first functional parameter as the receiver; a bound one
+    // passes its captured receiver and every functional parameter as an argument.
+    int argBase = !staticCall && prefix == 0 ? 1 : 0;
+    for (int i = argBase; i < md_lambda.params.length; i++) {
+      if (!passable(md_lambda.params[i], md_target.params[i - argBase])) {
+        return false;
+      }
+    }
+    if (!staticCall) {
+      VarType receiverType = prefix == 1
+        ? methodObject.getInferredExprType(md_content.params[0])
+        : md_lambda.params[0];
+      String owner = prefix == 0 && receiverCast != null ? receiverCast : target.classname;
+      if (receiverType == null || receiverType.type != CodeType.OBJECT
+          || !DecompilerContext.getStructContext().instanceOf(receiverType.value, owner)) {
+        return false;
+      }
+    }
+    index++;
+    while (index < seq.length() && (seq.getInstr(index).opcode == CodeConstants.opc_checkcast
+        || seq.getInstr(index).opcode == CodeConstants.opc_pop)) {
+      index++;
+    }
+    if (index + 1 != seq.length() || !isReturn(seq.getInstr(index).opcode)) {
+      return false;
+    }
+
+    if (prefix == 0) {
+      // A static method reference or an unbound instance method reference: the owner is the name.
+      buffer.appendCastTypeName(new VarType(target.classname, true));
+      buffer.append("::").appendMethod(target.elementname, false, target.classname,
+        target.elementname, target.descriptor);
+      return true;
+    }
+    // Bound to the captured receiver (`expr::name`); a cast instance stays parenthesized.
+    methodObject.getInferredExprType(md_content.params[0]);
+    TextBuffer instance = methodObject.toJava(indent);
+    if (methodObject instanceof FunctionExprent function && function.getFuncType() == FunctionType.CAST
+        && function.doesCast()) {
+      buffer.append('(').append(instance).append(')');
+    } else {
+      buffer.append(instance);
+    }
+    buffer.append("::").appendMethod(target.elementname, false, target.classname,
+      target.elementname, target.descriptor);
+    return true;
+  }
+
+  /** Whether an expression of type {@code from} is passable to {@code to} without a cast. */
+  private static boolean passable(VarType from, VarType to) {
+    if (from == null || to == null || from.isGeneric() || to.isGeneric()) {
+      return false;
+    }
+    if (from.equals(to)) {
+      return true;
+    }
+    if (from.type != CodeType.OBJECT || to.type != CodeType.OBJECT
+        || from.value == null || to.value == null) {
+      return false;
+    }
+    return DecompilerContext.getStructContext().instanceOf(from.value, to.value);
+  }
+
+  /** The local slot an instruction loads, or null when it is not a load. */
+  private static Integer loadSlot(Instruction ins) {
+    int op = ins.opcode;
+    if (op >= CodeConstants.opc_iload && op <= CodeConstants.opc_aload) {
+      return ins.operand(0);
+    }
+    if (op >= CodeConstants.opc_iload_0 && op <= CodeConstants.opc_aload_3) {
+      return (op - CodeConstants.opc_iload_0) % 4;
+    }
+    return null;
+  }
+
+  private static boolean isReturn(int opcode) {
+    return opcode == CodeConstants.opc_return || opcode == CodeConstants.opc_areturn
+      || opcode == CodeConstants.opc_ireturn || opcode == CodeConstants.opc_lreturn
+      || opcode == CodeConstants.opc_freturn || opcode == CodeConstants.opc_dreturn;
   }
 
   public void writeClassHeader(StructClass cl, TextBuffer buffer, ImportCollector importCollector) {
