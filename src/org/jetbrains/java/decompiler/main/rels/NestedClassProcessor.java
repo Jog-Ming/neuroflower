@@ -152,6 +152,11 @@ public class NestedClassProcessor {
       });
     }
 
+    // A lambda created inside another lambda or an anonymous class has an enclosing content
+    // method whose table says nothing about names inherited from further out: those are the
+    // enclosing classes' names, and a name the content method does not use cannot clash there.
+    boolean contentMethod = parent.type == ClassNode.Type.LAMBDA || parent.type == ClassNode.Type.ANONYMOUS;
+
     // this pointer
     if (!is_static_lambda_content && DecompilerContext.getOption(IFernflowerPreferences.LAMBDA_TO_ANONYMOUS_CLASS)) {
       varProc.getThisVars().put(new VarVersionPair(0, 0), parent_class_name);
@@ -186,7 +191,7 @@ public class NestedClassProcessor {
       // where its range covers the instruction that creates it. Everywhere else the source reused
       // the name legally, so the local keeps the name the table gives it.
       if (usedBefore.contains(name) && !"this".equals(name)
-          && inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites)) {
+          && inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites, contentMethod)) {
         name = enclosingCollector.getFreeName(name);
         mapNewNames.put(local, name);
         if (lvt != null) {
@@ -231,7 +236,7 @@ public class NestedClassProcessor {
               }
               else if (!mapNewNames.containsKey(varVersion)) {
                 String paramName = varProc.getVarName(varVersion);
-                if (inScopeAtLambda(parent.classStruct, enclosingMethod, paramName, sites)) {
+                if (inScopeAtLambda(parent.classStruct, enclosingMethod, paramName, sites, contentMethod)) {
                   paramName = enclosingCollector.getFreeName(paramName);
                 } else {
                   // Out of scope: the name is the object's own. Another parameter of this lambda
@@ -291,10 +296,12 @@ public class NestedClassProcessor {
   /**
    * Whether {@code name} is in scope in the enclosing method at one of the lambda's creation
    * sites. A name the enclosing table never uses is treated as in scope: without evidence the
-   * conservative rename stays.
+   * conservative rename stays. The exception is a content method (the enclosing lambda or
+   * anonymous class): its table only lists its own variables, and a name inherited from further
+   * out therefore cannot clash inside it.
    */
   private static boolean inScopeAtLambda(StructClass parentClass, MethodWrapper enclosingMethod,
-                                         String name, List<Integer> sites) {
+                                         String name, List<Integer> sites, boolean contentMethod) {
     if (sites.isEmpty() || name == null) {
       return true;
     }
@@ -320,7 +327,7 @@ public class NestedClassProcessor {
       }
     }
     // The table uses the name only outside the sites, so the source had left that scope.
-    return !named;
+    return !named && !contentMethod;
   }
 
   private static void checkNotFoundClasses(ClassNode root, ClassNode node) {

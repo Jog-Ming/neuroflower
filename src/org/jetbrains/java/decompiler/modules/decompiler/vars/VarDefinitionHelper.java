@@ -1928,18 +1928,12 @@ public class VarDefinitionHelper {
                 if (i >= startIdx) {
                   VarVersionPair vvp = new VarVersionPair(start, 0);
 
-                  // Try to perform a rename
+                  // An anonymous class body is its own class scope: its parameters may shadow a
+                  // name of the enclosing method, which javac accepts, so they keep the name the
+                  // table gives them. The body scan below still renames within the class.
                   String name = mw.varproc.getVarName(vvp);
                   if (name != null) {
-                    String original = name;
-                    LocalVariable paramLvt = mw.varproc.getVarLVT(vvp);
-                    name = rename(nameMap, name, liveVarDefs, mt2, true, paramLvt);
-
-                    // Did we rename? If so, we should add it to the name map and set as clashing
-                    if (!original.equals(name)) {
-                      mw.varproc.setClashingName(vvp, name);
-                      nameMap.put(new VarInMethod(vvp, mt2, paramLvt), name);
-                    }
+                    nameMap.put(new VarInMethod(vvp, mt2, mw.varproc.getVarLVT(vvp)), name);
                   }
                 }
 
