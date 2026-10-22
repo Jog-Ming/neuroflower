@@ -1354,15 +1354,37 @@ public class InvocationExprent extends Exprent {
 
           VarType rawType = desc.getSignature().parameterTypes.get(y++);
           VarType type = rawType.remap(hierarchyMap).remap(genericsMap);
+          // A name that is in scope at the call site may be the caller's own variable of the same
+          // name (the callee's signature and the caller often share letters); the source may have
+          // meant that one, so only a name with no in-scope declaration proves the cast wrong.
+          Map<VarType, List<VarType>> named = getNamedGenerics();
+          // A type parameter of the called method that inference left unbound has no name at the
+          // call site, but its recorded bound can be a type variable the caller does own: a
+          // callee {@code V extends T} where T is the caller's variable can only be bound there
+          // if the argument is a T, so the source cast to it. The cast erases to the bound's
+          // erasure, which is exactly the parameter's erased type, so it changes no bytecode and
+          // is only printed when the argument's own recorded type has that same erasure.
+          List<String> typeParameters = desc.getSignature().typeParameters;
+          if (type != null && type.type == CodeType.GENVAR && typeParameters.contains(type.value)
+            && !genericsMap.containsKey(type)) {
+            int index = typeParameters.indexOf(type.value);
+            List<VarType> declaredBounds = index < desc.getSignature().typeParameterBounds.size()
+              ? desc.getSignature().typeParameterBounds.get(index) : null;
+            if (declaredBounds != null && declaredBounds.size() == 1) {
+              VarType bound = declaredBounds.get(0).remap(hierarchyMap).remap(genericsMap);
+              VarType argumentType = lstParameters.get(x).getExprType();
+              if (bound != null && bound.type == CodeType.GENVAR && !bound.value.equals(type.value)
+                && isInScopeTypeVariable(bound, named) && argumentType != null
+                && argumentType.resizeArrayDim(0).equals(descriptor.params[x].resizeArrayDim(0))) {
+                type = bound;
+              }
+            }
+          }
           // A type parameter of the called method that inference left unbound is not a type any
           // source can name at the call site: its name belongs to the callee's signature, not to
           // this scope, and a caller variable that happens to share the name is a different
           // variable. Record it for the argument's cast decision; javac infers it again.
           Set<VarType> unbound = unboundTypeParameters(rawType, desc.getSignature().typeParameters, genericsMap);
-          // A name that is in scope at the call site may be the caller's own variable of the same
-          // name (the callee's signature and the caller often share letters); the source may have
-          // meant that one, so only a name with no in-scope declaration proves the cast wrong.
-          Map<VarType, List<VarType>> named = getNamedGenerics();
           unbound.removeIf(variable -> isInScopeTypeVariable(variable, named));
           if (!unbound.isEmpty()) {
             unboundArguments.put(x, unbound);
