@@ -713,7 +713,16 @@ public class InvocationExprent extends Exprent {
             if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
               || receiverDemand || returnOnlyDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
-              if (!receiverDemand && genericArgs.isEmpty() && !isNew
+              // A variable a declared parameter carries bare is fixed by that argument's recorded
+              // type, which every class file writes in full. A witness the printer could only
+              // render as a bare generic class for it is its own inference losing type arguments,
+              // and printing it would pin javac to a raw type the record never has; the call is
+              // left unparameterised and javac infers the variable from the argument again.
+              boolean rawWitness = !receiverDemand && !returnOnlyDemand && !isNew && dropsRawParameterWitness(fparams);
+              if (rawWitness) {
+                genericArgs.clear();
+              }
+              if (!rawWitness && genericArgs.isEmpty() && !isNew
                 && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
                 // The printer's inference has no value for some type variable; an argument's
                 // recorded metafactory type may still prove what the source passed.
@@ -2757,6 +2766,40 @@ public class InvocationExprent extends Exprent {
       }
     }
     return type.type != CodeType.OBJECT || !isGenericClass(type.value);
+  }
+
+  /**
+   * Whether a witness entry the printer could only render as a bare generic class belongs to a
+   * variable that a declared parameter carries as its own direct type argument. Such an argument
+   * gives javac the variable's value from its recorded type, which is always written in full, so
+   * a bare witness for it can only be the printer's inference losing arguments. A variable inside
+   * a wildcard or a functional interface is not fixed by the argument (javac solves it from the
+   * lambda body or leaves it to the target), so those witnesses stand.
+   */
+  private boolean dropsRawParameterWitness(List<String> fparams) {
+    if (desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    List<VarType> parameters = desc.getSignature().parameterTypes;
+    for (int i = 0; i < fparams.size() && i < genericArgs.size(); i++) {
+      VarType type = genericArgs.get(i);
+      if (type == null || type.type != CodeType.OBJECT || type.arrayDim != 0
+        || (type instanceof GenericType generic && !generic.getArguments().isEmpty())
+        || !isGenericClass(type.value)) {
+        continue;
+      }
+      VarType variable = GenericType.parse("T" + fparams.get(i) + ";");
+      for (VarType parameter : parameters) {
+        if (parameter instanceof GenericType generic) {
+          for (VarType argument : generic.getArguments()) {
+            if (variable.equals(argument)) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+    return false;
   }
 
   /** Whether a class name denotes a class with type parameters, so a bare name is a raw type. */
