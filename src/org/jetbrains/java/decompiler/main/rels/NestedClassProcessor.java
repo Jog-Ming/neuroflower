@@ -182,12 +182,11 @@ public class NestedClassProcessor {
       if (name == null) {
         name = varProc.getVarName(local);
       }
-      // Only a parameter may keep its name: a local inside the lambda body can clash with a
-      // declaration the generated source hoisted above the lambda even where the table says the
-      // original scope had ended.
+      // The table states the original scope: the enclosing variable only reaches into the lambda
+      // where its range covers the instruction that creates it. Everywhere else the source reused
+      // the name legally, so the local keeps the name the table gives it.
       if (usedBefore.contains(name) && !"this".equals(name)
-          && (!isContentParameter(method.methodStruct, local)
-              || inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites))) {
+          && inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites)) {
         name = enclosingCollector.getFreeName(name);
         mapNewNames.put(local, name);
         if (lvt != null) {
@@ -287,18 +286,6 @@ public class NestedClassProcessor {
       return 0;
     });
     varProc.nestedProcessed = true;
-  }
-
-  private static boolean isContentParameter(StructMethod mt, VarVersionPair pair) {
-    if (pair.version != 0) {
-      return false;
-    }
-    MethodDescriptor md = MethodDescriptor.parseDescriptor(mt.getDescriptor());
-    int args = mt.hasModifier(CodeConstants.ACC_STATIC) ? 0 : 1;
-    for (VarType param : md.params) {
-      args += param.stackSize;
-    }
-    return pair.var < args;
   }
 
   /**

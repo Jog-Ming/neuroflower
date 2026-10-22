@@ -56,6 +56,11 @@ public class VarDefinitionHelper {
   // carries that offset per enclosing method through nested lambdas.
   private final Map<StructMethod, Integer> lambdaSites = new HashMap<>();
 
+  // An anonymous class body is a separate class scope: a local declared in one of its methods may
+  // reuse a name from the enclosing method (javac accepts that shadowing), so the enclosing names
+  // do not reach into this scan.
+  private boolean separateClassScope;
+
   public VarDefinitionHelper(RootStatement root, StructMethod mt, VarProcessor varproc) {
     this(root, mt, varproc, true);
   }
@@ -1536,10 +1541,17 @@ public class VarDefinitionHelper {
   private static class VarInMethod {
     private final VarVersionPair pair;
     private final StructMethod mt;
+    // The recorded scope of this variable, when the definition carried one. Not part of identity.
+    private final LocalVariable lvt;
 
     private VarInMethod(VarVersionPair pair, StructMethod mt) {
+      this(pair, mt, null);
+    }
+
+    private VarInMethod(VarVersionPair pair, StructMethod mt, LocalVariable lvt) {
       this.pair = pair;
       this.mt = mt;
+      this.lvt = lvt;
     }
 
     @Override
@@ -1852,12 +1864,13 @@ public class VarDefinitionHelper {
                 // Try to perform a rename
                 String name = mw.varproc.getVarName(vvp);
                 String original = name;
-                name = rename(nameMap, name, liveVarDefs, mt2, true);
+                LocalVariable paramLvt = mw.varproc.getVarLVT(vvp);
+                name = rename(nameMap, name, liveVarDefs, mt2, true, paramLvt);
 
                 // Did we rename? If so, we should add it to the name map and set as clashing
                 if (original != null && !original.equals(name)) {
                   mw.varproc.setClashingName(vvp, name);
-                  nameMap.put(new VarInMethod(vvp, mt2), name);
+                  nameMap.put(new VarInMethod(vvp, mt2, paramLvt), name);
                 }
               }
 
@@ -1889,6 +1902,7 @@ public class VarDefinitionHelper {
               seenMethods.add(InterpreterUtil.makeUniqueKey(mt2.getName(), mt2.getDescriptor()));
               // Propagate current data through to method
               VarDefinitionHelper vardef = new VarDefinitionHelper(mw.root, mt2, mw.varproc, false);
+              vardef.separateClassScope = true;
 
               // The enclosing scan's names only reach into this method where the enclosing
               // variable's LVT range covers the instruction that creates the class or lambda.
@@ -1918,12 +1932,13 @@ public class VarDefinitionHelper {
                   String name = mw.varproc.getVarName(vvp);
                   if (name != null) {
                     String original = name;
-                    name = rename(nameMap, name, liveVarDefs, mt2, true);
+                    LocalVariable paramLvt = mw.varproc.getVarLVT(vvp);
+                    name = rename(nameMap, name, liveVarDefs, mt2, true, paramLvt);
 
                     // Did we rename? If so, we should add it to the name map and set as clashing
                     if (!original.equals(name)) {
                       mw.varproc.setClashingName(vvp, name);
-                      nameMap.put(new VarInMethod(vvp, mt2), name);
+                      nameMap.put(new VarInMethod(vvp, mt2, paramLvt), name);
                     }
                   }
                 }
@@ -1954,7 +1969,7 @@ public class VarDefinitionHelper {
       VarExprent var = (VarExprent) exprent;
 
       if (var.isDefinition()) {
-        VarInMethod def = new VarInMethod(var.getVarVersionPair(), mt);
+        VarInMethod def = new VarInMethod(var.getVarVersionPair(), mt, var.getLVT());
         curVarDefs.add(def);
         liveVarDefs.add(def);
 
@@ -1963,7 +1978,7 @@ public class VarDefinitionHelper {
           String name = var.getLVT() == null ? this.varproc.getVarName(var.getVarVersionPair()) : var.getLVT().getName();
 
           String originalName = name;
-          name = rename(nameMap, name, liveVarDefs, mt, isParameter(mt, var));
+          name = rename(nameMap, name, liveVarDefs, mt, isParameter(mt, var), var.getLVT());
 
           boolean scopedSwitch = false;
           if (!originalName.equals(name)) {
@@ -2076,13 +2091,13 @@ public class VarDefinitionHelper {
   }
 
   private @NotNull String rename(Map<VarInMethod, String> nameMap, String name, Set<VarInMethod> liveVarDefs,
-                                 StructMethod mt, boolean selfParam) {
+                                 StructMethod mt, boolean selfParam, LocalVariable selfLvt) {
     if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_VARIABLE_RENAME)) {
       return name;
     }
     while (true) {
       final String candidate = name;
-      if (liveVarDefs.stream().noneMatch(vim -> clashes(vim, candidate, nameMap, mt, selfParam))) {
+      if (liveVarDefs.stream().noneMatch(vim -> clashes(vim, candidate, nameMap, mt, selfParam, selfLvt))) {
         return candidate;
       }
       name += "x";
@@ -2091,28 +2106,42 @@ public class VarDefinitionHelper {
 
   /**
    * Whether {@code vim}'s name really blocks {@code name} in the generated source. The local
-   * variable table is javac's own record of the original scopes, so a lambda parameter whose
-   * outer namesake's range does not cover the lambda cannot have clashed with it. Locals inside
-   * the lambda body are not relaxed: the generated source may have hoisted the outer declaration
-   * above the lambda even where the table says the original scope had ended.
+   * variable table is javac's own record of the original scopes: within one method two same-named
+   * variables whose ranges are disjoint were legal in the original source (sibling blocks,
+   * try/catch arms, or several ranges of one variable), so the later declaration keeps the name
+   * the table gives it. Across a lambda boundary the enclosing variable's range likewise decides:
+   * it only reaches into the body where it covers the instruction that creates the lambda.
+   * Anonymous class bodies are separate class scopes, where javac allows the shadowing anyway.
    */
   private boolean clashes(VarInMethod vim, String name, Map<VarInMethod, String> nameMap,
-                          StructMethod mt, boolean selfParam) {
+                          StructMethod mt, boolean selfParam, LocalVariable selfLvt) {
     if (!name.equals(nameMap.get(vim))) {
       return false;
     }
-    if (vim.mt == mt || !selfParam) {
+    if (vim.mt == mt) {
+      return !disjointInTable(mt, selfLvt, vim.lvt);
+    }
+    if (separateClassScope) {
+      return false;
+    }
+    if (!selfParam) {
+      // A local of the lambda body is printed at the scope the decompiler built, which may reach
+      // past the original table range (a dropped block, a hoisted declaration); only a parameter
+      // gets the benefit of the site evidence here.
       return true;
     }
 
     List<LocalVariable> vars = lvtEntries(vim.mt, vim.pair.var, name);
+    if (vars.isEmpty() && vim.lvt != null) {
+      vars = entriesBySlot(vim.mt, vim.lvt.getVersion().var);
+    }
     if (vars.isEmpty()) {
       // No table evidence: keep the conservative rename.
       return true;
     }
 
-    // An enclosing method's variable only reaches into a lambda parameter where its range covers
-    // the instruction that creates the lambda; elsewhere the source reused the name legally.
+    // An enclosing method's variable only reaches into a lambda body where its range covers the
+    // instruction that creates the lambda; elsewhere the source reused the name legally.
     Integer site = lambdaSites.get(vim.mt);
     if (site == null) {
       return true;
@@ -2123,6 +2152,20 @@ public class VarDefinitionHelper {
       }
     }
     return false;
+  }
+
+  private static List<LocalVariable> entriesBySlot(StructMethod method, int index) {
+    StructLocalVariableTableAttribute attr = method.getLocalVariableAttr();
+    if (attr == null) {
+      return List.of();
+    }
+    List<LocalVariable> list = new ArrayList<>();
+    attr.getVariables().forEach(v -> {
+      if (v.getVersion().var == index) {
+        list.add(v);
+      }
+    });
+    return list;
   }
 
   private static boolean isParameter(StructMethod mt, VarExprent var) {
@@ -2149,6 +2192,43 @@ public class VarDefinitionHelper {
       }
     });
     return list;
+  }
+
+  /**
+   * Whether the two variables' recorded scopes in {@code mt} never intersect. Every entry of
+   * either slot counts: the table may carry several ranges for one variable whose declaration a
+   * branch split, and a slot can hold different variables at different times. Without entries for
+   * both the table proves nothing and the caller keeps the conservative rename.
+   */
+  private static boolean disjointInTable(StructMethod mt, LocalVariable a, LocalVariable b) {
+    if (a == null || b == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute attr = mt.getLocalVariableAttr();
+    if (attr == null) {
+      return false;
+    }
+    List<LocalVariable> mine = new ArrayList<>();
+    List<LocalVariable> theirs = new ArrayList<>();
+    attr.getVariables().forEach(v -> {
+      if (v.getVersion().var == a.getVersion().var) {
+        mine.add(v);
+      }
+      if (v.getVersion().var == b.getVersion().var) {
+        theirs.add(v);
+      }
+    });
+    if (mine.isEmpty() || theirs.isEmpty()) {
+      return false;
+    }
+    for (LocalVariable x : mine) {
+      for (LocalVariable y : theirs) {
+        if (x.getStart() < y.getEnd() && y.getStart() < x.getEnd()) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   // Finds the case statement that the given statement belongs to
