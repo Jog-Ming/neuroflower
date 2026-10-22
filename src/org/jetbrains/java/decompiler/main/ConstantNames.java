@@ -57,7 +57,7 @@ public final class ConstantNames {
     INT, LONG, FLOAT, DOUBLE, STRING, BOOLEAN, CHAR
   }
 
-  private record Site(int start, int end, String replacement) {
+  private record Site(int start, int end, String replacement, String owner) {
   }
 
   /** The text with named constants restored, or the same text when nothing is provable. */
@@ -1100,8 +1100,8 @@ public final class ConstantNames {
     if (own == null || (own.getAccessFlags() & CodeConstants.ACC_INTERFACE) != 0) {
       return;
     }
-    Integer ownIndex = classIndices(own).get(own.qualifiedName);
-    if (ownIndex == null || ownIndex != 1) {
+    List<String> owners = prefixOwners(own);
+    if (owners.isEmpty()) {
       return;
     }
     List<FieldConstant> constants = new ArrayList<>();
@@ -1117,62 +1117,233 @@ public final class ConstantNames {
       }
       constants.add(new FieldConstant(field, kind, constant.value));
     }
-    if (constants.size() < 2) {
+    if (constants.isEmpty()) {
       return;
     }
     Map<String, List<int[]>> initializers = ownInitializers(text, spans, own);
-    for (int i = 1; i < constants.size(); i++) {
-      FieldConstant target = constants.get(i);
-      List<int[]> ranges = initializers.get(target.field().getName());
-      if (ranges == null || ranges.isEmpty()) {
+    List<String> imports = imports(text);
+    String packageName = packageName(text);
+    int last = -1;
+    for (int k = 0; k < owners.size(); k++) {
+      String owner = owners.get(k);
+      Site existing = firstInitializerSite(sites, owner, spans, initializers);
+      if (existing != null) {
+        last = Math.max(last, existing.start());
         continue;
       }
-      int[] range = ranges.get(0);
-      boolean used = false;
-      for (Site site : sites) {
-        if (site.start() < range[1] && site.end() > range[0]) {
-          used = true;
-          break;
-        }
+      // A later pair that already has a site in an initializer fixes the upper end of the field
+      // interval this naming may use; a placement after it would reorder the pool.
+      int limit = initializerLimit(sites, owners, k + 1, spans, initializers);
+      boolean self = owner.equals(own.qualifiedName);
+      List<SourceConstant> sources = self ? List.of() : sourceConstants(owner, own, imports, packageName);
+      if (!self && sources.isEmpty()) {
+        // This owner's naming cannot be written, and a later one would move up into its slot.
+        return;
       }
-      if (used) {
-        continue; // a naming site already rewrites this initializer; leave it alone
-      }
-      for (int j = 0; j < i; j++) {
-        String expression = constantExpression(target, constants.get(j));
-        if (expression == null) {
+      Site placed = null;
+      for (int i = self ? 1 : 0; i < constants.size() && placed == null; i++) {
+        FieldConstant target = constants.get(i);
+        List<int[]> ranges = initializers.get(target.field().getName());
+        if (ranges == null || ranges.isEmpty()) {
           continue;
+        }
+        int[] range = ranges.get(0);
+        if (range[0] <= last || (limit >= 0 && range[0] >= limit) || occupied(sites, range)) {
+          continue; // outside the interval the pool order leaves, or already rewritten
         }
         int equals = text.indexOf('=', range[0]);
         if (equals < 0 || equals >= range[1]) {
-          break;
+          continue;
         }
-        sites.add(new Site(equals + 1, range[1], " " + expression));
+        if (self) {
+          for (int j = 0; j < i; j++) {
+            FieldConstant source = constants.get(j);
+            String expression = constantExpression(target, source.kind(), source.value(),
+              source.field().getName());
+            if (expression != null) {
+              placed = new Site(equals + 1, range[1], " " + expression, owner);
+              break;
+            }
+          }
+        }
+        else {
+          for (SourceConstant source : sources) {
+            String expression = constantExpression(target, source.kind(), source.value(), source.name());
+            if (expression != null) {
+              placed = new Site(equals + 1, range[1], " " + expression, owner);
+              break;
+            }
+          }
+        }
+      }
+      if (placed == null) {
         return;
       }
+      addSiteOnce(sites, placed);
+      last = placed.start();
     }
   }
 
-  /** An expression over {@code source} that folds to {@code target}'s exact value, or null. */
-  private static String constantExpression(FieldConstant target, FieldConstant source) {
-    VariableType t = target.kind();
-    VariableType s = source.kind();
-    String name = source.field().getName();
-    if (!numeric(t) || !numeric(s)) {
-      return t == s && target.value().equals(source.value()) ? name : null;
+  /**
+   * The classes whose {@code Class} entries open the constant pool, in first-naming order.
+   *
+   * <p>javac attributes the constant field initializers before it generates any code, and naming
+   * {@code Owner.NAME} interns the owner's {@code Class} entry and its name right there. The pool
+   * therefore opens with those entries as consecutive {@code Class}+name pairs, in the order the
+   * source first named each owner; whatever is generated later (a super call, a {@code new})
+   * follows them. A pair that some generated code produced still sits at the boundary, so naming
+   * it again at a constant initializer cannot move it when the earlier pairs keep their order.
+   */
+  private static List<String> prefixOwners(StructClass cls) {
+    List<String> owners = new ArrayList<>();
+    List<PooledConstant> pool = cls.getPool().getPool();
+    int i = 1;
+    while (i + 1 < pool.size()) {
+      if (!(pool.get(i) instanceof PrimitiveConstant entry) || entry.type != CodeConstants.CONSTANT_Class
+          || entry.index != i + 1 || entry.getString() == null) {
+        break;
+      }
+      if (!(pool.get(i + 1) instanceof PrimitiveConstant name)
+          || name.type != CodeConstants.CONSTANT_Utf8 || !entry.getString().equals(name.getString())) {
+        break;
+      }
+      owners.add(entry.getString());
+      i += 2;
     }
-    if (foldsTo(source.value(), s, target)) {
+    return owners;
+  }
+
+  /** A foreign owner's constant, written with a qualifier that resolves inside this class. */
+  private record SourceConstant(String name, VariableType kind, Object value) {
+  }
+
+  /** The accessible constant fields of a prefix owner, printed for this class's scope. */
+  private static List<SourceConstant> sourceConstants(String owner, StructClass site,
+                                                     List<String> imports, String packageName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    if (cls == null) {
+      return List.of();
+    }
+    String qualifier = qualifier(owner, site, imports, packageName);
+    if (qualifier == null) {
+      return List.of();
+    }
+    boolean samePackage = packageName.equals(packageOf(owner));
+    boolean sameNest = nestOf(owner).equals(nestOf(site.qualifiedName));
+    List<SourceConstant> sources = new ArrayList<>();
+    for (StructField field : cls.getFields()) {
+      int access = field.getAccessFlags();
+      if ((access & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      boolean accessible = (access & CodeConstants.ACC_PUBLIC) != 0
+        || ((access & CodeConstants.ACC_PRIVATE) == 0 && samePackage)
+        || ((access & CodeConstants.ACC_PRIVATE) != 0 && sameNest);
+      if (!accessible) {
+        continue;
+      }
+      PrimitiveConstant value = constantValue(cls, field);
+      VariableType kind = value == null ? null : kind(field.getDescriptor());
+      if (value == null || kind == null || value.value == null) {
+        continue;
+      }
+      sources.add(new SourceConstant(qualifier + "." + field.getName(), kind, value.value));
+    }
+    return sources;
+  }
+
+  /** The source-level prefix that names a foreign class's constant here, or null if unnameable. */
+  private static String qualifier(String owner, StructClass site, List<String> imports,
+                                  String packageName) {
+    String simple = simpleName(owner);
+    boolean nested = owner.contains("$");
+    boolean inScope = nestOf(owner).equals(nestOf(site.qualifiedName))
+      || imports.contains(simple)
+      || (!nested && packageName.equals(packageOf(owner)));
+    if (inScope) {
+      return simple;
+    }
+    if (nested) {
+      return anonymous(owner) || !publiclyNameable(owner, packageName) ? null
+        : owner.replace('/', '.').replace('$', '.');
+    }
+    return owner.replace('/', '.');
+  }
+
+  /** The first site that names this owner inside one of the class's constant initializers, or null. */
+  private static Site firstInitializerSite(List<Site> sites, String owner, List<int[]> spans,
+                                           Map<String, List<int[]>> initializers) {
+    Site first = null;
+    for (Site site : sites) {
+      if (owner.equals(site.owner()) && inside(spans, site.start())
+          && insideInitializer(initializers, site.start())
+          && (first == null || site.start() < first.start())) {
+        first = site;
+      }
+    }
+    return first;
+  }
+
+  /**
+   * The earliest initializer site among the prefix owners from {@code from} on, or -1.
+   *
+   * <p>The owners are named in this order, so a naming placed after an already reproduced later
+   * pair would swap the two {@code Class} entries in the pool.
+   */
+  private static int initializerLimit(List<Site> sites, List<String> owners, int from,
+                                      List<int[]> spans, Map<String, List<int[]>> initializers) {
+    int limit = -1;
+    for (int k = from; k < owners.size(); k++) {
+      Site site = firstInitializerSite(sites, owners.get(k), spans, initializers);
+      if (site != null && (limit < 0 || site.start() < limit)) {
+        limit = site.start();
+      }
+    }
+    return limit;
+  }
+
+  /** Whether the text position lies inside one of the constant initializers. */
+  private static boolean insideInitializer(Map<String, List<int[]>> initializers, int position) {
+    for (List<int[]> ranges : initializers.values()) {
+      for (int[] range : ranges) {
+        if (position >= range[0] && position < range[1]) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Whether a site already rewrites part of this initializer. */
+  private static boolean occupied(List<Site> sites, int[] range) {
+    for (Site site : sites) {
+      if (site.start() < range[1] && site.end() > range[0]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** An expression over a source constant that folds to {@code target}'s exact value, or null. */
+  private static String constantExpression(FieldConstant target, VariableType sourceKind,
+                                           Object sourceValue, String name) {
+    VariableType t = target.kind();
+    if (!numeric(t) || !numeric(sourceKind)) {
+      return t == sourceKind && target.value().equals(sourceValue) ? name : null;
+    }
+    if (foldsTo(sourceValue, sourceKind, target)) {
       return name;
     }
-    VariableType u = s == VariableType.CHAR ? VariableType.INT : s;
-    if (foldsTo(negate(source.value(), u), u, target)) {
+    VariableType u = sourceKind == VariableType.CHAR ? VariableType.INT : sourceKind;
+    if (foldsTo(negate(sourceValue, u), u, target)) {
       return "-" + name;
     }
-    if ((s == VariableType.INT || s == VariableType.CHAR || s == VariableType.LONG)
-        && foldsTo(complement(source.value(), u), u, target)) {
+    if ((sourceKind == VariableType.INT || sourceKind == VariableType.CHAR
+        || sourceKind == VariableType.LONG) && foldsTo(complement(sourceValue, u), u, target)) {
       return "~" + name;
     }
-    return binaryExpression(target, source);
+    return binaryExpression(target, sourceKind, sourceValue, name);
   }
 
   /**
@@ -1183,16 +1354,16 @@ public final class ConstantNames {
    * expression in that promoted type. A literal that only verifies rounded is preferred integral,
    * which keeps the common {@code 180.0F / PI} shape.
    */
-  private static String binaryExpression(FieldConstant target, FieldConstant source) {
-    VariableType p = promote(source.kind(), target.kind());
+  private static String binaryExpression(FieldConstant target, VariableType sourceKind,
+                                         Object sourceValue, String name) {
+    VariableType p = promote(sourceKind, target.kind());
     if (p == null || !assignmentAllowed(p, target.kind())) {
       return null;
     }
-    Object converted = convert(source.value(), source.kind(), p);
+    Object converted = convert(sourceValue, sourceKind, p);
     if (converted == null) {
       return null;
     }
-    String name = source.field().getName();
     if (p == VariableType.INT || p == VariableType.LONG) {
       long g = ((Number) converted).longValue();
       Object expected = convert(target.value(), target.kind(), p);
@@ -2224,7 +2395,8 @@ public final class ConstantNames {
     if (window != null) {
       if (!placed) {
         if (deferred != null) {
-          deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>()).add(new Site(start, end, printed));
+          deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>())
+            .add(new Site(start, end, printed, constant.owner()));
         }
         return;
       }
@@ -2232,7 +2404,7 @@ public final class ConstantNames {
         inWindow.add(constant.owner());
       }
     }
-    addSiteOnce(sites, new Site(start, end, printed));
+    addSiteOnce(sites, new Site(start, end, printed, constant.owner()));
   }
 
   /**
