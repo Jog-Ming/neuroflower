@@ -34,6 +34,7 @@ import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMain;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.struct.match.MatchEngine;
 import org.jetbrains.java.decompiler.struct.match.MatchNode;
@@ -76,6 +77,8 @@ public class InvocationExprent extends Exprent {
   private LinkConstant bootstrapMethod;
   private List<PooledConstant> bootstrapArguments;
   private final List<VarType> genericArgs = new ArrayList<>();
+  /** A witness this call prints that an unqualified name cannot carry: print the class too. */
+  private boolean witnessQualifier = false;
   private VarType remappedInstType = null;
   public boolean forceGenericQualfication = false;
   private final NullableConcurrentHashMap<VarType, VarType> genericsMap = new NullableConcurrentHashMap<>();
@@ -242,6 +245,7 @@ public class InvocationExprent extends Exprent {
     genericArgs.clear();
     genericsMap.clear();
     this.remappedInstType = null;
+    this.witnessQualifier = false;
 
     StructClass mthCls = DecompilerContext.getStructContext().getClass(classname);
 
@@ -681,8 +685,16 @@ public class InvocationExprent extends Exprent {
               && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
               && receiverTargetDemand(fparams, upperBoundsMap, bounds);
 
+            // A type variable no recorded parameter mentions can only default to its declared
+            // bound where javac has no target, and the recorded expected type rejects that
+            // instantiation, so the source pinned it. Only the witness whose erasure reproduces
+            // the pool's descriptor is used.
+            boolean returnOnlyDemand = suppress && !isNew
+              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && returnOnlyTypeVariableDemand(fparams, ret, bounds, upperBound, isNew);
+
             if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
-              || receiverDemand) {
+              || receiverDemand || returnOnlyDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
               if (!receiverDemand && genericArgs.isEmpty() && !isNew
                 && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
@@ -810,7 +822,9 @@ public class InvocationExprent extends Exprent {
       }
 
       ClassNode node = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
-      if (node == null || !classname.equals(node.classStruct.qualifiedName)) {
+      if (node == null || !classname.equals(node.classStruct.qualifiedName)
+        || (witnessQualifier && !genericArgs.isEmpty())) {
+        // An unqualified call has no place for a witness: `.m()` is not valid Java.
         buf.appendAllClasses(DecompilerContext.getImportCollector().getShortNameInClassContext(ExprProcessor.buildJavaClassName(classname)), classname);
       }
     }
@@ -2405,6 +2419,158 @@ public class InvocationExprent extends Exprent {
   }
 
   /**
+   * A call whose type variable occurs in no recorded parameter type, so javac cannot infer it
+   * from any argument. Where the call is not in a target position javac defaults such a variable
+   * to its declared bound, and the recorded expected type must then reject that instantiation -
+   * otherwise a source that compiled need not have pinned anything and no witness is printed.
+   * The witness must itself be a type variable the source can name: a concrete instantiation
+   * would freeze an inference javac still has to solve with its surrounding diamond or call
+   * chain. It is used only when its erasure reproduces the call the pool recorded at this site.
+   */
+  private boolean returnOnlyTypeVariableDemand(List<String> fparams, VarType ret,
+                                               Map<VarType, List<VarType>> bounds, VarType upperBound, boolean isNew) {
+    if (isNew || fparams.isEmpty() || desc == null || desc.getSignature() == null
+      || ret == null || upperBound == null
+      || upperBound.type == CodeType.GENVAR || upperBound.type == CodeType.VOID) {
+      return false;
+    }
+    // A call with arguments in receiver position is inferred by javac from those arguments;
+    // only a call that takes none has no constraint but the target there.
+    if (isInvocationInstance && !lstParameters.isEmpty()) {
+      return false;
+    }
+    GenericMethodDescriptor signature = desc.getSignature();
+    Set<String> mentioned = new HashSet<>();
+    for (VarType parameter : signature.parameterTypes) {
+      collectTypeVariables(parameter, mentioned);
+    }
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    Map<VarType, VarType> defaulted = new HashMap<>();
+    boolean demanded = false;
+    for (int i = 0; i < fparams.size(); i++) {
+      String fp = fparams.get(i);
+      VarType variable = GenericType.parse("T" + fp + ";");
+      boolean inferable = mentioned.contains(fp);
+      if (!inferable) {
+        demanded = true;
+      }
+      VarType value = genericsMap.get(variable);
+      if (!isWitnessType(value, named)) {
+        return false;
+      }
+      // Only a type variable the source itself can name proves a pin: a concrete instantiation
+      // (or one carrying wildcards) is also what javac's own inference over the surrounding
+      // diamond or call chain produces, and naming it would freeze an inference javac still
+      // needs to solve together with its context.
+      if (!inferable && (value.type != CodeType.GENVAR || !isInScopeTypeVariable(value, named))) {
+        return false;
+      }
+      witness.add(value);
+      List<VarType> declared = i < signature.typeParameterBounds.size()
+        ? signature.typeParameterBounds.get(i) : null;
+      VarType bound = declared == null || declared.isEmpty() ? VarType.VARTYPE_OBJECT : declared.get(0);
+      defaulted.put(variable, bound == null ? VarType.VARTYPE_OBJECT : bound);
+    }
+    if (!demanded) {
+      return false;
+    }
+    // What javac infers without a witness: every variable at its declared bound. If that
+    // instantiation already fits the recorded expected type, nothing proves the source pinned it.
+    VarType inferred = ret.remap(defaulted);
+    if (inferred != null && satisfiesUpperBound(inferred, upperBound)) {
+      return false;
+    }
+    if (!erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    witnessQualifier = true;
+    return true;
+  }
+
+  /** A witness position: a printable type, or a type variable that is in scope where it prints. */
+  private static boolean isWitnessType(VarType type, Map<VarType, List<VarType>> named) {
+    if (type == null || type == GenericType.DUMMY_VAR) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return isInScopeTypeVariable(type, named);
+    }
+    return isPrintableWitness(type);
+  }
+
+  /** The names of every type variable mentioned in a recorded type. */
+  private static void collectTypeVariables(VarType type, Set<String> names) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR) {
+      names.add(type.value);
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        collectTypeVariables(argument, names);
+      }
+    }
+  }
+
+  /**
+   * Whether a value the arguments alone would produce is accepted by the recorded expected type.
+   * Only used to prove that no witness was needed, so a wildcard (which accepts more) counts as
+   * satisfied, while a type variable outside a wildcard is an exact requirement: the position is
+   * invariant and only the same variable is an instance of it.
+   */
+  private static boolean satisfiesUpperBound(VarType value, VarType target) {
+    if (value == null || target == null) {
+      return false;
+    }
+    if (target.type == CodeType.GENVAR) {
+      // The expected type itself is a variable whose value is unknown here; it may accept it.
+      return true;
+    }
+    if (target instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return true;
+    }
+    if (target.type != CodeType.OBJECT) {
+      return value.equals(target);
+    }
+    GenericType targetGeneric = target instanceof GenericType generic ? generic : null;
+    if (targetGeneric == null || targetGeneric.getArguments().isEmpty()) {
+      return value.type == CodeType.OBJECT && value.value.equals(target.value)
+        && (!(value instanceof GenericType valueGeneric) || valueGeneric.getArguments().isEmpty());
+    }
+    if (!(value instanceof GenericType valueGeneric) || !value.value.equals(target.value)) {
+      return false;
+    }
+    List<VarType> targetArgs = targetGeneric.getArguments();
+    List<VarType> valueArgs = valueGeneric.getArguments();
+    if (valueArgs.size() != targetArgs.size()) {
+      return false;
+    }
+    for (int i = 0; i < targetArgs.size(); i++) {
+      if (!satisfiesArgument(valueArgs.get(i), targetArgs.get(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** One invariant type-argument position: only the very same type is accepted. */
+  private static boolean satisfiesArgument(VarType value, VarType target) {
+    if (target == null) {
+      return true; // an unbounded wildcard
+    }
+    if (target.type == CodeType.GENVAR) {
+      return value != null && value.type == CodeType.GENVAR && value.value.equals(target.value)
+        && (!(value instanceof GenericType generic) || generic.getWildcard() == GenericType.WILDCARD_NO);
+    }
+    if (target instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return true;
+    }
+    return satisfiesUpperBound(value, target);
+  }
+
+  /**
    * A type that can stand as a witness: no free type variable and no raw generic class. A raw
    * rendering of a generic class is not what the recorded types say and loses the information the
    * rest of the chain was typed with; unbounded wildcards are allowed and print as {@code ?}.
@@ -3233,8 +3399,14 @@ public class InvocationExprent extends Exprent {
         if (instruction.group != CodeConstants.GROUP_INVOCATION) {
           continue;
         }
-        LinkConstant link = pool.getLinkConstant(instruction.operand(0));
-        if (link != null && classname.equals(link.classname) && name.equals(link.elementname)
+        // A lifted initializer's offsets can name a position that is not this method's call in
+        // the class's own pool; only a link constant there can be the recorded method.
+        int operand = instruction.operand(0);
+        if (operand <= 0 || operand >= pool.getPool().size()
+          || !(pool.getConstant(operand) instanceof LinkConstant link)) {
+          continue;
+        }
+        if (classname.equals(link.classname) && name.equals(link.elementname)
             && stringDescriptor.equals(link.descriptor)) {
           return true;
         }

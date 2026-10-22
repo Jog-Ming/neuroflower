@@ -3,6 +3,7 @@
  */
 package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
+import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
@@ -13,6 +14,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
@@ -299,6 +302,28 @@ public abstract class Exprent implements IMatchable {
       class_ = class_.parent;
     }
     return ret;
+  }
+
+  /**
+   * Whether a type variable can be named at the point being printed. A static context cannot
+   * reference the type variables its class or an enclosing class declares, even though those are
+   * in {@link #getNamedGenerics()}: a witness or a qualifier written there would not compile.
+   */
+  protected static boolean isInScopeTypeVariable(VarType type, Map<VarType, List<VarType>> named) {
+    if (type == null || type.type != CodeType.GENVAR || !named.containsKey(type)) {
+      return false;
+    }
+    if (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    if (method == null || !method.hasModifier(CodeConstants.ACC_STATIC)) {
+      return true;
+    }
+    // In a static context only the method's own type parameters can be named; the class's and
+    // its enclosers' are out of reach. A method parameter shadows a class parameter of the same
+    // name, and then that name is the one in scope.
+    return method.getSignature() != null && method.getSignature().typeParameters.contains(type.value);
   }
 
   public void setInvocationInstance() {}

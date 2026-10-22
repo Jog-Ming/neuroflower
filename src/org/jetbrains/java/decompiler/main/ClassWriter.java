@@ -176,7 +176,7 @@ public class ClassWriter implements StatementWriter {
   }
 
   public void classLambdaToJava(ClassNode node, TextBuffer buffer, Exprent method_object, int indent,
-                                int creationLine) {
+                                int creationLine, VarType referenceQualifier) {
     ClassWrapper wrapper = node.getWrapper();
     if (wrapper == null) {
       return;
@@ -206,8 +206,11 @@ public class ClassWriter implements StatementWriter {
           }
         }
         else {
-          // reference to a static method
-          buffer.appendCastTypeName(new VarType(node.lambdaInformation.content_class_name, true));
+          // reference to a static method or a constructor: the class is the qualifier, and the
+          // type arguments recorded for the created value belong on it.
+          buffer.appendCastTypeName(referenceQualifier != null
+            ? referenceQualifier
+            : new VarType(node.lambdaInformation.content_class_name, true));
         }
 
         buffer.append("::")

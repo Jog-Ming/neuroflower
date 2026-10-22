@@ -435,7 +435,7 @@ public class NewExprent extends Exprent {
         // table entry can interpolate to an earlier line when the call spans lines.
         int callLine = InvocationExprent.enclosingCallLine();
         new ClassWriter().classLambdaToJava(child, buf, methodObject, indent,
-          callLine >= 0 ? callLine : RoundTrip.sourceLine(this));
+          callLine >= 0 ? callLine : RoundTrip.sourceLine(this), methodReferenceQualifier());
       }
       else if (!selfReference) {
         String regionClass = child == null || child.classStruct == null ? null : child.classStruct.qualifiedName;
@@ -940,6 +940,132 @@ public class NewExprent extends Exprent {
 
   public boolean isMethodReference() {
     return methodReference;
+  }
+
+  /**
+   * The instantiated class a static or constructor method reference names, when the recorded
+   * types prove the source pinned its type arguments. The printer's inference took the value's
+   * type from the target (a recorded signature); javac types a method reference without the
+   * target of the chain it is passed into, and a type variable no constructor argument constrains
+   * then defaults to its declared bound. The qualifier is printed only when the recorded
+   * instantiation names a type variable that is in scope and is not that bound.
+   */
+  private VarType methodReferenceQualifier() {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+      || !lambda || !isMethodReference() || inferredLambdaType == null || !inferredLambdaType.isGeneric()) {
+      return null;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
+    if (node == null || node.lambdaInformation == null) {
+      return null;
+    }
+    // Only a static method or a constructor names its class as the reference's qualifier.
+    if (!node.lambdaInformation.is_content_method_static
+      && !CodeConstants.INIT_NAME.equals(node.lambdaInformation.content_method_name)) {
+      return null;
+    }
+    String contentClass = node.lambdaInformation.content_class_name;
+    StructClass target = DecompilerContext.getStructContext().getClass(contentClass);
+    if (target == null || target.getSignature() == null || target.getSignature().fparameters.isEmpty()) {
+      return null;
+    }
+    // A class type variable the reference's own parameters mention is inferred by javac from the
+    // arguments; naming it on the qualifier would contradict that inference.
+    StructMethod content = target.getMethod(node.lambdaInformation.content_method_name,
+      node.lambdaInformation.content_method_descriptor);
+    Set<String> fromArguments = new HashSet<>();
+    if (content != null && content.getSignature() != null) {
+      for (VarType parameter : content.getSignature().parameterTypes) {
+        collectTypeVariableNames(parameter, fromArguments);
+      }
+    }
+    StructClass iface = DecompilerContext.getStructContext().getClass(node.anonymousClassType.value);
+    if (iface == null || iface.getSignature() == null) {
+      return null;
+    }
+    StructMethod sam = iface.getMethod(getLambdaMethodKey());
+    if (sam == null || sam.getSignature() == null || sam.getSignature().returnType == null) {
+      return null;
+    }
+    Map<VarType, VarType> map = new HashMap<>();
+    iface.getSignature().genericType.mapGenVarsTo((GenericType) inferredLambdaType, map);
+    VarType produced = unwrapWildcard(sam.getSignature().returnType.remap(map));
+    if (produced == null || produced.type != CodeType.OBJECT || !produced.isGeneric()
+      || !contentClass.equals(produced.value)) {
+      return null;
+    }
+    GenericClassDescriptor signature = target.getSignature();
+    List<VarType> args = ((GenericType) produced).getArguments();
+    if (args.size() != signature.fparameters.size()) {
+      return null;
+    }
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    boolean pinned = false;
+    for (int i = 0; i < args.size(); i++) {
+      VarType arg = args.get(i);
+      if (!isReferenceArgument(arg, named)) {
+        return null;
+      }
+      if (fromArguments.contains(signature.fparameters.get(i))) {
+        return null;
+      }
+      List<VarType> declared = signature.fbounds.size() > i ? signature.fbounds.get(i) : null;
+      VarType bound = declared == null || declared.isEmpty() ? null : declared.get(0);
+      if (isInScopeTypeVariable(arg, named)
+        && (bound == null || bound.type != CodeType.GENVAR || !bound.value.equals(arg.value))) {
+        pinned = true;
+      }
+    }
+    return pinned ? produced : null;
+  }
+
+  /** The names of every type variable mentioned in a recorded type. */
+  private static void collectTypeVariableNames(VarType type, Set<String> names) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR) {
+      names.add(type.value);
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        collectTypeVariableNames(argument, names);
+      }
+    }
+  }
+
+  /** Strip the wildcards a functional interface's return position wraps a value in. */
+  private static VarType unwrapWildcard(VarType type) {
+    while (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      List<VarType> arguments = generic.getArguments();
+      if (arguments.size() != 1 || arguments.get(0) == null) {
+        return null;
+      }
+      type = arguments.get(0);
+    }
+    return type;
+  }
+
+  /** A type argument a source can write: an in-scope type variable or a printable generic type. */
+  private static boolean isReferenceArgument(VarType type, Map<VarType, List<VarType>> named) {
+    if (type == null || type == GenericType.DUMMY_VAR) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return isInScopeTypeVariable(type, named);
+    }
+    if (type instanceof GenericType generic) {
+      if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+        return false;
+      }
+      for (VarType argument : generic.getArguments()) {
+        if (argument != null && !isReferenceArgument(argument, named)) {
+          return false;
+        }
+      }
+      return !generic.getArguments().isEmpty() || !hasTypeParameters(type);
+    }
+    return type.type == CodeType.OBJECT;
   }
 
   public String getLambdaMethodKey() {
