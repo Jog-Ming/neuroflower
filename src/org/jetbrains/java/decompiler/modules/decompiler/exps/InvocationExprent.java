@@ -651,9 +651,14 @@ public class InvocationExprent extends Exprent {
               suppress = false;
             }
 
-            if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)) {
+            boolean receiverDemand = suppress && !isNew
+              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && receiverTargetDemand(fparams, upperBoundsMap, bounds);
+
+            if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
+              || receiverDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
-              if (genericArgs.isEmpty() && !isNew
+              if (!receiverDemand && genericArgs.isEmpty() && !isNew
                 && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
                 // The printer's inference has no value for some type variable; an argument's
                 // recorded metafactory type may still prove what the source passed.
@@ -2286,6 +2291,124 @@ public class InvocationExprent extends Exprent {
   }
 
   /**
+   * An invocation in receiver position cannot take its type arguments from the surrounding
+   * target: javac types a method's receiver without one, so a type variable that only the target
+   * determines is left at its default there, and an inexact method reference argument supplies no
+   * constraint that could recover it. The printer's inference did use the target (the declared
+   * type of the field or assignment the whole chain flows into, a class-file signature); when the
+   * target determines a type variable and the printer settles every type variable of the call,
+   * that is the witness a compiling source must have written. It is printed only when it contains
+   * no free type variable, reproduces the method the pool recorded, and the call site is in this
+   * class's own pool.
+   */
+  private boolean receiverTargetDemand(List<String> fparams, Map<VarType, VarType> upperBoundsMap,
+                                       Map<VarType, List<VarType>> bounds) {
+    if (!isInvocationInstance || fparams.isEmpty() || desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    Set<VarType> targetSeeded = new HashSet<>();
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType target = upperBoundsMap.get(variable);
+      VarType inferred = genericsMap.get(variable);
+      if (target == null || GenericType.DUMMY_VAR.equals(target) || inferred == null) {
+        continue;
+      }
+      if (sameType(inferred, target)) {
+        targetSeeded.add(variable);
+      }
+    }
+    if (targetSeeded.isEmpty()) {
+      return false;
+    }
+    // Only a variable in the contravariant (receiver) position of a method reference is
+    // unrecoverable for javac: it types the receiver from the method reference's target, and an
+    // unbound reference to a generic class gives it no constraint there. A variable in the
+    // covariant position is inferred from the reference's recorded return type, and printing it
+    // would change the inference of the surrounding chain.
+    List<VarType> parameterTypes = desc.getSignature().parameterTypes;
+    int count = Math.min(parameterTypes.size(), lstParameters.size());
+    boolean receiverSeeded = false;
+    for (int i = 0; i < count; i++) {
+      if (!(lstParameters.get(i) instanceof NewExprent expr) || !expr.isMethodReference()) {
+        continue;
+      }
+      Set<VarType> covariant = new HashSet<>();
+      Set<VarType> other = new HashSet<>();
+      collectVariance(parameterTypes.get(i), true, covariant, other);
+      other.retainAll(targetSeeded);
+      if (!other.isEmpty()) {
+        receiverSeeded = true;
+        break;
+      }
+    }
+    if (!receiverSeeded) {
+      return false;
+    }
+    List<VarType> witness = new ArrayList<>();
+    getGenericArgs(fparams, genericsMap, witness);
+    if (witness.size() != fparams.size()) {
+      return false;
+    }
+    for (VarType type : witness) {
+      if (!isPrintableWitness(type)) {
+        return false;
+      }
+    }
+    if (!erasureMatchesDescriptor(fparams, witness, bounds)) {
+      return false;
+    }
+    if (!isRecordedCallSite()) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * A type that can stand as a witness: no free type variable and no raw generic class. A raw
+   * rendering of a generic class is not what the recorded types say and loses the information the
+   * rest of the chain was typed with; unbounded wildcards are allowed and print as {@code ?}.
+   */
+  private static boolean isPrintableWitness(VarType type) {
+    if (type == null || type == GenericType.DUMMY_VAR || type.type == CodeType.GENVAR) {
+      return false;
+    }
+    GenericType generic = type instanceof GenericType g ? g : null;
+    if (generic != null) {
+      if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+        return false;
+      }
+      List<VarType> arguments = generic.getArguments();
+      for (VarType argument : arguments) {
+        if (argument != null && !isPrintableWitness(argument)) {
+          return false;
+        }
+      }
+      if (!arguments.isEmpty()) {
+        return true;
+      }
+    }
+    return type.type != CodeType.OBJECT || !isGenericClass(type.value);
+  }
+
+  /** Whether a class name denotes a class with type parameters, so a bare name is a raw type. */
+  private static boolean isGenericClass(String internalName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(internalName);
+    if (cls != null && cls.getSignature() != null) {
+      return !cls.getSignature().fparameters.isEmpty();
+    }
+    if (internalName.startsWith("java/") || internalName.startsWith("javax/")) {
+      try {
+        return Class.forName(internalName.replace('/', '.'), false, null).getTypeParameters().length > 0;
+      }
+      catch (Throwable ignored) {
+        // Without the class there is no evidence that the name is raw.
+      }
+    }
+    return false;
+  }
+
+  /**
    * A method reference or lambda argument whose recorded instantiated type is wider than the
    * method it names: the class file's metafactory argument then proves the source fixed the call's
    * type variables itself, because javac's plain inference from the argument would have produced
@@ -2776,6 +2899,7 @@ public class InvocationExprent extends Exprent {
     if (method == null) {
       return false;
     }
+    boolean released = method.getInstructionSequence() == null;
     try {
       FullInstructionSequence seq = method.getInstructionSequence();
       if (seq == null) {
@@ -2802,6 +2926,13 @@ public class InvocationExprent extends Exprent {
       }
     } catch (IOException ignored) {
       return false;
+    }
+    finally {
+      if (released) {
+        // Reading must not leave the sequence live: printer rules that consult the current
+        // method's sequence would silently start firing after this check.
+        method.releaseResources();
+      }
     }
     return false;
   }
