@@ -2998,10 +2998,15 @@ public class InvocationExprent extends Exprent {
    * exact method the target recorded at this call site.
    */
   private boolean tryDemandWitness(List<String> fparams, Map<VarType, List<VarType>> bounds) {
-    if (fparams.isEmpty() || !isInvocationInstance) {
+    if (fparams.isEmpty()) {
       return false;
     }
-    List<VarType> witness = demandWitness(fparams);
+    // Most proofs here only hold for a receiver: an argument or assignment position hands the
+    // call a target, and javac may have inferred the recorded type from it. A method reference's
+    // recorded return at the functional method's own position is different, see
+    // recordedSettledTypes.
+    boolean instancePosition = isInvocationInstance;
+    List<VarType> witness = demandWitness(fparams, instancePosition);
     if (witness == null) {
       return false;
     }
@@ -3381,15 +3386,15 @@ public class InvocationExprent extends Exprent {
    * recorded argument agrees with it, else the recorded metafactory type itself when it settles
    * a type variable the printer's inference placed elsewhere. Null when nothing is proven.
    */
-  private List<VarType> demandWitness(List<String> fparams) {
-    if (recordedArgumentConstraint(fparams)) {
+  private List<VarType> demandWitness(List<String> fparams, boolean instancePosition) {
+    if (instancePosition && recordedArgumentConstraint(fparams)) {
       List<VarType> witness = new ArrayList<>(fparams.size());
       getGenericArgs(fparams, genericsMap, witness);
       if (witness.size() == fparams.size() && allConcreteTypes(witness)) {
         return witness;
       }
     }
-    Map<VarType, VarType> settled = recordedSettledTypes(fparams);
+    Map<VarType, VarType> settled = recordedSettledTypes(fparams, instancePosition);
     if (settled.isEmpty()) {
       return null;
     }
@@ -3417,12 +3422,13 @@ public class InvocationExprent extends Exprent {
    * Type variables a functional argument's recorded metafactory instantiated type settles to a
    * concrete value. The instantiated method type is the ground target type javac used, so its
    * return type is the value of the variable feeding the return position, provided that variable
-   * is the only one in a covariant position of the declared parameter type. The recorded return
-   * must widen the implementation's return: only then does it prove the source constrained the
-   * variable, because plain inference from the argument would have produced the narrower
-   * implementation type.
+   * is the only one in a covariant position of the declared parameter type, or is the functional
+   * method's own return type variable when a method reference's declared parameter spells the
+   * interface's arguments without wildcards. The recorded return must widen the implementation's
+   * return: only then does it prove the source constrained the variable, because plain inference
+   * from the argument would have produced the narrower implementation type.
    */
-  private Map<VarType, VarType> recordedSettledTypes(List<String> fparams) {
+  private Map<VarType, VarType> recordedSettledTypes(List<String> fparams, boolean instancePosition) {
     Map<VarType, VarType> settled = new HashMap<>();
     if (desc == null || desc.getSignature() == null || fparams.isEmpty()) {
       return settled;
@@ -3440,7 +3446,23 @@ public class InvocationExprent extends Exprent {
       collectVariance(parameterTypes.get(i), true, covariant, other);
       covariant.removeAll(other);
       covariant.retainAll(methodVars);
-      if (covariant.size() != 1) {
+      VarType variable = null;
+      boolean samReturn = false;
+      if (covariant.size() == 1 && instancePosition) {
+        variable = covariant.iterator().next();
+      }
+      else if (covariant.isEmpty() && lambda.isMethodReference()) {
+        // A method reference's instantiated return is the functional method's ground return
+        // type, so it fixes the type variable sitting at that position even when the declared
+        // parameter spells the interface's argument without a wildcard (Function<T, U>): javac
+        // infers such a variable from the referenced method's own return, so a recorded return
+        // that is wider can only come from the source constraining the call. This also holds
+        // outside receiver position: a call whose target is an inference variable is inferred
+        // standalone, so its own arguments are the only constraints javac has.
+        variable = samReturnTypeVariable(parameterTypes.get(i), methodVars, parameterTypes, i);
+        samReturn = variable != null;
+      }
+      if (variable == null) {
         continue;
       }
       ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
@@ -3474,16 +3496,82 @@ public class InvocationExprent extends Exprent {
           && isConcreteType(instantiatedRet)) {
         recorded = instantiatedRet;
       }
-      if (recorded == null) {
+      // A metafactory record carries erasure only, so the value it settles a SAM return variable
+      // to can be a bare generic class (a referenced method returning Holder.Reference widens to
+      // Holder). A witness the printer can only render raw names a different type, and the call
+      // is then left to javac.
+      if (recorded == null || (samReturn && !isPrintableWitness(recorded))) {
         continue;
       }
-      VarType variable = covariant.iterator().next();
       VarType prior = settled.putIfAbsent(variable, recorded);
       if (prior != null && !sameType(prior, recorded)) {
         return new HashMap<>();
       }
     }
     return settled;
+  }
+
+  /**
+   * The method type variable at the functional method's return position, when that position is
+   * exactly one of the interface's type variables and the variable occurs only once in the
+   * declared parameter type and nowhere in the call's other parameters. Anywhere else it would
+   * also constrain an argument position, which the recorded return does not settle.
+   */
+  private VarType samReturnTypeVariable(VarType declared, Set<VarType> methodVars,
+                                        List<VarType> parameterTypes, int index) {
+    if (!(declared instanceof GenericType parameter) || parameter.getWildcard() != GenericType.WILDCARD_NO) {
+      return null;
+    }
+    StructClass iface = DecompilerContext.getStructContext().getClass(parameter.value);
+    if (iface == null || iface.getSignature() == null) {
+      return null;
+    }
+    List<String> ifaceParams = iface.getSignature().fparameters;
+    List<VarType> actual = parameter.getArguments();
+    if (actual.size() != ifaceParams.size()) {
+      return null;
+    }
+    StructMethod sam = ExprProcessor.functionalMethod(iface);
+    if (sam == null || sam.getSignature() == null) {
+      return null;
+    }
+    VarType samRet = sam.getSignature().returnType;
+    // A return type built from a variable (List<R>) would need its own variance analysis.
+    if (samRet == null || samRet.type != CodeType.GENVAR || samRet.arrayDim != 0) {
+      return null;
+    }
+    int position = ifaceParams.indexOf(samRet.value);
+    if (position < 0 || position >= actual.size()) {
+      return null;
+    }
+    VarType variable = actual.get(position);
+    if (variable == null || variable.type != CodeType.GENVAR || !methodVars.contains(variable)
+        || countGenvar(declared, variable) != 1) {
+      return null;
+    }
+    for (int other = 0; other < parameterTypes.size(); other++) {
+      if (other != index && countGenvar(parameterTypes.get(other), variable) != 0) {
+        return null;
+      }
+    }
+    return variable;
+  }
+
+  private static int countGenvar(VarType type, VarType variable) {
+    if (type == null) {
+      return 0;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return type.equals(variable) ? 1 : 0;
+    }
+    if (type instanceof GenericType generic) {
+      int total = 0;
+      for (VarType argument : generic.getArguments()) {
+        total += countGenvar(argument, variable);
+      }
+      return total;
+    }
+    return 0;
   }
 
   /**
