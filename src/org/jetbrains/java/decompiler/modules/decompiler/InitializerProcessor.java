@@ -18,6 +18,9 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
@@ -261,6 +264,8 @@ public final class InitializerProcessor {
       }
     }
 
+    liftAssignmentsAfterStaticBlocks(wrapper, method, cl, firstData, whitelist);
+
     // Ensure enum fields have been inlined
     if (cl.hasModifier(CodeConstants.ACC_ENUM)) {
       for (StructField fd : cl.getFields()) {
@@ -273,6 +278,128 @@ public final class InitializerProcessor {
         }
       }
     }
+  }
+
+  /**
+   * javac gives a static block's local variables a scope that ends at the block's closing brace,
+   * not at the last use. An assignment to a static field of this class that trails {@code <clinit>}
+   * and whose store lies at or after that end was therefore written outside the block, as the
+   * field's initializer: the block closed before it. Lifting it reproduces the original - the
+   * regenerated static block ends at the same offset, and the field prints on its own line after
+   * it. Only the LVT length carries that evidence, and attribute scoring ignores it.
+   *
+   * <p>Only the tail of the straight-line path is lifted. The whole method prints as one static
+   * block at its first line, so an initializer between two blocks would be printed after both,
+   * reordering the code; a trailing run keeps the printed order.
+   */
+  private static void liftAssignmentsAfterStaticBlocks(ClassWrapper wrapper, MethodWrapper method,
+                                                       StructClass cl, Statement firstData,
+                                                       Set<String> whitelist) {
+    StructLocalVariableTableAttribute scope = method.methodStruct.getLocalVariableAttr();
+    StructLineNumberTableAttribute lines =
+      method.methodStruct.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (scope == null || lines == null) {
+      return;
+    }
+    int scopeEnd = -1;
+    for (Iterator<StructLocalVariableTableAttribute.LocalVariable> vars = scope.getVariables().iterator(); vars.hasNext(); ) {
+      scopeEnd = Math.max(scopeEnd, vars.next().getEnd());
+    }
+    if (scopeEnd <= 0) {
+      return;
+    }
+
+    // Fields assigned more than once on the straight-line path are not safe to inline.
+    List<String> seen = new ArrayList<>();
+    List<String> multiAssign = new ArrayList<>();
+    for (Statement stat : straightLineBlocks(method.root.getFirst())) {
+      for (Exprent exprent : stat.getExprents()) {
+        if (exprent instanceof AssignmentExprent && ((AssignmentExprent)exprent).getLeft() instanceof FieldExprent) {
+          String name = ((FieldExprent)((AssignmentExprent)exprent).getLeft()).getName();
+          if (seen.contains(name)) {
+            if (!multiAssign.contains(name)) {
+              multiAssign.add(name);
+            }
+          } else {
+            seen.add(name);
+          }
+        }
+      }
+    }
+
+    Statement tail = lastStraightLineBlock(method.root.getFirst());
+    if (tail == null || tail == firstData || tail.getExprents().isEmpty()) {
+      return;
+    }
+    int blockLine = lines.findLineNumber(0);
+    List<FieldExprent> notInlined = new ArrayList<>();
+    List<Exprent> exprents = tail.getExprents();
+    int first = exprents.size();
+    // Walk back over the trailing run; the first exprent that does not qualify ends it.
+    while (first > 0) {
+      Exprent exprent = exprents.get(first - 1);
+      if (!(exprent instanceof AssignmentExprent) || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+        break;
+      }
+      int offset = exprent.bytecode.nextSetBit(0);
+      if (offset < scopeEnd || lines.findLineNumber(offset) <= blockLine) {
+        break;
+      }
+      AssignmentExprent assignExpr = (AssignmentExprent)exprent;
+      if (!(assignExpr.getLeft() instanceof FieldExprent)) {
+        break;
+      }
+      FieldExprent fExpr = (FieldExprent)assignExpr.getLeft();
+      if (!fExpr.isStatic() || !fExpr.getClassname().equals(cl.qualifiedName) ||
+          !cl.hasField(fExpr.getName(), fExpr.getDescriptor().descriptorString)) {
+        break;
+      }
+      String keyField = InterpreterUtil.makeUniqueKey(fExpr.getName(), fExpr.getDescriptor().descriptorString);
+      if (wrapper.getStaticFieldInitializers().containsKey(keyField)) {
+        break;
+      }
+      if (!isExprentIndependent(fExpr, assignExpr.getRight(), method, cl, whitelist, multiAssign,
+                                notInlined, cl.getFields().getIndexByKey(keyField), true)) {
+        break;
+      }
+      wrapper.getStaticFieldInitializers().addWithKey(assignExpr.getRight(), keyField);
+      whitelist.add(keyField);
+      first--;
+    }
+    if (first < exprents.size()) {
+      exprents.subList(first, exprents.size()).clear();
+    }
+  }
+
+  /** Every basic block that executes unconditionally, in generation order. */
+  private static List<Statement> straightLineBlocks(Statement stat) {
+    List<Statement> out = new ArrayList<>();
+    collectStraightLineBlocks(stat, out);
+    return out;
+  }
+
+  private static void collectStraightLineBlocks(Statement stat, List<Statement> out) {
+    if (stat.type == Statement.StatementType.SEQUENCE) {
+      for (Statement child : stat.getStats()) {
+        collectStraightLineBlocks(child, out);
+      }
+    } else if (stat.type == Statement.StatementType.BASIC_BLOCK && stat.getExprents() != null) {
+      out.add(stat);
+    }
+  }
+
+  /**
+   * The basic block that ends {@code <clinit>}, or null when the last statement is not a plain
+   * block (then lifting would move its code past a later control structure).
+   */
+  private static Statement lastStraightLineBlock(Statement stat) {
+    while (stat.type == Statement.StatementType.SEQUENCE) {
+      if (stat.getStats().isEmpty()) {
+        return null;
+      }
+      stat = stat.getStats().get(stat.getStats().size() - 1);
+    }
+    return stat.type == Statement.StatementType.BASIC_BLOCK && stat.getExprents() != null ? stat : null;
   }
 
   private static void extractDynamicInitializers(ClassWrapper wrapper) {

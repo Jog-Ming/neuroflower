@@ -596,7 +596,14 @@ public class ClassWriter implements StatementWriter {
             if (member[0] == 1) {
               StructMethod mt = methods.get(member[1]);
               if (CodeConstants.INIT_NAME.equals(mt.getName()) || CodeConstants.CLINIT_NAME.equals(mt.getName())) {
-                boolean scoped = "all".equals(ctorMode) || CodeConstants.INIT_NAME.equals(mt.getName());
+                // A static block's line is a real declaration line when an initializer was lifted
+                // out of the block's tail: that initializer's code follows the block's, so the
+                // field is declared after it (InputConstants' UNKNOWN) and the clamp would drag
+                // the block past it. Without such a tail the block must stay after every field:
+                // it may read a field declared below it, which only compiles after the field.
+                boolean scoped = "all".equals(ctorMode) || CodeConstants.INIT_NAME.equals(mt.getName())
+                  || CodeConstants.CLINIT_NAME.equals(mt.getName())
+                     && endsWithLiftedInitializer(wrapper.getMethodWrapper(member[1]), wrapper);
                 // A lifted initializer's line is one of the field lines; a genuine declaration
                 // line that merely precedes a later field must not be dragged after it.
                 boolean realLine = ctorLine && scoped && member[2] >= 0
@@ -1555,7 +1562,9 @@ public class ClassWriter implements StatementWriter {
               hideMethod = true;
             } else {
               TextBuffer code = root.toJava(indent + 1);
-              code.addBytecodeMapping(root.getDummyExit().bytecode);
+              if (!clInit || !endsWithLiftedInitializer(methodWrapper, wrapper)) {
+                code.addBytecodeMapping(root.getDummyExit().bytecode);
+              }
               hideMethod = code.length() == 0 && (clInit || dInit || hideConstructor(node, init, throwsExceptions, paramCount, flags, mt));
               // javac puts a constructor's pc0 on its declaration line unless the body opens with
               // an explicit this(...)/super(...) call, which makes the call's line pc0's instead.
@@ -2270,6 +2279,29 @@ public class ClassWriter implements StatementWriter {
       }
     }
     return -1;
+  }
+
+  /**
+   * True when a static field initializer lifted out of the tail of {@code <clinit>} holds code
+   * beyond everything the root still prints. The method's implicit return has no line table entry,
+   * so the dummy exit anchor resolves to the floored line of the last entry - which is that lifted
+   * initializer, printed far below the block's closing brace. Constraining the brace to it drags
+   * the whole tail one line past its target; the brace's own line is not in the table and follows
+   * the last printed statement when unanchored.
+   */
+  private static boolean endsWithLiftedInitializer(MethodWrapper method, ClassWrapper wrapper) {
+    if (method == null || method.root == null) {
+      return false;
+    }
+    java.util.BitSet remaining = new java.util.BitSet();
+    method.root.getFirst().getOffset(remaining);
+    int lastPrinted = remaining.length() - 1;
+    for (Exprent initializer : wrapper.getStaticFieldInitializers()) {
+      if (initializer.bytecode != null && initializer.bytecode.length() - 1 > lastPrinted) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
