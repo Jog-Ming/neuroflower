@@ -207,7 +207,8 @@ public class SequenceStatement extends Statement {
           && ifStatement.getIfstat() != null
           && !(stats.get(i + 1).getExprents() != null && stats.get(i + 1).getExprents().isEmpty())) {
         Exprent exit = singleExit(ifStatement.getIfstat());
-        if (exit instanceof ExitExprent headExit && headExit.getExitType() == ExitExprent.Type.RETURN
+        if (exit instanceof ExitExprent headExit
+            && (headExit.getExitType() == ExitExprent.Type.RETURN || headExit.getExitType() == ExitExprent.Type.THROW)
             && !writesAny(stats.subList(i + 1, stats.size()), readLocals(headExit.getValue()))
             && RoundTrip.exitAfterBody(ifStatement.getIfstat(), stats.get(i + 1))) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();

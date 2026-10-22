@@ -32,6 +32,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> CONSUMED_GUARD_EXITS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Continue guards by branch end: {goto offset (the continue), body start (the branch target)}. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> CONTINUE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -41,6 +43,7 @@ public final class RoundTrip {
   public static void recordMethod(StructMethod method, FullInstructionSequence seq) {
     BitSet returns = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
+    java.util.Map<Integer, int[]> sites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
@@ -61,12 +64,14 @@ public final class RoundTrip {
           if (gotoTarget < next.startOffset && branchTarget > next.startOffset) {
             // Key by the branch's end; the head exprent's offsets cover the branch instruction.
             guards.put(instr.startOffset + instr.length, gotoTarget);
+            sites.put(instr.startOffset + instr.length, new int[]{next.startOffset, branchTarget});
           }
         }
       }
     }
     VOID_RETURNS.put(method, returns);
     CONTINUE_GUARDS.put(method, guards);
+    CONTINUE_SITES.put(method, sites);
     BRANCHES.put(method, branches);
     INSTRUCTION_ENDS.put(method, ends);
   }
@@ -729,7 +734,22 @@ public final class RoundTrip {
     if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
       return false;
     }
-    return isContinueTarget(doStatement, target);
+    if (!isContinueTarget(doStatement, target)) {
+      return false;
+    }
+    // The target's table must put the continue's line before the body's first line.
+    java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(offsets.length());
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (site != null && table != null) {
+      int continueLine = table.findLineNumber(site[0]);
+      int bodyLine = table.findLineNumber(site[1]);
+      if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** The instruction a {@code continue} in this loop jumps to. */
