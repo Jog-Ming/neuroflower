@@ -619,7 +619,8 @@ public class ExprProcessor implements CodeConstants {
                     // instance constant variable through a qualifying expression: the qualifier is
                     // null-checked, the value is inlined. The pushed constant is the field access.
                     if (nextOpc >= opc_aconst_null && nextOpc <= opc_ldc2_w) {
-                      FieldExprent access = constantVariableAccess(invocation, exprlist, seq.getInstr(i + 1), pool, cl);
+                      FieldExprent access = constantVariableAccess(invocation, exprlist, seq.getInstr(i + 1), pool, cl,
+                        methodDescriptor, varProcessor.getMethod().hasModifier(CodeConstants.ACC_STATIC));
                       if (access != null) {
                         // The check itself is not printed: javac re-emits it from the field access.
                         // Dropping the assignment here also keeps the qualified value's copy from
@@ -705,7 +706,8 @@ public class ExprProcessor implements CodeConstants {
    * superclasses by value, with the same conversions javac applies when it pushes the constant.
    */
   private static FieldExprent constantVariableAccess(InvocationExprent invocation, List<Exprent> exprlist,
-                                                     Instruction next, ConstantPool pool, StructClass cl) {
+                                                     Instruction next, ConstantPool pool, StructClass cl,
+                                                     MethodDescriptor methodDescriptor, boolean isStatic) {
     if (!invocation.isStatic()
       || !invocation.getClassname().equals("java/util/Objects")
       || !invocation.getName().equals("requireNonNull")
@@ -718,6 +720,8 @@ public class ExprProcessor implements CodeConstants {
     }
 
     // The value the null check guarded is the most recent assignment to the same stack variable.
+    // A parameter or local read directly into the check has no such assignment: the loaded
+    // variable itself is the qualifier.
     Exprent qualifier = null;
     for (int i = exprlist.size() - 2; i >= 0; i--) {
       Exprent exprent = exprlist.get(i);
@@ -728,7 +732,9 @@ public class ExprProcessor implements CodeConstants {
         break;
       }
     }
-
+    if (qualifier == null && !argument.isStack() && argument.getLVT() != null) {
+      qualifier = argument.copy();
+    }
     if (qualifier == null) {
       return null;
     }
@@ -739,6 +745,16 @@ public class ExprProcessor implements CodeConstants {
     }
 
     VarType qualifierType = qualifier.getExprType();
+    if (qualifier instanceof VarExprent qualifierVar) {
+      // A parameter carries no LocalVariableTable entry at parse time (its entry starts at pc 0,
+      // not after a load); the enclosing descriptor gives its declared type. A local that the
+      // table does cover uses its entry. The parse-time stack type is only the category.
+      VarType declared = qualifierVar.getLVT() != null ? qualifierVar.getLVT().getVarType()
+        : parameterType(qualifierVar, cl, methodDescriptor, isStatic);
+      if (declared != null && declared.type == CodeType.OBJECT && declared.arrayDim == 0) {
+        qualifierType = declared;
+      }
+    }
     if (qualifierType.type != CodeType.OBJECT || qualifierType.arrayDim != 0) {
       return null;
     }
@@ -795,6 +811,28 @@ public class ExprProcessor implements CodeConstants {
     }
 
     return exact != null ? exact : widened;
+  }
+
+  /** The declared type of a parameter slot in the method being decompiled. */
+  private static VarType parameterType(VarExprent var, StructClass cl, MethodDescriptor descriptor, boolean isStatic) {
+    int slot = var.getIndex();
+    int position = 0;
+    if (!isStatic) {
+      if (slot == 0) {
+        return new VarType("L" + cl.qualifiedName + ";");
+      }
+      position = 1;
+    }
+    for (VarType param : descriptor.params) {
+      if (position == slot) {
+        return param;
+      }
+      position += param.stackSize;
+      if (position > slot) {
+        return null;
+      }
+    }
+    return null;
   }
 
   /** The pushed constant of a constant instruction, built as the main switch builds it. */

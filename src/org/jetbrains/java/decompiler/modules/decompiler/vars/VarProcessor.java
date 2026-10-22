@@ -259,6 +259,10 @@ public class VarProcessor {
     return method.getLocalVariableAttr() != null;
   }
 
+  public StructMethod getMethod() {
+    return method;
+  }
+
   public @Nullable VarVersionsProcessor getVarVersions() {
     return varVersions;
   }
