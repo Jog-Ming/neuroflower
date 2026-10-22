@@ -15,6 +15,7 @@ import org.jetbrains.java.decompiler.main.plugins.PluginContext;
 import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdgeType;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
+import org.jetbrains.java.decompiler.struct.gen.FieldDescriptor;
 import org.jetbrains.java.decompiler.util.collections.ListStack;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
@@ -25,9 +26,12 @@ import org.jetbrains.java.decompiler.modules.decompiler.flow.FlattenStatementsHe
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructBootstrapMethodsAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructConstantValueAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructNestHostAttribute;
 import org.jetbrains.java.decompiler.struct.consts.ConstantPool;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
@@ -215,6 +219,12 @@ public class ExprProcessor implements CodeConstants {
 
     InstructionSequence seq = block.getSeq();
 
+    // A constant variable read through a qualifying expression leaves only the qualifier's null
+    // check in the class file: javac inlines the value at the access site. The constant push right
+    // after the check is replaced by the field access it stands for.
+    Exprent pendingFieldAccess = null;
+    int pendingFieldIndex = -1;
+
     for (int i = 0; i < seq.length(); i++) {
 
       Instruction instr = seq.getInstr(i);
@@ -223,6 +233,14 @@ public class ExprProcessor implements CodeConstants {
       if (bytecode_offset >= 0) {
         bytecode_offsets = new BitSet();
         bytecode_offsets.set(bytecode_offset, bytecode_offset + instr.length);
+      }
+
+      if (i == pendingFieldIndex) {
+        pendingFieldAccess.addBytecodeOffsets(bytecode_offsets);
+        pushEx(stack, exprlist, pendingFieldAccess);
+        pendingFieldAccess = null;
+        pendingFieldIndex = -1;
+        continue;
       }
 
       switch (instr.opcode) {
@@ -596,6 +614,21 @@ public class ExprProcessor implements CodeConstants {
                   int nextOpc = seq.getInstr(i + 1).opcode;
                   if ((nextOpc >= opc_aconst_null && nextOpc <= opc_ldc2_w) || (nextOpc == opc_astore || (nextOpc >= opc_astore_0 && nextOpc <= opc_astore_3))) {
                     invocation.setSyntheticNullCheck();
+
+                    // Objects.requireNonNull(qualifier); pop; <constant> is how javac reads an
+                    // instance constant variable through a qualifying expression: the qualifier is
+                    // null-checked, the value is inlined. The pushed constant is the field access.
+                    if (nextOpc >= opc_aconst_null && nextOpc <= opc_ldc2_w) {
+                      FieldExprent access = constantVariableAccess(invocation, exprlist, seq.getInstr(i + 1), pool, cl);
+                      if (access != null) {
+                        // The check itself is not printed: javac re-emits it from the field access.
+                        // Dropping the assignment here also keeps the qualified value's copy from
+                        // resolving to the check's result, which shares its stack slot.
+                        exprlist.remove(exprlist.size() - 1);
+                        pendingFieldAccess = access;
+                        pendingFieldIndex = i + 1;
+                      }
+                    }
                   }
                 }
               }
@@ -653,6 +686,231 @@ public class ExprProcessor implements CodeConstants {
     for (VarExprent expr : lst) {
       stack.push(expr);
     }
+  }
+
+  private static final int CONSTANT_EXACT = 0;
+  private static final int CONSTANT_WIDENED = 1;
+  private static final int CONSTANT_NO_MATCH = -1;
+
+  /**
+   * The field access a constant-variable read stands for, or {@code null} when the null check is
+   * not one.
+   *
+   * <p>javac reads a constant variable through a qualifying expression by evaluating the
+   * qualifier, null-checking it ({@code Objects.requireNonNull(qualifier)} + {@code pop}) and
+   * pushing the inlined value. The class file records exactly that shape, and its position is the
+   * evidence: a constant push right after such a check is the value of an instance constant field
+   * of the qualifier's static type. The declaring class and field name are absent from the
+   * constant pool (the access was inlined), so the field is chosen from the qualifier's type and
+   * superclasses by value, with the same conversions javac applies when it pushes the constant.
+   */
+  private static FieldExprent constantVariableAccess(InvocationExprent invocation, List<Exprent> exprlist,
+                                                     Instruction next, ConstantPool pool, StructClass cl) {
+    if (!invocation.isStatic()
+      || !invocation.getClassname().equals("java/util/Objects")
+      || !invocation.getName().equals("requireNonNull")
+      || invocation.getLstParameters().size() != 1) {
+      return null;
+    }
+
+    if (!(invocation.getLstParameters().get(0) instanceof VarExprent argument)) {
+      return null;
+    }
+
+    // The value the null check guarded is the most recent assignment to the same stack variable.
+    Exprent qualifier = null;
+    for (int i = exprlist.size() - 2; i >= 0; i--) {
+      Exprent exprent = exprlist.get(i);
+      if (exprent instanceof AssignmentExprent assignment
+        && assignment.getLeft() instanceof VarExprent left
+        && left.equalsVersions(argument)) {
+        qualifier = assignment.getRight();
+        break;
+      }
+    }
+
+    if (qualifier == null) {
+      return null;
+    }
+
+    ConstExprent pushed = pushedConstant(next, pool);
+    if (pushed == null || pushed.getValue() == null) {
+      return null;
+    }
+
+    VarType qualifierType = qualifier.getExprType();
+    if (qualifierType.type != CodeType.OBJECT || qualifierType.arrayDim != 0) {
+      return null;
+    }
+
+    StructClass owner = DecompilerContext.getStructContext().getClass(qualifierType.value);
+    if (owner == null) {
+      return null;
+    }
+
+    FieldExprent exact = null;
+    FieldExprent widened = null;
+    Set<String> hidden = new HashSet<>();
+    while (owner != null) {
+      Set<String> declaredHere = new HashSet<>();
+      for (StructField field : owner.getFields()) {
+        if (hidden.contains(field.getName())) {
+          continue; // a class on the path from the qualifier's type declares this name
+        }
+        declaredHere.add(field.getName());
+
+        int access = field.getAccessFlags();
+        if ((access & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) != CodeConstants.ACC_FINAL) {
+          continue; // an instance constant variable is final and has no ConstantValue otherwise
+        }
+        StructConstantValueAttribute value = field.getAttribute(StructGeneralAttribute.ATTRIBUTE_CONSTANT_VALUE);
+        if (value == null) {
+          continue;
+        }
+        PrimitiveConstant constant = owner.getPool().getPrimitiveConstant(value.getIndex());
+        if (constant == null || constant.value == null || !accessibleFrom(cl, owner, access)) {
+          continue;
+        }
+
+        int rank = constantMatch(field.getDescriptor(), constant.value, pushed.getConstType(), pushed.getValue());
+        if (rank == CONSTANT_NO_MATCH) {
+          continue;
+        }
+
+        // The field is read off the checked value itself, not off a copy of its expression: the
+        // check's assignment is dropped, so this use resolves to the qualifier's own definition.
+        FieldExprent candidate = new FieldExprent(field.getName(), owner.qualifiedName, false, argument.copy(),
+          FieldDescriptor.parseDescriptor(field.getDescriptor()), null);
+        if (rank == CONSTANT_EXACT) {
+          if (exact == null) {
+            exact = candidate;
+          }
+        }
+        else if (widened == null) {
+          widened = candidate;
+        }
+      }
+      hidden.addAll(declaredHere);
+      owner = owner.superClass == null ? null : DecompilerContext.getStructContext().getClass(owner.superClass.getString());
+    }
+
+    return exact != null ? exact : widened;
+  }
+
+  /** The pushed constant of a constant instruction, built as the main switch builds it. */
+  private static ConstExprent pushedConstant(Instruction instr, ConstantPool pool) {
+    switch (instr.opcode) {
+      case opc_bipush:
+      case opc_sipush:
+        return new ConstExprent(instr.operand(0), true, null);
+      case opc_lconst_0:
+      case opc_lconst_1:
+        return new ConstExprent(VarType.VARTYPE_LONG, (long)(instr.opcode - opc_lconst_0), null);
+      case opc_fconst_0:
+      case opc_fconst_1:
+      case opc_fconst_2:
+        return new ConstExprent(VarType.VARTYPE_FLOAT, (float)(instr.opcode - opc_fconst_0), null);
+      case opc_dconst_0:
+      case opc_dconst_1:
+        return new ConstExprent(VarType.VARTYPE_DOUBLE, (double)(instr.opcode - opc_dconst_0), null);
+      case opc_ldc:
+      case opc_ldc_w:
+      case opc_ldc2_w:
+        PooledConstant constant = pool.getConstant(instr.operand(0));
+        if (constant instanceof PrimitiveConstant) {
+          return new ConstExprent(consts[constant.type - CONSTANT_Integer], ((PrimitiveConstant)constant).value, null);
+        }
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * How a field's constant fits the pushed literal: exactly its declared type, or through a
+   * conversion javac performs while pushing the constant (widening), which reproduces the same
+   * pushed constant. Narrowing conversions are not implicit and never match.
+   */
+  private static int constantMatch(String descriptor, Object fieldValue, VarType pushedType, Object pushed) {
+    if (pushedType.type == CodeType.BOOLEAN) {
+      return descriptor.equals("Z") && fieldValue instanceof Integer flag && pushed instanceof Integer bit
+        ? ((flag != 0) == (bit != 0) ? CONSTANT_EXACT : CONSTANT_NO_MATCH) : CONSTANT_NO_MATCH;
+    }
+
+    switch (descriptor) {
+      case "I":
+        if (!(fieldValue instanceof Integer number)) {
+          return CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Integer target) {
+          return number.intValue() == target.intValue() ? CONSTANT_EXACT : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Long target) {
+          return number.longValue() == target ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Float target) {
+          return Float.compare(number.floatValue(), target) == 0 ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Double target) {
+          return Double.compare(number.doubleValue(), target) == 0 ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        return CONSTANT_NO_MATCH;
+      case "J":
+        if (!(fieldValue instanceof Long number)) {
+          return CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Long target) {
+          return number.longValue() == target ? CONSTANT_EXACT : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Float target) {
+          return Float.compare(number.floatValue(), target) == 0 ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Double target) {
+          return Double.compare(number.doubleValue(), target) == 0 ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        return CONSTANT_NO_MATCH;
+      case "F":
+        if (!(fieldValue instanceof Float number)) {
+          return CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Float target) {
+          return Float.compare(number, target) == 0 ? CONSTANT_EXACT : CONSTANT_NO_MATCH;
+        }
+        if (pushed instanceof Double target) {
+          return Double.compare(number.doubleValue(), target) == 0 ? CONSTANT_WIDENED : CONSTANT_NO_MATCH;
+        }
+        return CONSTANT_NO_MATCH;
+      case "D":
+        if (!(fieldValue instanceof Double number)) {
+          return CONSTANT_NO_MATCH;
+        }
+        return pushed instanceof Double target && Double.compare(number, target) == 0 ? CONSTANT_EXACT : CONSTANT_NO_MATCH;
+      case "Ljava/lang/String;":
+        return pushed instanceof String target && fieldValue instanceof String text && text.equals(target)
+          ? CONSTANT_EXACT : CONSTANT_NO_MATCH;
+      default:
+        return CONSTANT_NO_MATCH;
+    }
+  }
+
+  private static boolean accessibleFrom(StructClass current, StructClass owner, int access) {
+    if ((access & CodeConstants.ACC_PUBLIC) != 0) {
+      return true;
+    }
+    if ((access & CodeConstants.ACC_PRIVATE) != 0) {
+      return nestHost(current).equals(nestHost(owner));
+    }
+    return packageOf(current.qualifiedName).equals(packageOf(owner.qualifiedName));
+  }
+
+  private static String nestHost(StructClass cls) {
+    StructNestHostAttribute host = cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_NEST_HOST);
+    return host == null ? cls.qualifiedName : host.getHostClass(cls.getPool());
+  }
+
+  private static String packageOf(String internal) {
+    int slash = internal.lastIndexOf('/');
+    return slash < 0 ? "" : internal.substring(0, slash);
   }
 
   public static boolean canonicalizeCasts(RootStatement stat) {
