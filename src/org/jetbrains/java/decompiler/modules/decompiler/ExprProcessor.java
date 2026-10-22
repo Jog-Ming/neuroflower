@@ -1047,6 +1047,18 @@ public class ExprProcessor implements CodeConstants {
       && invariantWildcardTarget(exprent.getNamedGenerics(), leftType, rightType)) {
       doCastGenerics = true;
     }
+    // The same mismatch one level up the hierarchy: the value's recorded type instantiates a
+    // subclass, and the target instantiates its generic supertype with a type variable in scope
+    // where the value has a wildcard. The subclass's own class signature gives that supertype
+    // view; the wildcard is never literally the variable, so the instantiations are not in an
+    // invariant assignment, and the source cast the value to the target. The cast's erasure is
+    // the supertype the value already implements, so javac emits no checkcast for it.
+    if (!doCastGenerics
+      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
+      && contextIndependentValue(exprent)
+      && wildcardSubtypeTarget(exprent.getNamedGenerics(), leftType, rightType)) {
+      doCastGenerics = true;
+    }
 
     // A target of array type whose element is a type variable of the enclosing source, against a
     // value whose array element is a different type: no implicit conversion exists (arrays are
@@ -1508,6 +1520,60 @@ public class ExprProcessor implements CodeConstants {
         return true;
       }
       if (targetArg != null && valueArg != null && invariantWildcardTarget(named, targetArg, valueArg)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether the value's recorded generic instantiation is a subclass of the target's generic class
+   * whose recorded class signature, instantiated with the value's own arguments, puts a wildcard
+   * where the target has a type variable in scope. Both sides are then different instantiations of
+   * the same generic supertype in an invariant position, so no assignment converts one to the
+   * other and a source that compiled cast the value to the target.
+   */
+  private static boolean wildcardSubtypeTarget(Map<VarType, List<VarType>> named, VarType left, VarType right) {
+    if (left == null || right == null || !left.isGeneric() || !right.isGeneric()
+      || left.value == null || right.value == null || left.value.equals(right.value)
+      || left.arrayDim != 0 || right.arrayDim != 0) {
+      return false;
+    }
+    if (((GenericType) left).getWildcard() != GenericType.WILDCARD_NO
+      || ((GenericType) right).getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    StructClass derivedClass = DecompilerContext.getStructContext().getClass(right.value);
+    StructClass targetClass = DecompilerContext.getStructContext().getClass(left.value);
+    if (derivedClass == null || targetClass == null
+      || derivedClass.getSignature() == null || targetClass.getSignature() == null) {
+      return false;
+    }
+    // For each type parameter of the target class, the deriving class's own type parameter the
+    // recorded hierarchy binds it to.
+    Map<VarType, VarType> superMap = derivedClass.getAllGenerics().get(targetClass.qualifiedName);
+    if (superMap == null) {
+      return false;
+    }
+    List<String> targetParameters = targetClass.getSignature().fparameters;
+    List<VarType> targetArguments = ((GenericType) left).getArguments();
+    if (targetParameters.size() != targetArguments.size()) {
+      return false;
+    }
+    // The value's instantiation of the deriving class's type parameters: an unbounded wildcard
+    // argument is recorded as null, so the map can carry null values.
+    Map<VarType, VarType> actual = new HashMap<>();
+    derivedClass.getSignature().genericType.mapGenVarsTo((GenericType) right, actual);
+    for (int i = 0; i < targetArguments.size(); i++) {
+      VarType targetArgument = targetArguments.get(i);
+      if (!plainTypeVariable(targetArgument) || !named.containsKey(targetArgument)) {
+        continue;
+      }
+      VarType derivedVariable = superMap.get(GenericType.parse("T" + targetParameters.get(i) + ";"));
+      if (derivedVariable == null || derivedVariable.type != CodeType.GENVAR || !actual.containsKey(derivedVariable)) {
+        continue;
+      }
+      if (isWildcardArgument(actual.get(derivedVariable))) {
         return true;
       }
     }
