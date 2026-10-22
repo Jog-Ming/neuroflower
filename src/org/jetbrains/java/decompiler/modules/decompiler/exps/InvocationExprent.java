@@ -1166,10 +1166,30 @@ public class InvocationExprent extends Exprent {
     int count = Math.min(parameterTypes.size(), lstParameters.size());
     for (int i = 0; i < count; i++) {
       VarType parameter = parameterTypes.get(i);
-      if (parameter == null || parameter.type != CodeType.GENVAR || parameter.arrayDim != 0) {
+      if (parameter == null) {
         continue;
       }
-      int index = classSignature.fparameters.indexOf(parameter.value);
+      int index = -1;
+      boolean nested = false;
+      if (parameter.type == CodeType.GENVAR && parameter.arrayDim == 0) {
+        index = classSignature.fparameters.indexOf(parameter.value);
+      }
+      else if (parameter instanceof GenericType parameterized
+        && parameterized.getWildcard() == GenericType.WILDCARD_NO
+        && parameterized.getArguments().size() == 1) {
+        // A parameter built from the class variable (EntityType<C>) is invariant in it: a value
+        // recorded as EntityType<T> for any other argument is not convertible to EntityType<CAP>
+        // either, and the same erasure argument applies. A wildcard-wrapped variable
+        // (Comparator<? super E>) is a contravariant position that accepts such values, so only
+        // a plain, unwrapped argument proves the call cannot compile.
+        VarType nestedArgument = parameterized.getArguments().get(0);
+        if (nestedArgument != null && nestedArgument.type == CodeType.GENVAR && nestedArgument.arrayDim == 0
+          && (!(nestedArgument instanceof GenericType wrapped)
+          || wrapped.getWildcard() == GenericType.WILDCARD_NO)) {
+          index = classSignature.fparameters.indexOf(nestedArgument.value);
+          nested = index >= 0;
+        }
+      }
       if (index < 0) {
         continue;
       }
@@ -1186,6 +1206,26 @@ public class InvocationExprent extends Exprent {
       VarType valueType = value.getExprType();
       if (valueType instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
         continue;
+      }
+      if (nested) {
+        // The value must be the same generic class with an argument of its own: a type from the
+        // same wildcard instantiation reads as the capture and is accepted. Only a declaration
+        // records that argument (LocalVariableTypeTable or the field's Signature).
+        if (!(value instanceof VarExprent || value instanceof FieldExprent)) {
+          continue;
+        }
+        VarType recordedType = value.getInferredExprType(valueType);
+        if (!(recordedType instanceof GenericType recorded)
+          || !recorded.value.equals(((GenericType) parameter).value)
+          || recorded.getArguments().size() != 1) {
+          continue;
+        }
+        VarType recordedArgument = recorded.getArguments().get(0);
+        if (recordedArgument == null
+          || (recordedArgument instanceof GenericType recordedGeneric
+          && recordedGeneric.getWildcard() != GenericType.WILDCARD_NO)) {
+          continue;
+        }
       }
       return i;
     }
