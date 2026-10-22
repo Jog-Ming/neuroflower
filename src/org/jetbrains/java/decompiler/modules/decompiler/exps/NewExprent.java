@@ -48,6 +48,10 @@ public class NewExprent extends Exprent {
   private boolean enumConst;
   private List<VarType> genericArgs = new ArrayList<>();
   private VarType inferredLambdaType = null;
+  // Set when the lambda's interface type came from the wildcard form of the called method's
+  // parameter type rather than from resolved arguments; only an in-scope type variable return
+  // is used from such a target.
+  private boolean wildcardTargetLambda = false;
   // Type arguments the class file proved for a constructor call whose diamond javac would
   // otherwise close on a narrower type than the recorded method reference needs.
   private List<VarType> forcedConstructorArgs;
@@ -254,6 +258,15 @@ public class NewExprent extends Exprent {
               if (_new != ret) {
                 if (!_new.isGeneric() || !((GenericType)_new).hasUnknownGenericType(named.keySet())) {
                   inferredLambdaType = _new;
+                  wildcardTargetLambda = false;
+                }
+                else if (inferredLambdaType == null && _new.isGeneric()
+                  && _new.value.equals(classType.value) && cls.getSignature() != null) {
+                  // The target still names the functional interface the lambda was built for,
+                  // even though a wildcard in it leaves a variable unresolved. The interface's
+                  // recorded SAM return type is then the target of the body's returns.
+                  inferredLambdaType = _new;
+                  wildcardTargetLambda = true;
                 }
                 return _new;
               }
@@ -262,6 +275,17 @@ public class NewExprent extends Exprent {
         }
         else {
           inferredLambdaType = classType;
+          wildcardTargetLambda = false;
+        }
+        // The expected type of a functional argument is often the wildcard form the called
+        // method declares (Function<? super T, ? extends R>); the mapping above cannot bind
+        // the interface's variables through the wildcards, but that recorded type still says
+        // which interface and which arguments the lambda was built for. Keep it so the body's
+        // target type comes from the class file's signature rather than from nowhere.
+        if (inferredLambdaType == null && upperBound != null && upperBound.isGeneric()
+          && upperBound.value.equals(classType.value) && cls != null && cls.getSignature() != null) {
+          inferredLambdaType = upperBound;
+          wildcardTargetLambda = true;
         }
       }
     }
@@ -703,10 +727,38 @@ public class NewExprent extends Exprent {
               inferredLambdaType = GenericType.getGenericSuperType(inferredLambdaType, candidate.getSignature().genericType);
             }
           }
+          if (cls.getSignature() == null) {
+            // Without the interface's declared type parameters nothing can be mapped.
+            return;
+          }
 
           Map<VarType, VarType> tempMap = new HashMap<>();
           if (inferredLambdaType.isGeneric()) {
             cls.getSignature().genericType.mapGenVarsTo((GenericType)inferredLambdaType, tempMap);
+          }
+
+          if (wildcardTargetLambda) {
+            // The lambda's interface type came from the wildcard form of the called method's
+            // parameter type. Only a recorded return type that resolves to one type variable
+            // in the caller's scope is used: a value the body returns as a class can never be
+            // that variable, so the source cast it (the cast erases to the same bytes), and
+            // the class file's functional interface signature names the variable.
+            VarType rawRet = desc.getSignature().returnType;
+            VarType mappedRet = rawRet.type == CodeType.GENVAR ? tempMap.get(rawRet.resizeArrayDim(0)) : null;
+            // Only the wildcard form (? extends R) is the called method's recorded demand on
+            // the body; a return type that is the variable itself carries no such wrapper, and
+            // a body's own inference is what the source relied on there.
+            if (!(mappedRet instanceof GenericType wildcardRet)
+              || wildcardRet.getWildcard() == GenericType.WILDCARD_NO) {
+              return;
+            }
+            VarType retTarget = stripWildcard(mappedRet);
+            if (retTarget != null && retTarget.type == CodeType.GENVAR
+              && isInScopeTypeVariable(retTarget, getNamedGenerics())) {
+              GenericMethodDescriptor genDesc = new GenericMethodDescriptor(Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), retTarget, Collections.emptyList());
+              applyReturnTarget(methodWrapper.root, genDesc);
+            }
+            return;
           }
 
           MethodDescriptor md_content = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor);
@@ -772,6 +824,24 @@ public class NewExprent extends Exprent {
             }
           }
         }
+      }
+    }
+  }
+
+  /** Give every return in a lambda body the functional method's recorded return type. */
+  private static void applyReturnTarget(Statement stat, GenericMethodDescriptor genDesc) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (exprent instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+          && exit.getMethodDescriptor() != null) {
+          exit.getMethodDescriptor().genericInfo = genDesc;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (child != null) {
+        applyReturnTarget(child, genDesc);
       }
     }
   }
@@ -1087,6 +1157,14 @@ public class NewExprent extends Exprent {
         collectTypeVariableNames(argument, names);
       }
     }
+  }
+
+  /** Strip a wildcard wrapper to the type it bounds; other types are returned unchanged. */
+  private static VarType stripWildcard(VarType type) {
+    if (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return GenericType.withWildcard(generic, GenericType.WILDCARD_NO);
+    }
+    return type;
   }
 
   /** Strip the wildcards a functional interface's return position wraps a value in. */
