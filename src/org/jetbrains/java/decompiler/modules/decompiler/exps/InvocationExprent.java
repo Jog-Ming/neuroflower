@@ -714,12 +714,22 @@ public class InvocationExprent extends Exprent {
             if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
               || receiverDemand || returnOnlyDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
+              // The printer's own return type does not even fit the class of the expected type,
+              // so no substitution of its type arguments can make the call assignable: the value
+              // it inferred for them came from the target, not from the arguments, and javac will
+              // solve the same constraint itself. Printing it would pin a guess (List.<T>of()
+              // where the target is a HolderSet.Named<T>).
+              boolean misfit = !suppress && !isNew && newRet != null && newRet.isGeneric() && upperBound != null
+                && !DecompilerContext.getStructContext().instanceOf(newRet.value, upperBound.value);
+              if (misfit && !DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)) {
+                genericArgs.clear();
+              }
               // A variable a declared parameter carries bare is fixed by that argument's recorded
               // type, which every class file writes in full. A witness the printer could only
               // render as a bare generic class for it is its own inference losing type arguments,
               // and printing it would pin javac to a raw type the record never has; the call is
               // left unparameterised and javac infers the variable from the argument again.
-              boolean rawWitness = !receiverDemand && !returnOnlyDemand && !isNew && dropsRawParameterWitness(fparams);
+              boolean rawWitness = !misfit && !receiverDemand && !returnOnlyDemand && !isNew && dropsRawParameterWitness(fparams);
               if (rawWitness) {
                 genericArgs.clear();
               }
