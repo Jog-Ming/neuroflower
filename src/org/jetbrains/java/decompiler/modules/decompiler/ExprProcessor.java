@@ -1036,6 +1036,17 @@ public class ExprProcessor implements CodeConstants {
     if (doCastGenerics && !doCast && invalidGenericInstantiation(leftType)) {
       doCastGenerics = false;
     }
+    // A target whose direct type argument is a type variable in scope, against a value whose same
+    // position is a wildcard: a wildcard is never literally the variable, so the value does not
+    // assign across an invariant position and the source cast it. Only this direction casts
+    // (X<T> is an X<?>), only a value whose type the class file fixes without context is cast,
+    // and an out-of-scope variable cannot be named in the cast.
+    if (!doCastGenerics
+      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
+      && contextIndependentValue(exprent)
+      && invariantWildcardTarget(exprent.getNamedGenerics(), leftType, rightType)) {
+      doCastGenerics = true;
+    }
 
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
@@ -1301,6 +1312,61 @@ public class ExprProcessor implements CodeConstants {
         continue;
       }
       if (targetArg.type == CodeType.GENVAR && actualArg.type != CodeType.GENVAR && !targetArg.equals(actualArg)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** An unbounded wildcard is a null argument; a bounded one carries its own wildcard type. */
+  private static boolean isWildcardArgument(VarType type) {
+    return type == null || (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO);
+  }
+
+  /**
+   * A value whose type does not depend on the context it is printed in. A cast around a generic
+   * call or a diamond is itself the context for its inference, so the source could not have
+   * written one there: the call would have been inferred without the target and produced the
+   * type the printer already sees. Only a variable, field, constant, or a conditional of them
+   * is fixed by the class file alone.
+   */
+  private static boolean contextIndependentValue(Exprent exprent) {
+    if (exprent instanceof VarExprent || exprent instanceof FieldExprent || exprent instanceof ConstExprent) {
+      return true;
+    }
+    if (exprent instanceof FunctionExprent function && function.getFuncType() == FunctionType.TERNARY) {
+      List<Exprent> operands = function.getLstOperands();
+      return operands.size() == 3 && contextIndependentValue(operands.get(1)) && contextIndependentValue(operands.get(2));
+    }
+    return false;
+  }
+
+  /**
+   * Whether the target type names a type variable where the value's recorded type carries a
+   * wildcard in the same invariant position. The variable must be in scope at the point of
+   * printing, otherwise the cast would be illegal; a wildcard on the target side is fine
+   * (X&lt;T&gt; is an X&lt;?&gt;), so only the target-variable/value-wildcard direction counts.
+   */
+  private static boolean invariantWildcardTarget(Map<VarType, List<VarType>> named, VarType left, VarType right) {
+    if (left == null || right == null || !left.isGeneric() || !right.isGeneric()
+      || !left.value.equals(right.value) || left.type != CodeType.OBJECT) {
+      return false;
+    }
+    GenericType leftGeneric = (GenericType) left;
+    GenericType rightGeneric = (GenericType) right;
+    if (leftGeneric.getWildcard() != GenericType.WILDCARD_NO
+      || rightGeneric.getWildcard() != GenericType.WILDCARD_NO
+      || leftGeneric.getArguments().size() != rightGeneric.getArguments().size()) {
+      return false;
+    }
+    for (int i = 0; i < leftGeneric.getArguments().size(); i++) {
+      VarType targetArg = leftGeneric.getArguments().get(i);
+      VarType valueArg = rightGeneric.getArguments().get(i);
+      if (targetArg != null && targetArg.type == CodeType.GENVAR && named.containsKey(targetArg)
+        && isWildcardArgument(valueArg)) {
+        return true;
+      }
+      if (targetArg != null && valueArg != null && invariantWildcardTarget(named, targetArg, valueArg)) {
         return true;
       }
     }
