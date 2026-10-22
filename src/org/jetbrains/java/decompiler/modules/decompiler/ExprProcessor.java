@@ -1274,7 +1274,8 @@ public class ExprProcessor implements CodeConstants {
     }
 
     if (left.isGeneric() && right.isGeneric()) {
-      if (shouldGenericTypesCast(named, left, right)) {
+      boolean contextFixed = contextIndependentValue(ex);
+      if (shouldGenericTypesCast(named, left, right, contextFixed)) {
         return true;
       }
 
@@ -1293,7 +1294,7 @@ public class ExprProcessor implements CodeConstants {
         }
 
         if (leftType != null) {
-          if (shouldGenericTypesCast(named, leftType, rightType)) {
+          if (shouldGenericTypesCast(named, leftType, rightType, contextFixed)) {
             return true;
           }
         }
@@ -1364,6 +1365,12 @@ public class ExprProcessor implements CodeConstants {
     return false;
   }
 
+  /** A type variable with no wildcard of its own (the variable itself, not {@code ? extends T}). */
+  private static boolean plainTypeVariable(VarType type) {
+    return type != null && type.type == CodeType.GENVAR
+      && (!(type instanceof GenericType generic) || generic.getWildcard() == GenericType.WILDCARD_NO);
+  }
+
   /** An unbounded wildcard is a null argument; a bounded one carries its own wildcard type. */
   private static boolean isWildcardArgument(VarType type) {
     return type == null || (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO);
@@ -1419,7 +1426,8 @@ public class ExprProcessor implements CodeConstants {
     return false;
   }
 
-  private static boolean shouldGenericTypesCast(Map<VarType, List<VarType>> named, VarType leftType, VarType rightType) {
+  private static boolean shouldGenericTypesCast(Map<VarType, List<VarType>> named, VarType leftType, VarType rightType,
+                                                boolean contextFixed) {
     if (leftType.isGeneric()) {
       GenericType genLeft = (GenericType) leftType;
       if (rightType.isGeneric()) {
@@ -1487,9 +1495,20 @@ public class ExprProcessor implements CodeConstants {
                 || (rt.type == CodeType.GENVAR && lt.type != CodeType.GENVAR && !lt.isGeneric()))) {
               return true;
             }
+            // Two different type variables are different types even when one is a subtype of the
+            // other: invariance never assigns X<A> to X<B>, so a source that did it cast, and the
+            // target's variable must be nameable where the cast is printed. Only a value whose type
+            // the class file fixes without context is cast; an argument list or a method reference
+            // is inferred from the cast itself, so the source need not have written one. A bounded
+            // wildcard of a variable (? extends B) is not the variable itself - Class<T> does
+            // assign to Class<? extends B> - so both arguments must be plain variables.
+            if (invariant && contextFixed && plainTypeVariable(lt) && plainTypeVariable(rt)
+              && !lt.equals(rt) && named.containsKey(lt)) {
+              return true;
+            }
 
             if (lt != null && rt != null) {
-              if (shouldGenericTypesCast(named, lt, rt)) {
+              if (shouldGenericTypesCast(named, lt, rt, contextFixed)) {
                 return true;
               }
             }
