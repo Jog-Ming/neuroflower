@@ -206,7 +206,7 @@ public final class ConstantNames {
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
-                           Map<String, Long> namingAt, long[] usePoints) {
+                           Map<String, Long> namingAt) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -241,12 +241,13 @@ public final class ConstantNames {
 
     /**
      * Whether this site comes after the point where the owner's first naming entered its
-     * {@code Class} entry, or before it with nothing interned in between.
+     * {@code Class} entry, or before it where the pool order still admits it.
      *
-     * <p>A naming earlier than the original moves the Class entry earlier in the pool. That is
-     * harmless only when no other pool entry was entered between the two points: the entry then
-     * keeps its index. First instruction uses stand in for interning events; an entry entered
-     * earlier but first used late makes this check reject a site conservatively, never wrongly.
+     * <p>A naming earlier than the original moves the Class entry earlier in the pool, and that
+     * reorders every lower entry interned in between. The literal at such a site is itself usually
+     * a pooled value interned right there, and the name would enter the Class and its name before
+     * it instead of after, so a mere "nothing between" test is not enough: the site must lie after
+     * every lower entry's first use, the same bound that places a first naming exactly.
      */
     private boolean afterNaming(String owner, int start) {
       Long naming = namingAt == null ? null : namingAt.get(owner);
@@ -254,17 +255,10 @@ public final class ConstantNames {
         return true;
       }
       long nearest = printedCoordinate(spaces, start);
-      return nearest == NO_COORDINATE || nearest >= naming || !usedBetween(nearest, naming);
-    }
-
-    /** Whether any pool entry is first used strictly between these two generation points. */
-    private boolean usedBetween(long from, long to) {
-      if (usePoints == null || usePoints.length == 0) {
-        return false;
+      if (nearest == NO_COORDINATE || nearest >= naming) {
+        return true;
       }
-      int index = java.util.Arrays.binarySearch(usePoints, from);
-      index = index < 0 ? -index - 1 : index + 1; // the first point strictly after `from`
-      return index < usePoints.length && usePoints[index] < to;
+      return byCoordinate(owner, start);
     }
 
     /**
@@ -318,7 +312,7 @@ public final class ConstantNames {
   }
 
   private static final Placement NO_PLACEMENT =
-    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), null);
+    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -603,11 +597,9 @@ public final class ConstantNames {
         internedAt.put(link.classname, coordinate(use.order(), use.offset()));
       }
     }
-    long[] usePoints = firstUses.values().stream()
-      .mapToLong(use -> coordinate(use.order(), use.offset())).sorted().distinct().toArray();
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, usePoints),
+        namingAt),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
