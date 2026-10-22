@@ -147,6 +147,15 @@ public final class SwitchExpressionHelper {
       return false;
     }
 
+    // javac lowers a switch expression without per-arm stores: each arm leaves its value on the
+    // stack and the join stores it once. A real local assigned in every arm is therefore the
+    // target's own istore/astore, so the source wrote a switch statement; printing it as an
+    // expression drops those stores. Only a stack variable's assignment is the decompiler's own
+    // record of an arm value.
+    if (!relevantVar.isStack()) {
+      return false;
+    }
+
     Set<StatEdge> edges = new HashSet<>();
     for (Statement caseStat : stat.getCaseStatements()) {
       TryWithResourcesProcessor.findEdgesLeaving(caseStat, caseStat, edges);
