@@ -32,6 +32,7 @@ import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMain;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
@@ -995,7 +996,11 @@ public class InvocationExprent extends Exprent {
           ClassNode instNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(classname);
           // Don't cast to anonymous classes, since they by definition can't have a name
           // TODO: better fix may be to change equals to isSuperSet? all anonymous classes are superset of Object
-          if (rightType.equals(VarType.VARTYPE_OBJECT) && !leftType.equals(rightType) && (instNode != null && instNode.type != ClassNode.Type.ANONYMOUS)) {
+          if (wildcardCapturedParameter(cl, rightType) >= 0) {
+            // The value cannot be passed to the captured parameter, so the source erased the
+            // receiver's type; the erased cast adds no instruction and keeps the pool's descriptor.
+            appendInstCast(buf, new VarType(CodeType.OBJECT, 0, classname), res);
+          } else if (rightType.equals(VarType.VARTYPE_OBJECT) && !leftType.equals(rightType) && (instNode != null && instNode.type != ClassNode.Type.ANONYMOUS)) {
             appendInstCast(buf, leftType, res);
           } else if (remappedInstType != null) {
             // If we have a remap inst type, do a cast
@@ -1128,6 +1133,63 @@ public class InvocationExprent extends Exprent {
       res.encloseWithParens();
     }
     buf.append(res).append(")");
+  }
+
+  /**
+   * The position of an argument whose declared parameter is a type variable of the receiver's
+   * class, instantiated to a wildcard with no lower bound. javac captures such a wildcard before
+   * checking the call, and no expression type is a subtype of the capture, so the call the
+   * printer would write cannot compile; the class file's signatures (the class's type parameters,
+   * the receiver's recorded instantiation and the method's own signature) prove the source had to
+   * erase the receiver's type, and a raw cast is exactly that erasure. The argument's own
+   * recorded type must not be the wildcard itself: a value read out of the same instantiation has
+   * the capture's type and is accepted. Only a receiver whose type is a recorded declaration (a
+   * variable or a field) is evidence: the printer's own inference of a call can lower arguments to
+   * wildcards it invented, and a receiver the printer already casts to a recorded type is settled.
+   */
+  private int wildcardCapturedParameter(StructClass cl, VarType receiverType) {
+    if (cl == null || cl.getSignature() == null || desc == null || desc.getSignature() == null
+      || remappedInstType != null
+      || !(instance instanceof VarExprent || instance instanceof FieldExprent)) {
+      return -1;
+    }
+    GenericClassDescriptor classSignature = cl.getSignature();
+    if (classSignature.fparameters.isEmpty() || !(receiverType instanceof GenericType receiver)
+      || receiver.type != CodeType.OBJECT) {
+      return -1;
+    }
+    List<VarType> arguments = receiver.getArguments();
+    if (arguments.size() != classSignature.fparameters.size()) {
+      return -1;
+    }
+    List<VarType> parameterTypes = desc.getSignature().parameterTypes;
+    int count = Math.min(parameterTypes.size(), lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      VarType parameter = parameterTypes.get(i);
+      if (parameter == null || parameter.type != CodeType.GENVAR || parameter.arrayDim != 0) {
+        continue;
+      }
+      int index = classSignature.fparameters.indexOf(parameter.value);
+      if (index < 0) {
+        continue;
+      }
+      VarType argument = arguments.get(index);
+      boolean upperBounded = argument == null
+        || (argument instanceof GenericType generic && generic.getWildcard() == GenericType.WILDCARD_EXTENDS);
+      if (!upperBounded) {
+        continue;
+      }
+      Exprent value = lstParameters.get(i);
+      if (value instanceof ConstExprent constant && constant.getConstType() == VarType.VARTYPE_NULL) {
+        continue;
+      }
+      VarType valueType = value.getExprType();
+      if (valueType instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
+      }
+      return i;
+    }
+    return -1;
   }
 
   private boolean canSkipParenEnclose(Exprent instance) {
