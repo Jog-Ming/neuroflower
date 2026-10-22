@@ -85,6 +85,13 @@ public class InvocationExprent extends Exprent {
   private boolean isInvocationInstance = false;
   /** The invocation whose receiver is currently being typed; set only for the duration. */
   private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
+  /**
+   * The map invocation whose type argument an enclosing {@code Optional.orElse}/{@code orElseGet}
+   * argument pins, and the recorded wildcard type that pins it. Set only while the receiver
+   * subtree of such a call is being inferred or printed.
+   */
+  private static final ThreadLocal<InvocationExprent> OPTIONAL_MAP_DEMAND = new ThreadLocal<>();
+  private static final ThreadLocal<VarType> OPTIONAL_MAP_DEMAND_TYPE = new ThreadLocal<>();
   private boolean isQualifier = false;
   private final BoxState boxing = new BoxState();
   private boolean isSyntheticNullCheck = false;
@@ -379,7 +386,15 @@ public class InvocationExprent extends Exprent {
 
           VarType instUB = mthCls.getSignature() != null ? mthCls.getSignature().genericType.remap(upperBoundsMap) : upperBound;
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          InvocationExprent priorMapDemand = OPTIONAL_MAP_DEMAND.get();
+          VarType priorMapDemandType = OPTIONAL_MAP_DEMAND_TYPE.get();
+          VarType optionalDemand = optionalWildcardArgument();
+          InvocationExprent optionalMap = optionalDemand == null ? null : optionalElementMap();
           OUTER_INVOCATION.set(this);
+          if (optionalMap != null) {
+            OPTIONAL_MAP_DEMAND.set(optionalMap);
+            OPTIONAL_MAP_DEMAND_TYPE.set(optionalDemand);
+          }
           try {
             // don't want the casted type
             if (instance instanceof FunctionExprent && ((FunctionExprent)instance).getFuncType() == FunctionType.CAST) {
@@ -391,6 +406,8 @@ public class InvocationExprent extends Exprent {
           }
           finally {
             OUTER_INVOCATION.set(priorOuter);
+            OPTIONAL_MAP_DEMAND.set(priorMapDemand);
+            OPTIONAL_MAP_DEMAND_TYPE.set(priorMapDemandType);
           }
 
           if (instType.type == CodeType.GENVAR && named.containsKey(instType)) {
@@ -740,6 +757,17 @@ public class InvocationExprent extends Exprent {
             }
           }
 
+          // The map whose element type feeds an enclosing Optional.orElse/orElseGet argument of
+          // recorded wildcard type: every read of such a variable captures the wildcard afresh,
+          // so javac cannot infer this call's variable from the lambda to the argument's type.
+          // The source pinned it to the recorded declaration, which is the only nameable witness.
+          if (OPTIONAL_MAP_DEMAND.get() == this
+            && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            && optionalMapWitness(OPTIONAL_MAP_DEMAND_TYPE.get(), fparams, bounds)) {
+            genericArgs.clear();
+            genericArgs.add(OPTIONAL_MAP_DEMAND_TYPE.get());
+          }
+
           if (newRet != ret && newRet != null && !(newRet.isGeneric() && ((GenericType)newRet).hasUnknownGenericType(named.keySet()))) {
             return newRet;
           }
@@ -882,13 +910,23 @@ public class InvocationExprent extends Exprent {
 
           instance.setInvocationInstance();
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          InvocationExprent priorMapDemand = OPTIONAL_MAP_DEMAND.get();
+          VarType priorMapDemandType = OPTIONAL_MAP_DEMAND_TYPE.get();
+          VarType optionalDemand = optionalWildcardArgument();
+          InvocationExprent optionalMap = optionalDemand == null ? null : optionalElementMap();
           OUTER_INVOCATION.set(this);
+          if (optionalMap != null) {
+            OPTIONAL_MAP_DEMAND.set(optionalMap);
+            OPTIONAL_MAP_DEMAND_TYPE.set(optionalDemand);
+          }
           VarType rightType;
           try {
             rightType = instance.getInferredExprType(leftType);
           }
           finally {
             OUTER_INVOCATION.set(priorOuter);
+            OPTIONAL_MAP_DEMAND.set(priorMapDemand);
+            OPTIONAL_MAP_DEMAND_TYPE.set(priorMapDemandType);
           }
 
           if (isUnboxingCall() && !boxing.forceUnboxing) {
@@ -926,7 +964,24 @@ public class InvocationExprent extends Exprent {
             buf.pushNewlineGroup(indent, 1);
             pushedCallChainGroup = true;
           }
-          TextBuffer res = instance.toJava(indent);
+          TextBuffer res;
+          VarType printedDemand = optionalWildcardArgument();
+          InvocationExprent printedMap = printedDemand == null ? null : optionalElementMap();
+          InvocationExprent priorPrintedMap = OPTIONAL_MAP_DEMAND.get();
+          VarType priorPrintedType = OPTIONAL_MAP_DEMAND_TYPE.get();
+          if (printedMap != null) {
+            OPTIONAL_MAP_DEMAND.set(printedMap);
+            OPTIONAL_MAP_DEMAND_TYPE.set(printedDemand);
+          }
+          try {
+            // The receiver subtree is inferred again while it prints, so the demand must be
+            // visible for the whole print, not just for the type computation above.
+            res = instance.toJava(indent);
+          }
+          finally {
+            OPTIONAL_MAP_DEMAND.set(priorPrintedMap);
+            OPTIONAL_MAP_DEMAND_TYPE.set(priorPrintedType);
+          }
 
           ClassNode instNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(classname);
           // Don't cast to anonymous classes, since they by definition can't have a name
@@ -2719,6 +2774,91 @@ public class InvocationExprent extends Exprent {
       }
     }
     return false;
+  }
+
+  /**
+   * The wildcard-parameterised type recorded for an {@code Optional.orElse}/{@code orElseGet}
+   * argument, when the argument is a variable or field whose declaration carries wildcards.
+   * A read of such a declaration captures the wildcard afresh, so the value cannot be assigned
+   * to a parameter fixed by an earlier capture; the recorded declaration is what the source had
+   * to pin, and it is the only nameable type that makes the argument valid.
+   */
+  private VarType optionalWildcardArgument() {
+    if (isStatic || !"java/util/Optional".equals(classname)
+      || lstParameters.size() != 1 || !("orElse".equals(name) || "orElseGet".equals(name))) {
+      return null;
+    }
+    Exprent argument = lstParameters.get(0);
+    if (!(argument instanceof VarExprent) && !(argument instanceof FieldExprent)) {
+      return null;
+    }
+    VarType declared = argument.getInferredExprType(null);
+    if (declared == null || declared.type != CodeType.OBJECT || declared.arrayDim != 0
+      || !declared.isGeneric() || !hasWildcardArgument((GenericType) declared)) {
+      return null;
+    }
+    return declared;
+  }
+
+  /** The map invocation whose element type the receiver Optional exposes. */
+  private InvocationExprent optionalElementMap() {
+    if (!(instance instanceof InvocationExprent receiver)) {
+      return null;
+    }
+    // DataResult.result() exposes the DataResult's element; the map that produced it is next.
+    if ("com/mojang/serialization/DataResult".equals(receiver.classname) && "result".equals(receiver.name)
+      && receiver.lstParameters.isEmpty() && receiver.instance instanceof InvocationExprent map) {
+      return map;
+    }
+    return "java/util/Optional".equals(receiver.classname) && "map".equals(receiver.name) ? receiver : null;
+  }
+
+  /** Whether a type mentions a wildcard at any depth. */
+  private static boolean hasWildcardArgument(GenericType type) {
+    for (VarType argument : type.getArguments()) {
+      if (argument == null) {
+        return true;
+      }
+      if (argument instanceof GenericType generic
+        && (generic.getWildcard() != GenericType.WILDCARD_NO || hasWildcardArgument(generic))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether the demanded wildcard type can stand as this map call's explicit type argument: the
+   * functional argument is a lambda whose recorded instantiated return is that same class, the
+   * witness is printable, its erasure reproduces the call the pool recorded, and the call site
+   * belongs to this class.
+   */
+  private boolean optionalMapWitness(VarType demand, List<String> fparams,
+                                     Map<VarType, List<VarType>> bounds) {
+    if (demand == null || fparams.size() != 1 || lstParameters.size() != 1
+      || desc == null || desc.getSignature() == null
+      || !("com/mojang/serialization/DataResult".equals(classname) || "java/util/Optional".equals(classname))
+      || !"map".equals(name)) {
+      return false;
+    }
+    if (!(lstParameters.get(0) instanceof NewExprent lambda) || !lambda.isLambda()
+      || lambda.isMethodReference()) {
+      return false;
+    }
+    if (demand.type != CodeType.OBJECT || demand.arrayDim != 0 || !demand.isGeneric()
+      || !hasWildcardArgument((GenericType) demand) || !isPrintableWitness(demand)) {
+      return false;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+    if (node == null || node.lambdaInformation == null) {
+      return false;
+    }
+    VarType recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
+    if (recorded == null || recorded.type != CodeType.OBJECT || recorded.arrayDim != 0
+      || !recorded.value.equals(demand.value)) {
+      return false;
+    }
+    return erasureMatchesDescriptor(fparams, List.of(demand), bounds) && isRecordedCallSite();
   }
 
   /**
