@@ -12,6 +12,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.StructContext;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
@@ -148,6 +149,8 @@ public class FunctionExprent extends Exprent {
   private VarType implicitType;
   private final List<Exprent> lstOperands;
   private boolean needsCast = true;
+  /** The cast is the compiler's conversion of an erased generic value back to its recorded type. */
+  private boolean compilerCast = false;
   private boolean disableNewlineGroupCreation = false;
 
   public FunctionExprent(FunctionType funcType, ListStack<Exprent> stack, BitSet bytecodeOffsets) {
@@ -241,6 +244,7 @@ public class FunctionExprent extends Exprent {
   public VarType getInferredExprType(VarType upperBound) {
     if (funcType == FunctionType.CAST) {
       this.needsCast = true;
+      this.compilerCast = false;
       VarType right = lstOperands.get(0).getInferredExprType(upperBound);
       List<VarType> cast = lstOperands.subList(1, lstOperands.size()).stream().map(Exprent::getExprType).toList();
 
@@ -278,6 +282,15 @@ public class FunctionExprent extends Exprent {
       } else { //TODO: Capture generics to make cast better?
         final VarType finalRight = right;
         this.needsCast = right.type == CodeType.NULL || cast.stream().anyMatch(castType -> !DecompilerContext.getStructContext().instanceOf(finalRight.value, castType.value)) || cast.stream().anyMatch(castType -> finalRight.arrayDim != castType.arrayDim);
+      }
+
+      // A checkcast that converts an erased generic value back to its recorded type. The value's
+      // type is a variable of the enclosing source whose declared bounds are already subtypes of
+      // the cast type, so the cast is a widening conversion in source: a source cast there would
+      // be redundant, and javac emits this checkcast again from the erased return type alone.
+      if (this.needsCast && genericConversionCast(right, cast)) {
+        this.needsCast = false;
+        this.compilerCast = true;
       }
 
       return getExprType();
@@ -650,7 +663,7 @@ public class FunctionExprent extends Exprent {
       case IMM:
         return buf.append(wrapOperandString(lstOperands.get(0), true, indent).append(funcType.operator));
       case CAST:
-        if (!needsCast && !RoundTrip.forceCast(this)) {
+        if (!needsCast && (compilerCast || !RoundTrip.forceCast(this))) {
           return buf.append(lstOperands.get(0).toJava(indent));
         }
         for (int i = 1; i < lstOperands.size(); i++) {
@@ -859,6 +872,35 @@ public class FunctionExprent extends Exprent {
 
   public void setFuncType(FunctionType funcType) {
     this.funcType = funcType;
+  }
+
+  /**
+   * Whether the cast only re-materialises the declared type of a generic value: the value's
+   * recorded type is a type variable of the enclosing source (possibly an array of one), every
+   * one of its declared bounds is a subtype of the cast type, and the array dimensions agree.
+   * javac's erasure of the generic type is what put the checkcast in the class file; the source
+   * that compiled wrote no cast, and compiling our source without it restores the same bytes.
+   */
+  private boolean genericConversionCast(VarType right, List<VarType> cast) {
+    if (right == null || right.type != CodeType.GENVAR || cast.size() != 1) {
+      return false;
+    }
+    VarType castType = cast.get(0);
+    if (castType == null || castType.type != CodeType.OBJECT || castType.arrayDim != right.arrayDim) {
+      return false;
+    }
+    List<VarType> bounds = this.getNamedGenerics().get(right.resizeArrayDim(0));
+    if (bounds == null || bounds.isEmpty()) {
+      return false;
+    }
+    StructContext context = DecompilerContext.getStructContext();
+    for (VarType bound : bounds) {
+      if (bound == null || bound.arrayDim != 0 || bound.type != CodeType.OBJECT
+        || !context.instanceOf(bound.value, castType.value)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   public List<Exprent> getLstOperands() {
