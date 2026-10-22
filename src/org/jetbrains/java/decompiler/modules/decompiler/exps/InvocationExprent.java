@@ -400,10 +400,14 @@ public class InvocationExprent extends Exprent {
           }
         }
 
+        // Type variables whose value comes from the target type alone; javac cannot recover
+        // them from the arguments, so a context that withholds the target needs the witness.
+        Map<VarType, VarType> targetSeeded = new HashMap<>();
         if (!isInvocationInstance) {
           upperBoundsMap.forEach((k, v) -> {
             if (fparams.contains(k.value) && !GenericType.DUMMY_VAR.equals(v) && !genericsMap.containsKey(k)) {
               genericsMap.put(k, v);
+              targetSeeded.put(k, v);
             }
           });
         }
@@ -667,6 +671,13 @@ public class InvocationExprent extends Exprent {
               && inArgument() && hasWildcardArgs(fparams, genericsMap)) {
               // A call whose inferred arguments carry wildcards can be beyond javac's inference
               // from an argument position; the original wrote the witnesses it inferred itself.
+              getGenericArgs(fparams, genericsMap, genericArgs);
+            }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && constructorDelegationDemand(fparams, ret, targetSeeded, isNew)) {
+              // this(...)/super(...) overload resolution cannot hand the target type to the
+              // argument, so a type variable the arguments leave to the target must be pinned
+              // in source; the constructor's recorded parameter type is what demanded it.
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
             else if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
@@ -970,7 +981,17 @@ public class InvocationExprent extends Exprent {
         }
     }
 
-    buf.append(appendParamList(indent)).append(')');
+    boolean delegation = functype == Type.INIT && (super_qualifier != null || isInstanceThis);
+    if (delegation) {
+      enterConstructorDelegation();
+    }
+    try {
+      buf.append(appendParamList(indent)).append(')');
+    } finally {
+      if (delegation) {
+        exitConstructorDelegation();
+      }
+    }
     if (pushedCallChainGroup) {
       buf.popNewlineGroup();
     }
@@ -1026,6 +1047,63 @@ public class InvocationExprent extends Exprent {
   }
 
   private static final ThreadLocal<int[]> ARGUMENT = ThreadLocal.withInitial(() -> new int[1]);
+
+  // The direct arguments of a this(...)/super(...) delegation whose class declares another
+  // constructor of the same arity: only those expressions are judged, and only while one is
+  // being inferred or printed.
+  private static final ThreadLocal<ListStack<List<Exprent>>> CTOR_DELEGATION =
+    ThreadLocal.withInitial(ListStack::new);
+
+  private boolean inConstructorDelegation() {
+    ListStack<List<Exprent>> stack = CTOR_DELEGATION.get();
+    if (stack.isEmpty()) {
+      return false;
+    }
+    List<Exprent> direct = stack.peek();
+    for (Exprent argument : direct) {
+      Exprent value = argument;
+      // The source's cast may still be in the tree even when the printer elides it.
+      while (value instanceof FunctionExprent cast && cast.getFuncType() == FunctionType.CAST
+        && !cast.getLstOperands().isEmpty()) {
+        value = cast.getLstOperands().get(0);
+      }
+      if (value == this) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private void enterConstructorDelegation() {
+    CTOR_DELEGATION.get().push(constructorLooksOverloaded() ? lstParameters : List.of());
+  }
+
+  private static void exitConstructorDelegation() {
+    CTOR_DELEGATION.get().pop();
+  }
+
+  /**
+   * Whether this class declares more than one constructor with the call's parameter count. That
+   * is the precondition for the delegation's overload resolution to withhold the target type.
+   */
+  private boolean constructorLooksOverloaded() {
+    StructClass cl = DecompilerContext.getStructContext().getClass(classname);
+    if (cl == null || descriptor == null) {
+      return false;
+    }
+    int arity = descriptor.params.length;
+    int count = 0;
+    for (StructMethod method : cl.getMethods()) {
+      if (CodeConstants.INIT_NAME.equals(method.getName())
+        && MethodDescriptor.parseDescriptor(method.getDescriptor()).params.length == arity) {
+        if (++count >= 2) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   private static final ThreadLocal<int[]> CALL_LINE = ThreadLocal.withInitial(() -> new int[]{-1});
 
   /** The target line of the innermost call whose arguments are being printed, or -1. */
@@ -2165,6 +2243,46 @@ public class InvocationExprent extends Exprent {
       }
     }
     return false;
+  }
+
+  /**
+   * A this(...)/super(...) argument whose result type is one of the callee's own type variables
+   * and whose value in the printer's inference was seeded by the target type alone. Constructor
+   * overload resolution cannot pass the target type to a poly argument, so a source that compiled
+   * must have pinned those type arguments explicitly; the target type itself is the constructor
+   * parameter recorded in the pool descriptor and its generic Signature. The witness is printed
+   * only when every type variable settles to a concrete type.
+   */
+  private boolean constructorDelegationDemand(List<String> fparams, VarType ret,
+                                              Map<VarType, VarType> targetSeeded, boolean isNew) {
+    if (!inConstructorDelegation() || isInvocationInstance || isNew || fparams.isEmpty()
+      || targetSeeded.isEmpty()) {
+      return false;
+    }
+    Set<VarType> resultVars = new HashSet<>();
+    if (ret.type == CodeType.GENVAR) {
+      resultVars.add(ret.resizeArrayDim(0));
+    } else if (ret.isGeneric()) {
+      resultVars.addAll(((GenericType) ret).getAllGenericVars());
+    } else {
+      return false;
+    }
+    boolean demanded = false;
+    for (VarType variable : resultVars) {
+      if (!fparams.contains(variable.value)) {
+        continue;
+      }
+      VarType seeded = targetSeeded.get(variable);
+      if (seeded != null && seeded.equals(genericsMap.get(variable))) {
+        demanded = true;
+      }
+    }
+    if (!demanded) {
+      return false;
+    }
+    List<VarType> probe = new ArrayList<>();
+    getGenericArgs(fparams, genericsMap, probe);
+    return probe.size() == fparams.size() && allConcreteTypes(probe);
   }
 
   /**
