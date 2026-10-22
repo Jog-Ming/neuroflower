@@ -1048,6 +1048,15 @@ public class ExprProcessor implements CodeConstants {
       doCastGenerics = true;
     }
 
+    // A cast whose type argument is a generic class written bare cannot come from a source that
+    // compiled: every class file records generic types in full, so a bare argument here is the
+    // printer's own inference losing arguments, and F<Bare> is not a conversion javac accepts from
+    // the value's recorded F<?> or F<Concrete>. Dropping the cast lets javac infer the argument
+    // again, which is what the original source did.
+    if (doCastGenerics && hasRawTypeArgument(leftType)) {
+      doCastGenerics = false;
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
@@ -1113,6 +1122,43 @@ public class ExprProcessor implements CodeConstants {
     NullCastType(boolean cast) {
       this.cast = cast;
     }
+  }
+
+  /** Whether a type argument names a generic class without its type arguments. */
+  private static boolean hasRawTypeArgument(VarType type) {
+    if (!(type instanceof GenericType generic)) {
+      return false;
+    }
+    for (VarType argument : generic.getArguments()) {
+      if (argument == null) {
+        continue;
+      }
+      if (argument.type == CodeType.OBJECT && argument.arrayDim == 0 && !argument.isGeneric()
+        && isGenericClass(argument.value)) {
+        return true;
+      }
+      if (hasRawTypeArgument(argument)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Whether a class name denotes a class with type parameters, so a bare name is a raw type. */
+  private static boolean isGenericClass(String internalName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(internalName);
+    if (cls != null && cls.getSignature() != null) {
+      return !cls.getSignature().fparameters.isEmpty();
+    }
+    if (internalName.startsWith("java/") || internalName.startsWith("javax/")) {
+      try {
+        return Class.forName(internalName.replace('/', '.'), false, null).getTypeParameters().length > 0;
+      }
+      catch (Throwable ignored) {
+        // Without the class there is no evidence that the name is raw.
+      }
+    }
+    return false;
   }
 
   /** A concrete target instantiated from a wildcard declaration: assignable only through a cast. */
