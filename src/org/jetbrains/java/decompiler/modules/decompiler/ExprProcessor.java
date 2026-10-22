@@ -1357,6 +1357,26 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
+    // A functional argument whose inferred SAM return is a type variable neither side can name
+    // produces a capture. When the target instantiates the same class with a type variable of
+    // the caller, the call's own variable is constrained by the target to that named variable
+    // and by the argument to the capture, so no instantiation satisfies both and javac rejects
+    // the call; a source that compiled cast the result. The cast erases to the class the call
+    // already returns, so it emits no checkcast. A target with a wildcard accepts the capture,
+    // and a target with a concrete argument lets javac infer the variable from that target, so
+    // neither needs a cast.
+    if (!doCastGenerics
+      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
+      && exprent instanceof InvocationExprent
+      && leftType instanceof GenericType && leftType.type == CodeType.OBJECT && leftType.arrayDim == 0
+      && !hasWildcard(leftType) && !hasRawTypeArgument(leftType)
+      && rightType != null && rightType.isGeneric() && rightType.type == CodeType.OBJECT
+      && rightType.value != null && rightType.value.equals(leftType.value)
+      && hasInScopeTypeVariable(leftType, exprent.getNamedGenerics())
+      && captureReturnedArgument(exprent)) {
+      doCastGenerics = true;
+    }
+
     // A target type that still names a type parameter of the callee which inference left unbound
     // has no nameable form at the call site, so a compiling source cannot have written a cast
     // built on it. Passing the expression on lets javac infer the callee's variable again. The
@@ -1522,6 +1542,43 @@ public class ExprProcessor implements CodeConstants {
       }
       catch (Throwable ignored) {
         // Without the class there is no evidence that the name is raw.
+      }
+    }
+    return false;
+  }
+
+  /** Whether the type names a type variable the enclosing source declares, at any depth. */
+  private static boolean hasInScopeTypeVariable(VarType type, Map<VarType, List<VarType>> named) {
+    if (type == null) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return named.containsKey(type);
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (hasInScopeTypeVariable(argument, named)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Whether a method-reference argument's inferred SAM return is an unnameable type variable. */
+  private static boolean captureReturnedArgument(Exprent exprent) {
+    if (!(exprent instanceof InvocationExprent invocation)) {
+      return false;
+    }
+    Map<VarType, List<VarType>> named = exprent.getNamedGenerics();
+    for (Exprent argument : invocation.getLstParameters()) {
+      if (argument instanceof NewExprent lambda && lambda.isLambda() && lambda.isMethodReference()) {
+        VarType produced = lambda.getFunctionalReturnType();
+        if (produced != null && produced.type == CodeType.GENVAR
+          && (!(produced instanceof GenericType generic) || generic.getWildcard() == GenericType.WILDCARD_NO)
+          && !named.containsKey(produced)) {
+          return true;
+        }
       }
     }
     return false;

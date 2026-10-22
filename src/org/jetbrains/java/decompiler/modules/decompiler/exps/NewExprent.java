@@ -45,6 +45,8 @@ public class NewExprent extends Exprent {
   private boolean anonymous;
   private boolean lambda;
   private boolean methodReference = false;
+  // Printed as the receiver of a call or field access: a receiver has no target type.
+  private boolean isQualifier;
 
   private boolean enumConst;
   private List<VarType> genericArgs = new ArrayList<>();
@@ -985,6 +987,11 @@ public class NewExprent extends Exprent {
     this.enumConst = enumConst;
   }
 
+  @Override
+  public void setIsQualifier() {
+    isQualifier = true;
+  }
+
   /**
    * Prints the supertype an anonymous class is written against, with a diamond where javac was
    * given one.
@@ -995,14 +1002,18 @@ public class NewExprent extends Exprent {
    * source used, and printing the arguments where the original had a diamond adds an attribute the
    * class does not have. A class that captures nothing carries no signature in either form and is
    * left alone, since there the arguments are also recoverable from the context.
+   *
+   * <p>A receiver has no target type, so a diamond there cannot be inferred and cannot be the
+   * form the source wrote: the explicit arguments are printed even without the constructor's
+   * signature.
    */
-  private static void appendAnonymousSuperType(TextBuffer buf, VarType superType, ClassNode node) {
+  private void appendAnonymousSuperType(TextBuffer buf, VarType superType, ClassNode node) {
     if (superType instanceof GenericType && !((GenericType)superType).getArguments().isEmpty()
         && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
         && node.classStruct != null) {
       for (StructMethod method : node.classStruct.getMethods()) {
         if (CodeConstants.INIT_NAME.equals(method.getName()) && !method.getDescriptor().startsWith("()")) {
-          if (method.getSignature() == null) {
+          if (method.getSignature() == null && !isQualifier) {
             buf.appendCastTypeName(new VarType(superType.type, superType.arrayDim, superType.value)).append("<>");
             return;
           }
@@ -1074,6 +1085,38 @@ public class NewExprent extends Exprent {
 
   public boolean isMethodReference() {
     return methodReference;
+  }
+
+  /** The functional interface type this lambda was inferred against, if any. */
+  public VarType getInferredLambdaType() {
+    return inferredLambdaType;
+  }
+
+  /**
+   * The SAM's return type as this functional argument was inferred to produce, instantiated from
+   * the functional interface's recorded type. A type variable that stays unresolved here belongs
+   * to the referenced class or the interface itself; print-time code cannot name it, and a
+   * call's own inference cannot bind it to a type variable of the caller either.
+   */
+  public VarType getFunctionalReturnType() {
+    if (!lambda || inferredLambdaType == null || !inferredLambdaType.isGeneric()) {
+      return null;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
+    if (node == null || node.lambdaInformation == null) {
+      return null;
+    }
+    StructClass iface = DecompilerContext.getStructContext().getClass(node.anonymousClassType.value);
+    if (iface == null || iface.getSignature() == null) {
+      return null;
+    }
+    StructMethod sam = iface.getMethod(getLambdaMethodKey());
+    if (sam == null || sam.getSignature() == null || sam.getSignature().returnType == null) {
+      return null;
+    }
+    Map<VarType, VarType> map = new HashMap<>();
+    iface.getSignature().genericType.mapGenVarsTo((GenericType) inferredLambdaType, map);
+    return sam.getSignature().returnType.remap(map);
   }
 
   /**
