@@ -213,7 +213,7 @@ public final class ConstantNames {
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
-                           List<int[]> spans) {
+                           List<int[]> spans, Set<String> prefix) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -336,7 +336,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of());
+      List.of(), null);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -654,7 +654,7 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical, spans),
+        namingAt, lexical, spans, new HashSet<>(prefixOwners(own))),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -2578,6 +2578,15 @@ public final class ConstantNames {
     boolean foreign = !constant.owner().equals(own);
     boolean lexical = foreign && placement != null && placement.lexical() != null
       && placement.lexical().contains(constant.owner());
+    if (foreign && !lexical && placement != null && placement.prefix() != null
+        && !placement.prefix().contains(constant.owner())
+        && insideInitializer(ownInitializers, anchor)) {
+      // A naming in a constant field initializer is resolved before any code is generated, so the
+      // owner's Class entry and its name would open the pool, right after the earlier namings. A
+      // pool without that pair means the source did not name a constant here; the window only
+      // found a literal on a line the owner happens to touch.
+      return;
+    }
     if (lexical) {
       // Names are resolved in source order, so a name printed earlier in this class would enter
       // its Class entry first. Nothing may precede the owner that opens the pool.
