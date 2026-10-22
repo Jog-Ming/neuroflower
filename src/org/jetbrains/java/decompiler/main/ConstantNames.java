@@ -7,12 +7,14 @@ import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
+import org.jetbrains.java.decompiler.struct.StructContext;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructConstantValueAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructEnclosingMethodAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructExceptionsAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructInnerClassesAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructNestHostAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructNestMembersAttribute;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
@@ -208,7 +210,7 @@ public final class ConstantNames {
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
-                           Map<String, Long> namingAt) {
+                           Map<String, Long> namingAt, Set<String> lexical) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -324,7 +326,7 @@ public final class ConstantNames {
   }
 
   private static final Placement NO_PLACEMENT =
-    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of());
+    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -549,6 +551,7 @@ public final class ConstantNames {
     }
     String nest = nestOf(own.qualifiedName);
     Map<String, Long> namingAt = new HashMap<>();
+    Set<String> lexical = new HashSet<>();
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
         continue;
@@ -584,6 +587,20 @@ public final class ConstantNames {
         continue;
       }
       int[] window = window(text, own, index, orderedUses, positions, true);
+      if (window == null && opensPool(own, index, early, firstUses)
+          && own.qualifiedName.startsWith(owner + "$")) {
+        // The owner's Class entry is the first pool entry and no instruction references any
+        // entry yet, so javac entered it while visiting the fields: a nested class naming an
+        // enclosing constant in a field initializer does exactly this. Nothing was interned
+        // before it, so there is no lower bound to prove; the first printed use still bounds
+        // the site from above. Such a name is written without a qualifier: for an ordinary
+        // field initializer javac interns the enclosing Class only from the simple name, and
+        // the enclosing class is in lexical scope anyway.
+        window = window(text, own, index, orderedUses, positions, false);
+        if (window != null) {
+          lexical.add(owner);
+        }
+      }
       if (window == null) {
         continue;
       }
@@ -611,7 +628,7 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt),
+        namingAt, lexical),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -877,6 +894,39 @@ public final class ConstantNames {
    * and are skipped rather than failing the window. Both bounds are widened to the whole printed
    * line, because a line is the finest text unit the printer proves.
    */
+  /**
+   * Whether pool entry {@code index} is the first entry and was interned before any instruction
+   * output, with no reference beside it that could have created it as an operand.
+   *
+   * <p>javac visits the fields before it generates any method body; a folded constant naming in a
+   * field initializer interns the owner's {@code Class} entry there. Nothing else produces a pool
+   * where the owner's Class entry leads and every instruction-referenced entry follows, while no
+   * nearby reference names the owner; the class's own, superclass and interface entries are
+   * entered as the class is, so they never count.
+   */
+  private static boolean opensPool(StructClass cls, int index, Set<Integer> early,
+                                   Map<Integer, FirstUse> uses) {
+    if (index != 1 || early.contains(index)) {
+      return false;
+    }
+    for (int key : uses.keySet()) {
+      if (key <= index) {
+        return false; // an instruction already references an entry, so the class was generating
+      }
+    }
+    List<PooledConstant> pool = cls.getPool().getPool();
+    if (!(pool.get(index) instanceof PrimitiveConstant primitive) || primitive.getString() == null) {
+      return false;
+    }
+    String owner = primitive.getString();
+    for (int i = index + 1; i < Math.min(pool.size(), index + 5); i++) {
+      if (pool.get(i) instanceof LinkConstant link && owner.equals(link.classname)) {
+        return false; // the Class entry is the reference's operand, not a naming
+      }
+    }
+    return true;
+  }
+
   private static int[] window(String text, StructClass cls, int index,
                               List<Map.Entry<Integer, FirstUse>> ordered,
                               Map<Pair<String, String>, Map<Integer, Integer>> positions,
@@ -1677,6 +1727,51 @@ public final class ConstantNames {
     return dollar < 0 ? internal : internal.substring(0, dollar);
   }
 
+  /** Whether a simple name in this class's body resolves to the enclosing owner's constant. */
+  private static boolean resolvesTo(StructClass site, String owner, String name) {
+    StructContext context = DecompilerContext.getStructContext();
+    String current = site.qualifiedName;
+    while (current != null && !current.equals(owner)) {
+      if (declaresField(context.getClass(current), context, name)) {
+        return false; // a field of this class or an enclosing one shadows the name
+      }
+      int dollar = current.lastIndexOf('$');
+      if (dollar < 0) {
+        return false;
+      }
+      current = current.substring(0, dollar);
+    }
+    if (owner.equals(current) && declaresLocal(site, name)) {
+      return false; // a local variable of one of this class's bodies shadows the name
+    }
+    return owner.equals(current);
+  }
+
+  /** Whether any method body of the class declares a local or parameter with this name. */
+  private static boolean declaresLocal(StructClass cls, String name) {
+    for (StructMethod method : cls.getMethods()) {
+      StructLocalVariableTableAttribute table =
+        method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+      if (table != null && table.getVariables().anyMatch(variable -> name.equals(variable.getName()))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean declaresField(StructClass cls, StructContext context, String name) {
+    while (cls != null) {
+      for (StructField field : cls.getFields()) {
+        if (field.getName().equals(name)) {
+          return true;
+        }
+      }
+      String superName = cls.superClass == null ? null : cls.superClass.getString();
+      cls = superName == null ? null : context.getClass(superName);
+    }
+    return false;
+  }
+
   private static String packageOf(String internal) {
     int slash = internal.lastIndexOf('/');
     return slash < 0 ? "" : internal.substring(0, slash).replace('/', '.');
@@ -2013,7 +2108,21 @@ public final class ConstantNames {
     }
     String name = simpleName(constant.owner());
     String printed;
-    if (placement != null && placement.windows() != null && constant.owner().equals(own)
+    if (placement != null && placement.lexical() != null
+        && placement.lexical().contains(constant.owner())) {
+      // The pool proves the enclosing class was named in a field initializer, and javac enters
+      // the enclosing Class only for the simple name there. The name must resolve to that owner
+      // and not to a field declared closer to the site.
+      StructClass site = DecompilerContext.getStructContext().getClass(own);
+      if (site == null || !resolvesTo(site, constant.owner(), constant.name())) {
+        return;
+      }
+      printed = prefix + constant.name();
+      if (key.startsWith("FLOATCAST|")) {
+        printed = "(float) " + printed;
+      }
+    }
+    else if (placement != null && placement.windows() != null && constant.owner().equals(own)
         && anonymous(constant.owner())) {
       // Inside its own class the constant needs no qualifier, and an anonymous class has no
       // writable simple name at all (its binary suffix is a number).
