@@ -1593,7 +1593,9 @@ public class InvocationExprent extends Exprent {
           // this scope, and a caller variable that happens to share the name is a different
           // variable. Record it for the argument's cast decision; javac infers it again.
           Set<VarType> unbound = unboundTypeParameters(rawType, desc.getSignature().typeParameters, genericsMap);
-          unbound.removeIf(variable -> isInScopeTypeVariable(variable, named));
+          VarType erasedParameter = x < descriptor.params.length ? descriptor.params[x] : null;
+          unbound.removeIf(variable -> isInScopeTypeVariable(variable, named)
+            && (!isBareTypeVariable(rawType) || callerVariableFitsParameter(variable, named, erasedParameter)));
           if (!unbound.isEmpty()) {
             unboundArguments.put(x, unbound);
           }
@@ -1761,6 +1763,32 @@ public class InvocationExprent extends Exprent {
     Set<VarType> result = new HashSet<>();
     collectUnboundTypeParameters(type, typeParameters, genericsMap, result);
     return result;
+  }
+
+  /** Whether the declared parameter type is nothing but the type variable itself. */
+  private static boolean isBareTypeVariable(VarType type) {
+    return type != null && type.type == CodeType.GENVAR && type.arrayDim == 0
+      && (!(type instanceof GenericType generic) || generic.getWildcard() == GenericType.WILDCARD_NO);
+  }
+
+  /**
+   * A parameter that is exactly the callee's own unbound type variable can only be printed as a
+   * caller variable of the same name, so the cast this printer emits names that variable. The
+   * call then has to compile: the argument is converted to the caller's variable, whose erasure
+   * must be a subtype of the parameter's erased type. When it is not - a callee {@code <T
+   * extends Avatar> get(T)} called from a {@code <T extends Entity>} method, where the shared
+   * letter is the caller's - no source could have written the cast, and the argument is passed
+   * through for javac to infer the callee's variable from it.
+   */
+  private static boolean callerVariableFitsParameter(VarType variable, Map<VarType, List<VarType>> named,
+                                                     VarType parameter) {
+    List<VarType> callerBounds = named.get(variable);
+    VarType callerBound = callerBounds == null || callerBounds.isEmpty() ? null : callerBounds.get(0);
+    if (callerBound == null || callerBound.type != CodeType.OBJECT || parameter == null
+      || parameter.type != CodeType.OBJECT || parameter.arrayDim != 0) {
+      return true; // no class bound to compare, or an erased shape this check does not cover
+    }
+    return DecompilerContext.getStructContext().instanceOf(callerBound.value, parameter.value);
   }
 
   private static void collectUnboundTypeParameters(VarType type, List<String> typeParameters,

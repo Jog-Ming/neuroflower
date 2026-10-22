@@ -1272,6 +1272,10 @@ public class ExprProcessor implements CodeConstants {
     }
 
     VarType rightType = exprent.getInferredExprType(leftType);
+    if (exprent instanceof SwitchExprent switchExprent) {
+      // The switch is poly in this context; the arms are printed against this target.
+      switchExprent.setPrintTarget(leftType);
+    }
     exprent = narrowGenericCastType(exprent, leftType);
 
     boolean doCast = (!leftType.higherEqualInLatticeThan(rightType) && (rightType.equals(VarType.VARTYPE_OBJECT) || leftType.type != CodeType.OBJECT));
@@ -1355,9 +1359,13 @@ public class ExprProcessor implements CodeConstants {
 
     // A target type that still names a type parameter of the callee which inference left unbound
     // has no nameable form at the call site, so a compiling source cannot have written a cast
-    // built on it. Passing the expression on lets javac infer the callee's variable again.
-    if (doCastGenerics && InvocationExprent.namesUnboundArgumentVariable(leftType)) {
+    // built on it. Passing the expression on lets javac infer the callee's variable again. The
+    // lattice conversion to a bare type variable is a cast like any other: the argument's own
+    // recorded type is at or below the variable's erasure, and javac infers the callee's variable
+    // from it.
+    if ((doCastGenerics || doCast) && InvocationExprent.namesUnboundArgumentVariable(leftType)) {
       doCastGenerics = false;
+      doCast = false;
       castRaw = false;
     }
 

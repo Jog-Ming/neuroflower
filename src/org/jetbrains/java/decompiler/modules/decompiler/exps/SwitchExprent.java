@@ -4,12 +4,15 @@ import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.*;
@@ -21,6 +24,12 @@ public class SwitchExprent extends Exprent {
   private final boolean fallthrough;
   // Whether the switch expression returns a value, for case type coercion
   private final boolean standalone;
+  /**
+   * The type the enclosing context expects from this value, set by the printer just before
+   * {@link #toJava}. A switch expression is poly there, so an arm that cannot satisfy the
+   * target's type arguments must carry the cast the source wrote.
+   */
+  private VarType printTarget;
 
   public SwitchExprent(SwitchStatement backing, VarType type, boolean fallthrough, boolean standalone) {
     super(Type.SWITCH);
@@ -38,6 +47,8 @@ public class SwitchExprent extends Exprent {
     }
 
     TextBuffer buf = new TextBuffer();
+    VarType target = this.printTarget;
+    this.printTarget = null;
 
     VarType switchType = this.backing.getHeadexprent().getExprType();
     boolean isExhaustive = isExhaustive();
@@ -152,7 +163,17 @@ public class SwitchExprent extends Exprent {
             ((ConstExprent)content).setConstType(this.type);
           }
 
-          buf.append(content.toJava(indent + 1).append(";"));
+          if (armNeedsTargetCast(content, target)) {
+            buf.append('(').appendCastTypeName(target).append(')');
+            if (content.getPrecedence() >= FunctionType.CAST.precedence) {
+              buf.append('(').append(content.toJava(indent + 1)).append(')');
+            } else {
+              buf.append(content.toJava(indent + 1));
+            }
+            buf.append(';');
+          } else {
+            buf.append(content.toJava(indent + 1).append(";"));
+          }
         } else if (exprent instanceof ExitExprent) {
           ExitExprent exit = (ExitExprent) exprent;
 
@@ -231,6 +252,80 @@ public class SwitchExprent extends Exprent {
     }
     order.add(rank, defaultIndex);
     return order;
+  }
+
+  /** The type the enclosing context expects from this value; consumed by the next {@link #toJava}. */
+  public void setPrintTarget(VarType target) {
+    this.printTarget = target;
+  }
+
+  /**
+   * Whether an arm's value provably fails the target's type arguments. A switch expression in an
+   * assignment or invocation context is poly: javac checks every arm against the target type, and
+   * an arm that is a call is inferred against it. The call's own recorded arguments can pin its
+   * type variable to a class the target rejects. The target's {@code ? super X} at a position
+   * where the arm's instantiation is a concrete class C cannot be satisfied when X's own recorded
+   * upper bound is not a subtype of C: no inference satisfies both the argument's recorded type
+   * and the target, so the source cast the arm. That cast erases to the class the arm already
+   * has, which is why the class file does not show it. Lambdas and method references are left
+   * alone: they have no type of their own and need the poly context.
+   */
+  private boolean armNeedsTargetCast(Exprent content, VarType target) {
+    if (!(content instanceof InvocationExprent) || target == null || !target.isGeneric()
+      || target.type != CodeType.OBJECT || target.arrayDim != 0) {
+      return false;
+    }
+    List<VarType> targetArguments = ((GenericType) target).getArguments();
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    boolean bounded = false;
+    for (VarType argument : targetArguments) {
+      if (argument instanceof GenericType wildcard && wildcard.getWildcard() == GenericType.WILDCARD_SUPER
+        && wildcard.type == CodeType.GENVAR && isInScopeTypeVariable(plainVariable(wildcard), named)) {
+        bounded = true;
+        break;
+      }
+    }
+    if (!bounded) {
+      return false; // an unbounded wildcard accepts every instantiation; a bare variable is inferable
+    }
+
+    VarType value = content.getInferredExprType(null);
+    if (value == null || !value.isGeneric() || value.type != CodeType.OBJECT || value.arrayDim != 0) {
+      return false;
+    }
+    VarType view = value.value.equals(target.value) ? value : GenericType.getGenericSuperType(value, target);
+    if (view == null || !view.isGeneric() || !view.value.equals(target.value) || view.arrayDim != 0) {
+      return false;
+    }
+    List<VarType> viewArguments = ((GenericType) view).getArguments();
+    if (viewArguments.size() != targetArguments.size()) {
+      return false;
+    }
+
+    for (int i = 0; i < targetArguments.size(); i++) {
+      if (!(targetArguments.get(i) instanceof GenericType wildcard)
+        || wildcard.getWildcard() != GenericType.WILDCARD_SUPER || wildcard.type != CodeType.GENVAR) {
+        continue;
+      }
+      List<VarType> bounds = named.get(plainVariable(wildcard));
+      if (bounds == null || bounds.isEmpty() || bounds.get(0) == null) {
+        continue;
+      }
+      VarType upper = bounds.get(0);
+      VarType actual = viewArguments.get(i);
+      if (upper.type != CodeType.OBJECT || upper.arrayDim != 0
+        || actual == null || actual.type != CodeType.OBJECT || actual.arrayDim != 0 || actual.isGeneric()) {
+        continue; // only a concrete class argument can fall outside the variable's upper bound
+      }
+      if (!DecompilerContext.getStructContext().instanceOf(upper.value, actual.value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static VarType plainVariable(GenericType wildcard) {
+    return GenericType.parse("T" + wildcard.value + ";");
   }
 
   private static boolean isEmptyDefault(BasicBlockStatement block, SwitchStatement head) {
