@@ -270,7 +270,7 @@ public class IfStatement extends Statement {
 
     // A guard whose else was declared in the method body: the table writes the else's first
     // local after the parameters, so the original source closed the branch before it.
-    if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
+    if (ifstat != null && elsestat != null
         && condition != null && !isLabeled() && endsWithExit(ifstat)
         && RoundTrip.startsWithMethodScopeLocal(elsestat)) {
       buf.appendIndent(indent).append(condition.toJava(indent)).append(" {").appendLineSeparator();
