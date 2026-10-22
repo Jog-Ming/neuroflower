@@ -20,6 +20,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
@@ -515,7 +516,13 @@ public class NewExprent extends Exprent {
         buf.append("new ");
 
         String typename = ExprProcessor.getTypeName(newType);
-        if (enclosing != null) {
+        if (enclosing == null) {
+          String qualified = qualifiedInnerNewType(newType);
+          if (qualified != null) {
+            typename = qualified;
+          }
+        }
+        else {
           ClassNode newNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
           if (newNode != null) {
             typename = newNode.simpleName;
@@ -1012,6 +1019,57 @@ public class NewExprent extends Exprent {
       return node != null && node.getSignature() != null && !node.getSignature().fparameters.isEmpty();
     }
     return false;
+  }
+
+  /**
+   * The name of a non-static inner class declared inside the class being decompiled, qualified by
+   * its outer type's arguments.
+   *
+   * <p>javac rejects type arguments written on a raw type, so a source that compiled never says
+   * {@code new Outer.Inner<T>()} for a class that needs the outer's parameters; it writes
+   * {@code new Outer<T>.Inner<>()}. A member class that holds an outer instance carries the
+   * compiler's synthetic {@code this$0} field recording that outer, and the arguments the outer
+   * needs are exactly the type parameters the current class declares.
+   */
+  private static String qualifiedInnerNewType(VarType type) {
+    if (type == null || type.type != CodeType.OBJECT || type.arrayDim != 0 || type.isGeneric()) {
+      return null;
+    }
+    StructClass inner = DecompilerContext.getStructContext().getClass(type.value);
+    if (inner == null) {
+      return null;
+    }
+    StructClass outer = capturedOuterClass(inner);
+    if (outer == null || outer.getSignature() == null || outer.getSignature().fparameters.isEmpty()) {
+      return null;
+    }
+    StructClass current = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS);
+    String outerName = outer.qualifiedName;
+    String prefix = outerName + "$";
+    if (current == null || !(current.qualifiedName.equals(outerName) || current.qualifiedName.startsWith(prefix))) {
+      return null;
+    }
+    if (type.value == null || !type.value.startsWith(prefix) || type.value.indexOf('$', prefix.length()) >= 0) {
+      return null;
+    }
+    StringBuilder signature = new StringBuilder("L").append(outerName).append('<');
+    for (String parameter : outer.getSignature().fparameters) {
+      signature.append('T').append(parameter).append(';');
+    }
+    signature.append(">.").append(type.value.substring(prefix.length())).append(';');
+    VarType view = GenericType.parse(signature.toString());
+    return view.isGeneric() ? ExprProcessor.getTypeName(view) : null;
+  }
+
+  /** The outer class whose instance a member class holds in the compiler's synthetic field. */
+  private static StructClass capturedOuterClass(StructClass inner) {
+    for (StructField field : inner.getFields()) {
+      String name = field.getName();
+      if (name.startsWith("this$") && field.getDescriptor().startsWith("L") && field.getDescriptor().endsWith(";")) {
+        return DecompilerContext.getStructContext().getClass(field.getDescriptor().substring(1, field.getDescriptor().length() - 1));
+      }
+    }
+    return null;
   }
 
   public boolean isMethodReference() {
