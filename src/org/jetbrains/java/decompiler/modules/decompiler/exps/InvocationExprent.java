@@ -1503,8 +1503,31 @@ public class InvocationExprent extends Exprent {
         if (unbound != null) {
           UNBOUND_ARGUMENT.get().push(new UnboundArgument(RoundTrip.currentMethod(), unbound));
         }
+        VarType argumentType = types[i];
+        if (unbound != null && !unbound.isEmpty() && argumentType != null
+          && lstParameters.get(i) instanceof NewExprent lambda && lambda.isLambda() && !lambda.isMethodReference()) {
+          // The called method's signature declared these variables and the printer's inference
+          // gave them no value. The source cannot name them at the call site, so a name shared
+          // with a caller variable is a different variable; leaving it in the lambda's target
+          // type makes the printer read it as the caller's and pin the body's returns to it.
+          // The body's own recorded value type is then the only target, and javac infers the
+          // call's variable from it exactly as the original source did.
+          Map<VarType, List<VarType>> inScope = getNamedGenerics();
+          Map<VarType, VarType> shadowed = null;
+          for (VarType variable : unbound) {
+            if (inScope.containsKey(variable)) {
+              if (shadowed == null) {
+                shadowed = new HashMap<>();
+              }
+              shadowed.put(variable, GenericType.DUMMY_VAR);
+            }
+          }
+          if (shadowed != null) {
+            argumentType = argumentType.remap(shadowed);
+          }
+        }
         try {
-          ExprProcessor.getCastedExprent(lstParameters.get(i), types[i], buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
+          ExprProcessor.getCastedExprent(lstParameters.get(i), argumentType, buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
         } finally {
           if (unbound != null) {
             UNBOUND_ARGUMENT.get().pop();
