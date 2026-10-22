@@ -21,7 +21,9 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.consts.ConstantPool;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
@@ -30,6 +32,8 @@ import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericMain;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.struct.match.MatchEngine;
 import org.jetbrains.java.decompiler.struct.match.MatchNode;
@@ -76,6 +80,8 @@ public class InvocationExprent extends Exprent {
   public boolean forceGenericQualfication = false;
   private final NullableConcurrentHashMap<VarType, VarType> genericsMap = new NullableConcurrentHashMap<>();
   private boolean isInvocationInstance = false;
+  /** The invocation whose receiver is currently being typed; set only for the duration. */
+  private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
   private boolean isQualifier = false;
   private final BoxState boxing = new BoxState();
   private boolean isSyntheticNullCheck = false;
@@ -355,12 +361,19 @@ public class InvocationExprent extends Exprent {
           instance.setInvocationInstance();
 
           VarType instUB = mthCls.getSignature() != null ? mthCls.getSignature().genericType.remap(upperBoundsMap) : upperBound;
-          // don't want the casted type
-          if (instance instanceof FunctionExprent && ((FunctionExprent)instance).getFuncType() == FunctionType.CAST) {
-            instType = ((FunctionExprent)instance).getLstOperands().get(0).getInferredExprType(instUB);
+          InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          OUTER_INVOCATION.set(this);
+          try {
+            // don't want the casted type
+            if (instance instanceof FunctionExprent && ((FunctionExprent)instance).getFuncType() == FunctionType.CAST) {
+              instType = ((FunctionExprent)instance).getLstOperands().get(0).getInferredExprType(instUB);
+            }
+            else {
+              instType = instance.getInferredExprType(instUB);
+            }
           }
-          else {
-            instType = instance.getInferredExprType(instUB);
+          finally {
+            OUTER_INVOCATION.set(priorOuter);
           }
 
           if (instType.type == CodeType.GENVAR && named.containsKey(instType)) {
@@ -665,6 +678,12 @@ public class InvocationExprent extends Exprent {
                 tryDemandWitness(fparams, bounds);
               }
             }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && receiverRecordedValueDemand(fparams, ret, bounds)) {
+              // The printer has no value for some type variable of a call in receiver position.
+              // The outer call's functional argument records the value it must return, and the
+              // receiver's type argument is invariant in it: the recorded type pins the variable.
+            }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
               && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
               // A call inferred to an enclosing method's or class's type variable can need the
@@ -835,7 +854,15 @@ public class InvocationExprent extends Exprent {
           }
 
           instance.setInvocationInstance();
-          VarType rightType = instance.getInferredExprType(leftType);
+          InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          OUTER_INVOCATION.set(this);
+          VarType rightType;
+          try {
+            rightType = instance.getInferredExprType(leftType);
+          }
+          finally {
+            OUTER_INVOCATION.set(priorOuter);
+          }
 
           if (isUnboxingCall() && !boxing.forceUnboxing) {
             // we don't print the unboxing call - no need to bother with the instance wrapping / casting
@@ -2433,6 +2460,247 @@ public class InvocationExprent extends Exprent {
     genericArgs.clear();
     genericArgs.addAll(witness);
     return true;
+  }
+
+  /**
+   * A call in receiver position whose type arguments the printer cannot settle. The class file
+   * records what the outer invocation's functional argument returns: the implementation method's
+   * tail is a local whose LocalVariableTypeTable gives the generic type it was declared with, or
+   * a field whose Signature does. The outer class's type argument is that value's supertype, and
+   * the receiver returns the outer class instance, so the recorded value fixes the receiver's
+   * type variables through an invariant position (Map&lt;K, V&gt; accepts exactly a Map with
+   * those arguments). The witness is printed only when it is fully printable, its erasure
+   * reproduces the call the pool recorded, and the call site belongs to this class.
+   */
+  private boolean receiverRecordedValueDemand(List<String> fparams, VarType ret,
+                                              Map<VarType, List<VarType>> bounds) {
+    if (!isInvocationInstance || fparams.isEmpty() || ret == null || desc == null
+      || ret.type != CodeType.OBJECT || !ret.isGeneric()) {
+      return false;
+    }
+    InvocationExprent outer = OUTER_INVOCATION.get();
+    if (outer == null || outer == this || outer.desc == null || outer.desc.getSignature() == null
+      || outer.lstParameters.isEmpty()) {
+      return false;
+    }
+    StructClass outerClass = DecompilerContext.getStructContext().getClass(outer.classname);
+    if (outerClass == null || outerClass.getSignature() == null
+      || outerClass.getSignature().fparameters.isEmpty() || !outer.classname.equals(ret.value)) {
+      return false;
+    }
+    List<String> classParams = outerClass.getSignature().fparameters;
+    if (((GenericType) ret).getArguments().size() != classParams.size()) {
+      return false;
+    }
+    // Only a variable the printer could not print is in demand.
+    List<VarType> probe = new ArrayList<>();
+    getGenericArgs(fparams, genericsMap, probe);
+    if (!probe.isEmpty()) {
+      return false;
+    }
+    Map<VarType, VarType> partial = new HashMap<>();
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType inferred = genericsMap.get(variable);
+      if (inferred != null && isPrintableWitness(inferred)) {
+        partial.put(variable, inferred);
+      }
+    }
+    VarType receiver = ret.remap(partial);
+    if (receiver == null || !receiver.isGeneric() || !outer.classname.equals(receiver.value)) {
+      return false;
+    }
+    List<VarType> receiverArgs = ((GenericType) receiver).getArguments();
+    if (receiverArgs.size() != classParams.size()) {
+      return false;
+    }
+    Map<VarType, VarType> bindings = new HashMap<>();
+    List<VarType> declared = outer.desc.getSignature().parameterTypes;
+    int count = Math.min(declared.size(), outer.lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      if (!(outer.lstParameters.get(i) instanceof NewExprent lambda) || !lambda.isLambda()) {
+        continue;
+      }
+      Set<VarType> covariant = new HashSet<>();
+      Set<VarType> other = new HashSet<>();
+      collectVariance(declared.get(i), true, covariant, other);
+      for (VarType variable : covariant) {
+        if (variable.type != CodeType.GENVAR) {
+          continue;
+        }
+        int index = classParams.indexOf(variable.value);
+        if (index < 0) {
+          continue;
+        }
+        VarType recorded = recordedLambdaValueSignature(lambda);
+        if (recorded == null) {
+          continue;
+        }
+        if (!bindRecordedValue(receiverArgs.get(index), recorded, fparams, bindings)) {
+          return false;
+        }
+      }
+    }
+    if (bindings.isEmpty()) {
+      return false;
+    }
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType value = bindings.get(variable);
+      if (value == null) {
+        value = genericsMap.get(variable);
+      }
+      if (!isPrintableWitness(value)) {
+        return false;
+      }
+      witness.add(value);
+    }
+    if (!erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /**
+   * Bind the type variables of a receiver's type argument to the arguments a recorded value type
+   * supplies. The receiver's argument and the recorded value must have the same raw class, and
+   * every position is compared exactly, because the position is invariant; a wildcard in the
+   * receiver's argument constrains nothing. A contradiction between two records rejects the
+   * whole witness rather than picking one.
+   */
+  private static boolean bindRecordedValue(VarType pattern, VarType recorded, List<String> fparams,
+                                           Map<VarType, VarType> bindings) {
+    if (pattern == null || recorded == null) {
+      return false;
+    }
+    if (pattern.type == CodeType.GENVAR) {
+      if (!fparams.contains(pattern.value) || pattern.arrayDim != 0) {
+        return false;
+      }
+      VarType prior = bindings.putIfAbsent(pattern, recorded);
+      return prior == null || sameType(prior, recorded);
+    }
+    if (pattern.type != CodeType.OBJECT || !pattern.isGeneric()) {
+      return false;
+    }
+    VarType view = recorded;
+    if (!pattern.value.equals(recorded.value)) {
+      view = GenericType.getGenericSuperType(recorded, pattern);
+      if (!(view instanceof GenericType) || !pattern.value.equals(view.value)) {
+        return false;
+      }
+    }
+    List<VarType> patternArgs = ((GenericType) pattern).getArguments();
+    List<VarType> recordedArgs = ((GenericType) view).getArguments();
+    if (patternArgs.size() != recordedArgs.size()) {
+      return false;
+    }
+    for (int i = 0; i < patternArgs.size(); i++) {
+      VarType p = patternArgs.get(i);
+      VarType r = recordedArgs.get(i);
+      if (p == null || r == null) {
+        return false;
+      }
+      if (p.type == CodeType.GENVAR && fparams.contains(p.value)) {
+        VarType prior = bindings.putIfAbsent(p.resizeArrayDim(0), r);
+        if (prior != null && !sameType(prior, r)) {
+          return false;
+        }
+      }
+      else if (p instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
+      }
+      else if (!sameType(p, r)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The generic type of the value a lambda's recorded implementation method returns, read from
+   * the class file alone: the LocalVariableTypeTable signature of the local it returns, or the
+   * Signature of the field it reads. An erased descriptor names no type arguments and is not
+   * used. Only a single-exit method is read.
+   */
+  private static VarType recordedLambdaValueSignature(NewExprent lambda) {
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+    if (node == null) {
+      return null;
+    }
+    StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+    if (content == null) {
+      return null;
+    }
+    StructMethod method = content.getMethod(node.lambdaInformation.content_method_name,
+      node.lambdaInformation.content_method_descriptor);
+    if (method == null) {
+      return null;
+    }
+    boolean released = method.getInstructionSequence() == null;
+    try {
+      FullInstructionSequence seq = method.getInstructionSequence();
+      if (seq == null) {
+        method.expandData(content);
+        seq = method.getInstructionSequence();
+      }
+      if (seq == null || seq.length() < 2 || seq.getInstr(seq.length() - 1).opcode != CodeConstants.opc_areturn) {
+        return null;
+      }
+      for (int i = 0; i < seq.length() - 1; i++) {
+        int opcode = seq.getInstr(i).opcode;
+        if (opcode == CodeConstants.opc_areturn || opcode == CodeConstants.opc_ireturn
+          || opcode == CodeConstants.opc_lreturn || opcode == CodeConstants.opc_freturn
+          || opcode == CodeConstants.opc_dreturn || opcode == CodeConstants.opc_return) {
+          return null;
+        }
+      }
+      Instruction value = seq.getInstr(seq.length() - 2);
+      if (value.opcode == CodeConstants.opc_aload || value.opcode == CodeConstants.opc_aload_0
+        || value.opcode == CodeConstants.opc_aload_1 || value.opcode == CodeConstants.opc_aload_2
+        || value.opcode == CodeConstants.opc_aload_3) {
+        int slot = value.opcode == CodeConstants.opc_aload ? value.operand(0) : value.opcode - CodeConstants.opc_aload_0;
+        StructLocalVariableTableAttribute lvt = method.getLocalVariableAttr();
+        if (lvt != null) {
+          Iterator<StructLocalVariableTableAttribute.LocalVariable> variables = lvt.getVariables().iterator();
+          while (variables.hasNext()) {
+            StructLocalVariableTableAttribute.LocalVariable variable = variables.next();
+            if (variable.getVersion().var == slot && variable.getSignature() != null
+              && value.startOffset >= variable.getStart() && value.startOffset < variable.getEnd()) {
+              GenericFieldDescriptor descriptor = GenericMain.parseFieldSignature(variable.getSignature());
+              if (descriptor != null) {
+                return descriptor.type;
+              }
+            }
+          }
+        }
+        return null;
+      }
+      if (value.group == CodeConstants.GROUP_FIELDACCESS) {
+        LinkConstant link = content.getPool().getLinkConstant(value.operand(0));
+        if (link == null) {
+          return null;
+        }
+        StructClass owner = DecompilerContext.getStructContext().getClass(link.classname);
+        StructField field = owner == null ? null : owner.getField(link.elementname, link.descriptor);
+        GenericFieldDescriptor descriptor = field == null ? null : field.getSignature();
+        return descriptor == null ? null : descriptor.type;
+      }
+    }
+    catch (IOException ignored) {
+      // Without the method's code there is no proof.
+    }
+    finally {
+      if (released) {
+        // Reading must not leave the sequence live: printer rules that consult the current
+        // method's sequence would silently start firing inside a lambda body.
+        method.releaseResources();
+      }
+    }
+    return null;
   }
 
   /**
