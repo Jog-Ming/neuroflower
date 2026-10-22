@@ -1331,6 +1331,7 @@ public class InvocationExprent extends Exprent {
         }
       }
     }
+    Map<Integer, Set<VarType>> unboundArguments = new HashMap<>();
     if (desc != null && desc.getSignature() != null) {
       Map<VarType, VarType> hierarchyMap = new HashMap<>();
       if (!classname.equals(desc.getClassQualifiedName())) {
@@ -1351,7 +1352,21 @@ public class InvocationExprent extends Exprent {
             continue;
           }
 
-          VarType type = desc.getSignature().parameterTypes.get(y++).remap(hierarchyMap).remap(genericsMap);
+          VarType rawType = desc.getSignature().parameterTypes.get(y++);
+          VarType type = rawType.remap(hierarchyMap).remap(genericsMap);
+          // A type parameter of the called method that inference left unbound is not a type any
+          // source can name at the call site: its name belongs to the callee's signature, not to
+          // this scope, and a caller variable that happens to share the name is a different
+          // variable. Record it for the argument's cast decision; javac infers it again.
+          Set<VarType> unbound = unboundTypeParameters(rawType, desc.getSignature().typeParameters, genericsMap);
+          // A name that is in scope at the call site may be the caller's own variable of the same
+          // name (the callee's signature and the caller often share letters); the source may have
+          // meant that one, so only a name with no in-scope declaration proves the cast wrong.
+          Map<VarType, List<VarType>> named = getNamedGenerics();
+          unbound.removeIf(variable -> isInScopeTypeVariable(variable, named));
+          if (!unbound.isEmpty()) {
+            unboundArguments.put(x, unbound);
+          }
           if (type != null && !(type.isGeneric() && ((GenericType)type).hasUnknownGenericType(namedGens))) {
             types[x] = type;
           }
@@ -1398,7 +1413,17 @@ public class InvocationExprent extends Exprent {
         }
 
         // 'byte' and 'short' literals need an explicit narrowing type cast when used as a parameter
-        ExprProcessor.getCastedExprent(lstParameters.get(i), types[i], buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
+        Set<VarType> unbound = unboundArguments.get(i);
+        if (unbound != null) {
+          UNBOUND_ARGUMENT.get().push(new UnboundArgument(RoundTrip.currentMethod(), unbound));
+        }
+        try {
+          ExprProcessor.getCastedExprent(lstParameters.get(i), types[i], buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
+        } finally {
+          if (unbound != null) {
+            UNBOUND_ARGUMENT.get().pop();
+          }
+        }
 
         int line = RoundTrip.sourceLine(lstParameters.get(i));
         // Only a later line is a break the original had; an equal or earlier one is inheritance
@@ -1439,6 +1464,66 @@ public class InvocationExprent extends Exprent {
     }
 
     return buf;
+  }
+
+  /** An argument's recorded parameter type names variables no source can spell at this call. */
+  private record UnboundArgument(StructMethod method, Set<VarType> variables) {}
+
+  private static final ThreadLocal<Deque<UnboundArgument>> UNBOUND_ARGUMENT =
+    ThreadLocal.withInitial(ArrayDeque::new);
+
+  /**
+   * Whether the type names a type parameter of the method whose argument is being printed while
+   * the inference at this call site left it unbound. Such a variable exists only inside the
+   * callee's declaration; a caller variable that happens to share its name is a different
+   * variable, so a cast written with it names the wrong type. The lambda body is a different
+   * method, printed under its own signatures, and does not inherit the argument's scope.
+   */
+  public static boolean namesUnboundArgumentVariable(VarType type) {
+    UnboundArgument top = UNBOUND_ARGUMENT.get().peek();
+    return top != null && top.method == RoundTrip.currentMethod()
+      && mentionsVariable(type, top.variables);
+  }
+
+  private static boolean mentionsVariable(VarType type, Set<VarType> variables) {
+    if (type == null) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR && variables.contains(type)) {
+      return true;
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (mentionsVariable(argument, variables)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The callee-declared type parameters a recorded parameter type still names after inference. */
+  private static Set<VarType> unboundTypeParameters(VarType type, List<String> typeParameters,
+                                                    Map<VarType, VarType> genericsMap) {
+    Set<VarType> result = new HashSet<>();
+    collectUnboundTypeParameters(type, typeParameters, genericsMap, result);
+    return result;
+  }
+
+  private static void collectUnboundTypeParameters(VarType type, List<String> typeParameters,
+                                                   Map<VarType, VarType> genericsMap, Set<VarType> result) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR && typeParameters.contains(type.value)
+      && !genericsMap.containsKey(type)) {
+      result.add(type.resizeArrayDim(0));
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        collectUnboundTypeParameters(argument, typeParameters, genericsMap, result);
+      }
+    }
   }
 
   private boolean isVarArgCall() {

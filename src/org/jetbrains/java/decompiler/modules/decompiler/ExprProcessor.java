@@ -1072,6 +1072,14 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
+    // A target type that still names a type parameter of the callee which inference left unbound
+    // has no nameable form at the call site, so a compiling source cannot have written a cast
+    // built on it. Passing the expression on lets javac infer the callee's variable again.
+    if (doCastGenerics && InvocationExprent.namesUnboundArgumentVariable(leftType)) {
+      doCastGenerics = false;
+      castRaw = false;
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {

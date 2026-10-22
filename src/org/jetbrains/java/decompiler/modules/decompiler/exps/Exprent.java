@@ -14,8 +14,10 @@ import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
+import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
@@ -317,13 +319,60 @@ public abstract class Exprent implements IMatchable {
       return false;
     }
     StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
-    if (method == null || !method.hasModifier(CodeConstants.ACC_STATIC)) {
+    if (method == null) {
       return true;
     }
-    // In a static context only the method's own type parameters can be named; the class's and
-    // its enclosers' are out of reach. A method parameter shadows a class parameter of the same
-    // name, and then that name is the one in scope.
-    return method.getSignature() != null && method.getSignature().typeParameters.contains(type.value);
+    if (method.hasModifier(CodeConstants.ACC_STATIC)) {
+      // In a static context only the method's own type parameters can be named; the class's and
+      // its enclosers' are out of reach. A method parameter shadows a class parameter of the same
+      // name, and then that name is the one in scope.
+      return method.getSignature() != null && method.getSignature().typeParameters.contains(type.value);
+    }
+    // A type variable of an enclosing class is nameable only where the class has the enclosing
+    // instance it belongs to. The class file records that as the first parameter of the inner
+    // class's constructor: javac passes the enclosing instance there for member, local, and
+    // anonymous classes created in an instance context, and omits it for static contexts (a
+    // static field's anonymous class has a no-argument constructor). A lambda is compiled into
+    // its host class and kept as it was.
+    ClassNode current = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    if (current == null || current.type == ClassNode.Type.LAMBDA) {
+      return true;
+    }
+    ClassNode declaring = declaringClass(current, type.value);
+    if (declaring == null || declaring == current) {
+      return true;
+    }
+    for (ClassNode node = current; node != declaring; node = node.parent) {
+      if (node.parent == null || !capturesEnclosingInstance(node.classStruct, node.parent.classStruct)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static ClassNode declaringClass(ClassNode start, String name) {
+    for (ClassNode node = start; node != null; node = node.parent) {
+      GenericClassDescriptor signature = node.classStruct.getSignature();
+      if (signature != null && signature.fparameters.contains(name)) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  /** Whether the inner class's constructors take the enclosing class as their first parameter. */
+  private static boolean capturesEnclosingInstance(StructClass inner, StructClass outer) {
+    for (StructMethod method : inner.getMethods()) {
+      if (!"<init>".equals(method.getName())) {
+        continue;
+      }
+      MethodDescriptor descriptor = MethodDescriptor.parseDescriptor(method.getDescriptor());
+      if (descriptor.params.length > 0 && descriptor.params[0].type == CodeType.OBJECT
+        && outer.qualifiedName.equals(descriptor.params[0].value)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public void setInvocationInstance() {}
