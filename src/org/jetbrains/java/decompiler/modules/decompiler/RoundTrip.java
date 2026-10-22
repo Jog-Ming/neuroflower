@@ -38,6 +38,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> CONTINUE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Slot stored immediately before the load a value return reads, by the return's start offset. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -48,11 +50,23 @@ public final class RoundTrip {
     java.util.Map<Integer, int[]> sites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
+      }
+      // `store N; load N; return`: javac's copy of a value the source kept in a variable. The
+      // printer folded the copy away; the slot's LVT entry proves the variable existed.
+      if (i >= 2 && instr.opcode >= CodeConstants.opc_ireturn && instr.opcode <= CodeConstants.opc_areturn) {
+        Instruction load = seq.getInstr(i - 1);
+        Instruction store = seq.getInstr(i - 2);
+        if (load.opcode >= CodeConstants.opc_iload && load.opcode <= CodeConstants.opc_aload
+          && store.opcode >= CodeConstants.opc_istore && store.opcode <= CodeConstants.opc_astore
+          && load.operand(0) == store.operand(0)) {
+          returnStores.put(instr.startOffset, load.operand(0));
+        }
       }
       if (isConditional(instr.opcode)) {
         branches.put(instr.startOffset + instr.length, instr.opcode);
@@ -78,6 +92,29 @@ public final class RoundTrip {
     CONTINUE_SITES.put(method, sites);
     BRANCHES.put(method, branches);
     INSTRUCTION_ENDS.put(method, ends);
+    RETURN_STORES.put(method, returnStores);
+  }
+
+  /**
+   * The slot a value return's preceding load reads and the instruction store writes. -1 unless the
+   * target's last three instructions before the return are exactly {@code store N; load N; ret}.
+   */
+  public static int storedBeforeReturn(BitSet offsets) {
+    StructMethod method = currentMethod();
+    if (method == null || offsets == null) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> stores = RETURN_STORES.get(method);
+    if (stores == null) {
+      return -1;
+    }
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      Integer slot = stores.get(offset);
+      if (slot != null) {
+        return slot;
+      }
+    }
+    return -1;
   }
 
   /**
