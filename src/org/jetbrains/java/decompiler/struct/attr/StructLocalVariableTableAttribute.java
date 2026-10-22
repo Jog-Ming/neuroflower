@@ -46,6 +46,9 @@ public class StructLocalVariableTableAttribute extends StructGeneralAttribute {
                                              pool.getPrimitiveConstant(descriptorIndex).getString(),
                                              varIndex));
       }
+      for (int i = 0; i < localVariables.size(); i++) {
+        localVariables.get(i).order = i;
+      }
       Collections.sort(localVariables);
       versionVariables(localVariables);
     }
@@ -119,6 +122,9 @@ public class StructLocalVariableTableAttribute extends StructGeneralAttribute {
     final int index;
     private String signature;
     private VarVersionPair version;
+    // Position in the attribute as read. javac writes entries when their scope closes, so a
+    // variable emitted before the parameters was block scoped in the source.
+    private int order = -1;
 
     public LocalVariable(int start_pc, int length, String name, String descriptor, int index) {
       this.start_pc = start_pc;
@@ -156,6 +162,10 @@ public class StructLocalVariableTableAttribute extends StructGeneralAttribute {
       return start_pc + length;
     }
 
+    public int getOrder() {
+      return order;
+    }
+
     public VarVersionPair getVersion() {
       return version;
     }
@@ -172,6 +182,7 @@ public class StructLocalVariableTableAttribute extends StructGeneralAttribute {
     public LocalVariable rename(String newName) {
       LocalVariable ret = new LocalVariable(start_pc, length, newName, descriptor, index);
       ret.signature = signature;
+      ret.order = order;
       return ret;
     }
   }
