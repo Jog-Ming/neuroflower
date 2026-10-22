@@ -2109,7 +2109,7 @@ public class InvocationExprent extends Exprent {
   }
 
   private boolean processGenericMapping(VarType from, VarType to, Map<VarType, List<VarType>> named, Map<VarType, List<VarType>> bounds) {
-    if (VarType.VARTYPE_NULL.equals(to) || (to != null && to.type == CodeType.GENVAR && !named.containsKey(to))) {
+    if (VarType.VARTYPE_NULL.equals(to) || (to != null && to.type == CodeType.GENVAR && !named.containsKey(to.resizeArrayDim(0)))) {
       return false;
     }
 
@@ -2119,13 +2119,13 @@ public class InvocationExprent extends Exprent {
 
       return true;
     } else if (to != null && current != null && !to.equals(current)) {
-      if (named.containsKey(current)) {
+      if (named.containsKey(current.resizeArrayDim(0))) {
         return false;
       }
 
       if (current.type != CodeType.GENVAR && to.type == CodeType.GENVAR) {
-        if (named.containsKey(to)) {
-          VarType bound = named.get(to).get(0);
+        if (named.containsKey(to.resizeArrayDim(0))) {
+          VarType bound = named.get(to.resizeArrayDim(0)).get(0);
           if (!bound.equals(VarType.VARTYPE_OBJECT) && DecompilerContext.getStructContext().instanceOf(bound.value, current.value)) {
             return false;
           }
@@ -2153,7 +2153,7 @@ public class InvocationExprent extends Exprent {
       return false;
     }
 
-    if (to == null || (to.type == CodeType.GENVAR && !named.containsKey(to))) {
+    if (to == null || (to.type == CodeType.GENVAR && !named.containsKey(to.resizeArrayDim(0)))) {
       return true;
     }
 
@@ -2256,7 +2256,7 @@ public class InvocationExprent extends Exprent {
       return true;
     };
 
-    List<VarType> toVerify = (to.type == CodeType.GENVAR) ? named.get(to) : Collections.singletonList(to);
+    List<VarType> toVerify = (to.type == CodeType.GENVAR) ? named.get(to.resizeArrayDim(0)) : Collections.singletonList(to);
 
     // We need to satisfy all the bounds for the type we are mapping to
     // The bounds can be satisfied by any of the bounds for the named type. Inference can add to a

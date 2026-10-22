@@ -1048,6 +1048,17 @@ public class ExprProcessor implements CodeConstants {
       doCastGenerics = true;
     }
 
+    // A target of array type whose element is a type variable of the enclosing source, against a
+    // value whose array element is a different type: no implicit conversion exists (arrays are
+    // covariant only over reifiable element types), so a source that compiled cast the value to
+    // that same array type. The call's recorded signature proves the target; the cast erases to
+    // the variable's erasure, so javac either elides the checkcast or the target already has it.
+    if (!doCastGenerics
+      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
+      && typeVariableArrayTarget(exprent.getNamedGenerics(), leftType, rightType)) {
+      doCastGenerics = true;
+    }
+
     // A cast whose type argument is a generic class written bare cannot come from a source that
     // compiled: every class file records generic types in full, so a bare argument here is the
     // printer's own inference losing arguments, and F<Bare> is not a conversion javac accepts from
@@ -1501,6 +1512,27 @@ public class ExprProcessor implements CodeConstants {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether the target type is an array whose element is a type variable of the enclosing source
+   * while the value's array type is a different one. Arrays are covariant only over reifiable
+   * element types, and no array whose element is not that same variable is a subtype of
+   * {@code S[]}, so a source that compiled had to cast; the call's recorded signature (a field or
+   * method signature, possibly on another class) proves the target is {@code S[]}. Only a value
+   * whose erased array type is exactly {@code Object[]} is judged: the cast then erases to the
+   * variable's unbounded erasure, so javac emits no checkcast for it.
+   */
+  private static boolean typeVariableArrayTarget(Map<VarType, List<VarType>> named, VarType left, VarType right) {
+    if (left == null || right == null || left.arrayDim == 0 || left.arrayDim != right.arrayDim) {
+      return false;
+    }
+    VarType leftBase = left.resizeArrayDim(0);
+    VarType rightBase = right.resizeArrayDim(0);
+    return leftBase.type == CodeType.GENVAR
+      && named.containsKey(leftBase)
+      && !leftBase.equals(rightBase)
+      && rightBase.equals(VarType.VARTYPE_OBJECT);
   }
 
   private static boolean shouldGenericTypesCast(Map<VarType, List<VarType>> named, VarType leftType, VarType rightType,
