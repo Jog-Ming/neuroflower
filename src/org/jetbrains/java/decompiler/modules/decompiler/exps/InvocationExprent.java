@@ -900,7 +900,7 @@ public class InvocationExprent extends Exprent {
           }
           buf.append(".");
           // Adds generic arguments to the invocation, so .m() becomes .<T>m()
-          this.appendParameters(buf, genericArgs);
+          this.appendParameters(buf, witnessContradictsRecordedMethodReference() ? Collections.emptyList() : genericArgs);
         }
 
         buf.addBytecodeMapping(bytecode);
@@ -2192,6 +2192,91 @@ public class InvocationExprent extends Exprent {
     genericArgs.clear();
     genericArgs.addAll(witness);
     return true;
+  }
+
+  /**
+   * A witness printed for a type variable that feeds a functional argument's parameter position
+   * must be accepted by the method reference the class file recorded. The metafactory's
+   * instantiated method type lists the concrete parameter types that reference has, and a
+   * functional parameter type is only adaptable to one of their supertypes; a witness that
+   * violates this cannot come from any compiling source, so it is the printer's own inference
+   * and is dropped, letting javac infer the type from the argument the source passed.
+   */
+  private boolean witnessContradictsRecordedMethodReference() {
+    if (genericArgs.isEmpty() || desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    List<String> fparams = desc.getSignature().typeParameters;
+    if (fparams.size() != genericArgs.size()) {
+      return false;
+    }
+    Map<VarType, VarType> witness = new HashMap<>();
+    Set<VarType> variables = new HashSet<>();
+    for (int i = 0; i < fparams.size(); i++) {
+      VarType variable = GenericType.parse("T" + fparams.get(i) + ";");
+      variables.add(variable);
+      witness.put(variable, genericArgs.get(i));
+    }
+    List<VarType> declared = desc.getSignature().parameterTypes;
+    int count = Math.min(declared.size(), lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      if (!(lstParameters.get(i) instanceof NewExprent ref) || !ref.isMethodReference()) {
+        continue;
+      }
+      if (!(declared.get(i) instanceof GenericType parameter) || parameter.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
+      }
+      StructClass iface = DecompilerContext.getStructContext().getClass(parameter.value);
+      if (iface == null || iface.getSignature() == null) {
+        continue;
+      }
+      List<String> ifaceParams = iface.getSignature().fparameters;
+      List<VarType> actual = parameter.getArguments();
+      if (actual.size() != ifaceParams.size()) {
+        continue;
+      }
+      StructMethod sam = ExprProcessor.functionalMethod(iface);
+      if (sam == null || sam.getSignature() == null) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(ref.getNewType().value);
+      if (node == null) {
+        continue;
+      }
+      VarType[] recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).params;
+      List<VarType> samParams = sam.getSignature().parameterTypes;
+      if (recorded.length != samParams.size()) {
+        continue;
+      }
+      for (int j = 0; j < samParams.size(); j++) {
+        // Only a functional parameter that is exactly one of the interface's type variables is
+        // judged; a type built from one needs its own variance analysis.
+        VarType samParam = samParams.get(j);
+        if (samParam.type != CodeType.GENVAR || samParam.arrayDim != 0) {
+          continue;
+        }
+        int index = ifaceParams.indexOf(samParam.value);
+        if (index < 0) {
+          continue;
+        }
+        VarType argument = actual.get(index);
+        if (!variables.contains(argument)) {
+          continue;
+        }
+        VarType substituted = argument.remap(witness);
+        if (substituted == null || substituted.type != CodeType.OBJECT || substituted.arrayDim != 0) {
+          continue;
+        }
+        if (DecompilerContext.getStructContext().getClass(substituted.value) == null
+            || DecompilerContext.getStructContext().getClass(recorded[j].value) == null) {
+          continue;
+        }
+        if (!DecompilerContext.getStructContext().instanceOf(substituted.value, recorded[j].value)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
