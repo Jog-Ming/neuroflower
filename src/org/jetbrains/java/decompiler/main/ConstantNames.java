@@ -285,7 +285,17 @@ public final class ConstantNames {
         return false;
       }
       long coordinate = siteCoordinate(spaces, start);
-      return coordinate != NO_COORDINATE && (coordinate <= bounds[0] || coordinate >= bounds[1]);
+      if (coordinate == NO_COORDINATE) {
+        return false;
+      }
+      Long naming = namingAt == null ? null : namingAt.get(owner);
+      // Only a bound on the far side of the point the pool proves interns the Class can bracket
+      // the naming. A lower entry first used after that point was interned earlier regardless,
+      // and a higher entry first used before it shows the rank model placed a use too early;
+      // neither is evidence against the site.
+      boolean beforePred = coordinate <= bounds[0] && (naming == null || bounds[0] < naming);
+      boolean afterSucc = coordinate >= bounds[1] && (naming == null || bounds[1] > naming);
+      return beforePred || afterSucc;
     }
 
     private boolean byCoordinate(String owner, int start) {
