@@ -1751,6 +1751,7 @@ public class ClassWriter implements StatementWriter {
             if (RecordHelper.isHiddenRecordMethod(cl, mt, root)) {
               hideMethod = true;
             } else {
+              LocalDeclarationOrder.reorder(root);
               TextBuffer code = root.toJava(indent + 1);
               if (!clInit || !endsWithLiftedInitializer(methodWrapper, wrapper)) {
                 code.addBytecodeMapping(root.getDummyExit().bytecode);
