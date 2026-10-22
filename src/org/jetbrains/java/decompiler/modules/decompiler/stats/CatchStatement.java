@@ -13,6 +13,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -209,12 +211,64 @@ public class CatchStatement extends Statement {
       }
 
       buf.append(") {").appendLineSeparator();
+      // javac ends a catch parameter's scope at the closing brace, so a statement whose first
+      // instruction lies at or after that end was written outside the catch block. The decompiler
+      // folds such a tail into the handler, which lengthens the scope by the tail's first
+      // statement. Print the tail after the brace, where the variable table says it belongs.
+      List<Exprent> tail = null;
+      if (i == stats.size() - 1 && stat.getExprents() != null
+          && getParent() != null && getParent().type == StatementType.SEQUENCE) {
+        int scopeEnd = catchScopeEnd(stat);
+        if (scopeEnd > 0) {
+          List<Exprent> exprents = stat.getExprents();
+          int split = exprents.size();
+          while (split > 0) {
+            Exprent last = exprents.get(split - 1);
+            if (last.bytecode == null || last.bytecode.isEmpty() || last.bytecode.nextSetBit(0) < scopeEnd) {
+              break;
+            }
+            split--;
+          }
+          if (split < exprents.size()) {
+            tail = new ArrayList<>(exprents.subList(split, exprents.size()));
+            exprents.subList(split, exprents.size()).clear();
+          }
+        }
+      }
       buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, false)).appendIndent(indent)
         .append("}");
+      if (tail != null) {
+        buf.appendLineSeparator();
+        buf.append(ExprProcessor.listToJava(tail, indent));
+        stat.getExprents().addAll(tail);
+      }
     }
     buf.appendLineSeparator();
 
     return buf;
+  }
+
+  /**
+   * The end of the catch parameter's local variable table scope, or -1 when the table cannot name
+   * it. The handler's first instruction stores the exception; the entry that starts at the next
+   * instruction and covers it is the parameter, and its length ends at the original closing brace.
+   */
+  private static int catchScopeEnd(Statement handler) {
+    BasicBlock block = handler.getBasichead() == null ? null : handler.getBasichead().getBlock();
+    if (block == null || block.getSeq().length() < 2 || block.getInstruction(0).opcode != CodeConstants.opc_astore) {
+      return -1;
+    }
+    StructMethod mt = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    StructLocalVariableTableAttribute lvt = mt == null ? null : mt.getLocalVariableAttr();
+    if (lvt == null) {
+      return -1;
+    }
+    int body = block.getOldOffset(1);
+    if (body < 0) {
+      return -1;
+    }
+    return lvt.matchingVars(block.getInstruction(0).operand(0), body)
+      .findFirst().map(StructLocalVariableTableAttribute.LocalVariable::getEnd).orElse(-1);
   }
 
   private void validateType(List<String> exTypes, VarType exVarType) {
