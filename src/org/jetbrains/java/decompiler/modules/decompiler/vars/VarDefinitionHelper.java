@@ -2,6 +2,7 @@
 package org.jetbrains.java.decompiler.modules.decompiler.vars;
 
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
@@ -18,6 +19,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarTypeProcessor.Fi
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.attr.StructMethodParametersAttribute;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
@@ -47,6 +49,12 @@ public class VarDefinitionHelper {
   private final RootStatement root;
   private final StructMethod mt;
   private final Map<VarVersionPair, String> clashingNames = new HashMap<>();
+
+  // A lambda content method is scanned with the enclosing method's names in scope. Whether an
+  // outer name really clashes with a name inside the lambda is a bytecode question: the outer
+  // variable is in scope only where its LVT range covers the lambda's instruction. The site map
+  // carries that offset per enclosing method through nested lambdas.
+  private final Map<StructMethod, Integer> lambdaSites = new HashMap<>();
 
   public VarDefinitionHelper(RootStatement root, StructMethod mt, VarProcessor varproc) {
     this(root, mt, varproc, true);
@@ -1818,6 +1826,17 @@ public class VarDefinitionHelper {
             // Propagate current data through to lambda
             VarDefinitionHelper vardef = new VarDefinitionHelper(mw.root, mt2, mw.varproc, false);
 
+            // The enclosing scan's names only reach into this method where the enclosing
+            // variable's LVT range covers the instruction that creates the class or lambda.
+            vardef.lambdaSites.putAll(this.lambdaSites);
+            int lambdaSite = exprent.bytecode == null ? -1 : exprent.bytecode.nextSetBit(0);
+            if (lambdaSite >= 0) {
+              // Both helpers need it: this one renames the lambda's parameters right here, the
+              // content scan renames its locals and parameters against the same enclosing names.
+              this.lambdaSites.put(mt, lambdaSite);
+              vardef.lambdaSites.put(mt, lambdaSite);
+            }
+
             // Do lambda parameter rename
 
             // Calculate which varversions are the parameters
@@ -1833,7 +1852,7 @@ public class VarDefinitionHelper {
                 // Try to perform a rename
                 String name = mw.varproc.getVarName(vvp);
                 String original = name;
-                name = rename(nameMap, name, liveVarDefs);
+                name = rename(nameMap, name, liveVarDefs, mt2, true);
 
                 // Did we rename? If so, we should add it to the name map and set as clashing
                 if (original != null && !original.equals(name)) {
@@ -1871,6 +1890,17 @@ public class VarDefinitionHelper {
               // Propagate current data through to method
               VarDefinitionHelper vardef = new VarDefinitionHelper(mw.root, mt2, mw.varproc, false);
 
+              // The enclosing scan's names only reach into this method where the enclosing
+              // variable's LVT range covers the instruction that creates the class or lambda.
+              vardef.lambdaSites.putAll(this.lambdaSites);
+              int lambdaSite = exprent.bytecode == null ? -1 : exprent.bytecode.nextSetBit(0);
+              if (lambdaSite >= 0) {
+                // Both helpers need it: this one renames the lambda's parameters right here, the
+                // content scan renames its locals and parameters against the same enclosing names.
+                this.lambdaSites.put(mt, lambdaSite);
+                vardef.lambdaSites.put(mt, lambdaSite);
+              }
+
               // Do lambda parameter rename
 
               // Calculate which varversions are the parameters
@@ -1888,7 +1918,7 @@ public class VarDefinitionHelper {
                   String name = mw.varproc.getVarName(vvp);
                   if (name != null) {
                     String original = name;
-                    name = rename(nameMap, name, liveVarDefs);
+                    name = rename(nameMap, name, liveVarDefs, mt2, true);
 
                     // Did we rename? If so, we should add it to the name map and set as clashing
                     if (!original.equals(name)) {
@@ -1933,7 +1963,7 @@ public class VarDefinitionHelper {
           String name = var.getLVT() == null ? this.varproc.getVarName(var.getVarVersionPair()) : var.getLVT().getName();
 
           String originalName = name;
-          name = rename(nameMap, name, liveVarDefs);
+          name = rename(nameMap, name, liveVarDefs, mt, isParameter(mt, var));
 
           boolean scopedSwitch = false;
           if (!originalName.equals(name)) {
@@ -2045,14 +2075,80 @@ public class VarDefinitionHelper {
     }
   }
 
-  private static @NotNull String rename(Map<VarInMethod, String> nameMap, String name, Set<VarInMethod> liveVarDefs) {
+  private @NotNull String rename(Map<VarInMethod, String> nameMap, String name, Set<VarInMethod> liveVarDefs,
+                                 StructMethod mt, boolean selfParam) {
     if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_VARIABLE_RENAME)) {
       return name;
     }
-    while (liveVarDefs.stream().map(nameMap::get).anyMatch(name::equals)) {
+    while (true) {
+      final String candidate = name;
+      if (liveVarDefs.stream().noneMatch(vim -> clashes(vim, candidate, nameMap, mt, selfParam))) {
+        return candidate;
+      }
       name += "x";
     }
-    return name;
+  }
+
+  /**
+   * Whether {@code vim}'s name really blocks {@code name} in the generated source. The local
+   * variable table is javac's own record of the original scopes, so a lambda parameter whose
+   * outer namesake's range does not cover the lambda cannot have clashed with it. Locals inside
+   * the lambda body are not relaxed: the generated source may have hoisted the outer declaration
+   * above the lambda even where the table says the original scope had ended.
+   */
+  private boolean clashes(VarInMethod vim, String name, Map<VarInMethod, String> nameMap,
+                          StructMethod mt, boolean selfParam) {
+    if (!name.equals(nameMap.get(vim))) {
+      return false;
+    }
+    if (vim.mt == mt || !selfParam) {
+      return true;
+    }
+
+    List<LocalVariable> vars = lvtEntries(vim.mt, vim.pair.var, name);
+    if (vars.isEmpty()) {
+      // No table evidence: keep the conservative rename.
+      return true;
+    }
+
+    // An enclosing method's variable only reaches into a lambda parameter where its range covers
+    // the instruction that creates the lambda; elsewhere the source reused the name legally.
+    Integer site = lambdaSites.get(vim.mt);
+    if (site == null) {
+      return true;
+    }
+    for (LocalVariable v : vars) {
+      if (v.getStart() <= site && site < v.getEnd()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean isParameter(StructMethod mt, VarExprent var) {
+    if (var.getVarVersionPair().version != 0) {
+      return false;
+    }
+    MethodDescriptor md = MethodDescriptor.parseDescriptor(mt.getDescriptor());
+    int args = mt.hasModifier(CodeConstants.ACC_STATIC) ? 0 : 1;
+    for (VarType param : md.params) {
+      args += param.stackSize;
+    }
+    return var.getIndex() < args;
+  }
+
+  private static List<LocalVariable> lvtEntries(StructMethod method, int index, String name) {
+    StructLocalVariableTableAttribute attr = method.getLocalVariableAttr();
+    if (attr == null) {
+      return List.of();
+    }
+    List<LocalVariable> list = new ArrayList<>();
+    attr.getVariables().forEach(v -> {
+      if (v.getVersion().var == index && name.equals(v.getName())) {
+        list.add(v);
+      }
+    });
+    return list;
   }
 
   // Finds the case statement that the given statement belongs to

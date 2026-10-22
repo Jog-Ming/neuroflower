@@ -137,6 +137,21 @@ public class NestedClassProcessor {
 
     VarType lambda_class_type = new VarType(lambda_class_name, true);
 
+    // The sites that create this lambda class. An enclosing name only reaches into the lambda
+    // where its variable is in scope there, which the local variable table states exactly: a
+    // range that covers no site belongs to a variable the original source had already left.
+    List<Integer> sites = new ArrayList<>();
+    if (enclosingMethod.getOrBuildGraph() != null) {
+      enclosingMethod.getOrBuildGraph().iterateExprentsDeep(exprent -> {
+        if (exprent instanceof NewExprent newExpr && newExpr.isLambda()
+            && lambda_class_type.equals(newExpr.getNewType())
+            && exprent.bytecode != null && !exprent.bytecode.isEmpty()) {
+          sites.add(exprent.bytecode.nextSetBit(0));
+        }
+        return 0;
+      });
+    }
+
     // this pointer
     if (!is_static_lambda_content && DecompilerContext.getOption(IFernflowerPreferences.LAMBDA_TO_ANONYMOUS_CLASS)) {
       varProc.getThisVars().put(new VarVersionPair(0, 0), parent_class_name);
@@ -167,7 +182,12 @@ public class NestedClassProcessor {
       if (name == null) {
         name = varProc.getVarName(local);
       }
-      if (usedBefore.contains(name) && !"this".equals(name)) {
+      // Only a parameter may keep its name: a local inside the lambda body can clash with a
+      // declaration the generated source hoisted above the lambda even where the table says the
+      // original scope had ended.
+      if (usedBefore.contains(name) && !"this".equals(name)
+          && (!isContentParameter(method.methodStruct, local)
+              || inScopeAtLambda(parent.classStruct, enclosingMethod, name, sites))) {
         name = enclosingCollector.getFreeName(name);
         mapNewNames.put(local, name);
         if (lvt != null) {
@@ -211,7 +231,18 @@ public class NestedClassProcessor {
                 }
               }
               else if (!mapNewNames.containsKey(varVersion)) {
-                mapNewNames.put(varVersion, enclosingCollector.getFreeName(varProc.getVarName(varVersion)));
+                String paramName = varProc.getVarName(varVersion);
+                if (inScopeAtLambda(parent.classStruct, enclosingMethod, paramName, sites)) {
+                  paramName = enclosingCollector.getFreeName(paramName);
+                } else {
+                  // Out of scope: the name is the object's own. Another parameter of this lambda
+                  // still needs a different spelling, but the enclosing one does not.
+                  while (mapNewNames.containsValue(paramName)) {
+                    paramName += "x";
+                  }
+                  enclosingCollector.addName(paramName);
+                }
+                mapNewNames.put(varVersion, paramName);
               }
 
               varIndex += md_content.params[i].stackSize;
@@ -256,6 +287,53 @@ public class NestedClassProcessor {
       return 0;
     });
     varProc.nestedProcessed = true;
+  }
+
+  private static boolean isContentParameter(StructMethod mt, VarVersionPair pair) {
+    if (pair.version != 0) {
+      return false;
+    }
+    MethodDescriptor md = MethodDescriptor.parseDescriptor(mt.getDescriptor());
+    int args = mt.hasModifier(CodeConstants.ACC_STATIC) ? 0 : 1;
+    for (VarType param : md.params) {
+      args += param.stackSize;
+    }
+    return pair.var < args;
+  }
+
+  /**
+   * Whether {@code name} is in scope in the enclosing method at one of the lambda's creation
+   * sites. A name the enclosing table never uses is treated as in scope: without evidence the
+   * conservative rename stays.
+   */
+  private static boolean inScopeAtLambda(StructClass parentClass, MethodWrapper enclosingMethod,
+                                         String name, List<Integer> sites) {
+    if (sites.isEmpty() || name == null) {
+      return true;
+    }
+    for (StructField field : parentClass.getFields()) {
+      if (name.equals(field.getName())) {
+        return true;
+      }
+    }
+    var attr = enclosingMethod.methodStruct.getLocalVariableAttr();
+    if (attr == null) {
+      return true;
+    }
+    boolean named = false;
+    for (LocalVariable v : attr.getVariables().toList()) {
+      if (!name.equals(v.getName())) {
+        continue;
+      }
+      named = true;
+      for (int site : sites) {
+        if (v.getStart() <= site && site < v.getEnd()) {
+          return true;
+        }
+      }
+    }
+    // The table uses the name only outside the sites, so the source had left that scope.
+    return !named;
   }
 
   private static void checkNotFoundClasses(ClassNode root, ClassNode node) {
