@@ -48,6 +48,9 @@ public class NewExprent extends Exprent {
   private boolean enumConst;
   private List<VarType> genericArgs = new ArrayList<>();
   private VarType inferredLambdaType = null;
+  // Type arguments the class file proved for a constructor call whose diamond javac would
+  // otherwise close on a narrower type than the recorded method reference needs.
+  private List<VarType> forcedConstructorArgs;
 
   public NewExprent(VarType newType, ListStack<Exprent> stack, int arrayDim, BitSet bytecodeOffsets) {
     this(newType, getDimensions(arrayDim, stack), bytecodeOffsets);
@@ -431,6 +434,9 @@ public class NewExprent extends Exprent {
         }
         setLambdaGenericTypes();
         Exprent methodObject = constructor == null ? null : constructor.getInstance();
+        if (methodObject != null && isMethodReference()) {
+          forceRecordedReceiverType(methodObject);
+        }
         // The lambda's line is the line of the call that carries it; the invokeDynamic's own
         // table entry can interpolate to an earlier line when the call spans lines.
         int callLine = InvocationExprent.enclosingCallLine();
@@ -500,7 +506,7 @@ public class NewExprent extends Exprent {
       if (constructor != null) {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
-          List<VarType> args = constructor.getGenericArgs();
+          List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs : constructor.getGenericArgs();
           if (args.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
               && InvocationExprent.inArgument() && hasTypeParameters(newType)) {
             // No recovered type arguments, but javac infers them from the context; the original
@@ -940,6 +946,55 @@ public class NewExprent extends Exprent {
 
   public boolean isMethodReference() {
     return methodReference;
+  }
+
+  /**
+   * A bound method reference's recorded instantiated type proves the receiver's parameterized
+   * type. The metafactory's instantiated method type is the functional method javac adapted, and
+   * when its return type is a class but the referenced method's erased return is Object while its
+   * generic signature returns the receiver class's own sole type variable, the only way javac
+   * produced that adaptation is a receiver typed {@code C<Return>}: the variable had to be bound
+   * to the recorded return type. The receiver expression is printed as the reference's qualifier,
+   * and a diamond constructor inside it is the element that carried the type argument in source;
+   * printing the recorded argument there keeps javac's inference of the constructor from closing
+   * on Object and rejecting the reference. Nothing is forced unless every recorded fact agrees.
+   */
+  private void forceRecordedReceiverType(Exprent receiver) {
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
+    if (node == null || node.lambdaInformation == null || !node.lambdaInformation.is_method_reference
+      || node.lambdaInformation.is_content_method_static) {
+      return;
+    }
+    MethodDescriptor sam = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
+    MethodDescriptor content = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor);
+    VarType samReturn = sam.ret;
+    if (samReturn.type != CodeType.OBJECT || samReturn.arrayDim != 0
+      || samReturn.value.equals(content.ret.value)) {
+      return;
+    }
+    StructClass receiverClass = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+    if (receiverClass == null || receiverClass.getSignature() == null
+      || receiverClass.getSignature().fparameters.size() != 1) {
+      return;
+    }
+    StructMethod referenced = receiverClass.getMethod(node.lambdaInformation.content_method_name,
+      node.lambdaInformation.content_method_descriptor);
+    if (referenced == null || referenced.getSignature() == null) {
+      return;
+    }
+    VarType declared = referenced.getSignature().returnType;
+    if (declared == null || declared.type != CodeType.GENVAR
+      || !declared.value.equals(receiverClass.getSignature().fparameters.get(0))) {
+      return;
+    }
+    for (Exprent expr : receiver.getAllExprents(true, true)) {
+      if (expr instanceof NewExprent created && created != this && !created.isLambda() && !created.isAnonymous()
+        && created.newType.type == CodeType.OBJECT && created.newType.arrayDim == 0
+        && created.newType.value.equals(receiverClass.qualifiedName) && created.constructor != null) {
+        created.forcedConstructorArgs = new ArrayList<>(List.of(samReturn));
+        return;
+      }
+    }
   }
 
   /**
