@@ -2470,22 +2470,97 @@ public class InvocationExprent extends Exprent {
       }
       VarType instantiatedRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
       VarType implRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor).ret;
-      if (instantiatedRet == null || implRet == null || instantiatedRet.equals(implRet)) {
+      if (instantiatedRet == null || implRet == null || implRet.type != CodeType.OBJECT || implRet.arrayDim != 0) {
         continue;
       }
-      if (instantiatedRet.type != CodeType.OBJECT || implRet.type != CodeType.OBJECT
-          || instantiatedRet.arrayDim != 0 || implRet.arrayDim != 0
-          || !DecompilerContext.getStructContext().instanceOf(implRet.value, instantiatedRet.value)
-          || !isConcreteType(instantiatedRet)) {
+      VarType recorded = null;
+      if (instantiatedRet.equals(implRet) && !node.lambdaInformation.is_method_reference) {
+        // A lambda's synthetic method is generated with the ground target type javac chose. When
+        // the value the method itself returns is a proper subtype of that recorded return, plain
+        // inference from the body would have produced the narrower type, so the source pinned the
+        // variable to the wider one (a witness, or an equally byte-neutral cast in the body).
+        VarType bodyRet = recordedLambdaValueType(node);
+        if (bodyRet != null && bodyRet.type == CodeType.OBJECT && bodyRet.arrayDim == 0
+            && !bodyRet.equals(implRet)
+            && DecompilerContext.getStructContext().instanceOf(bodyRet.value, implRet.value)
+            && isConcreteType(implRet)) {
+          recorded = implRet;
+        }
+      }
+      if (recorded == null
+          && !instantiatedRet.equals(implRet)
+          && instantiatedRet.type == CodeType.OBJECT
+          && instantiatedRet.arrayDim == 0
+          && DecompilerContext.getStructContext().instanceOf(implRet.value, instantiatedRet.value)
+          && isConcreteType(instantiatedRet)) {
+        recorded = instantiatedRet;
+      }
+      if (recorded == null) {
         continue;
       }
       VarType variable = covariant.iterator().next();
-      VarType prior = settled.putIfAbsent(variable, instantiatedRet);
-      if (prior != null && !sameType(prior, instantiatedRet)) {
+      VarType prior = settled.putIfAbsent(variable, recorded);
+      if (prior != null && !sameType(prior, recorded)) {
         return new HashMap<>();
       }
     }
     return settled;
+  }
+
+  /**
+   * The type of the value a lambda's recorded implementation method returns, read from the class
+   * file alone. Only a single-exit method whose returned value comes straight from an invocation
+   * or a field read is judged; any other shape has no simple recorded producer type.
+   */
+  private static VarType recordedLambdaValueType(ClassNode node) {
+    StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+    if (content == null) {
+      return null;
+    }
+    StructMethod method = content.getMethod(node.lambdaInformation.content_method_name,
+      node.lambdaInformation.content_method_descriptor);
+    if (method == null) {
+      return null;
+    }
+    boolean released = method.getInstructionSequence() == null;
+    try {
+      FullInstructionSequence seq = method.getInstructionSequence();
+      if (seq == null) {
+        method.expandData(content);
+        seq = method.getInstructionSequence();
+      }
+      if (seq == null || seq.length() < 2 || seq.getInstr(seq.length() - 1).opcode != CodeConstants.opc_areturn) {
+        return null;
+      }
+      for (int i = 0; i < seq.length() - 1; i++) {
+        int opcode = seq.getInstr(i).opcode;
+        if (opcode == CodeConstants.opc_areturn || opcode == CodeConstants.opc_ireturn
+            || opcode == CodeConstants.opc_lreturn || opcode == CodeConstants.opc_freturn
+            || opcode == CodeConstants.opc_dreturn || opcode == CodeConstants.opc_return) {
+          return null;
+        }
+      }
+      Instruction value = seq.getInstr(seq.length() - 2);
+      if (value.group == CodeConstants.GROUP_INVOCATION) {
+        LinkConstant link = content.getPool().getLinkConstant(value.operand(0));
+        return link == null ? null : MethodDescriptor.parseDescriptor(link.descriptor).ret;
+      }
+      if (value.group == CodeConstants.GROUP_FIELDACCESS) {
+        LinkConstant link = content.getPool().getLinkConstant(value.operand(0));
+        return link == null ? null : new VarType(link.descriptor);
+      }
+    }
+    catch (IOException ignored) {
+      // Without the method's code there is no proof.
+    }
+    finally {
+      if (released) {
+        // Reading must not leave the sequence live: printer rules that consult the current
+        // method's sequence would silently start firing inside a lambda body.
+        method.releaseResources();
+      }
+    }
+    return null;
   }
 
   /**
