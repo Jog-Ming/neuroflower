@@ -1,7 +1,6 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
-import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
@@ -12,9 +11,6 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
-import org.jetbrains.java.decompiler.struct.StructMethod;
-import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
-import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.ArrayList;
@@ -237,7 +233,7 @@ public class SequenceStatement extends Statement {
           && ifStatement.getIfstat() != null && !ifStatement.isLabeled()
           && !ifStatement.isPatternMatched()
           && endsWithReturn(ifStatement.getIfstat())
-          && opensTrailingBlock(stats.get(i + 1))) {
+          && RoundTrip.opensTrailingBlock(stats.get(i + 1))) {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
@@ -367,63 +363,6 @@ public class SequenceStatement extends Statement {
       return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
     }
     return endsWithExit(last.getStats());
-  }
-
-  /**
-   * Whether the statement opens a block that the class file says ended at the method's close:
-   * its first definition's table entry was written before the parameters (block scope) and its
-   * end is the method's last offset. Only then is the source shape an else arm, not a guard.
-   */
-  private static boolean opensTrailingBlock(Statement firstTail) {
-    StructMethod mt = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
-    StructLocalVariableTableAttribute lvt = mt == null ? null : mt.getLocalVariableAttr();
-    if (lvt == null) {
-      return false;
-    }
-    List<LocalVariable> vars = lvt.getVariables().toList();
-    int methodScope = Integer.MAX_VALUE;
-    int maxEnd = 0;
-    for (LocalVariable v : vars) {
-      if (v.getStart() == 0) {
-        methodScope = Math.min(methodScope, v.getOrder());
-      }
-      maxEnd = Math.max(maxEnd, v.getEnd());
-    }
-    if (methodScope == Integer.MAX_VALUE) {
-      return false;
-    }
-    boolean spansMethod = false;
-    for (LocalVariable v : vars) {
-      if (v.getStart() == 0 && v.getEnd() == maxEnd) {
-        spansMethod = true;
-        break;
-      }
-    }
-    if (!spansMethod) {
-      return false;
-    }
-    LocalVariable first = firstDefinedLvt(firstTail);
-    return first != null && first.getStart() > 0 && first.getOrder() >= 0
-        && first.getOrder() < methodScope && first.getEnd() == maxEnd;
-  }
-
-  private static LocalVariable firstDefinedLvt(Statement stat) {
-    if (stat.getExprents() != null) {
-      for (Exprent exprent : stat.getExprents()) {
-        for (Exprent e : exprent.getAllExprents(true, true)) {
-          if (e instanceof VarExprent var && var.isDefinition() && var.getLVT() != null) {
-            return var.getLVT();
-          }
-        }
-      }
-    }
-    for (Statement child : stat.getStats()) {
-      LocalVariable lvt = firstDefinedLvt(child);
-      if (lvt != null) {
-        return lvt;
-      }
-    }
-    return null;
   }
 
   private static boolean endsWithReturn(Statement stat) {

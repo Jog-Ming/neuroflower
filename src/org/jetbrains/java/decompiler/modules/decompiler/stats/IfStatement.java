@@ -8,6 +8,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.match.IMatchable;
 import org.jetbrains.java.decompiler.struct.match.MatchEngine;
 import org.jetbrains.java.decompiler.struct.match.MatchNode;
@@ -251,11 +252,31 @@ public class IfStatement extends Statement {
         && (RoundTrip.swapIfArms(ifHead) || RoundTrip.swapIfArmsByLine(ifstat, elsestat))) {
       IfExprent head = (IfExprent) ifHead.copy();
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+      // The arm the swap prints second was declared in the method body, so the source closed
+      // the branch before it and wrote the other arm as a guard.
+      boolean guard = endsWithExit(elsestat) && RoundTrip.startsWithMethodScopeLocal(ifstat);
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
-      buf.appendIndent(indent).append("} else {").appendLineSeparator();
-      buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+      if (guard) {
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      } else {
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
+      return buf;
+    }
+
+    // A guard whose else was declared in the method body: the table writes the else's first
+    // local after the parameters, so the original source closed the branch before it.
+    if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
+        && condition != null && !isLabeled() && endsWithExit(ifstat)
+        && RoundTrip.startsWithMethodScopeLocal(elsestat)) {
+      buf.appendIndent(indent).append(condition.toJava(indent)).append(" {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
       buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
       return buf;
     }
 
@@ -324,6 +345,20 @@ public class IfStatement extends Statement {
     }
 
     return buf;
+  }
+
+  private static boolean endsWithExit(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      if (exprents.isEmpty()) {
+        return false;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return last instanceof ExitExprent exit
+          && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW);
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && endsWithExit(children.get(children.size() - 1));
   }
 
   @Override

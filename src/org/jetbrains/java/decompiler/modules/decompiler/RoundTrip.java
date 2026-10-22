@@ -17,6 +17,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 
@@ -74,6 +76,86 @@ public final class RoundTrip {
     CONTINUE_SITES.put(method, sites);
     BRANCHES.put(method, branches);
     INSTRUCTION_ENDS.put(method, ends);
+  }
+
+  /**
+   * Whether the statement opens a block whose table entry was written before the parameters:
+   * javac emits a block's variables when the block closes, so such an entry was block scoped.
+   * The block must also end at the method's close for the tail to be the guard's else arm.
+   */
+  public static boolean opensTrailingBlock(Statement firstTail) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute lvt = method == null ? null : method.getLocalVariableAttr();
+    if (lvt == null) {
+      return false;
+    }
+    List<LocalVariable> vars = lvt.getVariables().toList();
+    int paramsStart = Integer.MAX_VALUE;
+    int maxEnd = 0;
+    for (LocalVariable v : vars) {
+      if (v.getStart() == 0) {
+        paramsStart = Math.min(paramsStart, v.getOrder());
+      }
+      maxEnd = Math.max(maxEnd, v.getEnd());
+    }
+    if (paramsStart == Integer.MAX_VALUE || !spansMethod(vars, maxEnd)) {
+      return false;
+    }
+    LocalVariable first = firstDefinedLvt(firstTail);
+    return first != null && first.getStart() > 0 && first.getOrder() >= 0
+        && first.getOrder() < paramsStart && first.getEnd() == maxEnd;
+  }
+
+  /**
+   * Whether the statement's first local was method scoped in the source: its entry follows the
+   * parameter group, so the original declared it outside the enclosing brace.
+   */
+  public static boolean startsWithMethodScopeLocal(Statement stat) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute lvt = method == null ? null : method.getLocalVariableAttr();
+    if (lvt == null) {
+      return false;
+    }
+    List<LocalVariable> vars = lvt.getVariables().toList();
+    int paramsEnd = -1;
+    for (LocalVariable v : vars) {
+      if (v.getStart() == 0) {
+        paramsEnd = Math.max(paramsEnd, v.getOrder());
+      }
+    }
+    if (paramsEnd < 0) {
+      return false;
+    }
+    LocalVariable first = firstDefinedLvt(stat);
+    return first != null && first.getStart() > 0 && first.getOrder() > paramsEnd;
+  }
+
+  private static boolean spansMethod(List<LocalVariable> vars, int maxEnd) {
+    for (LocalVariable v : vars) {
+      if (v.getStart() == 0 && v.getEnd() == maxEnd) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public static LocalVariable firstDefinedLvt(Statement stat) {
+    if (stat.getExprents() != null) {
+      for (Exprent exprent : stat.getExprents()) {
+        for (Exprent e : exprent.getAllExprents(true, true)) {
+          if (e instanceof VarExprent var && var.isDefinition() && var.getLVT() != null) {
+            return var.getLVT();
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      LocalVariable lvt = firstDefinedLvt(child);
+      if (lvt != null) {
+        return lvt;
+      }
+    }
+    return null;
   }
 
   /**
