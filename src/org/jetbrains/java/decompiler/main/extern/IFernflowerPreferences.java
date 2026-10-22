@@ -255,6 +255,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_DEMAND_WITNESS = "rt-demand-witness";
 
+  @Name("Round Trip: Builder Inference")
+  @Description("Solve the type argument of a RecordCodecBuilder.create/mapCodec call from the declared builder signatures when no record proves it.")
+  @ShortName("rtbi")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_BUILDER_INFERENCE = "rt-builder-inference";
+
   @Name("Round Trip: Same-Line Join")
   @Description("Join two printed lines whose offsets the original's table puts on one source line.")
   @ShortName("rtslj")
@@ -557,6 +563,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_NO_VARIABLE_RENAME, "0");
     defaults.put(ROUND_TRIP_DIAMOND, "1");
     defaults.put(ROUND_TRIP_DEMAND_WITNESS, "1");
+    defaults.put(ROUND_TRIP_BUILDER_INFERENCE, "1");
     defaults.put(ROUND_TRIP_SAME_LINE_JOIN, "1");
     defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
     defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");

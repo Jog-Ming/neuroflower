@@ -63,6 +63,8 @@ public class InvocationExprent extends Exprent {
 
   private static final VarType JAVA_NIO_BUFFER = new VarType(CodeType.OBJECT, 0, "java/nio/Buffer");
 
+  private static final String BUILDER_OWNER = "com/mojang/serialization/codecs/RecordCodecBuilder";
+
   private String name;
   private String classname;
   private boolean isStatic;
@@ -290,6 +292,18 @@ public class InvocationExprent extends Exprent {
         Map<VarType, VarType> tempMap = new HashMap<>();
         Map<VarType, VarType> upperBoundsMap = new HashMap<>();
         Map<VarType, VarType> hierarchyMap = new HashMap<>();
+
+        // The builder chain's type argument is not recorded anywhere; the declared signatures of
+        // the builder calls do determine it, and javac's own resolution of the nested method
+        // reference cannot reach it without the witness the source wrote.
+        Map<VarType, VarType> builderInference = null;
+        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_BUILDER_INFERENCE)
+          && BUILDER_OWNER.equals(classname) && ("create".equals(name) || "mapCodec".equals(name))) {
+          builderInference = BuilderInference.solve(this, fparams);
+          if (builderInference != null) {
+            builderInference.forEach(genericsMap::putIfAbsent);
+          }
+        }
 
         if (!classname.equals(desc.getClassQualifiedName())) {
           Map<String, Map<VarType, VarType>> hierarchy = mthCls.getAllGenerics();
@@ -786,6 +800,24 @@ public class InvocationExprent extends Exprent {
             && optionalMapWitness(OPTIONAL_MAP_DEMAND_TYPE.get(), fparams, bounds)) {
             genericArgs.clear();
             genericArgs.add(OPTIONAL_MAP_DEMAND_TYPE.get());
+          }
+
+          // The solved builder argument is printed even where the printer's own inference left
+          // nothing: every type variable it names is in scope and every constraint holds.
+          if (builderInference != null && !builderInference.isEmpty()) {
+            List<VarType> solved = new ArrayList<>(fparams.size());
+            for (String param : fparams) {
+              VarType value = builderInference.get(GenericType.parse("T" + param + ";"));
+              if (value == null) {
+                solved.clear();
+                break;
+              }
+              solved.add(value);
+            }
+            if (!solved.isEmpty()) {
+              genericArgs.clear();
+              genericArgs.addAll(solved);
+            }
           }
 
           if (newRet != ret && newRet != null && !(newRet.isGeneric() && ((GenericType)newRet).hasUnknownGenericType(named.keySet()))) {
@@ -3865,7 +3897,7 @@ public class InvocationExprent extends Exprent {
    * Whether the pool of the class being printed holds the method reference for this call and the
    * call site's own instruction points at it. Only a call the class file records can take a witness.
    */
-  private boolean isRecordedCallSite() {
+  boolean isRecordedCallSite() {
     if (invocationType != InvocationType.VIRTUAL && invocationType != InvocationType.SPECIAL
         && invocationType != InvocationType.STATIC && invocationType != InvocationType.INTERFACE) {
       return false;
