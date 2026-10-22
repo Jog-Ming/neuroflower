@@ -215,7 +215,7 @@ public final class ConstantNames {
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
-                           Map<String, PairSite> pairs) {
+                           Map<String, PairSite> pairs, Map<String, ValueSite> values) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -338,7 +338,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of());
+      List.of(), null, Set.of(), Map.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -659,6 +659,17 @@ public final class ConstantNames {
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       activePairs.put(owner, entry.getValue());
     }
+    // The pool's own record of the naming point: the folded value it entered with the pair.
+    Map<String, ValueSite> values = valueSites(own, firstUses, catchTypes, early, positions);
+    Map<String, ValueSite> activeValues = new HashMap<>();
+    for (Map.Entry<String, ValueSite> entry : values.entrySet()) {
+      String owner = entry.getKey();
+      if (claimed.contains(owner) || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)) {
+        continue;
+      }
+      addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      activeValues.put(owner, entry.getValue());
+    }
     if (candidates.isEmpty()) {
       return null;
     }
@@ -678,7 +689,8 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs),
+        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
+        activeValues),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -1300,6 +1312,71 @@ public final class ConstantNames {
     return -1;
   }
 
+  /** A folded-constant naming whose value the pool entered right after the Class and name. */
+  private record ValueSite(int classIndex, long naming, String poolKey) {
+    /** Whether this literal would fold to the very value the pool entered with the pair. */
+    boolean accepts(String key) {
+      if (key.equals(poolKey)) {
+        return true;
+      }
+      // A char constant folds to the same int value; javac enters the same Integer entry.
+      return poolKey.startsWith(VariableType.INT.name() + "|")
+        && key.startsWith(VariableType.CHAR.name() + "|")
+        && key.substring(key.indexOf('|') + 1).equals(poolKey.substring(poolKey.indexOf('|') + 1));
+    }
+  }
+
+  /**
+   * The owners whose Class pair the pool follows with the folded value it entered there.
+   *
+   * <p>When the source names a folded constant whose value the pool does not hold yet, javac
+   * enters the Class, its name and that value, in that order. The value's first instruction use is
+   * then the literal the name folded to, so the pool records the naming's exact generation point.
+   * An owner no instruction uses and no attribute explains is the only kind a naming enters;
+   * a value an equal entry already covers would have been reused, and its pair would not precede
+   * it, so those are skipped too.
+   */
+  private static Map<String, ValueSite> valueSites(StructClass cls,
+                                                   Map<Integer, FirstUse> firstUses,
+                                                   Set<String> catchTypes, Set<Integer> early,
+                                                   Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    Map<String, ValueSite> sites = new HashMap<>();
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i + 2 < pool.size(); i++) {
+      if (!(pool.get(i) instanceof PrimitiveConstant entry)
+          || entry.type != CodeConstants.CONSTANT_Class
+          || entry.getString() == null || entry.index != i + 1) {
+        continue;
+      }
+      String owner = entry.getString();
+      if (owner.equals(cls.qualifiedName) || early.contains(i) || catchTypes.contains(owner)
+          || firstUses.containsKey(i) || hasEarlierEqual(cls, i + 2)) {
+        continue;
+      }
+      if (!(pool.get(i + 2) instanceof PrimitiveConstant value) || value.value == null) {
+        continue;
+      }
+      VariableType kind = switch (value.type) {
+        case CodeConstants.CONSTANT_Integer -> VariableType.INT;
+        case CodeConstants.CONSTANT_Long -> VariableType.LONG;
+        case CodeConstants.CONSTANT_Float -> VariableType.FLOAT;
+        case CodeConstants.CONSTANT_Double -> VariableType.DOUBLE;
+        case CodeConstants.CONSTANT_String -> VariableType.STRING;
+        default -> null;
+      };
+      if (kind == null) {
+        continue;
+      }
+      FirstUse use = firstUses.get(i + 2);
+      if (use == null || position(cls, use, positions) == null) {
+        continue;
+      }
+      sites.putIfAbsent(owner, new ValueSite(i, coordinate(use.order(), use.offset()),
+        kind + "|" + value.value));
+    }
+    return sites;
+  }
+
   /**
    * The literal keys whose values the pool already holds below {@code classIndex}.
    *
@@ -1358,6 +1435,9 @@ public final class ConstantNames {
       if (rules.placement().pairs() != null && rules.placement().pairs().containsKey(entry.getKey())) {
         continue; // a pair owner is placed by the reference its Class pair precedes
       }
+      if (rules.placement().values() != null && rules.placement().values().containsKey(entry.getKey())) {
+        continue; // a triplet owner is placed by the value the pool entered at its naming
+      }
       if (!inWindow.contains(entry.getKey())) {
         // A referenced owner's window is the only evidence of where the original named it; without
         // a site inside the window there is nothing to place the name against.
@@ -1379,6 +1459,25 @@ public final class ConstantNames {
       for (Site site : entry.getValue()) {
         if (window != null && site.start() >= window[1]) {
           addSiteOnce(sites, site);
+        }
+      }
+    }
+    if (rules.placement().values() != null) {
+      for (Map.Entry<String, ValueSite> entry : rules.placement().values().entrySet()) {
+        ValueSite valueSite = entry.getValue();
+        if (hasSiteFor(sites, entry.getKey())) {
+          continue;
+        }
+        List<Site> candidates = deferred.get(entry.getKey());
+        if (candidates == null) {
+          continue;
+        }
+        for (Site site : candidates) {
+          // The value's first use is the literal itself, so the site must sit at that very point.
+          if (siteCoordinate(rules.placement().spaces(), site.start()) == valueSite.naming()) {
+            addSiteOnce(sites, site);
+            break;
+          }
         }
       }
     }
@@ -3156,6 +3255,17 @@ public final class ConstantNames {
     // literal must not carry a pool value of its own unless one already sits below the pair, and
     // the latest matching literal before the reference is the one whose naming keeps the pool
     // order (nothing is entered between it and the reference).
+    ValueSite valueSite = placement == null || placement.values() == null
+      ? null : placement.values().get(constant.owner());
+    if (valueSite != null) {
+      // The value the pool entered at the naming is this literal's: only a literal that folds to
+      // it (and hence names a constant of that value) reproduces the entry.
+      if (valueSite.accepts(key) && deferred != null) {
+        deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>())
+          .add(new Site(start, end, printed, constant.owner()));
+      }
+      return;
+    }
     PairSite pair = placement == null || placement.pairs() == null
       ? null : placement.pairs().get(constant.owner());
     if (pair != null) {
