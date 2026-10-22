@@ -213,7 +213,7 @@ public final class ConstantNames {
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
-                           List<int[]> spans, Set<String> prefix) {
+                           List<int[]> spans, Set<String> prefix, Set<String> inherited) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -336,7 +336,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null);
+      List.of(), null, Set.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -573,11 +573,13 @@ public final class ConstantNames {
         addOwnerCandidates(candidates, ancestor, nest, packageName, imports);
       }
     }
+    Set<String> inheritedNames = new HashSet<>();
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
         continue;
       }
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      inheritedNames.addAll(addInheritedCandidates(candidates, owner, packageName, imports));
       Integer index = classIndices.get(owner);
       if (index != null) {
         if (opensPool(own, index, early, firstUses) && own.qualifiedName.startsWith(owner + "$")) {
@@ -654,7 +656,7 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical, spans, new HashSet<>(prefixOwners(own))),
+        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -671,9 +673,10 @@ public final class ConstantNames {
       if (!own.qualifiedName.equals(entry.getKey().a) || entry.getValue().isEmpty()) {
         continue;
       }
-      Integer rank = ranks.get(entry.getKey().b);
+      Integer rank = entry.getKey().b.startsWith("<field-init ")
+        ? initializerRank(own, ranks, entry.getValue()) : ranks.get(entry.getKey().b);
       if (rank == null) {
-        continue; // a field initializer or another key that names no method body
+        continue; // a key that names no method body, or an initializer no one constructor owns
       }
       int min = Integer.MAX_VALUE;
       int max = Integer.MIN_VALUE;
@@ -684,6 +687,42 @@ public final class ConstantNames {
       spaces.add(new SiteSpace(rank, entry.getValue(), min, max));
     }
     return spaces;
+  }
+
+  /**
+   * The generation rank of the constructor a lifted field initializer was printed from, or null.
+   *
+   * <p>The printer records an initializer's offsets under a key naming the field, not the method
+   * that generated it. The offsets belong to a constructor only when its code contains every one
+   * of them; a buffer no single constructor owns places nothing, and one shared by several is
+   * left out rather than guessed.
+   */
+  private static Integer initializerRank(StructClass own, Map<String, Integer> ranks,
+                                         Map<Integer, Integer> positions) {
+    Integer found = null;
+    for (StructMethod method : own.getMethods()) {
+      if (!CodeConstants.INIT_NAME.equals(method.getName())) {
+        continue;
+      }
+      String methodKey = InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor());
+      if (method.getInstructionSequence() == null) {
+        try {
+          method.expandData(own);
+        }
+        catch (Exception e) {
+          continue;
+        }
+      }
+      FullInstructionSequence code = method.getInstructionSequence();
+      if (code == null || !containsOffsets(code, positions.keySet())) {
+        continue;
+      }
+      if (found != null) {
+        return null; // several constructors contain the offsets; the owner is ambiguous
+      }
+      found = ranks.get(methodKey);
+    }
+    return found;
   }
 
   /**
@@ -1009,18 +1048,67 @@ public final class ConstantNames {
     if (method != null && method.containsKey(use.offset())) {
       return method.get(use.offset());
     }
-    // A static field initializer is printed at its declaration but generated inside <clinit>, and
-    // the printer records its positions under a field-initializer key rather than <clinit>.
-    if (use.methodKey().startsWith(CodeConstants.CLINIT_NAME)) {
-      for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry : positions.entrySet()) {
-        if (cls.qualifiedName.equals(entry.getKey().a)
-            && entry.getKey().b.startsWith("<field-init ")
-            && entry.getValue().containsKey(use.offset())) {
-          return entry.getValue().get(use.offset());
-        }
-      }
+    // A field initializer is printed at its declaration but generated inside <clinit> or a
+    // constructor, and the printer records its positions under a field-initializer key rather
+    // than the generating method's. The initializer's offsets all come from one constructor, so
+    // the map belongs to a use only when that constructor's code contains every one of them;
+    // a coincident offset in some unrelated method's buffer then cannot place anything.
+    Integer lifted = liftedPosition(cls, use, positions);
+    if (lifted != null) {
+      return lifted;
     }
     return method == null ? null : method.get(use.offset());
+  }
+
+  /** The printed position of a use generated into a lifted field initializer, or null. */
+  private static Integer liftedPosition(StructClass cls, FirstUse use,
+                                        Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    if (!use.methodKey().startsWith(CodeConstants.INIT_NAME + " ")
+        && !use.methodKey().startsWith(CodeConstants.CLINIT_NAME + " ")) {
+      return null;
+    }
+    StructMethod method = cls.getMethod(use.methodKey());
+    if (method == null) {
+      return null;
+    }
+    if (method.getInstructionSequence() == null) {
+      try {
+        method.expandData(cls);
+      }
+      catch (Exception e) {
+        return null;
+      }
+    }
+    FullInstructionSequence code = method.getInstructionSequence();
+    if (code == null) {
+      return null;
+    }
+    for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry : positions.entrySet()) {
+      if (!cls.qualifiedName.equals(entry.getKey().a)
+          || !entry.getKey().b.startsWith("<field-init ")
+          || !entry.getValue().containsKey(use.offset())) {
+        continue;
+      }
+      if (containsOffsets(code, entry.getValue().keySet())) {
+        return entry.getValue().get(use.offset());
+      }
+    }
+    return null;
+  }
+
+  private static boolean containsOffsets(FullInstructionSequence code, Set<Integer> offsets) {
+    Set<Integer> remaining = new HashSet<>(offsets);
+    for (Instruction instruction : code) {
+      // The tracer records operand bytes as well as instruction starts, so an offset is inside
+      // the method when any instruction covers it.
+      for (int offset = instruction.startOffset; offset < instruction.startOffset + instruction.length; offset++) {
+        remaining.remove(offset);
+      }
+      if (remaining.isEmpty()) {
+        return true;
+      }
+    }
+    return remaining.isEmpty();
   }
 
   private static int lineStart(String text, int position) {
@@ -1522,6 +1610,18 @@ public final class ConstantNames {
         continue;
       }
       sources.add(new SourceConstant(qualifier + "." + field.getName(), kind, value.value));
+    }
+    // The same inherited fields addOwnerCandidates reads, written through the owner's name.
+    if (anonymous(owner)) {
+      return sources; // an anonymous class has no writable name
+    }
+    for (InheritedConstant inherited : inheritedConstants(cls)) {
+      if (inherited.declaring() == cls
+          || (inherited.field().getAccessFlags() & CodeConstants.ACC_PUBLIC) == 0) {
+        continue;
+      }
+      sources.add(new SourceConstant(qualifier + "." + inherited.field().getName(),
+        inherited.kind(), inherited.value()));
     }
     return sources;
   }
@@ -2109,6 +2209,111 @@ public final class ConstantNames {
     }
   }
 
+  /**
+   * Adds the inherited constants of an owner whose {@code Class} entry only the source can explain.
+   *
+   * <p>A referenced owner's entry is whatever the reference that makes it a candidate entered, so
+   * its inherited constants would just compete with the owner the pool is really asking for at a
+   * site. Where the entry exists solely because a constant was named, the name may resolve to an
+   * inherited field, and only then does the pool's record include it.
+   */
+  private static Set<String> addInheritedCandidates(Map<String, List<Constant>> candidates,
+                                                    String owner, String packageName,
+                                                    List<String> imports) {
+    Set<String> keys = new HashSet<>();
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    // An anonymous class has no writable name, so its inherited constants cannot be written
+    // through it (naming one inside its own text is the own-constant rule's business).
+    if (cls == null || anonymous(owner)) {
+      return keys;
+    }
+    if (!packageName.equals(packageOf(owner)) && !imports.contains(simpleName(owner))
+        && owner.contains("$")) {
+      return keys;
+    }
+    for (InheritedConstant inherited : inheritedConstants(cls)) {
+      if (inherited.declaring() == cls
+          || (inherited.field().getAccessFlags() & CodeConstants.ACC_PUBLIC) == 0) {
+        continue;
+      }
+      String key = inherited.kind() + "|" + inherited.printed();
+      if (tooCommon(key)) {
+        continue; // a frequent value cannot pick an inherited name; it fits almost every owner
+      }
+      candidate(candidates, key, new Constant(owner, inherited.field().getName(), inherited.kind()));
+      keys.add(owner + "|" + inherited.field().getName());
+    }
+    return keys;
+  }
+
+  /** A constant field an owner's name resolves to, with the class whose pool holds its value. */
+  private record InheritedConstant(StructField field, StructClass declaring, VariableType kind,
+                                   Object value) {
+    String printed() {
+      return kind == VariableType.BOOLEAN && value instanceof Integer flag
+        ? Boolean.toString(flag != 0) : String.valueOf(value);
+    }
+  }
+
+  /**
+   * The static final constant fields a name resolves to through {@code cls}: its own, then those
+   * inherited from superclasses and superinterfaces.
+   *
+   * <p>A field a subclass redeclares hides the inherited one; a name two declarations of different
+   * values answer cannot be written at all and is dropped. Values come from the declaring class's
+   * pool, where the ConstantValue attribute points.
+   */
+  private static List<InheritedConstant> inheritedConstants(StructClass cls) {
+    List<InheritedConstant> fields = new ArrayList<>();
+    Map<String, InheritedConstant> byName = new LinkedHashMap<>();
+    Set<String> ambiguous = new HashSet<>();
+    Deque<StructClass> queue = new ArrayDeque<>();
+    Set<String> seen = new HashSet<>();
+    queue.add(cls);
+    while (!queue.isEmpty()) {
+      StructClass current = queue.poll();
+      if (current == null || !seen.add(current.qualifiedName)) {
+        continue;
+      }
+      for (StructField field : current.getFields()) {
+        if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+            != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+          continue;
+        }
+        PrimitiveConstant value = constantValue(current, field);
+        VariableType kind = value == null ? null : kind(field.getDescriptor());
+        if (value == null || kind == null || value.value == null) {
+          continue;
+        }
+        InheritedConstant known = byName.get(field.getName());
+        if (known == null) {
+          byName.put(field.getName(), new InheritedConstant(field, current, kind, value.value));
+        }
+        else if (!known.value().equals(value.value)) {
+          ambiguous.add(field.getName());
+        }
+      }
+      if (current.superClass != null && current.superClass.getString() != null) {
+        StructClass sup = DecompilerContext.getStructContext().getClass(current.superClass.getString());
+        if (sup != null) {
+          queue.add(sup);
+        }
+      }
+      for (String name : current.getInterfaceNames()) {
+        StructClass itf = DecompilerContext.getStructContext().getClass(name);
+        if (itf != null) {
+          queue.add(itf);
+        }
+      }
+    }
+    for (InheritedConstant constant : byName.values()) {
+      if (!ambiguous.contains(constant.field().getName())) {
+        fields.add(constant);
+      }
+    }
+    return fields;
+  }
+
   private static void collectPool(ClassNode node, Set<String> present, Set<String> explained,
                                   Set<String> referenced) {
     if (node == null) {
@@ -2607,6 +2812,15 @@ public final class ConstantNames {
     // constant naming; a site printed before those points would move the entry earlier.
     if (foreign && placement != null && !placement.existsAt(constant.owner(), anchor)) {
       return;
+    }
+    if (foreign && placement != null && placement.inherited() != null
+        && placement.inherited().contains(constant.owner() + "|" + constant.name())) {
+      // An inherited constant has no pool entry of its own: the value alone can sit on a line the
+      // owner happens to touch. Only the generation order's exact point proves the naming.
+      if (!placement.provesExactly(constant.owner(), anchor)) {
+        return;
+      }
+      placed = true;
     }
     // A frequent value is only weak evidence where there is no better one. A window means the pool
     // proves this owner was named somewhere, and the value only has to pick among its constants;
