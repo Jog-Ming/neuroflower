@@ -447,6 +447,20 @@ public class ConstExprent extends Exprent {
         if (UNINLINED_DOUBLES.containsKey(doubleVal) && !NO_PAREN_VALUES.contains(doubleVal) && UNINLINED_DOUBLES.get(doubleVal).apply(bytecode).countChars('(') < 2) {
           return 4;
         }
+
+        // toJava falls back to the float table when the double is exactly a float and the float
+        // spelling is shorter. That text is a multi-token expression like the double one, so it
+        // needs the same parentheses: without them a surrounding operator absorbs its operands
+        // and the constant is no longer a compile-time constant at that position.
+        float floatRepresentation = (float)doubleVal;
+        if (floatRepresentation == doubleVal
+          && trimFloat(Float.toString(floatRepresentation), floatRepresentation).length() < trimDouble(Double.toString(doubleVal), doubleVal).length()
+          && UNINLINED_FLOATS.containsKey(floatRepresentation) && !NO_PAREN_VALUES.contains(floatRepresentation)) {
+          TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
+          if (uninlined.countChars('(') < 2 && ownerNamedInPool(uninlined)) {
+            return 4;
+          }
+        }
         break;
     }
 
