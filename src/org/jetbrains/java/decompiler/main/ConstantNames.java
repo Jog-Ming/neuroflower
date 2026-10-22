@@ -205,7 +205,8 @@ public final class ConstantNames {
    */
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
-                           Map<String, Double> folded, Map<String, Long> internedAt) {
+                           Map<String, Double> folded, Map<String, Long> internedAt,
+                           Map<String, Long> namingAt, long[] usePoints) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -219,7 +220,7 @@ public final class ConstantNames {
      * arguments, although they are generated first.
      */
     boolean proves(String owner, int start) {
-      if (!withinInterned(owner, start)) {
+      if (!existsAt(owner, start)) {
         return false;
       }
       int[] window = windows == null ? null : windows.get(owner);
@@ -230,13 +231,50 @@ public final class ConstantNames {
     }
 
     /**
+     * Whether the pool allows this owner's {@code Class} entry to exist at the site: the entry's
+     * first field or method reference, and the first naming of a pool-unexplained owner, cannot
+     * be preceded by a naming.
+     */
+    boolean existsAt(String owner, int start) {
+      return withinInterned(owner, start) && afterNaming(owner, start);
+    }
+
+    /**
+     * Whether this site comes after the point where the owner's first naming entered its
+     * {@code Class} entry, or before it with nothing interned in between.
+     *
+     * <p>A naming earlier than the original moves the Class entry earlier in the pool. That is
+     * harmless only when no other pool entry was entered between the two points: the entry then
+     * keeps its index. First instruction uses stand in for interning events; an entry entered
+     * earlier but first used late makes this check reject a site conservatively, never wrongly.
+     */
+    private boolean afterNaming(String owner, int start) {
+      Long naming = namingAt == null ? null : namingAt.get(owner);
+      if (naming == null) {
+        return true;
+      }
+      long nearest = printedCoordinate(spaces, start);
+      return nearest == NO_COORDINATE || nearest >= naming || !usedBetween(nearest, naming);
+    }
+
+    /** Whether any pool entry is first used strictly between these two generation points. */
+    private boolean usedBetween(long from, long to) {
+      if (usePoints == null || usePoints.length == 0) {
+        return false;
+      }
+      int index = java.util.Arrays.binarySearch(usePoints, from);
+      index = index < 0 ? -index - 1 : index + 1; // the first point strictly after `from`
+      return index < usePoints.length && usePoints[index] < to;
+    }
+
+    /**
      * Whether the generation order alone puts the site in the pool slot, without the looser
      * printed-line window. Choosing among several constants of one owner needs this: a line
      * window only proves the owner appeared somewhere on that line, and a frequent value on the
      * same line proves nothing about which literal the source named.
      */
     boolean provesExactly(String owner, int start) {
-      return withinInterned(owner, start) && byCoordinate(owner, start);
+      return existsAt(owner, start) && byCoordinate(owner, start);
     }
 
     /**
@@ -280,7 +318,7 @@ public final class ConstantNames {
   }
 
   private static final Placement NO_PLACEMENT =
-    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of());
+    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), null);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -504,6 +542,7 @@ public final class ConstantNames {
       }
     }
     String nest = nestOf(own.qualifiedName);
+    Map<String, Long> namingAt = new HashMap<>();
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
         continue;
@@ -519,6 +558,10 @@ public final class ConstantNames {
         // (nothing else in the class file explains it), and javac entered the folded value right
         // after the Class and its name. That value's use is the naming site, so it cannot bound it.
         coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+        Long naming = namingPoint(own, index, firstUses, positions);
+        if (naming != null) {
+          namingAt.put(owner, naming);
+        }
       }
     }
     // A class the pool uses through a field or method names nothing by itself, but the position of
@@ -560,8 +603,11 @@ public final class ConstantNames {
         internedAt.put(link.classname, coordinate(use.order(), use.offset()));
       }
     }
+    long[] usePoints = firstUses.values().stream()
+      .mapToLong(use -> coordinate(use.order(), use.offset())).sorted().distinct().toArray();
     return new Rules(candidates,
-      new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt),
+      new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
+        namingAt, usePoints),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -668,6 +714,54 @@ public final class ConstantNames {
            CodeConstants.CONSTANT_String -> index + 2;
       default -> -1;
     };
+  }
+
+  /**
+   * The generation point at which a pool-unexplained owner was first named, or null.
+   *
+   * <p>javac enters the owner's {@code Class}, its name and the folded constant's value together
+   * when the source first names one of the owner's constants, so that value's first instruction use
+   * is the naming site. Only a pooled value can be that neighbour: a constant the source folds to
+   * an immediate (a small int or char) enters no value, and the following entry then belongs to
+   * whatever was entered next. An equal constant already in the pool is reused instead, with the
+   * same consequence. Without a printed position for the use, the point is unknown.
+   */
+  private static Long namingPoint(StructClass cls, int index, Map<Integer, FirstUse> firstUses,
+                                  Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    int folded = foldedNeighbor(cls, index);
+    if (folded < 0 || !pooledValue(cls, folded) || hasEarlierEqual(cls, folded)) {
+      return null;
+    }
+    FirstUse use = firstUses.get(folded);
+    if (use == null || position(cls, use, positions) == null) {
+      return null;
+    }
+    return coordinate(use.order(), use.offset());
+  }
+
+  /** Whether the pool entry is a long, float or double value, which javac always pools. */
+  private static boolean pooledValue(StructClass cls, int index) {
+    return index > 0 && index < cls.getPool().getPool().size()
+      && cls.getPool().getPool().get(index) instanceof PrimitiveConstant primitive
+      && (primitive.type == CodeConstants.CONSTANT_Long
+          || primitive.type == CodeConstants.CONSTANT_Float
+          || primitive.type == CodeConstants.CONSTANT_Double);
+  }
+
+  /** Whether a constant equal to the pool entry at {@code index} already sat before it. */
+  private static boolean hasEarlierEqual(StructClass cls, int index) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    if (index <= 0 || index >= pool.size() || !(pool.get(index) instanceof PrimitiveConstant value)
+        || value.value == null) {
+      return true; // a long/double second slot or an empty entry proves nothing
+    }
+    for (int i = 1; i < index; i++) {
+      if (pool.get(i) instanceof PrimitiveConstant other && other.value != null
+          && other.type == value.type && other.equals(value)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** The pool index of each Class entry, keyed by the class name it names. */
@@ -879,7 +973,8 @@ public final class ConstantNames {
         // a site inside the window there is nothing to place the name against.
         if (!rules.strict().contains(entry.getKey())) {
           for (Site site : entry.getValue()) {
-            if (!rules.placement().contradicts(entry.getKey(), site.start())) {
+            if (rules.placement().existsAt(entry.getKey(), site.start())
+                && !rules.placement().contradicts(entry.getKey(), site.start())) {
               addSiteOnce(sites, site);
             }
           }
@@ -1456,6 +1551,11 @@ public final class ConstantNames {
     // coordinate check places the site by the positions the printer recorded for its method, which
     // also covers a static field initializer generated in <clinit> but printed at its declaration.
     boolean placed = foreign && placement != null && placement.proves(constant.owner(), anchor);
+    // The pool enters the owner's Class at its first field or method reference and at its first
+    // constant naming; a site printed before those points would move the entry earlier.
+    if (foreign && placement != null && !placement.existsAt(constant.owner(), anchor)) {
+      return;
+    }
     // A frequent value is only weak evidence where there is no better one. A window means the pool
     // proves this owner was named somewhere, and the value only has to pick among its constants;
     // the site itself is still placed by the window or its fallback below.
