@@ -3,6 +3,8 @@ package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassWriter;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
@@ -20,6 +22,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.consts.ConstantPool;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
@@ -34,6 +37,7 @@ import org.jetbrains.java.decompiler.util.*;
 import org.jetbrains.java.decompiler.util.collections.ListStack;
 import org.jetbrains.java.decompiler.util.collections.NullableConcurrentHashMap;
 
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.util.*;
 import java.util.function.BiFunction;
@@ -658,6 +662,12 @@ public class InvocationExprent extends Exprent {
               // A call whose inferred arguments carry wildcards can be beyond javac's inference
               // from an argument position; the original wrote the witnesses it inferred itself.
               getGenericArgs(fparams, genericsMap, genericArgs);
+            }
+            else if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && tryDemandWitness(fparams, bounds)) {
+              // A functional argument's recorded instantiated type is wider than the method it
+              // names, so the source constrained the call's type arguments explicitly. The witness
+              // is printed only when its erasure reproduces the call the target actually recorded.
             }
             else if (isGenNew) {
               genericArgs.add(GenericType.DUMMY_VAR);
@@ -2147,6 +2157,254 @@ public class InvocationExprent extends Exprent {
       if (arg.type == CodeType.GENVAR && arg != GenericType.DUMMY_VAR) {
         return true;
       }
+    }
+    return false;
+  }
+
+  /**
+   * A method reference or lambda argument whose recorded instantiated type is wider than the
+   * method it names: the class file's metafactory argument then proves the source fixed the call's
+   * type variables itself, because javac's plain inference from the argument would have produced
+   * the method's own return type. Print the inferred (recorded) type arguments as the witness,
+   * but only when every type variable is determined concretely and the erasure reproduces the
+   * exact method the target recorded at this call site.
+   */
+  private boolean tryDemandWitness(List<String> fparams, Map<VarType, List<VarType>> bounds) {
+    if (fparams.isEmpty() || !isInvocationInstance) {
+      return false;
+    }
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    getGenericArgs(fparams, genericsMap, witness);
+    if (witness.size() != fparams.size()) {
+      return false;
+    }
+    for (VarType arg : witness) {
+      if (!isConcreteType(arg)) {
+        return false;
+      }
+    }
+    if (!recordedArgumentConstraint(fparams)) {
+      return false;
+    }
+    if (!erasureMatchesDescriptor(fparams, witness, bounds)) {
+      return false;
+    }
+    if (!isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /**
+   * Whether an argument is a functional expression whose recorded metafactory instantiated type
+   * widens the implementation method's return type at a position fed by a method type variable.
+   * That widening can only come from a source-level constraint on the call's type arguments.
+   */
+  private boolean recordedArgumentConstraint(List<String> fparams) {
+    if (desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    List<VarType> parameterTypes = desc.getSignature().parameterTypes;
+    int count = Math.min(parameterTypes.size(), lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      Exprent argument = lstParameters.get(i);
+      if (!(argument instanceof NewExprent lambda) || !lambda.isLambda()) {
+        continue;
+      }
+      Set<VarType> mentioned = new HashSet<>();
+      collectGenvars(parameterTypes.get(i), mentioned);
+      mentioned.retainAll(fparamTypes(fparams));
+      if (mentioned.isEmpty()) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+      if (node == null) {
+        continue;
+      }
+      VarType instantiatedRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
+      VarType implRet = MethodDescriptor.parseDescriptor(node.lambdaInformation.content_method_descriptor).ret;
+      if (instantiatedRet == null || implRet == null || instantiatedRet.equals(implRet)) {
+        continue;
+      }
+      if (instantiatedRet.type != CodeType.OBJECT || implRet.type != CodeType.OBJECT
+          || instantiatedRet.arrayDim != 0 || implRet.arrayDim != 0
+          || !DecompilerContext.getStructContext().instanceOf(implRet.value, instantiatedRet.value)) {
+        continue;
+      }
+      // The widening must be the recorded value of one of the type variables it feeds.
+      for (VarType variable : mentioned) {
+        VarType inferred = genericsMap.get(variable);
+        if (inferred != null && isConcreteType(inferred) && sameType(inferred, instantiatedRet)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static Set<VarType> fparamTypes(List<String> fparams) {
+    Set<VarType> types = new HashSet<>();
+    for (String fp : fparams) {
+      types.add(GenericType.parse("T" + fp + ";"));
+    }
+    return types;
+  }
+
+  private static void collectGenvars(VarType type, Set<VarType> out) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR) {
+      out.add(type);
+      return;
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        collectGenvars(argument, out);
+      }
+    }
+  }
+
+  private static boolean sameType(VarType a, VarType b) {
+    if (a instanceof GenericType generic) {
+      return generic.equalsExact(b);
+    }
+    return b != null && !(b instanceof GenericType) && a.equals(b);
+  }
+
+  /** A type with no free type variable, wildcard or unbound argument anywhere inside it. */
+  private static boolean isConcreteType(VarType type) {
+    if (type == null || type == GenericType.DUMMY_VAR || type.type == CodeType.GENVAR) {
+      return false;
+    }
+    if (!(type instanceof GenericType generic)) {
+      return true;
+    }
+    if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    for (VarType argument : generic.getArguments()) {
+      if (!isConcreteType(argument)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Substituting the witness into the declared generic signature and erasing must reproduce the
+   * descriptor the pool recorded for the call; otherwise the witness names a different method.
+   */
+  private boolean erasureMatchesDescriptor(List<String> fparams, List<VarType> witness,
+                                           Map<VarType, List<VarType>> bounds) {
+    if (desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    Map<VarType, VarType> substitution = new HashMap<>();
+    for (int i = 0; i < fparams.size(); i++) {
+      substitution.put(GenericType.parse("T" + fparams.get(i) + ";"), witness.get(i));
+    }
+    List<VarType> parameters = desc.getSignature().parameterTypes;
+    if (parameters.size() != descriptor.params.length) {
+      return false;
+    }
+    for (int i = 0; i < parameters.size(); i++) {
+      VarType erased = erase(parameters.get(i), substitution, bounds, new HashSet<>());
+      if (erased == null || !erased.equals(descriptor.params[i])) {
+        return false;
+      }
+    }
+    VarType erasedRet = erase(desc.getSignature().returnType, substitution, bounds, new HashSet<>());
+    return erasedRet != null && erasedRet.equals(descriptor.ret);
+  }
+
+  private static VarType erase(VarType type, Map<VarType, VarType> substitution,
+                               Map<VarType, List<VarType>> bounds, Set<VarType> seen) {
+    if (type == null) {
+      return null;
+    }
+    if (type.type == CodeType.GENVAR) {
+      VarType substituted = substitution.get(type);
+      if (substituted != null) {
+        return substituted.resizeArrayDim(substituted.arrayDim + type.arrayDim);
+      }
+      List<VarType> declared = bounds.get(type);
+      if (declared != null && !declared.isEmpty() && seen.add(type)) {
+        VarType erased = erase(declared.get(0), substitution, bounds, seen);
+        seen.remove(type);
+        if (erased != null) {
+          return erased.resizeArrayDim(erased.arrayDim + type.arrayDim);
+        }
+      }
+      return new VarType(CodeType.OBJECT, type.arrayDim, "java/lang/Object");
+    }
+    if (type.type == CodeType.OBJECT) {
+      // Erasure drops type arguments and wildcards.
+      return new VarType(CodeType.OBJECT, type.arrayDim, type.value);
+    }
+    return type;
+  }
+
+  /**
+   * Whether the pool of the class being printed holds the method reference for this call and the
+   * call site's own instruction points at it. Only a call the class file records can take a witness.
+   */
+  private boolean isRecordedCallSite() {
+    if (invocationType != InvocationType.VIRTUAL && invocationType != InvocationType.SPECIAL
+        && invocationType != InvocationType.STATIC && invocationType != InvocationType.INTERFACE) {
+      return false;
+    }
+    ClassNode node = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    if (node == null || bytecode == null || bytecode.isEmpty()) {
+      return false;
+    }
+    StructClass cl = node.classStruct;
+    ConstantPool pool = cl.getPool();
+    boolean inPool = false;
+    for (PooledConstant constant : pool.getPool()) {
+      if (constant instanceof LinkConstant link
+          && (link.type == CodeConstants.CONSTANT_Methodref || link.type == CodeConstants.CONSTANT_InterfaceMethodref)
+          && classname.equals(link.classname) && name.equals(link.elementname)
+          && stringDescriptor.equals(link.descriptor)) {
+        inPool = true;
+        break;
+      }
+    }
+    if (!inPool) {
+      return false;
+    }
+    StructMethod method = RoundTrip.currentMethod();
+    if (method == null) {
+      return false;
+    }
+    try {
+      FullInstructionSequence seq = method.getInstructionSequence();
+      if (seq == null) {
+        method.expandData(cl);
+        seq = method.getInstructionSequence();
+      }
+      if (seq == null) {
+        return false;
+      }
+      for (int offset = bytecode.nextSetBit(0); offset >= 0; offset = bytecode.nextSetBit(offset + 1)) {
+        Integer index = seq.offsetToIndex().get(offset);
+        if (index == null) {
+          continue;
+        }
+        Instruction instruction = seq.getInstr(index);
+        if (instruction.group != CodeConstants.GROUP_INVOCATION) {
+          continue;
+        }
+        LinkConstant link = pool.getLinkConstant(instruction.operand(0));
+        if (link != null && classname.equals(link.classname) && name.equals(link.elementname)
+            && stringDescriptor.equals(link.descriptor)) {
+          return true;
+        }
+      }
+    } catch (IOException ignored) {
+      return false;
     }
     return false;
   }

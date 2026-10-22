@@ -249,6 +249,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_DIAMOND = "rt-diamond";
 
+  @Name("Round Trip: Demand Witnesses")
+  @Description("Print a call's type arguments where an argument's recorded instantiated type proves the source fixed them, if the erasure matches the recorded call.")
+  @ShortName("rtdw")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_DEMAND_WITNESS = "rt-demand-witness";
+
   @Name("Round Trip: Same-Line Join")
   @Description("Join two printed lines whose offsets the original's table puts on one source line.")
   @ShortName("rtslj")
@@ -550,6 +556,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_NO_GENERIC_CAST, "0");
     defaults.put(ROUND_TRIP_NO_VARIABLE_RENAME, "0");
     defaults.put(ROUND_TRIP_DIAMOND, "1");
+    defaults.put(ROUND_TRIP_DEMAND_WITNESS, "1");
     defaults.put(ROUND_TRIP_SAME_LINE_JOIN, "1");
     defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
     defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");
