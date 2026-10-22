@@ -210,7 +210,8 @@ public final class ConstantNames {
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
                            Map<String, Double> folded, Map<String, Long> internedAt,
-                           Map<String, Long> namingAt, Set<String> lexical) {
+                           Map<String, Long> namingAt, Set<String> lexical,
+                           List<int[]> spans) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -224,6 +225,11 @@ public final class ConstantNames {
      * arguments, although they are generated first.
      */
     boolean proves(String owner, int start) {
+      if (lexical != null && lexical.contains(owner)) {
+        // The enclosing Class entry was interned while the class's names were resolved, before
+        // any generated code and independently of where the source put the name.
+        return existsAt(owner, start);
+      }
       if (!existsAt(owner, start)) {
         return false;
       }
@@ -272,7 +278,8 @@ public final class ConstantNames {
      * same line proves nothing about which literal the source named.
      */
     boolean provesExactly(String owner, int start) {
-      return existsAt(owner, start) && byCoordinate(owner, start);
+      return (lexical != null && lexical.contains(owner))
+        || existsAt(owner, start) && byCoordinate(owner, start);
     }
 
     /**
@@ -326,7 +333,8 @@ public final class ConstantNames {
   }
 
   private static final Placement NO_PLACEMENT =
-    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of());
+    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
+      List.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
@@ -552,6 +560,17 @@ public final class ConstantNames {
     String nest = nestOf(own.qualifiedName);
     Map<String, Long> namingAt = new HashMap<>();
     Set<String> lexical = new HashSet<>();
+    // An enclosing class whose Class entry opens the pool was named with the simple name while
+    // the class's names were resolved, before any generated code. The nesting attributes explain
+    // that Class entry, so the missing and referenced tests never see the owner; visit every
+    // enclosing name directly instead.
+    for (String ancestor : enclosings(own.qualifiedName)) {
+      Integer index = classIndices.get(ancestor);
+      if (index != null && opensPool(own, index, early, firstUses)) {
+        lexical.add(ancestor);
+        addOwnerCandidates(candidates, ancestor, nest, packageName, imports);
+      }
+    }
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
         continue;
@@ -559,6 +578,12 @@ public final class ConstantNames {
       addOwnerCandidates(candidates, owner, nest, packageName, imports);
       Integer index = classIndices.get(owner);
       if (index != null) {
+        if (opensPool(own, index, early, firstUses) && own.qualifiedName.startsWith(owner + "$")) {
+          // The enclosing Class opens the pool, so the simple name was written while the class's
+          // names were resolved; the lexical rule places the site and writes it unqualified.
+          lexical.add(owner);
+          continue;
+        }
         int[] window = window(text, own, index, orderedUses, positions, false);
         if (window != null) {
           windows.put(owner, window);
@@ -590,16 +615,15 @@ public final class ConstantNames {
       if (window == null && opensPool(own, index, early, firstUses)
           && own.qualifiedName.startsWith(owner + "$")) {
         // The owner's Class entry is the first pool entry and no instruction references any
-        // entry yet, so javac entered it while visiting the fields: a nested class naming an
-        // enclosing constant in a field initializer does exactly this. Nothing was interned
-        // before it, so there is no lower bound to prove; the first printed use still bounds
-        // the site from above. Such a name is written without a qualifier: for an ordinary
-        // field initializer javac interns the enclosing Class only from the simple name, and
-        // the enclosing class is in lexical scope anyway.
-        window = window(text, own, index, orderedUses, positions, false);
-        if (window != null) {
-          lexical.add(owner);
-        }
+        // entry yet, so javac entered it while it resolved the class's names: a nested class
+        // naming an enclosing constant with the simple name does exactly this, in a field
+        // initializer or in a method body, before any generated code. The name is written
+        // without a qualifier (javac interns the enclosing Class only from the simple name),
+        // and the pool order places nothing around it, so no window is needed; the ordering
+        // guard in the site pass keeps it ahead of every other name in the class.
+        lexical.add(owner);
+        addOwnerCandidates(candidates, owner, nest, packageName, imports);
+        continue;
       }
       if (window == null) {
         continue;
@@ -628,7 +652,7 @@ public final class ConstantNames {
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical),
+        namingAt, lexical, spans),
       strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
   }
 
@@ -1727,6 +1751,33 @@ public final class ConstantNames {
     return dollar < 0 ? internal : internal.substring(0, dollar);
   }
 
+  /** Every class that lexically encloses this one, innermost first. */
+  private static List<String> enclosings(String internal) {
+    List<String> names = new ArrayList<>();
+    String current = internal;
+    while (true) {
+      int dollar = current.lastIndexOf('$');
+      if (dollar < 0) {
+        return names;
+      }
+      current = current.substring(0, dollar);
+      names.add(current);
+    }
+  }
+
+  /** Whether a text position lies in one of the class's own text ranges. */
+  private static boolean inside(List<int[]> spans, int position) {
+    if (spans == null) {
+      return false;
+    }
+    for (int[] span : spans) {
+      if (position >= span[0] && position < span[1]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Whether a simple name in this class's body resolves to the enclosing owner's constant. */
   private static boolean resolvesTo(StructClass site, String owner, String name) {
     StructContext context = DecompilerContext.getStructContext();
@@ -2081,6 +2132,17 @@ public final class ConstantNames {
       return;
     }
     boolean foreign = !constant.owner().equals(own);
+    boolean lexical = foreign && placement != null && placement.lexical() != null
+      && placement.lexical().contains(constant.owner());
+    if (lexical) {
+      // Names are resolved in source order, so a name printed earlier in this class would enter
+      // its Class entry first. Nothing may precede the owner that opens the pool.
+      for (Site earlier : sites) {
+        if (earlier.start() < start && inside(placement.spans(), earlier.start())) {
+          return;
+        }
+      }
+    }
     int[] window = placement == null || placement.windows() == null || !foreign
       ? null : placement.windows().get(constant.owner());
     // The pool order in generation order is exact: the site must fall after every lower entry's
