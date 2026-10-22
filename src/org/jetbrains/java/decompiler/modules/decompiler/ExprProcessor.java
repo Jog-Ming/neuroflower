@@ -1057,6 +1057,21 @@ public class ExprProcessor implements CodeConstants {
       doCastGenerics = false;
     }
 
+    // An instantiation of X cannot be cast to another instantiation of X whose arguments are
+    // provably distinct: javac rejects the conversion outright, so no compiling source wrote it.
+    // In an argument list the printer seeded a type variable from the call's own context and
+    // javac infers it again from the value, which is what the original relied on; elsewhere the
+    // value must be converted, and the source that compiled wrote the raw cast.
+    boolean castRaw = false;
+    if (doCastGenerics && !castAlways && !doCast && !doCastNull && !doCastNarrowing
+      && provablyInconvertible(leftType, rightType)) {
+      if (InvocationExprent.inArgument()) {
+        doCastGenerics = false;
+      } else {
+        castRaw = true;
+      }
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
@@ -1081,7 +1096,8 @@ public class ExprProcessor implements CodeConstants {
     }
 
     if (cast) {
-      buffer.append('(').appendCastTypeName(leftType).append(')');
+      VarType castType = castRaw ? new VarType(leftType.type, leftType.arrayDim, leftType.value) : leftType;
+      buffer.append('(').appendCastTypeName(castType).append(')');
     }
 
     if (castLambda) {
@@ -1122,6 +1138,59 @@ public class ExprProcessor implements CodeConstants {
     NullCastType(boolean cast) {
       this.cast = cast;
     }
+  }
+
+  /**
+   * Whether a cast from {@code right} to {@code left} is one javac rejects: both are the same
+   * generic class and some pair of arguments is provably distinct, so neither instantiation is a
+   * subtype of the other and the conversion is not an unchecked one either. Only the invariant
+   * case is judged; wildcard targets, raw values and type variables keep the existing rules.
+   */
+  private static boolean provablyInconvertible(VarType left, VarType right) {
+    if (!(left instanceof GenericType target) || !(right instanceof GenericType value)) {
+      return false;
+    }
+    if (target.getWildcard() != GenericType.WILDCARD_NO || value.getWildcard() != GenericType.WILDCARD_NO
+      || target.arrayDim != 0 || value.arrayDim != 0 || !target.value.equals(value.value)) {
+      return false;
+    }
+    List<VarType> targetArgs = target.getArguments();
+    List<VarType> valueArgs = value.getArguments();
+    if (targetArgs.size() != valueArgs.size() || target.equalsExact(value)) {
+      return false;
+    }
+    for (int i = 0; i < targetArgs.size(); i++) {
+      if (argumentProvablyDistinct(targetArgs.get(i), valueArgs.get(i))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** JLS 4.5 "provably distinct" for one position, limited to the shapes the printer produces. */
+  private static boolean argumentProvablyDistinct(VarType target, VarType value) {
+    if (target == null || value == null || target.type == CodeType.GENVAR || value.type == CodeType.GENVAR) {
+      return false;
+    }
+    if (target instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    if (value instanceof GenericType wild && wild.getWildcard() != GenericType.WILDCARD_NO) {
+      // A capture of ? extends B may only be cast to an instantiation below B; a supertype of
+      // the bound (or an unrelated class) is provably distinct.
+      if (wild.getWildcard() != GenericType.WILDCARD_EXTENDS || wild.value == null
+        || target.isGeneric() || target.type != CodeType.OBJECT || target.value == null) {
+        return false;
+      }
+      return !DecompilerContext.getStructContext().instanceOf(target.value, wild.value);
+    }
+    if (target.isGeneric() != value.isGeneric()) {
+      return false;
+    }
+    if (target.isGeneric()) {
+      return !((GenericType) target).equalsExact(value);
+    }
+    return target.type == CodeType.OBJECT && value.type == CodeType.OBJECT && !target.value.equals(value.value);
   }
 
   /** Whether a type argument names a generic class without its type arguments. */
