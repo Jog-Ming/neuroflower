@@ -217,7 +217,8 @@ public class CatchStatement extends Statement {
       // statement. Print the tail after the brace, where the variable table says it belongs.
       List<Exprent> tail = null;
       if (i == stats.size() - 1 && stat.getExprents() != null
-          && getParent() != null && getParent().type == StatementType.SEQUENCE) {
+          && getParent() != null
+          && (getParent().type == StatementType.SEQUENCE || getParent().type == StatementType.ROOT)) {
         int scopeEnd = catchScopeEnd(stat);
         if (scopeEnd > 0) {
           List<Exprent> exprents = stat.getExprents();
