@@ -121,15 +121,22 @@ public class SequenceStatement extends Statement {
 
 
       // `if (C) continue; body` in the source; the decompiler printed its mirror `if (!C) { body }`.
+      // The target's branch-then-goto shape and line table prove the continue. The mirror is the
+      // loop's whole remaining body, so the guard is exact only when this sequence is the loop
+      // body and the if is its last statement; otherwise the continue would skip the tail.
       if (st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !st.isLabeled()
           && ifStatement.getIfstat() != null
-          && ifStatement.getHeadexprent().getCondition() instanceof FunctionExprent not
-          && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT
+          && i == stats.size() - 1 && getParent() instanceof DoStatement
           && RoundTrip.printContinueGuard(ifStatement.getHeadexprent(), this)) {
+        Exprent condition = ifStatement.getHeadexprent().getCondition();
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
-        head.setCondition(not.getLstOperands().get(0));
+        head.setCondition(condition instanceof FunctionExprent not
+            && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT
+            && not.getLstOperands().size() == 1
+          ? not.getLstOperands().get(0)
+          : RoundTrip.negateCondition(condition));
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
         buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();

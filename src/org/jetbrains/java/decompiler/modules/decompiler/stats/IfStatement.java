@@ -230,13 +230,18 @@ public class IfStatement extends Statement {
     }
 
     // `if (C) continue; body`: the loop printed the mirror `if (!C) { body }` as its body.
+    // The target's branch-then-goto shape and line table prove the continue; the printed
+    // condition may be any expression, and its negation is what the source wrote.
     if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
-        && ifHead.getCondition() instanceof FunctionExprent not
-        && not.getFuncType() == FunctionType.BOOL_NOT
         && getParent() instanceof DoStatement
         && RoundTrip.printContinueGuard(ifHead, this)) {
+      Exprent printed = ifHead.getCondition();
       IfExprent guard = (IfExprent) ifHead.copy();
-      guard.setCondition(not.getLstOperands().get(0));
+      guard.setCondition(printed instanceof FunctionExprent not
+          && not.getFuncType() == FunctionType.BOOL_NOT
+          && not.getLstOperands().size() == 1
+        ? not.getLstOperands().get(0)
+        : RoundTrip.negateCondition(printed));
       buf.appendIndent(indent);
       buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
       buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();

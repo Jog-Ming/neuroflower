@@ -57,13 +57,15 @@ public final class RoundTrip {
       if (isConditional(instr.opcode)) {
         branches.put(instr.startOffset + instr.length, instr.opcode);
       }
-      // `if (C) continue;`: the branch falls through to a backwards goto and jumps past it to the body.
+      // `if (C) continue;`: the branch falls through to a goto and jumps past it to the body.
+      // The goto may go back to the loop head (while/for-each) or forward to a for loop's
+      // increment; the loop the statement belongs to decides which target is the continue.
       if (i + 1 < seq.length() && isConditional(instr.opcode)) {
         Instruction next = seq.getInstr(i + 1);
         if (next.opcode == CodeConstants.opc_goto) {
           int branchTarget = instr.startOffset + instr.operand(0);
           int gotoTarget = next.startOffset + next.operand(0);
-          if (gotoTarget < next.startOffset && branchTarget > next.startOffset) {
+          if (branchTarget > next.startOffset) {
             // Key by the branch's end; the head exprent's offsets cover the branch instruction.
             guards.put(instr.startOffset + instr.length, gotoTarget);
             sites.put(instr.startOffset + instr.length, new int[]{next.startOffset, branchTarget});
@@ -836,6 +838,12 @@ public final class RoundTrip {
 
   /** The instruction a {@code continue} in this loop jumps to. */
   private static boolean isContinueTarget(org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    // A continue jumps to the loop's head, which is built before the body's first statement. The
+    // condition's own bytecode may not cover the receiver chain, so compare with the body start.
+    int bodyStart = firstOffset(loop.getFirst());
+    if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
+      return true;
+    }
     Exprent head = switch (loop.getLooptype()) {
       case WHILE, DO_WHILE -> loop.getConditionExprent();
       case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
@@ -848,13 +856,17 @@ public final class RoundTrip {
       if (target <= start && target >= start - 3) {
         return true;
       }
+      // An array for-each keeps its increment after the body; the exprent owns that bytecode.
+      Exprent inc = loop.getIncExprent();
+      if (inc != null && inc.bytecode != null && inc.bytecode.get(target)) {
+        return true;
+      }
     }
     // A for-each continue jumps to the compiler's hasNext block and a for's to the increment; both
     // live inside the loop but are not owned by the iterable or condition exprent.
     if (loop.getLooptype() == org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.FOR_EACH) {
       // A for-each continue jumps into the compiler's hasNext block, which sits before the first
       // instruction any exprent of the loop covers.
-      int bodyStart = firstOffset(loop.getFirst());
       return target >= 0 && bodyStart >= 0 && target < bodyStart;
     }
     int min = firstOffset(loop);
