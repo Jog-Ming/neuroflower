@@ -140,6 +140,36 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (C) { body } rest` where the target's table puts a void return between the condition
+      // and the body, before the body's line: the source wrote `if (!C) { rest; return; } body`.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && (!ifStatement.isPatternMatched()
+              || ifStatement.getHeadexprent().getCondition() instanceof FunctionExprent patternNot
+                 && patternNot.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT)
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          // The exit-first guard of a trailing if is the printer's own; only a rest with content
+          // needs this swap, and an empty rest is what that other rule sees.
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && RoundTrip.voidReturnBeforeBody(ifStatement.getHeadexprent().bytecode, ifStatement.getIfstat()) >= 0) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(
+          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+        // The block's own return prints as a statement when the printer kept it.
+        if (!endsWithExit(stats.subList(i + 1, stats.size()))) {
+          buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
+        }
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
@@ -283,6 +313,33 @@ public class SequenceStatement extends Statement {
       }
     }
     return true;
+  }
+
+  /** True when any of these statements prints anything. */
+  private static boolean hasContent(List<Statement> statements) {
+    for (Statement statement : statements) {
+      List<Exprent> exprents = statement.getExprents();
+      if (exprents != null && !exprents.isEmpty()) {
+        return true;
+      }
+      if (exprents == null && hasContent(statement.getStats())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** True when the last of these statements ends in a return or throw. */
+  private static boolean endsWithExit(List<Statement> statements) {
+    if (statements.isEmpty()) {
+      return false;
+    }
+    Statement last = statements.get(statements.size() - 1);
+    List<Exprent> exprents = last.getExprents();
+    if (exprents != null) {
+      return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
+    }
+    return endsWithExit(last.getStats());
   }
 
   private static boolean endsWithReturn(Statement stat) {

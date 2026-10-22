@@ -72,6 +72,51 @@ public final class RoundTrip {
   }
 
   /**
+   * The target's void return that ends the block between a condition and its body, when the line
+   * table puts that return before the body's first line; -1 when no such return proves the guard
+   * shape. The return block is exactly the fall-through the printer folded into the body, so the
+   * AST does not carry it.
+   */
+  public static int voidReturnBeforeBody(BitSet conditionOffsets, Statement body) {
+    if (!selector("bodyguard")) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return -1;
+    }
+    BitSet returns = VOID_RETURNS.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    StructLineNumberTableAttribute table = method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    int bodyStart = firstOffset(body);
+    if (returns == null || ends == null || table == null || conditionOffsets == null
+        || conditionOffsets.isEmpty() || bodyStart < 0) {
+      return -1;
+    }
+    int conditionEnd = -1;
+    for (int offset = conditionOffsets.nextSetBit(0); offset >= 0; offset = conditionOffsets.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && end > conditionEnd) {
+        conditionEnd = end;
+      }
+    }
+    if (conditionEnd < 0) {
+      return -1;
+    }
+    int exit = -1;
+    for (int candidate = returns.nextSetBit(conditionEnd); candidate >= 0 && candidate < bodyStart;
+         candidate = returns.nextSetBit(candidate + 1)) {
+      exit = candidate;
+    }
+    if (exit < 0) {
+      return -1;
+    }
+    int exitLine = table.findLineNumber(exit);
+    int bodyLine = table.findLineNumber(bodyStart);
+    return exitLine >= 0 && bodyLine >= 0 && exitLine < bodyLine ? exit : -1;
+  }
+
+  /**
    * True when the target's line table puts this if's else arm before its then arm, so the source
    * wrote the arms in the other order with the negated condition.
    */
