@@ -72,6 +72,30 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's line table puts this if's else arm before its then arm, so the source
+   * wrote the arms in the other order with the negated condition.
+   */
+  public static boolean swapIfArmsByLine(Statement thenArm, Statement elseArm) {
+    if (!selector("polarityline")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int thenStart = firstOffset(thenArm);
+    int elseStart = firstOffset(elseArm);
+    if (thenStart < 0 || elseStart < 0) {
+      return false;
+    }
+    int thenLine = table.findLineNumber(thenStart);
+    int elseLine = table.findLineNumber(elseStart);
+    return thenLine >= 0 && elseLine >= 0 && thenLine > elseLine;
+  }
+
+  /**
    * True when the target branched the other way: the original wrote the negated condition with the
    * arms swapped. Only plain boolean tests are handled; comparisons and short-circuit conditions
    * compile to different opcode families and are left alone.
@@ -90,6 +114,10 @@ public final class RoundTrip {
       return false;
     }
     Integer opcode = branches.get(offsets.length());
+    if (System.getenv("NEUROFLOWER_POLARITY_DEBUG") != null) {
+      System.err.println("polarity " + method.getName() + " len " + offsets.length() + " opcode " + opcode
+        + " expected " + lastBranch(ifHead.getCondition()));
+    }
     if (opcode == null) {
       return false;
     }

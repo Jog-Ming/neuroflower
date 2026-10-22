@@ -233,16 +233,12 @@ public class IfStatement extends Statement {
     }
 
     // `if (C) A else B` and `if (!C) B else A` are the same program in different bytes; the target's
-    // branch opcode says which one was written.
+    // branch opcode or the arm lines' order says which one was written.
     if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
-        && condition instanceof IfExprent ifHead && RoundTrip.swapIfArms(ifHead)) {
+        && condition instanceof IfExprent ifHead
+        && (RoundTrip.swapIfArms(ifHead) || RoundTrip.swapIfArmsByLine(ifstat, elsestat))) {
       IfExprent head = (IfExprent) ifHead.copy();
-      Exprent cond = head.getCondition();
-      if (cond instanceof FunctionExprent not && not.getFuncType() == FunctionType.BOOL_NOT) {
-        head.setCondition(not.getLstOperands().get(0));
-      } else {
-        head.setCondition(new FunctionExprent(FunctionType.BOOL_NOT, cond, null));
-      }
+      head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
       buf.appendIndent(indent).append("} else {").appendLineSeparator();
