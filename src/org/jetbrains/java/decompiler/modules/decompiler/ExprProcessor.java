@@ -1243,7 +1243,7 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
-    return false;
+    return plainClassToInvariantGeneric(left, right);
   }
 
   /** True when a wildcard sits below the type's direct arguments, not in them. */
@@ -1266,6 +1266,41 @@ public class ExprProcessor implements CodeConstants {
     }
     for (VarType argument : type.getArguments()) {
       if (argument instanceof GenericType generic && containsWildcard(generic)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * A plain class assigned to a generic type: its supertype instantiation is recorded in its own
+   * class file, and {@code class C implements Owner<Object>} is not an {@code Owner<T>} for an
+   * unknown T, so the source made the assignment compile with a cast.
+   */
+  private static boolean plainClassToInvariantGeneric(VarType left, VarType right) {
+    if (left == null || right == null || !left.isGeneric() || right.isGeneric()
+      || right.type != CodeType.OBJECT) {
+      return false;
+    }
+    VarType view = GenericType.getGenericSuperType(right, left);
+    if (!(view instanceof GenericType genView) || !left.value.equals(genView.value)) {
+      return false;
+    }
+    List<VarType> targetArgs = ((GenericType) left).getArguments();
+    List<VarType> actualArgs = genView.getArguments();
+    if (targetArgs.size() != actualArgs.size()) {
+      return false;
+    }
+    for (int i = 0; i < targetArgs.size(); i++) {
+      VarType targetArg = targetArgs.get(i);
+      VarType actualArg = actualArgs.get(i);
+      if (targetArg == null || actualArg == null) {
+        continue;
+      }
+      if (targetArg instanceof GenericType genericArg && genericArg.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
+      }
+      if (targetArg.type == CodeType.GENVAR && actualArg.type != CodeType.GENVAR && !targetArg.equals(actualArg)) {
         return true;
       }
     }
@@ -1323,11 +1358,21 @@ public class ExprProcessor implements CodeConstants {
         }
 
         if (genLeft.getWildcard() == genRight.getWildcard()) {
+          // Arguments of the same generic class are invariant positions: two instantiations are
+          // the same type only when each argument is literally the same. A type variable on one
+          // side and a different type on the other therefore never assigns across, and the source
+          // made it compile with a cast.
+          boolean invariant = leftType.value.equals(rightType.value);
           for (int i = 0; i < genLeft.getArguments().size(); i++) {
             VarType lt = genLeft.getArguments().get(i);
             VarType rt = genRight.getArguments().get(i);
             // Subset of Type<?> -> Type<T> check: Only check for genvars. If T is concrete, then don't force casting.
             if (rt == null && lt != null && lt.type == CodeType.GENVAR) {
+              return true;
+            }
+            if (invariant && lt != null && rt != null
+              && ((lt.type == CodeType.GENVAR && rt.type != CodeType.GENVAR && !rt.isGeneric())
+                || (rt.type == CodeType.GENVAR && lt.type != CodeType.GENVAR && !lt.isGeneric()))) {
               return true;
             }
 
