@@ -1626,6 +1626,7 @@ public class InvocationExprent extends Exprent {
 
     boolean firstParameter = true;
     int previousLine = -1;
+    int previousEnd = -1;
     int callLine = RoundTrip.sourceLineEnd(this);
     int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
     // The line the call's own token sits on: the first argument's, when javac started a line
@@ -1692,12 +1693,22 @@ public class InvocationExprent extends Exprent {
         }
 
         int line = RoundTrip.sourceLine(lstParameters.get(i));
+        // A constructor argument's own offsets stop at its new; the invoke at the end of its
+        // argument list is what the target's table places on the last line of the expression.
+        Exprent argument = lstParameters.get(i);
+        int end = argument instanceof NewExprent created && created.getConstructor() != null
+          ? RoundTrip.sourceLineEnd(created.getConstructor())
+          : RoundTrip.sourceLineEnd(argument);
         // Only a later line is a break the original had; an equal or earlier one is inheritance
         // from the enclosing statement's marker. javac attributes the invoke to the first
         // argument's line, so a later argument at the call's own line was written on that line:
         // the first argument merely inherited the declaration's line above it.
         boolean callLineGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_CALL_LINE);
-        boolean forced = !firstParameter && line >= 0 && previousLine >= 0 && line > previousLine
+        // The target's line for the previous argument's last instruction is where that argument
+        // ended; an argument that starts on it was written on the same source line.
+        boolean prevEndGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_PREV_END);
+        int previous = prevEndGate ? previousEnd : previousLine;
+        boolean forced = !firstParameter && line >= 0 && previous >= 0 && line > previous
           && (!callLineGate || openingLine < 0 || line > openingLine);
 
         // the last "new Object[0]" in the vararg call is not printed
@@ -1714,6 +1725,9 @@ public class InvocationExprent extends Exprent {
         }
         if (line >= 0) {
           previousLine = line;
+        }
+        if (end >= 0) {
+          previousEnd = end;
         }
 
         firstParameter = false;
