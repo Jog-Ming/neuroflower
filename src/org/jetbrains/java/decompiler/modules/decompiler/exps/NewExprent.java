@@ -381,6 +381,22 @@ public class NewExprent extends Exprent {
     return 1; // precedence of new
   }
 
+  /** An expression kind whose line table entry is its own, not inherited from the statement. */
+  private static boolean hasOwnLine(Exprent element) {
+    return element instanceof InvocationExprent || element instanceof NewExprent
+      || element instanceof FunctionExprent;
+  }
+
+  /** An element whose first token is on its own line: not a chained call's later qualifier. */
+  private static boolean startsOnItsLine(Exprent element) {
+    if (element instanceof InvocationExprent invocation && invocation.getInstance() != null) {
+      int receiver = RoundTrip.sourceLine(invocation.getInstance());
+      int call = RoundTrip.sourceLine(invocation);
+      return receiver < 0 || call < 0 || receiver == call;
+    }
+    return true;
+  }
+
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
@@ -679,13 +695,37 @@ public class NewExprent extends Exprent {
         VarType leftType = newType.decreaseArrayDim();
         buf.append('{');
         buf.pushNewlineGroup(indent, 1);
-        buf.appendPossibleNewline();
+        // The target's table gives every element its own line when the source wrote the array
+        // across lines; an equal or absent line is no evidence of a break.
+        int arrayLine = RoundTrip.sourceLine(this);
+        Exprent firstElement = lstArrayElements.get(0);
+        int firstLine = RoundTrip.sourceLine(firstElement);
+        // A variable or constant carries no line entry: its line is inherited from the statement,
+        // so a gap from it to a later element proves nothing. Only an expression with its own
+        // entry can anchor a break, on either side.
+        boolean firstOwnLine = hasOwnLine(firstElement) && startsOnItsLine(firstElement);
+        if (arrayLine >= 0 && firstOwnLine && firstLine > arrayLine) {
+          buf.appendLineSeparator().appendIndent(indent + 1);
+        } else {
+          buf.appendPossibleNewline();
+        }
         buf.pushNewlineGroup(indent, 0);
+        boolean previousOwnLine = firstOwnLine;
         for (int i = 0; i < lstArrayElements.size(); i++) {
           if (i > 0) {
-            buf.append(",").appendPossibleNewline(" ");
+            Exprent element = lstArrayElements.get(i);
+            buf.append(",");
+            int previousLine = RoundTrip.sourceLine(lstArrayElements.get(i - 1));
+            int line = RoundTrip.sourceLine(element);
+            if (previousOwnLine && hasOwnLine(element) && startsOnItsLine(element)
+              && previousLine >= 0 && line > previousLine) {
+              buf.appendLineSeparator().appendIndent(indent + 1);
+            } else {
+              buf.appendPossibleNewline(" ");
+            }
           }
           ExprProcessor.getCastedExprent(lstArrayElements.get(i), leftType, buf, indent, false);
+          previousOwnLine = hasOwnLine(lstArrayElements.get(i));
         }
         buf.popNewlineGroup();
         buf.appendPossibleNewline("", true);
