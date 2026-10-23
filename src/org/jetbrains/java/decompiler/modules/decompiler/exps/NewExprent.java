@@ -441,6 +441,7 @@ public class NewExprent extends Exprent {
           InvocationExprent.enterPoly();
         }
         try {
+          constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
           buf.append(constructor.appendParamList(indent));
         } finally {
           if (diamond) {
@@ -562,6 +563,7 @@ public class NewExprent extends Exprent {
           } else {
             appendParameters(buf, args);
           }
+          constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
           buf.append('(').append(constructor.appendParamList(indent)).append(')');
         }
       }

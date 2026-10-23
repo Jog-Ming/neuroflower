@@ -83,6 +83,8 @@ public class InvocationExprent extends Exprent {
   /** A witness this call prints that an unqualified name cannot carry: print the class too. */
   private boolean witnessQualifier = false;
   private VarType remappedInstType = null;
+  /** The line the call's own token sits on, when the printer of a constructor knows it. */
+  private int callerOpeningLine = -1;
   public boolean forceGenericQualfication = false;
   private final NullableConcurrentHashMap<VarType, VarType> genericsMap = new NullableConcurrentHashMap<>();
   private boolean isInvocationInstance = false;
@@ -1394,6 +1396,11 @@ public class InvocationExprent extends Exprent {
     return depth > 0 && ARGUMENT_AT.get()[depth - 1] == RoundTrip.currentMethod();
   }
 
+  /** Tells the argument printer the line the call's own token sits on, from its `new`. */
+  public void setCallerOpeningLine(int line) {
+    callerOpeningLine = line;
+  }
+
   public TextBuffer appendParamList(int indent) {
     int savedCallLine = CALL_LINE.get()[0];
     CALL_LINE.get()[0] = RoundTrip.sourceLineEnd(this);
@@ -1620,9 +1627,13 @@ public class InvocationExprent extends Exprent {
     boolean firstParameter = true;
     int previousLine = -1;
     int callLine = RoundTrip.sourceLineEnd(this);
+    int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
+    // The line the call's own token sits on: the first argument's, when javac started a line
+    // there; otherwise the invoke's inherited line is the only line the call is known to have.
+    boolean firstStartsLine = start < lstParameters.size() && RoundTrip.lineStartsHere(lstParameters.get(start));
+    int openingLine = callerOpeningLine >= 0 ? callerOpeningLine : firstStartsLine ? firstLine : callLine;
     if (!lstParameters.isEmpty()) {
       buf.pushNewlineGroup(indent, 1);
-      int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
       // A later argument line is always a break the source had. An earlier one is normally the
       // enclosing statement's marker inherited by the argument's pushes, but not when the argument
       // itself has an entry there: then its own expression started that line.
@@ -1687,7 +1698,7 @@ public class InvocationExprent extends Exprent {
         // the first argument merely inherited the declaration's line above it.
         boolean callLineGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_CALL_LINE);
         boolean forced = !firstParameter && line >= 0 && previousLine >= 0 && line > previousLine
-          && (!callLineGate || callLine < 0 || line > callLine);
+          && (!callLineGate || openingLine < 0 || line > openingLine);
 
         // the last "new Object[0]" in the vararg call is not printed
         if (buff.length() > 0) {
