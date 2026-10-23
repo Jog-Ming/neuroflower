@@ -602,7 +602,8 @@ public final class LineAlign {
       }
       for (StructMethod method : cls.getMethods()) {
         boolean bridge = (method.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_BRIDGE) != 0;
-        if (!"<init>".equals(method.getName()) && !bridge) {
+        boolean accessor = isSyntheticAccessor(method);
+        if (!"<init>".equals(method.getName()) && !bridge && !accessor) {
           continue;
         }
         BytecodeMappingTracer tracer = tracers.get(
@@ -620,16 +621,27 @@ public final class LineAlign {
         if (target < 0) {
           continue;
         }
-        if (bridge && !singleLine(table)) {
+        if ((bridge || accessor) && !singleLine(table)) {
           continue; // a bridge spanning several lines is not anchored to the declaration
         }
-        int anchor = bridge
+        int anchor = bridge || accessor
           ? classDeclarationTop(lines, declaration, 0)
           : declaration;
         entryLines.add(anchor);
         add(shifts, conflicted, anchor, target - anchor);
       }
     }
+  }
+
+  /**
+   * A compiler-generated access method for a private member read from a nested class.
+   *
+   * <p>It is not printed, and javac gives its single line entry the class declaration's line, so
+   * it anchors the declaration exactly like a bridge.
+   */
+  private static boolean isSyntheticAccessor(StructMethod method) {
+    return method.getName().startsWith("access$")
+      && (method.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_SYNTHETIC) != 0;
   }
 
   private static void collectNodes(ClassesProcessor.ClassNode node, List<ClassesProcessor.ClassNode> out) {
@@ -721,7 +733,8 @@ public final class LineAlign {
     }
     for (StructMethod method : cls.getMethods()) {
       boolean bridge = (method.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_BRIDGE) != 0;
-      if (!"<init>".equals(method.getName()) && !bridge) {
+      boolean accessor = isSyntheticAccessor(method);
+      if (!"<init>".equals(method.getName()) && !bridge && !accessor) {
         continue;
       }
       BytecodeMappingTracer tracer = tracers.get(
