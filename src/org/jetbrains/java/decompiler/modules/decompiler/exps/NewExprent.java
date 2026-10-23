@@ -571,17 +571,47 @@ public class NewExprent extends Exprent {
     else if (isVarArgParam) {
       // just print the array elements
       VarType leftType = newType.decreaseArrayDim();
+      // The array's own line is the packaging instruction's, which inherits whichever call the
+      // elements are arguments of; the elements' lines are only comparable with that call's.
+      int callLine = InvocationExprent.enclosingCallLine();
+      int previousEnd = callLine >= 0 ? callLine : RoundTrip.sourceLine(this);
+      // An invocation, a creation and a conditional expression carry a line entry of their own; a
+      // variable or constant carries none, so its line is whatever the statement before it left
+      // and no gap from it to a later element proves anything.
+      boolean enabled = RoundTrip.selector("vararg-elements");
+      boolean previousOwnLine = true;
       for (int i = 0; i < lstArrayElements.size(); i++) {
+        Exprent element = lstArrayElements.get(i);
+        int line = RoundTrip.sourceLine(element);
+        int end = RoundTrip.sourceLineEnd(element);
+        // An element the original put on a later line starts a line here. A later element whose
+        // own line is inherited but whose invoke is later was written on that later line, for the
+        // same reason as an argument.
+        boolean later = enabled && previousOwnLine
+          && line >= 0 && previousEnd >= 0 && line > previousEnd;
+        boolean ownLater = enabled && element instanceof InvocationExprent
+          && line >= 0 && previousEnd >= 0 && line <= previousEnd && end > previousEnd;
         if (i > 0) {
-          buf.append(",").appendPossibleNewline(" ");
+          buf.append(",");
+          if (later || ownLater) {
+            buf.appendLineSeparator();
+          } else {
+            buf.appendPossibleNewline(" ");
+          }
+        } else if (later || ownLater) {
+          buf.appendLineSeparator();
         }
 
         // new String[][]{{"abc"}, {"DEF"}} => new String[]{"abc"}, new String[]{"DEF"}
-        Exprent element = lstArrayElements.get(i);
         if (element instanceof NewExprent) {
           ((NewExprent) element).setDirectArrayInit(false);
         }
         ExprProcessor.getCastedExprent(element, leftType, buf, indent, false);
+        if (end >= 0) {
+          previousEnd = end;
+        }
+        previousOwnLine = element instanceof InvocationExprent || element instanceof NewExprent
+          || element instanceof FunctionExprent;
       }
 
       // if there is just one element of Object[] type it needs to be casted to resolve ambiguity

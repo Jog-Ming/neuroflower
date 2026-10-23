@@ -1644,8 +1644,24 @@ public class InvocationExprent extends Exprent {
       boolean lambdaArgument = start < lstParameters.size()
         && lstParameters.get(start) instanceof NewExprent created
         && created.isLambda() && !created.isMethodReference();
-      if (!lambdaArgument && callLine >= 0 && firstLine >= 0 && firstLine != callLine
-          && (firstLine > callLine || RoundTrip.lineStartsHere(lstParameters.get(start)))) {
+      // A varargs call's array holds the arguments; its elements are printed without a parameter
+      // of their own. A first element whose own invoke is on a later line than the call started
+      // the element on that later line: javac emits an invocation's line at its invoke, and the
+      // receiver's loads before it only inherit the statement's. A call whose own arguments span
+      // lines emits its invoke on its own (earlier) line, so this is not a break inside the
+      // element.
+      Exprent firstArgument = start < lstParameters.size() ? lstParameters.get(start) : null;
+      boolean elementStartsLater = false;
+      if (RoundTrip.selector("vararg-elements") && firstArgument instanceof NewExprent array
+          && array.isVarArgParam() && !array.getLstArrayElements().isEmpty()) {
+        Exprent element = array.getLstArrayElements().get(0);
+        int line = RoundTrip.sourceLine(element);
+        elementStartsLater = element instanceof InvocationExprent && callLine >= 0 && line >= 0
+          && line <= callLine && RoundTrip.sourceLineEnd(element) > callLine;
+      }
+      boolean explicitStart = callLine >= 0 && firstLine >= 0 && firstLine != callLine
+        && (firstLine > callLine || RoundTrip.lineStartsHere(lstParameters.get(start)));
+      if (!lambdaArgument && (elementStartsLater || explicitStart)) {
         buf.appendLineSeparator();
       } else {
         buf.appendPossibleNewline();
