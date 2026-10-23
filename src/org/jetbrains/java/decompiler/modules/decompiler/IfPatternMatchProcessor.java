@@ -123,6 +123,13 @@ public final class IfPatternMatchProcessor {
       return false;
     }
 
+    // The target reached this assignment by the condition's jump. javac compiled the guard as
+    // `if (!(x instanceof T)) return ...; T t = (T)x;`, whose branch targets the cast; a pattern
+    // binding would fall through to the cast and branch to the returning arm instead.
+    if (RoundTrip.branchEntersAt(statement.getHeadexprent(), first)) {
+      return false;
+    }
+
     // If it's an assignement, get both sides
     Exprent left = first.getAllExprents().get(0);
     Exprent right = first.getAllExprents().get(1);

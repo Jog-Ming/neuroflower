@@ -38,6 +38,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> CONTINUE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Jump target of each conditional branch, by the end offset of the branch instruction. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -49,6 +51,7 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
     java.util.Map<Integer, int[]> sites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> branchTargets = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
@@ -70,6 +73,7 @@ public final class RoundTrip {
       }
       if (isConditional(instr.opcode)) {
         branches.put(instr.startOffset + instr.length, instr.opcode);
+        branchTargets.put(instr.startOffset + instr.length, instr.startOffset + instr.operand(0));
       }
       // `if (C) continue;`: the branch falls through to a goto and jumps past it to the body.
       // The goto may go back to the loop head (while/for-each) or forward to a for loop's
@@ -91,6 +95,7 @@ public final class RoundTrip {
     CONTINUE_GUARDS.put(method, guards);
     CONTINUE_SITES.put(method, sites);
     BRANCHES.put(method, branches);
+    BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
     RETURN_STORES.put(method, returnStores);
   }
@@ -315,6 +320,33 @@ public final class RoundTrip {
     int expected = lastBranch(ifHead.getCondition());
     int other = complement(expected);
     return other != 0 && opcode == other;
+  }
+
+  /**
+   * True when the target's last condition branch jumps exactly to the instruction this exprent
+   * starts at. A negated instanceof guard with an explicit cast compiles to {@code ifne} over the
+   * returning arm to the cast; the same guard written with a pattern variable branches with
+   * {@code ifeq} to the returning arm and falls through to the cast. The jump target therefore
+   * proves which of the two sources the class file came from.
+   */
+  public static boolean branchEntersAt(Exprent head, Exprent exprent) {
+    if (!selector("patternjump")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || head == null || exprent == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    BitSet offsets = head.bytecode;
+    // The assignment's own offsets start at the store; the value it stores starts earlier.
+    BitSet starts = new BitSet();
+    exprent.getBytecodeRange(starts);
+    if (targets == null || offsets == null || offsets.isEmpty() || starts.isEmpty()) {
+      return false;
+    }
+    Integer target = targets.get(offsets.length());
+    return target != null && target == starts.nextSetBit(0);
   }
 
   /**
