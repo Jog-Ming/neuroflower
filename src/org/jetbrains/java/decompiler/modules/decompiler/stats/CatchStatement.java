@@ -8,6 +8,7 @@ import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
@@ -173,12 +174,25 @@ public class CatchStatement extends Statement {
       Statement stat = stats.get(i);
       // map first instruction storing the exception to the catch statement
       BasicBlock block = stat.getBasichead().getBlock();
+      Integer handlerOffset = null;
       if (!block.getSeq().isEmpty() && block.getInstruction(0).opcode == CodeConstants.opc_astore) {
-        Integer offset = block.getOldOffset(0);
-        if (offset > -1) buf.addBytecodeMapping(offset);
+        handlerOffset = block.getOldOffset(0);
       }
 
-      buf.append(" catch (");
+      // javac gives a try-with-resources' synthetic close the closing brace's line, so the
+      // target's table says whether the original put the brace on a line without the catch.
+      boolean newLine = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CATCH_LINE)
+          && handlerOffset != null
+          && RoundTrip.catchOnNewLine(i == 1 ? first : stats.get(i - 1), handlerOffset,
+              i == 1 && !resources.isEmpty());
+      if (newLine) {
+        buf.appendLineSeparator().appendIndent(indent);
+      }
+      if (handlerOffset != null && handlerOffset > -1) {
+        // The store belongs to the catch's line, which is this one only after a split.
+        buf.addBytecodeMapping(handlerOffset);
+      }
+      buf.append(newLine ? "catch (" : " catch (");
 
       List<String> exception_types = exctstrings.get(i - 1);
       for (int exc_index = 0; exc_index < exception_types.size(); ++exc_index) {

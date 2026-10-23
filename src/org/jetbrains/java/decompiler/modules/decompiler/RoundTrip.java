@@ -498,6 +498,50 @@ public final class RoundTrip {
     return lnt.findLineNumber(offset) != (offset <= 0 ? -1 : lnt.findLineNumber(offset - 1));
   }
 
+  /** The target's source line for a bytecode offset, or -1. */
+  public static int lineAtOffset(int offset) {
+    StructMethod method = currentMethod();
+    return method == null || offset < 0 ? -1 : lineAt(method, offset);
+  }
+
+  /** The greatest line the target gives an instruction strictly between two offsets, or -1. */
+  public static int highestLineBetween(int from, int to) {
+    StructMethod method = currentMethod();
+    if (method == null || from < 0 || to <= from) {
+      return -1;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    int[] raw = table.getRawData();
+    int best = -1;
+    for (int i = 0; i + 1 < raw.length; i += 2) {
+      if (raw[i] > from && raw[i] < to) {
+        best = Math.max(best, raw[i + 1]);
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Whether the original wrote this catch clause on a line of its own. A try-with-resources'
+   * synthetic close sits on the closing brace's line, so the greatest line between the block's
+   * last exprent and the handler belongs to the closing brace. A brace written on the catch's
+   * line puts that entry on the handler's line. A try without resources emits nothing there,
+   * and the brace's line is not in the class file at all.
+   */
+  public static boolean catchOnNewLine(Statement previous, int handlerOffset, boolean resources) {
+    if (!resources || previous == null || handlerOffset < 0) {
+      return false;
+    }
+    int end = previous.getStartEndRange().end;
+    int braceLine = Math.max(lineAtOffset(end), highestLineBetween(end, handlerOffset));
+    int handlerLine = lineAtOffset(handlerOffset);
+    return braceLine >= 0 && handlerLine > braceLine;
+  }
+
   /** Whether the original source started the second expression on a later line than the first ended. */
   public static boolean newlineBetween(Exprent before, Exprent after) {
     int end = sourceLineEnd(before);
