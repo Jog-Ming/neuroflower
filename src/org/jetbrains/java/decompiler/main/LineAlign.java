@@ -763,8 +763,8 @@ public final class LineAlign {
    * printed on another line than the entry's own instruction: a chain link's receiver, or the store
    * of an expression spanning several lines. Such an inherited line describes the entry it came
    * from, not the text printed beside it. The instructions that have an entry of their own are the
-   * ones whose text this printed line actually holds, so their shift is taken when they agree;
-   * otherwise the line stays conflicted and unmoved.
+   * ones whose text this printed line actually holds; a line still starts where the earliest of
+   * them does, which is the statement's own line rather than an operand's continuation.
    */
   private static void resolveCandidates(Map<Integer, List<int[]>> candidates,
       TreeMap<Integer, Integer> shifts, Set<Integer> conflicted) {
@@ -780,7 +780,9 @@ public final class LineAlign {
       if (all.size() == 1) {
         add(shifts, conflicted, line.getKey(), all.iterator().next());
       }
-      else if (exact.size() == 1) {
+      else if (!exact.isEmpty()) {
+        // The line's first token is the statement's start, and the instructions printed before
+        // the operands that continue it carry the earliest original line among its own entries.
         add(shifts, conflicted, line.getKey(), exact.iterator().next());
       }
       else {
