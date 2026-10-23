@@ -363,7 +363,13 @@ public class ClassWriter implements StatementWriter {
                   }
                 }
               } else if (firstStat instanceof BasicBlockStatement && firstStat.getExprents() != null && firstStat.getExprents().isEmpty()) {
-                buffer.append(" {}");
+                // An empty body is still a body: when the target's method starts on a later line
+                // than the lambda was created on, the braces were written on that later line.
+                if (creationLine >= 0 && RoundTrip.methodLine(methodWrapper.methodStruct) > creationLine) {
+                  buffer.appendLineSeparator().append("{}");
+                } else {
+                  buffer.append(" {}");
+                }
                 simpleLambda = true;
               }
             }
