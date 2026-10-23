@@ -1557,9 +1557,8 @@ public final class ConstantNames {
         int fieldMatches = 0;
         long bestCoordinate = NO_COORDINATE;
         for (Site site : candidates) {
-          if (pair.open() >= 0 && (site.start() <= pair.open() || site.start() >= pair.close())) {
-            continue; // outside the call's argument list
-          }
+          boolean inArgs = pair.open() >= 0 && site.start() > pair.open()
+            && site.start() < pair.close();
           long coordinate = siteCoordinate(rules.placement().spaces(), site.start());
           if (coordinate == NO_COORDINATE) {
             // A field initializer's folded literal is printed in the class body, where the
@@ -1584,7 +1583,10 @@ public final class ConstantNames {
           if (!sameRank || !atOrBefore) {
             continue; // another method, or after the reference was generated
           }
-          if (pair.open() < 0 && !atValue && coordinate <= pair.lower()) {
+          if (pair.open() >= 0 && inArgs) {
+            // the naming sits in the call's own argument list, between the pair and the invoke
+          }
+          else if (!atValue && coordinate <= pair.lower()) {
             continue; // before the previous entry's first use; the naming would move it
           }
           if (best == null || coordinate > bestCoordinate) {
