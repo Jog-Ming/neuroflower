@@ -846,6 +846,7 @@ public class InvocationExprent extends Exprent {
               // argument, so a type variable the arguments leave to the target must be pinned
               // in source; the constructor's recorded parameter type is what demanded it.
               getGenericArgs(fparams, genericsMap, genericArgs);
+              narrowRecordedFunctionReturns(fparams, genericArgs);
             }
             else if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
               && tryDemandWitness(fparams, bounds)) {
@@ -2883,6 +2884,53 @@ public class InvocationExprent extends Exprent {
     List<VarType> probe = new ArrayList<>();
     getGenericArgs(fparams, genericsMap, probe);
     return probe.size() == fparams.size() && allConcreteTypes(probe);
+  }
+
+  /**
+   * Narrow a witness value the call's target named to the type a method reference inside the
+   * matching argument records. javac leaves a reference's ground target to the natural type when
+   * the call itself leaves the variable to the target, and the metafactory records the choice:
+   * `FriendlyByteBuf.limitValue(ArrayList::new, 8)` records {@code (I)ArrayList}, so the
+   * readCollection argument's {@code IntFunction<C>} had C = ArrayList, not the List the
+   * enclosing constructor's parameter supplied. Only a one-argument functional parameter whose
+   * argument holds a reference of that same interface, recording a class strictly below the
+   * printed erasure, replaces the value; the arguments the witness already carries stay.
+   */
+  private void narrowRecordedFunctionReturns(List<String> fparams, List<VarType> witness) {
+    if (desc == null || desc.getSignature() == null || witness.size() != fparams.size()) {
+      return;
+    }
+    List<VarType> parameterTypes = desc.getSignature().parameterTypes;
+    int count = Math.min(parameterTypes.size(), lstParameters.size());
+    for (int p = 0; p < count; p++) {
+      if (!(parameterTypes.get(p) instanceof GenericType functional)
+        || functional.getArguments().size() != 1) {
+        continue;
+      }
+      VarType variable = functional.getArguments().get(0);
+      int index = fparams.indexOf(variable.value);
+      if (index < 0 || !(witness.get(index) instanceof GenericType printed) || printed.getArguments().isEmpty()) {
+        continue;
+      }
+      for (Exprent nested : lstParameters.get(p).getAllExprents(true, true)) {
+        if (!(nested instanceof NewExprent lambda) || !lambda.isLambda() || !lambda.isMethodReference()) {
+          continue;
+        }
+        ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+        if (node == null || node.lambdaInformation == null || node.anonymousClassType == null
+          || !functional.value.equals(node.anonymousClassType.value)) {
+          continue;
+        }
+        VarType recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
+        if (recorded == null || recorded.type != CodeType.OBJECT || recorded.arrayDim != 0
+          || recorded.value.equals(printed.value)
+          || !DecompilerContext.getStructContext().instanceOf(recorded.value, printed.value)) {
+          continue;
+        }
+        witness.set(index, new GenericType(CodeType.OBJECT, 0, recorded.value, null, printed.getArguments(), printed.getWildcard()));
+        break;
+      }
+    }
   }
 
   /**
