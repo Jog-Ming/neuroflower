@@ -158,7 +158,12 @@ public final class IfPatternMatchProcessor {
           Exprent stored = assign.getLeft();
           Exprent method = assign.getRight();
           if ((!(method instanceof FunctionExprent) || ((FunctionExprent) method).getFuncType() != FunctionType.CAST)
-            && checked.equals(stored) && !checked.isVarReferenced(root, (VarExprent) stored)) {
+            && checked.equals(stored) && !checked.isVarReferenced(root, (VarExprent) stored)
+            // The target's local variable table names this slot at the store's end: the source
+            // declared the variable, and folding its value into the instanceof would drop the
+            // store javac emitted and shift every later slot. javac's own pattern temporaries
+            // are named pattN$temp and stay foldable.
+            && !declaredInSource(stored)) {
             iof.getLstOperands().set(0, assign.getRight());
             before.getExprents().remove(before.getExprents().size() - 1);
           }
@@ -167,6 +172,15 @@ public final class IfPatternMatchProcessor {
     }
 
     return result;
+  }
+
+  /** True when the target's table gives this variable a name the source must have written. */
+  private static boolean declaredInSource(Exprent stored) {
+    if (!(stored instanceof VarExprent var) || var.getLVT() == null) {
+      return false;
+    }
+    String name = var.getLVT().getName();
+    return name == null || !name.matches("patt[0-9]+\\$temp");
   }
 
   private static boolean findPatternMatchingInstanceof(Exprent left, Exprent right, Exprent source, Exprent target, Statement branch, FunctionExprent iof, Statement head) {
