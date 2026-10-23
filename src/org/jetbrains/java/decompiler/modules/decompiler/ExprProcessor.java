@@ -1454,7 +1454,33 @@ public class ExprProcessor implements CodeConstants {
       castRaw = true;
     }
 
-    boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
+    // An argument whose parameter is the raw class G but whose value is a parameterized subtype
+    // of G: our solution for the callee's G<A> is the subtype's own argument, a capture javac
+    // cannot use. The subtype's recorded supertype view names the parameterization the source
+    // cast to (TaggedChoiceType<?> as Type<Pair<?,?>>); that view's instantiation is provably
+    // distinct from the subtype's, so the source widened to the erased G first. Both steps erase
+    // to the parameter's own class, so no checkcast can appear.
+    boolean doubleCast = false;
+    VarType doubleCastTarget = leftType;
+    if (!doCastGenerics && !doCast && !castRaw && !doCastNull && !doCastNarrowing && !castAlways
+      && leftType != null && leftType.type == CodeType.OBJECT && leftType.arrayDim == 0 && !leftType.isGeneric()
+      && exprent instanceof InvocationExprent
+      && rightType instanceof GenericType typedValue && typedValue.getWildcard() == GenericType.WILDCARD_NO
+      && typedValue.type == CodeType.OBJECT && typedValue.value != null
+      && !typedValue.value.equals(leftType.value)
+      && DecompilerContext.getStructContext().instanceOf(typedValue.value, leftType.value)) {
+      VarType view = GenericType.getGenericSuperType(typedValue, new VarType(CodeType.OBJECT, 0, leftType.value));
+      boolean[] captured = new boolean[1];
+      view = wildcardUnnameableInView(view, exprent.getNamedGenerics(), captured);
+      if (captured[0] && view instanceof GenericType superView && leftType.value.equals(superView.value)
+        && superView.getWildcard() == GenericType.WILDCARD_NO && !superView.equalsExact(typedValue)
+        && !invalidGenericInstantiation(superView) && unboundedClassParameters(superView.value)) {
+        doubleCastTarget = superView;
+        doubleCast = true;
+      }
+    }
+
+    boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics || doubleCast;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
       cast = castAlways;
@@ -1478,8 +1504,12 @@ public class ExprProcessor implements CodeConstants {
     }
 
     if (cast) {
-      VarType castType = castRaw ? new VarType(leftType.type, leftType.arrayDim, leftType.value) : leftType;
+      VarType castType = doubleCast ? doubleCastTarget
+        : castRaw ? new VarType(leftType.type, leftType.arrayDim, leftType.value) : leftType;
       buffer.append('(').appendCastTypeName(castType).append(')');
+      if (doubleCast) {
+        buffer.append('(').appendCastTypeName(erasedWildcardForm(doubleCastTarget)).append(')');
+      }
     }
 
     if (castLambda) {
@@ -1547,6 +1577,77 @@ public class ExprProcessor implements CodeConstants {
       }
     }
     return false;
+  }
+
+  /**
+   * Replaces every type variable not recorded at the call site with the unbounded wildcard,
+   * reporting whether any was replaced: such a position is a capture, the value our inference
+   * could not name.
+   */
+  private static VarType wildcardUnnameableInView(VarType type, Map<VarType, List<VarType>> named,
+                                                  boolean[] captured) {
+    if (type == null) {
+      return null;
+    }
+    if (type.type == CodeType.GENVAR) {
+      if (named.containsKey(type.resizeArrayDim(0))) {
+        return type;
+      }
+      captured[0] = true;
+      return null;
+    }
+    if (!(type instanceof GenericType generic) || generic.getArguments().isEmpty()) {
+      return type;
+    }
+    List<VarType> arguments = new ArrayList<>(generic.getArguments().size());
+    boolean changed = false;
+    for (VarType argument : generic.getArguments()) {
+      if (argument == null) {
+        arguments.add(null);
+        continue;
+      }
+      VarType value = wildcardUnnameableInView(argument, named, captured);
+      if (value != argument) {
+        changed = true;
+      }
+      arguments.add(value);
+    }
+    if (!changed) {
+      return type;
+    }
+    return new GenericType(type.type, type.arrayDim, type.value, generic.getParent(),
+      Collections.unmodifiableList(arguments), generic.getWildcard());
+  }
+
+  /**
+   * Whether a class's type parameters are all unbounded: a wildcard argument is a legal cast
+   * argument there. A self-referential bound (Builder&lt;T extends Builder&lt;T&gt;&gt;) rejects
+   * the wildcard, so its subtypes' casts must not be invented.
+   */
+  private static boolean unboundedClassParameters(String internalName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(internalName);
+    if (cls == null || cls.getSignature() == null) {
+      return true;
+    }
+    for (List<VarType> bounds : cls.getSignature().fbounds) {
+      if (bounds != null && !bounds.isEmpty() && !VarType.VARTYPE_OBJECT.equals(bounds.get(0))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** The erased form of a parameterized instantiation: its class with unbounded wildcards. */
+  private static VarType erasedWildcardForm(VarType type) {
+    if (!(type instanceof GenericType generic)) {
+      return new VarType(type.type, type.arrayDim, type.value);
+    }
+    List<VarType> arguments = new ArrayList<>(generic.getArguments().size());
+    for (int i = 0; i < generic.getArguments().size(); i++) {
+      arguments.add(null);
+    }
+    return new GenericType(CodeType.OBJECT, type.arrayDim, type.value, null,
+      Collections.unmodifiableList(arguments), GenericType.WILDCARD_NO);
   }
 
   /**
