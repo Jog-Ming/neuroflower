@@ -1705,6 +1705,140 @@ public final class ConstantNames {
       && (atValue || coordinate > pair.lower());
   }
 
+  /**
+   * The expression a pool-proven naming site wrote.
+   *
+   * <p>A pair directly before the site records that the source named a constant of its owner as
+   * the last pool-entering event there; the folded value it produced is the recorded literal. When
+   * no constant of that value exists, the source wrote an expression over one of the owner's
+   * constants and a literal. Each constant is tried with the verified solver, which folds the
+   * whole expression back in the recorded type and accepts only a bit-exact result; the literal
+   * is printed parenthesised so the surrounding expression keeps its precedence.
+   */
+  private static Site solvedSite(String key, int start, int end, String own, List<String> imports,
+                                 String packageName, Placement placement) {
+    if (placement == null || placement.pairs() == null || placement.spaces() == null) {
+      return null;
+    }
+    int bar = key.indexOf('|');
+    if (bar < 0) {
+      return null;
+    }
+    VariableType kind = variableType(key.substring(0, bar));
+    if (kind == null) {
+      return null;
+    }
+    Object value;
+    try {
+      String text = key.substring(bar + 1);
+      value = switch (kind) {
+        case INT -> Integer.valueOf(Integer.parseInt(text));
+        case LONG -> Long.valueOf(Long.parseLong(text));
+        case FLOAT -> Float.valueOf(Float.parseFloat(text));
+        case DOUBLE -> Double.valueOf(Double.parseDouble(text));
+        default -> null;
+      };
+    }
+    catch (NumberFormatException e) {
+      return null;
+    }
+    if (value == null) {
+      return null;
+    }
+    StructClass site = DecompilerContext.getStructContext().getClass(own);
+    if (site == null) {
+      return null;
+    }
+    for (Map.Entry<String, PairSite> entry : placement.pairs().entrySet()) {
+      if (entry.getValue().successorKey() == null
+          || !pairProvesSite(entry.getValue(), key, start, placement)) {
+        continue; // only the value the naming itself entered is an exact solved-value proof
+      }
+      String owner = entry.getKey();
+      String qualifier = solverQualifier(owner, packageName);
+      if (qualifier == null) {
+        return null; // the owner cannot be named unambiguously from this class
+      }
+      List<SourceConstant> sources = sourceConstants(owner, site, imports, packageName);
+      String found = null;
+      for (SourceConstant source : sources) {
+        if (!numeric(source.kind()) || promote(source.kind(), kind) != kind) {
+          continue; // the expression's static type must be the recorded literal's own type
+        }
+        String fieldName = source.name().substring(source.name().lastIndexOf('.') + 1);
+        String name = qualifier + "." + fieldName;
+        String expression = constantExpression(new FieldConstant(null, kind, value),
+          source.kind(), source.value(), name);
+        if (expression != null && source.kind() != kind
+            && (expression.equals(name) || expression.equals("-" + name)
+                || expression.equals("~" + name))) {
+          // A bare constant keeps its own type: an int constant where a float literal stood would
+          // turn a division or multiplication into integer arithmetic.
+          continue;
+        }
+        if (expression == null) {
+          continue;
+        }
+        if (found == null) {
+          // Several constants of one owner may fold to the value (PI/6, HALF_PI/3, ...). The
+          // naming enters only the owner's Class and class name, so the chosen constant's name
+          // is not in the pool and any of them reproduces the same bytes; the first declared wins.
+          found = expression;
+        }
+      }
+      return found == null ? null : new Site(start, end, "(" + found + ")", entry.getKey());
+    }
+    return null;
+  }
+
+  /** The fully qualified form of the owner's name, unambiguous at any site, or null. */
+  private static String solverQualifier(String owner, String packageName) {
+    if (anonymous(owner)) {
+      return null;
+    }
+    if (!publiclyNameable(owner, packageName) && !packageName.equals(packageOf(owner))) {
+      return null;
+    }
+    return owner.replace('/', '.').replace('$', '.');
+  }
+
+  private static VariableType variableType(String name) {
+    return switch (name) {
+      case "INT" -> VariableType.INT;
+      case "LONG" -> VariableType.LONG;
+      case "FLOAT" -> VariableType.FLOAT;
+      case "DOUBLE" -> VariableType.DOUBLE;
+      default -> null;
+    };
+  }
+
+  /** Whether the pair's own record places a naming at this literal, for that literal's value. */
+  private static boolean pairProvesSite(PairSite pair, String key, int position, Placement placement) {
+    if (!pair.valueAvailable(key)) {
+      return false; // naming this value would enter a pool entry the original did not have
+    }
+    long coordinate = siteCoordinate(placement.spaces(), position);
+    if (coordinate == NO_COORDINATE) {
+      return false;
+    }
+    long offset = coordinate & 0xffffffffL;
+    long successorOffset = pair.successor() & 0xffffffffL;
+    boolean sameRank = (coordinate >>> 32) == (pair.successor() >>> 32);
+    boolean atValue = pair.member() == null && offset == successorOffset
+      && key.equals(pair.successorKey());
+    if (pair.successorKey() != null) {
+      // The pair's next entry is the folded value the naming entered; a different value would
+      // stand between the pair and it in the pool.
+      return sameRank && atValue;
+    }
+    boolean before = offset < successorOffset;
+    if (pair.open() >= 0) {
+      boolean inArgs = position > pair.open() && position < pair.close();
+      return sameRank && (inArgs || before && coordinate > pair.lower());
+    }
+    return sameRank && before && coordinate > pair.lower();
+  }
+
   /** Whether some site already names this owner in the class text. */
   private static boolean hasSiteFor(List<Site> sites, String owner) {
     for (Site site : sites) {
@@ -3322,6 +3456,12 @@ public final class ConstantNames {
                               Set<String> inWindow) {
     List<Constant> constants = candidates.get(key);
     if (constants == null || constants.isEmpty()) {
+      // No constant of this value exists, but a pool pair may still prove that the source named
+      // an owner here: the folded value was written as an expression over one of its constants.
+      Site solved = prefix.isEmpty() ? solvedSite(key, start, end, own, imports, packageName, placement) : null;
+      if (solved != null) {
+        addSiteOnce(sites, solved);
+      }
       return;
     }
     // A quoted literal is printed by enclosing a buffer whose mapping sits at its content start,
