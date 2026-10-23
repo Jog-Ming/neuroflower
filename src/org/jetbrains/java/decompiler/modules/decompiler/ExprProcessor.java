@@ -25,6 +25,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectNode;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.FlattenStatementsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
@@ -624,7 +625,8 @@ public class ExprProcessor implements CodeConstants {
                     // null-checked, the value is inlined. The pushed constant is the field access.
                     if (nextOpc >= opc_aconst_null && nextOpc <= opc_ldc2_w) {
                       FieldExprent access = constantVariableAccess(invocation, exprlist, seq.getInstr(i + 1), pool, cl,
-                        methodDescriptor, varProcessor.getMethod().hasModifier(CodeConstants.ACC_STATIC));
+                        methodDescriptor, varProcessor.getMethod().hasModifier(CodeConstants.ACC_STATIC),
+                        varProcessor, seq.getInstr(i + 1).startOffset);
                       if (access != null) {
                         // The check itself is not printed: javac re-emits it from the field access.
                         // Dropping the assignment here also keeps the qualified value's copy from
@@ -711,7 +713,8 @@ public class ExprProcessor implements CodeConstants {
    */
   private static FieldExprent constantVariableAccess(InvocationExprent invocation, List<Exprent> exprlist,
                                                      Instruction next, ConstantPool pool, StructClass cl,
-                                                     MethodDescriptor methodDescriptor, boolean isStatic) {
+                                                     MethodDescriptor methodDescriptor, boolean isStatic,
+                                                     VarProcessor varProcessor, int offset) {
     if (!invocation.isStatic()
       || !invocation.getClassname().equals("java/util/Objects")
       || !invocation.getName().equals("requireNonNull")
@@ -755,6 +758,24 @@ public class ExprProcessor implements CodeConstants {
       // table does cover uses its entry. The parse-time stack type is only the category.
       VarType declared = qualifierVar.getLVT() != null ? qualifierVar.getLVT().getVarType()
         : parameterType(qualifierVar, cl, methodDescriptor, isStatic);
+      if ((declared == null || declared.type != CodeType.OBJECT) && varProcessor.hasLVT()) {
+        // Only the load that opens a variable's scope carries its table entry while the
+        // expression list is built; a later load still has the entry whose range covers this pc.
+        LocalVariable covering = null;
+        List<LocalVariable> candidates =
+          varProcessor.getCandidates(qualifierVar.getIndex());
+        if (candidates != null) {
+          for (LocalVariable candidate : candidates) {
+            if (candidate.getStart() <= offset && offset < candidate.getEnd()
+              && (covering == null || candidate.getStart() > covering.getStart())) {
+              covering = candidate;
+            }
+          }
+        }
+        if (covering != null) {
+          declared = covering.getVarType();
+        }
+      }
       if (declared != null && declared.type == CodeType.OBJECT && declared.arrayDim == 0) {
         qualifierType = declared;
       }
@@ -763,8 +784,7 @@ public class ExprProcessor implements CodeConstants {
       return null;
     }
 
-    StructClass owner = DecompilerContext.getStructContext().getClass(qualifierType.value);
-    if (owner == null) {
+    StructClass owner = DecompilerContext.getStructContext().getClass(qualifierType.value);    if (owner == null) {
       return null;
     }
 
