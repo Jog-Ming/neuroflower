@@ -762,6 +762,11 @@ public class InvocationExprent extends Exprent {
               // The outer call's functional argument records the value it must return, and the
               // receiver's type argument is invariant in it: the recorded type pins the variable.
             }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && targetProjectionDemand(fparams, ret, upperBound, bounds)) {
+              // The recorded expected type names the arguments this call's own value must carry,
+              // and the printer's own inference landed on a different one.
+            }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
               && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
               // A call inferred to an enclosing method's or class's type variable can need the
@@ -3278,6 +3283,92 @@ public class InvocationExprent extends Exprent {
     genericArgs.clear();
     genericArgs.addAll(witness);
     return true;
+  }
+
+  /**
+   * A call whose whole value is what the recorded expected type constrains, while the printer's
+   * own inference landed on an argument that invariant position rejects. The source had to name
+   * the expected one (a method reference's implementation type, say, is narrower than what the
+   * call returns). A receiver does not qualify: javac does not hand the outer chain's target to
+   * a receiver, so the outer call infers its own arguments and the receiver's result need not
+   * carry them. Values come from the expected type's projection where it names one and from the
+   * printer otherwise; every value must be nameable here and reproduce the erased descriptor.
+   */
+  private boolean targetProjectionDemand(List<String> fparams, VarType ret, VarType upperBound,
+                                         Map<VarType, List<VarType>> bounds) {
+    if (isInvocationInstance || fparams.isEmpty() || ret == null || upperBound == null || desc == null
+      || desc.getSignature() == null || !ret.isGeneric() || !upperBound.isGeneric()
+      || ret.type != CodeType.OBJECT || upperBound.type != CodeType.OBJECT
+      || ret.arrayDim != 0 || upperBound.arrayDim != 0
+      || !ret.value.equals(upperBound.value)
+      || ((GenericType) upperBound).getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    Map<VarType, VarType> projected = new HashMap<>();
+    ((GenericType) ret).mapGenVarsTo((GenericType) upperBound, projected);
+    if (projected.isEmpty()) {
+      return false;
+    }
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    boolean demanded = false;
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType value = genericsMap.get(variable);
+      VarType expected = projected.get(variable);
+      if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS) {
+        // A covariant position accepts the bound itself as the witness.
+        expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
+      } else if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() != GenericType.WILDCARD_NO) {
+        expected = null;
+      }
+      if (expected != null && isNameableWitness(expected, named, true)
+        && (value == null || !satisfiesUpperBound(value, expected))) {
+        value = expected;
+        demanded = true;
+      }
+      if (!isNameableWitness(value, named, true)) {
+        return false;
+      }
+      witness.add(value);
+    }
+    if (!demanded || !erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /** True for a witness value every type variable of which is in scope at the call. */
+  private static boolean isNameableWitness(VarType type, Map<VarType, List<VarType>> named, boolean topLevel) {
+    if (type == null) {
+      // Only an argument can be an unbounded wildcard (printed '?'); a witness cannot.
+      return !topLevel;
+    }
+    if (type == GenericType.DUMMY_VAR) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return isInScopeTypeVariable(type, named);
+    }
+    if (type instanceof GenericType generic) {
+      if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+        return !topLevel;
+      }
+      List<VarType> arguments = generic.getArguments();
+      for (VarType argument : arguments) {
+        if (!isNameableWitness(argument, named, false)) {
+          return false;
+        }
+      }
+      if (!arguments.isEmpty()) {
+        return true;
+      }
+    }
+    return type.type != CodeType.OBJECT || !isGenericClass(type.value);
   }
 
   /**
