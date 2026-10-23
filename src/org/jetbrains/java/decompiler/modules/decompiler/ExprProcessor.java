@@ -1504,7 +1504,31 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
-    boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics || doubleCast;
+    // A field whose recorded type is a wildcard-ed generic (Codec<? extends Schema<?>>) passed
+    // to a parameterized parameter: the value's argument is a capture, which the parameter's
+    // variable cannot be inferred from, so the source cast the field to the wildcard's bound
+    // instantiation (Codec<Schema<?>>). Both types are recorded - the field's Signature and the
+    // parameter's - and the cast erases to the class the value already has.
+    boolean fieldBoundCast = false;
+    VarType fieldBoundTarget = null;
+    if (!castAlways && !doCast && !doCastGenerics && !castRaw && !doCastNull && !doCastNarrowing && !doubleCast
+      && exprent instanceof FieldExprent
+      && rightType instanceof GenericType fieldType && fieldType.getWildcard() == GenericType.WILDCARD_NO
+      && fieldType.type == CodeType.OBJECT && fieldType.arrayDim == 0 && fieldType.getArguments().size() == 1
+      && fieldType.getArguments().get(0) instanceof GenericType boundWildcard
+      && boundWildcard.getWildcard() == GenericType.WILDCARD_EXTENDS && boundWildcard.value != null
+      && unboundedClassParameters(fieldType.value)) {
+      VarType bound = GenericType.withWildcard(boundWildcard, GenericType.WILDCARD_NO);
+      VarType target = new GenericType(CodeType.OBJECT, 0, fieldType.value, null,
+        Collections.singletonList(bound), GenericType.WILDCARD_NO);
+      if (!invalidGenericInstantiation(target)) {
+        fieldBoundTarget = target;
+        fieldBoundCast = true;
+      }
+    }
+
+    boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics || doubleCast
+      || fieldBoundCast;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
       cast = castAlways;
@@ -1528,7 +1552,8 @@ public class ExprProcessor implements CodeConstants {
     }
 
     if (cast) {
-      VarType castType = doubleCast ? doubleCastTarget
+      VarType castType = fieldBoundCast ? fieldBoundTarget
+        : doubleCast ? doubleCastTarget
         : castRaw ? new VarType(leftType.type, leftType.arrayDim, leftType.value) : leftType;
       buffer.append('(').appendCastTypeName(castType).append(')');
       if (doubleCast) {
