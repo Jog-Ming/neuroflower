@@ -671,6 +671,25 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's increment instruction follows the assignment's store, so the source
+   * wrote the increment as a later statement ({@code x = y; y++;}) and the printer's merge into
+   * {@code x = y++} would move the iinc in front of the store.
+   */
+  public static boolean incrementAfterStore(Exprent assignment, Exprent increment) {
+    if (!selector("ppistore")) {
+      return false;
+    }
+    BitSet store = assignment.bytecode;
+    BitSet inc = increment.bytecode;
+    if (store == null || store.isEmpty() || inc == null || inc.isEmpty()) {
+      return false;
+    }
+    int incOffset = inc.nextSetBit(0);
+    int storeOffset = store.length() - 1;
+    return incOffset >= 0 && incOffset >= storeOffset;
+  }
+
+  /**
    * True when the target kept a duplicate of the left-hand side next to the matching operand:
    * {@code this.f += e} compiles as {@code aload_0; dup; getfield f; ...; putfield f}, while
    * {@code this.f = this.f + e} loads the field twice.

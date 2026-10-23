@@ -568,6 +568,12 @@ public class SimplifyExprentsHelper {
 
       if ((in.getFuncType() == FunctionType.MMI || in.getFuncType() == FunctionType.PPI) &&
         in.getLstOperands().get(0).equals(as.getRight())) {
+        // The merge moves the increment in front of the store. Only a target whose iinc already
+        // sits before the store had that expression form; an iinc after the store is the
+        // source's own following statement (`x = y; y++;`), and merging it reorders the bytes.
+        if (RoundTrip.incrementAfterStore(as, in)) {
+          return false;
+        }
 
         if (in.getFuncType() == FunctionType.MMI) {
           in.setFuncType(FunctionType.IMM);
