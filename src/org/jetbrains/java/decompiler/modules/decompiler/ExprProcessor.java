@@ -1721,9 +1721,10 @@ public class ExprProcessor implements CodeConstants {
 
   /**
    * JLS 5.5.1 for the wildcard-capture shape: a cast to {@code X<Z>} from {@code X<? extends B<..>>}
-   * is legal only when Z is reachable from the wildcard's bound, i.e. Z's view as B is exactly the
-   * bound (a proper subtype would be accepted too, but its view is what the capture could be).
-   * Anything else is provably distinct and javac rejects the cast; only the raw erasure compiles.
+   * is legal only when Z is contained by the wildcard's bound, i.e. Z is a subtype of B. A target
+   * position that is itself a wildcard, or a type variable, is never provably distinct from the
+   * value's wildcard and javac accepts the unchecked cast. Anything else is provably distinct and
+   * javac rejects the cast; only the raw erasure compiles.
    */
   private static boolean parameterizedCastIllegal(VarType left, VarType right) {
     if (!(left instanceof GenericType target) || !(right instanceof GenericType value)
@@ -1744,13 +1745,23 @@ public class ExprProcessor implements CodeConstants {
         || !wildcard.isGeneric() || wildcard.getArguments().isEmpty() || wildcard.value == null) {
         continue;
       }
-      if (targetArg == null || targetArg.value == null) {
-        return true;
+      // An unbounded `?` parses as null; like every wildcard target it is never provably distinct.
+      if (targetArg == null || targetArg instanceof GenericType targetWildcard
+        && targetWildcard.getWildcard() != GenericType.WILDCARD_NO) {
+        continue;
       }
-      VarType view = targetArg.value.equals(wildcard.value) ? targetArg
-        : GenericType.getGenericSuperType(targetArg, new VarType(CodeType.OBJECT, 0, wildcard.value));
-      if (!(view instanceof GenericType genericView) || !wildcard.value.equals(view.value)
-        || !genericView.equalsExact(wildcard)) {
+      // A type variable is not provably distinct from a wildcard either.
+      if (targetArg.type == CodeType.GENVAR) {
+        continue;
+      }
+      // A concrete argument is contained by `? extends B` when it is a subtype of B: Integer is
+      // legal under `? extends Number`, Object is not. A parameterized argument is contained only
+      // when its own class is B's class; a parameterized proper subtype is rejected even though
+      // its erasure is a subtype (the capture could have been a sibling subtype), and the source
+      // that compiled wrote the raw erasure there. Only an uncontained argument forces the raw.
+      if (targetArg.type != CodeType.OBJECT || targetArg.arrayDim != 0 || targetArg.value == null
+        || !DecompilerContext.getStructContext().instanceOf(targetArg.value, wildcard.value)
+        || targetArg.isGeneric() && !targetArg.value.equals(wildcard.value)) {
         return true;
       }
     }
