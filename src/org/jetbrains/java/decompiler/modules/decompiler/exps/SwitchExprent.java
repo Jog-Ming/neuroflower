@@ -241,16 +241,10 @@ public class SwitchExprent extends Exprent {
         return order;
       }
     }
-    if (defaultIndex < 0) {
-      return order;
-    }
-
-    order.remove(defaultIndex);
-    int rank = 0;
-    while (rank < order.size() && offset[order.get(rank)] < offset[defaultIndex]) {
-      rank++;
-    }
-    order.add(rank, defaultIndex);
+    // Javac emits every arm's code in source order, the default included; the case table is
+    // what reorders the labels, not the blocks. Sorting by the arm's first instruction
+    // restores the source's arm order.
+    order.sort((a, b) -> Integer.compare(offset[a], offset[b]));
     return order;
   }
 
