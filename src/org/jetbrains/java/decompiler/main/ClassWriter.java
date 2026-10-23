@@ -1228,14 +1228,16 @@ public class ClassWriter implements StatementWriter {
 
   private void writeField(TextBuffer buffer, int indent, StructField fd, ClassWrapper wrapper) {
     TextBuffer fieldBuffer = new TextBuffer();
-    // A static field's initializer, and every enum constant, lives in <clinit>; printing it needs
-    // that method's line table for its argument and chain breaks. Fields are written outside any
-    // method's context, where the previous method would otherwise supply the wrong lines.
+    // A static field's initializer, and every enum constant, lives in <clinit>; an instance
+    // initializer keeps the constructor's offsets. Printing either needs that method's line table
+    // for its argument and chain breaks. Fields are written outside any method's context, where
+    // the previous method would otherwise supply the wrong lines -- or none at all.
     StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
-    StructMethod clinit = fd.hasModifier(CodeConstants.ACC_STATIC)
-      ? wrapper.getClassStruct().getMethod(CodeConstants.CLINIT_NAME, "()V") : null;
-    if (clinit != null) {
-      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, clinit);
+    StructMethod context = fd.hasModifier(CodeConstants.ACC_STATIC)
+      ? wrapper.getClassStruct().getMethod(CodeConstants.CLINIT_NAME, "()V")
+      : wrapper.getDynamicInitializerOwner();
+    if (context != null) {
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, context);
     }
     try {
       writeField(wrapper, wrapper.getClassStruct(), fd, fieldBuffer, indent + 1);

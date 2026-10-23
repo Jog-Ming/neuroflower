@@ -433,6 +433,11 @@ public final class InitializerProcessor {
       return;
     }
 
+    // The value stored below is the first constructor's own expression, so its bytecode offsets
+    // are offsets into that constructor. The printer must read the target's lines for them from
+    // the same method: no other table describes where the initializer's text sat.
+    wrapper.setDynamicInitializerOwner(lstMethodWrappers.get(0).methodStruct);
+
     Set<String> whitelist = new HashSet<String>(wrapper.getStaticFieldInitializers().getLstKeys());
     int prev_fidx = 0;
 

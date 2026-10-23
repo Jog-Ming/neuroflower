@@ -41,6 +41,9 @@ public class ClassWrapper {
   private final Set<String> hiddenMembers = new HashSet<>();
   private final VBStyleCollection<Exprent, String> staticFieldInitializers = new VBStyleCollection<>();
   private final VBStyleCollection<Exprent, String> dynamicFieldInitializers = new VBStyleCollection<>();
+  // The constructor a lifted instance initializer was taken from; its line table is the only
+  // record of the target lines inside the initializer's expression.
+  private StructMethod dynamicInitializerOwner;
   private final VBStyleCollection<MethodWrapper, String> methods = new VBStyleCollection<>();
   private final Map<String, MethodProperties> methodProperties = new HashMap<>();
 
@@ -267,6 +270,14 @@ public class ClassWrapper {
 
   public VBStyleCollection<Exprent, String> getDynamicFieldInitializers() {
     return dynamicFieldInitializers;
+  }
+
+  public StructMethod getDynamicInitializerOwner() {
+    return dynamicInitializerOwner;
+  }
+
+  public void setDynamicInitializerOwner(StructMethod method) {
+    this.dynamicInitializerOwner = method;
   }
 
   @Override
