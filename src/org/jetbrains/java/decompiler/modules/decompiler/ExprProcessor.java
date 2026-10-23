@@ -1445,6 +1445,15 @@ public class ExprProcessor implements CodeConstants {
       castRaw = false;
     }
 
+    // A cast from an instantiation whose type argument is a wildcard capture to another
+    // instantiation is illegal under JLS 5.5.1 unless the target's argument is the wildcard's
+    // own bound (or below it): javac rejects the printed conversion outright. The source that
+    // compiled wrote the raw erasure instead, which erases to the same class, so the class file
+    // is unchanged.
+    if (doCastGenerics && !castRaw && parameterizedCastIllegal(leftType, rightType)) {
+      castRaw = true;
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
@@ -1534,6 +1543,44 @@ public class ExprProcessor implements CodeConstants {
     }
     for (int i = 0; i < targetArgs.size(); i++) {
       if (argumentProvablyDistinct(targetArgs.get(i), valueArgs.get(i))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * JLS 5.5.1 for the wildcard-capture shape: a cast to {@code X<Z>} from {@code X<? extends B<..>>}
+   * is legal only when Z is reachable from the wildcard's bound, i.e. Z's view as B is exactly the
+   * bound (a proper subtype would be accepted too, but its view is what the capture could be).
+   * Anything else is provably distinct and javac rejects the cast; only the raw erasure compiles.
+   */
+  private static boolean parameterizedCastIllegal(VarType left, VarType right) {
+    if (!(left instanceof GenericType target) || !(right instanceof GenericType value)
+      || target.getWildcard() != GenericType.WILDCARD_NO || value.getWildcard() != GenericType.WILDCARD_NO
+      || target.arrayDim != 0 || value.arrayDim != 0 || target.value == null || value.value == null
+      || !target.value.equals(value.value)) {
+      return false;
+    }
+    List<VarType> targetArgs = target.getArguments();
+    List<VarType> valueArgs = value.getArguments();
+    if (targetArgs.size() != valueArgs.size()) {
+      return false;
+    }
+    for (int i = 0; i < targetArgs.size(); i++) {
+      VarType targetArg = targetArgs.get(i);
+      VarType valueArg = valueArgs.get(i);
+      if (!(valueArg instanceof GenericType wildcard) || wildcard.getWildcard() != GenericType.WILDCARD_EXTENDS
+        || !wildcard.isGeneric() || wildcard.getArguments().isEmpty() || wildcard.value == null) {
+        continue;
+      }
+      if (targetArg == null || targetArg.value == null) {
+        return true;
+      }
+      VarType view = targetArg.value.equals(wildcard.value) ? targetArg
+        : GenericType.getGenericSuperType(targetArg, new VarType(CodeType.OBJECT, 0, wildcard.value));
+      if (!(view instanceof GenericType genericView) || !wildcard.value.equals(view.value)
+        || !genericView.equalsExact(wildcard)) {
         return true;
       }
     }
