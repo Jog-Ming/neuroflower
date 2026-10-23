@@ -573,7 +573,7 @@ public class NewExprent extends Exprent {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
           List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs
-            : impliedConstructorArgs != null ? impliedConstructorArgs : constructor.getGenericArgs();
+            : impliedConstructorArgs != null ? impliedConstructorArgs : constructor.getPrintedGenericArgs();
           if (targetedDiamond && forcedConstructorArgs == null) {
             // The recovered arguments are only subtypes of the expected ones; printing them
             // would pin javac to a type the target rejects, so the source wrote the diamond.

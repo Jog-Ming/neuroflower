@@ -100,6 +100,13 @@ public class InvocationExprent extends Exprent {
   /** The witness the lambda-body target pass proved, kept across the print-time re-inference. */
   private List<VarType> lambdaBodyWitness;
   /**
+   * The witness the top-down solver proved from a recorded parameter or declaration Signature.
+   * Kept apart from {@link #genericArgs} so a later re-inference cannot lose it.
+   */
+  private List<VarType> topDownWitness;
+  /** Whether the proof replaces the constructor's printed bound default rather than filling a gap. */
+  private boolean topDownOverridesPrinted;
+  /**
    * The map invocation whose type argument an enclosing {@code Optional.orElse}/{@code orElseGet}
    * argument pins, and the recorded wildcard type that pins it. Set only while the receiver
    * subtree of such a call is being inferred or printed.
@@ -628,6 +635,21 @@ public class InvocationExprent extends Exprent {
                 }
                 else {
                   argtype = parameter.getInferredExprType(paramUB);
+                }
+
+                // The declared parameter type is a recorded target. When it fixes this
+                // argument's own type variables to nameable types, the source named them; a pure
+                // element factory passes the target one level in to its elements.
+                if (functype != Type.INIT
+                  && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+                  && paramUB != null && paramUB.isGeneric()) {
+                  if (parameter instanceof InvocationExprent topDown) {
+                    topDown.applyTopDownTarget(paramUB);
+                  }
+                  else if (parameter instanceof NewExprent created && !created.isLambda()
+                    && created.getConstructor() != null) {
+                    created.getConstructor().applyTopDownNewTarget(created, paramUB);
+                  }
                 }
 
                 // If the instance type is a wildcard and the param type can give us more information about the instance
@@ -3184,6 +3206,252 @@ public class InvocationExprent extends Exprent {
       }
     }
     return type.type != CodeType.OBJECT || !isGenericClass(type.value);
+  }
+
+  // ------------------------------------------------------------------ top-down witnesses
+
+  /**
+   * The recorded target of an argument, handed down by the enclosing call's parameter Signature.
+   * A call whose declared return is {@code C<V>} and whose parameters are all the variable V is a
+   * pure element factory: its elements have the target's element type, so the same question is
+   * asked one level in. A call's own witness is not named here: the existing recorded-
+   * instantiation proofs already name those, and a value inferred against a different target
+   * changed calls that used to compile. The constructor below is the gap this fills, because its
+   * printed type argument otherwise falls back to the declared bound.
+   */
+  private void applyTopDownTarget(VarType target) {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+      || target == null || !target.isGeneric() || desc == null || desc.getSignature() == null) {
+      return;
+    }
+    VarType elementTarget = elementArgumentTarget(target);
+    if (elementTarget != null) {
+      for (Exprent argument : lstParameters) {
+        if (argument instanceof InvocationExprent invocation) {
+          invocation.applyTopDownTarget(elementTarget);
+        }
+        else if (argument instanceof NewExprent created && !created.isLambda()
+          && created.getConstructor() != null) {
+          created.getConstructor().applyTopDownNewTarget(created, elementTarget);
+        }
+      }
+      return;
+    }
+  }
+
+  /** The element type when this call is a pure factory of its single type variable, else null. */
+  private VarType elementArgumentTarget(VarType target) {
+    List<String> typeParameters = desc.getSignature().typeParameters;
+    if (typeParameters.size() != 1 || lstParameters.isEmpty()) {
+      return null;
+    }
+    VarType ret = desc.getSignature().returnType;
+    if (!(ret instanceof GenericType genericReturn) || genericReturn.type != CodeType.OBJECT
+      || genericReturn.arrayDim != 0 || genericReturn.getArguments().size() != 1) {
+      return null;
+    }
+    VarType variable = genericReturn.getArguments().get(0);
+    if (variable == null || variable.type != CodeType.GENVAR || variable.arrayDim != 0
+      || !typeParameters.contains(variable.value)) {
+      return null;
+    }
+    for (VarType parameter : desc.getSignature().parameterTypes) {
+      if (!variable.equals(parameter)) {
+        return null;
+      }
+    }
+    if (target.type != CodeType.OBJECT || target.arrayDim != 0
+      || !target.value.equals(genericReturn.value)
+      || ((GenericType) target).getArguments().size() != 1) {
+      return null;
+    }
+    VarType element = ((GenericType) target).getArguments().get(0);
+    if (element instanceof GenericType wildcard && wildcard.getWildcard() != GenericType.WILDCARD_NO) {
+      // An upper-bounded wildcard element target binds the elements to its bound; only that bound
+      // is a recorded target. A lower-bounded or unbounded wildcard forces nothing.
+      return wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS && wildcard.type == CodeType.OBJECT
+        ? wildcard.resizeArrayDim(0) : null;
+    }
+    return element;
+  }
+
+  /** The same proof for a constructor whose value must fit the recorded target. */
+  private void applyTopDownNewTarget(NewExprent created, VarType target) {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+      || target == null || !target.isGeneric() || created.getNewType().arrayDim != 0) {
+      return;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(created.getNewType().value);
+    if (cls == null || cls.getSignature() == null || cls.getSignature().fparameters.isEmpty()) {
+      return;
+    }
+    GenericType classType = cls.getSignature().genericType;
+    List<String> typeParameters = cls.getSignature().fparameters;
+    List<List<VarType>> typeBounds = cls.getSignature().fbounds;
+    VarType view = target.value.equals(classType.value) ? classType
+      : GenericType.getGenericSuperType(classType, target);
+    if (view == null || view.type != CodeType.OBJECT || !view.value.equals(target.value)) {
+      return;
+    }
+    if (typeParameters.size() == 1 && !typeBounds.isEmpty() && !typeBounds.get(0).isEmpty()) {
+      VarType variable = GenericType.parse("T" + typeParameters.get(0) + ";");
+      VarType printed = genericsMap.get(variable);
+      boolean boundDefault = printed == null || isDeclaredBound(typeBounds.get(0), printed);
+      VarType lower = lowerBound(view, target);
+      if (boundDefault && lower != null && isPrintableWitness(lower)
+        && strictSubtype(lower, typeBounds.get(0).get(0))) {
+        // The target is the only lower bound and the printer fell back to the declared bound.
+        // The source had to name the lower bound for javac to close the variable; every value
+        // between it and the bound erases to the same constructor call.
+        List<VarType> witness = new ArrayList<>(1);
+        witness.add(lower);
+        topDownWitness = witness;
+        topDownOverridesPrinted = true;
+        return;
+      }
+    }
+    List<VarType> witness = recordedWitness(view, target, typeParameters, typeBounds);
+    if (witness != null) {
+      topDownWitness = witness;
+    }
+  }
+
+  /**
+   * The printer's own instantiation of every variable, when it is printable, is not just the
+   * variable's declared bound, and its substitution into the declared type fits the recorded
+   * target. The value came from recorded argument Signatures (a functional argument's metafactory
+   * type); the target only proves that naming it is consistent.
+   */
+  private List<VarType> recordedWitness(VarType declared, VarType target, List<String> typeParameters,
+                                        List<List<VarType>> typeBounds) {
+    if (declared == null || typeParameters.isEmpty() || !target.isGeneric()) {
+      return null;
+    }
+    List<VarType> witness = new ArrayList<>(typeParameters.size());
+    for (int i = 0; i < typeParameters.size(); i++) {
+      VarType value = genericsMap.get(GenericType.parse("T" + typeParameters.get(i) + ";"));
+      if (!isPrintableWitness(value) || (i < typeBounds.size() && isDeclaredBound(typeBounds.get(i), value))) {
+        return null;
+      }
+      witness.add(value);
+    }
+    VarType substituted = declared;
+    for (int i = 0; i < typeParameters.size(); i++) {
+      Map<VarType, VarType> mapping = new HashMap<>();
+      mapping.put(GenericType.parse("T" + typeParameters.get(i) + ";"), witness.get(i));
+      substituted = substituted.remap(mapping);
+    }
+    return substituted != null && satisfiesRecordedTarget(substituted, target) ? witness : null;
+  }
+
+  private static boolean isDeclaredBound(List<VarType> bounds, VarType value) {
+    if (value == null) {
+      return true;
+    }
+    for (VarType bound : bounds) {
+      if (bound == null) {
+        continue;
+      }
+      if (bound.equals(value)) {
+        return true;
+      }
+      if (bound.type == CodeType.OBJECT && value.type == CodeType.OBJECT
+        && bound.arrayDim == value.arrayDim && !bound.isGeneric() && !value.isGeneric()
+        && bound.value.equals(value.value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether a value fits a recorded target under Java's containment rules: an upper-bounded
+   * wildcard is a subtype bound, a lower-bounded wildcard a supertype bound, and invariant
+   * arguments must match exactly. Only erased class relationships are consulted.
+   */
+  private static boolean satisfiesRecordedTarget(VarType value, VarType target) {
+    if (value == null || target == null) {
+      return false;
+    }
+    if (target instanceof GenericType wildcard && wildcard.getWildcard() != GenericType.WILDCARD_NO) {
+      VarType bound = new GenericType(wildcard.type, wildcard.arrayDim, wildcard.value, null,
+        wildcard.getArguments(), GenericType.WILDCARD_NO);
+      return wildcard.getWildcard() == GenericType.WILDCARD_SUPER
+        ? erasureSubtype(bound, value) : satisfiesRecordedTarget(value, bound);
+    }
+    if (target instanceof GenericType targetGeneric) {
+      if (value.type != CodeType.OBJECT || value.arrayDim != target.arrayDim
+        || !(value instanceof GenericType valueGeneric)) {
+        return false;
+      }
+      VarType view = value.value.equals(target.value) ? valueGeneric
+        : GenericType.getGenericSuperType(valueGeneric, targetGeneric);
+      if (!(view instanceof GenericType viewGeneric)
+        || viewGeneric.getWildcard() != GenericType.WILDCARD_NO
+        || viewGeneric.getArguments().size() != targetGeneric.getArguments().size()) {
+        return false;
+      }
+      for (int i = 0; i < targetGeneric.getArguments().size(); i++) {
+        VarType targetArgument = targetGeneric.getArguments().get(i);
+        VarType valueArgument = viewGeneric.getArguments().get(i);
+        if (targetArgument == null) {
+          continue;
+        }
+        if (valueArgument == null || !satisfiesRecordedTarget(valueArgument, targetArgument)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return target.value.equals(value.value) && target.arrayDim == value.arrayDim;
+  }
+
+  private static boolean erasureSubtype(VarType value, VarType upper) {
+    if (value == null || upper == null) {
+      return false;
+    }
+    if (value.equals(upper)) {
+      return true;
+    }
+    return value.type == CodeType.OBJECT && upper.type == CodeType.OBJECT
+      && value.arrayDim == upper.arrayDim
+      && DecompilerContext.getStructContext().instanceOf(value.value, upper.value);
+  }
+
+  private static boolean strictSubtype(VarType value, VarType upper) {
+    return value != null && upper != null && !value.value.equals(upper.value) && erasureSubtype(value, upper);
+  }
+
+  /** The lower bound a recorded target puts on a class variable at a matching argument position. */
+  private static VarType lowerBound(VarType view, VarType target) {
+    if (!(view instanceof GenericType viewGeneric) || !(target instanceof GenericType targetGeneric)) {
+      return null;
+    }
+    if (targetGeneric.getWildcard() != GenericType.WILDCARD_NO) {
+      targetGeneric = new GenericType(targetGeneric.type, targetGeneric.arrayDim, targetGeneric.value, null,
+        targetGeneric.getArguments(), GenericType.WILDCARD_NO);
+    }
+    if (!viewGeneric.value.equals(targetGeneric.value)
+      || viewGeneric.getArguments().size() != targetGeneric.getArguments().size()) {
+      return null;
+    }
+    for (int i = 0; i < targetGeneric.getArguments().size(); i++) {
+      VarType targetArgument = targetGeneric.getArguments().get(i);
+      VarType viewArgument = viewGeneric.getArguments().get(i);
+      if (viewArgument != null && viewArgument.type == CodeType.GENVAR
+        && targetArgument instanceof GenericType wildcard
+        && wildcard.getWildcard() == GenericType.WILDCARD_SUPER) {
+        return new GenericType(wildcard.type, wildcard.arrayDim, wildcard.value, null,
+          wildcard.getArguments(), GenericType.WILDCARD_NO);
+      }
+    }
+    return null;
+  }
+
+  /** The witness the top-down solver proved, for a constructor whose value must fit a target. */
+  public List<VarType> getPrintedGenericArgs() {
+    return topDownWitness != null && (topDownOverridesPrinted || genericArgs.isEmpty())
+      ? topDownWitness : genericArgs;
   }
 
   /**
