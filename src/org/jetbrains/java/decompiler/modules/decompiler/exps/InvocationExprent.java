@@ -1413,6 +1413,10 @@ public class InvocationExprent extends Exprent {
   private static final ThreadLocal<StructMethod[]> ARGUMENT_AT =
     ThreadLocal.withInitial(() -> new StructMethod[64]);
 
+  public static boolean isLambdaBody(Exprent exprent) {
+    return LAMBDA_BODY.get() == exprent;
+  }
+
   public static void enterLambdaBody(Exprent body) {
     LAMBDA_BODY.set(body);
   }

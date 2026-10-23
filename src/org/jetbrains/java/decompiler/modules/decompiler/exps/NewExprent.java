@@ -65,6 +65,9 @@ public class NewExprent extends Exprent {
   // The recovered arguments are subtypes of what the expected type needs at an invariant
   // position: only a diamond can let javac infer the expected arguments from the target.
   private boolean targetedDiamond;
+  // A diamond whose recorded target is a parameterized supertype: the arguments implied by
+  // that supertype's instantiation are the ones the source wrote on the constructor.
+  private List<VarType> impliedConstructorArgs;
 
   public NewExprent(VarType newType, ListStack<Exprent> stack, int arrayDim, BitSet bytecodeOffsets) {
     this(newType, getDimensions(arrayDim, stack), bytecodeOffsets);
@@ -129,6 +132,15 @@ public class NewExprent extends Exprent {
             }
             if (expectsWiderArguments(upperBound)) {
               targetedDiamond = true;
+            }
+            List<VarType> recovered = constructor.getGenericArgs();
+            boolean diamond = recovered.isEmpty()
+              || (recovered.size() == 1 && recovered.get(0) == GenericType.DUMMY_VAR);
+            if (diamond && InvocationExprent.isLambdaBody(this)) {
+              List<VarType> implied = impliedArguments(upperBound);
+              if (implied != null) {
+                impliedConstructorArgs = implied;
+              }
             }
             return ret.type != CodeType.VOID ? ret : getExprType();
           }
@@ -560,7 +572,8 @@ public class NewExprent extends Exprent {
       if (constructor != null) {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
-          List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs : constructor.getGenericArgs();
+          List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs
+            : impliedConstructorArgs != null ? impliedConstructorArgs : constructor.getGenericArgs();
           if (targetedDiamond && forcedConstructorArgs == null) {
             // The recovered arguments are only subtypes of the expected ones; printing them
             // would pin javac to a type the target rejects, so the source wrote the diamond.
@@ -1254,6 +1267,65 @@ public class NewExprent extends Exprent {
     Map<VarType, VarType> map = new HashMap<>();
     iface.getSignature().genericType.mapGenVarsTo((GenericType) inferredLambdaType, map);
     return sam.getSignature().returnType.remap(map);
+  }
+
+  /**
+   * The arguments of a diamond whose recorded target is a parameterized supertype of the
+   * constructed class ({@code new C<>()} where the target is {@code Map<List<Runnable>>}):
+   * reading the target through the class's recorded supertype signature (C<K,V> as Map<K,V>)
+   * solves the class's variables. The erased constructor invocation is the one the target
+   * recorded, and the source named the arguments the target required.
+   */
+  private List<VarType> impliedArguments(VarType upperBound) {
+    if (!(upperBound instanceof GenericType target) || target.type != CodeType.OBJECT
+      || target.arrayDim != 0 || target.getWildcard() != GenericType.WILDCARD_NO) {
+      return null;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(newType.value);
+    if (cls == null || cls.getSignature() == null) {
+      return null;
+    }
+    GenericClassDescriptor signature = cls.getSignature();
+    if (signature.fparameters.isEmpty()) {
+      return null;
+    }
+    VarType view = target.value.equals(newType.value)
+      ? signature.genericType : GenericType.getGenericSuperType(signature.genericType, target);
+    if (!(view instanceof GenericType superView) || !target.value.equals(superView.value)
+      || superView.getArguments().size() != target.getArguments().size()) {
+      return null;
+    }
+    Map<VarType, VarType> solved = new HashMap<>();
+    superView.mapGenVarsTo(target, solved);
+    List<VarType> args = new ArrayList<>(signature.fparameters.size());
+    for (String parameter : signature.fparameters) {
+      VarType value = solved.get(GenericType.parse("T" + parameter + ";"));
+      if (!isImpliedType(value)) {
+        return null;
+      }
+      args.add(value);
+    }
+    return args;
+  }
+
+  /** A type the implied arguments can name: no free variable, wildcard or raw generic. */
+  private static boolean isImpliedType(VarType type) {
+    if (type == null || type == GenericType.DUMMY_VAR || type.type == CodeType.GENVAR) {
+      return false;
+    }
+    if (type instanceof GenericType generic) {
+      if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+        return false;
+      }
+      for (VarType argument : generic.getArguments()) {
+        if (!isImpliedType(argument)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(type.value);
+    return cls == null || cls.getSignature() == null || cls.getSignature().fparameters.isEmpty();
   }
 
   /**
