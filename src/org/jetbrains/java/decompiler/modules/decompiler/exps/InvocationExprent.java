@@ -1619,9 +1619,9 @@ public class InvocationExprent extends Exprent {
 
     boolean firstParameter = true;
     int previousLine = -1;
+    int callLine = RoundTrip.sourceLineEnd(this);
     if (!lstParameters.isEmpty()) {
       buf.pushNewlineGroup(indent, 1);
-      int callLine = RoundTrip.sourceLineEnd(this);
       int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
       // A later argument line is always a break the source had. An earlier one is normally the
       // enclosing statement's marker inherited by the argument's pushes, but not when the argument
@@ -1682,8 +1682,12 @@ public class InvocationExprent extends Exprent {
 
         int line = RoundTrip.sourceLine(lstParameters.get(i));
         // Only a later line is a break the original had; an equal or earlier one is inheritance
-        // from the enclosing statement's marker.
-        boolean forced = !firstParameter && line >= 0 && previousLine >= 0 && line > previousLine;
+        // from the enclosing statement's marker. javac attributes the invoke to the first
+        // argument's line, so a later argument at the call's own line was written on that line:
+        // the first argument merely inherited the declaration's line above it.
+        boolean callLineGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_CALL_LINE);
+        boolean forced = !firstParameter && line >= 0 && previousLine >= 0 && line > previousLine
+          && (!callLineGate || callLine < 0 || line > callLine);
 
         // the last "new Object[0]" in the vararg call is not printed
         if (buff.length() > 0) {
@@ -1707,7 +1711,6 @@ public class InvocationExprent extends Exprent {
 
     if (!lstParameters.isEmpty()) {
       buf.popNewlineGroup();
-      int callLine = RoundTrip.sourceLineEnd(this);
       if (previousLine >= 0 && callLine >= 0 && previousLine != callLine
           && (!RoundTrip.selector("arg-entry")
               || RoundTrip.lineStartsHere(lstParameters.get(lstParameters.size() - 1)))) {

@@ -237,6 +237,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_MEMBER_TAIL = "rt-member-tail";
 
+  @Name("Round Trip: Argument Call Line")
+  @Description("Break between arguments only above the call's own line, where javac puts the invoke.")
+  @ShortName("rtacl")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_ARG_CALL_LINE = "rt-arg-call-line";
+
   @Name("Round Trip: Catch Line")
   @Description("Start a catch clause on its own line when the target proves the closing brace was.")
   @ShortName("rtcl")
@@ -592,6 +598,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
     defaults.put(ROUND_TRIP_MEMBER_TAIL, "1");
     defaults.put(ROUND_TRIP_CATCH_LINE, "1");
+    defaults.put(ROUND_TRIP_ARG_CALL_LINE, "1");
     defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
     defaults.put(ROUND_TRIP_CONSTANT_SITES, "1");
     defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
