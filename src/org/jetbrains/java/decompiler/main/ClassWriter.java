@@ -404,7 +404,14 @@ public class ClassWriter implements StatementWriter {
         }
 
         if ((!simpleLambda && !written) || lambdaToAnonymous) {
-          buffer.append(" {").appendLineSeparator();
+          // The target's first body line is the lambda expression's own line when the source
+          // wrote `{ return ...` inline; a body starting later keeps the brace's line.
+          int lambdaBodyLine = methodWrapper == null ? -1 : RoundTrip.methodLine(methodWrapper.methodStruct);
+          if (creationLine >= 0 && lambdaBodyLine == creationLine) {
+            buffer.append(" { ");
+          } else {
+            buffer.append(" {").appendLineSeparator();
+          }
 
           VarType lambdaReturn = functionalReturn;
           if (lambdaReturn instanceof GenericType wildcard) {

@@ -97,6 +97,16 @@ public class InvocationExprent extends Exprent {
   /** The expression whose value is a single-expression lambda body being typed against its
    * functional return type; a variable only the target determines must be pinned there. */
   private static final ThreadLocal<Exprent> LAMBDA_BODY = new ThreadLocal<>();
+  /** While printing a `new T(...) { ... }` creation's arguments, a chain break is not a source break. */
+  private static final ThreadLocal<Boolean> ANONYMOUS_CREATION = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+  public static void enterAnonymousCreation() {
+    ANONYMOUS_CREATION.set(Boolean.TRUE);
+  }
+
+  public static void exitAnonymousCreation() {
+    ANONYMOUS_CREATION.remove();
+  }
   /** The witness the lambda-body target pass proved, kept across the print-time re-inference. */
   private List<VarType> lambdaBodyWitness;
   /**
@@ -1181,7 +1191,17 @@ public class InvocationExprent extends Exprent {
           // A chain link whose invoke the original put on a later line than the receiver's last
           // instruction starts a line of its own. Inside an argument list javac attributes the
           // invoke to the first argument's line, so the entry proves nothing about the dot there.
-          if (instance != null && !insideOwnArgumentList() && RoundTrip.newlineBetween(instance, this)) {
+          // Inside an argument list javac attributes the invoke to the first argument's line, so
+          // the entry proves nothing about the dot there -- unless the receiver is itself a
+          // chain link with its own entry: then the later invoke line is the source's own break.
+          // Inside an argument list javac attributes the invoke to the first argument's line, so
+          // an inherited entry proves nothing about the dot. A chain link whose line is exactly
+          // the receiver's end plus one is the source's own continuation line; a jump to a later
+          // statement line is the inherited argument entry, not a break.
+          if (instance != null && RoundTrip.newlineBetween(instance, this)
+            && (!insideOwnArgumentList()
+              || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass() && instance instanceof InvocationExprent
+                 && RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1)) {
             buf.appendLineSeparator().appendIndent(indent);
           }
           buf.append(".");
@@ -1507,6 +1527,13 @@ public class InvocationExprent extends Exprent {
    * switches the current method, so a call written there is not subject to the enclosing call's
    * argument-line attribution.
    */
+  /** The method being printed belongs to an anonymous or local class body. */
+  private static boolean inAnonymousOrLocalClass() {
+    Object wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    return wrapper instanceof org.jetbrains.java.decompiler.main.rels.MethodWrapper method
+      && method.methodStruct.getClassQualifiedName().contains("$");
+  }
+
   public static boolean insideOwnArgumentList() {
     int depth = ARGUMENT.get()[0];
     return depth > 0 && ARGUMENT_AT.get()[depth - 1] == RoundTrip.currentMethod();

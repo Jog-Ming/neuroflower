@@ -474,10 +474,17 @@ public class NewExprent extends Exprent {
         if (diamond) {
           InvocationExprent.enterPoly();
         }
+        boolean anonymousCreation = child != null;
+        if (anonymousCreation) {
+          InvocationExprent.enterAnonymousCreation();
+        }
         try {
           constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
           buf.append(constructor.appendParamList(indent));
         } finally {
+          if (anonymousCreation) {
+            InvocationExprent.exitAnonymousCreation();
+          }
           if (diamond) {
             InvocationExprent.exitPoly();
           }
