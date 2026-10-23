@@ -3,6 +3,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
@@ -135,6 +136,21 @@ public class DoStatement extends Statement {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
       case FOR:
+        int incLine = incExprent.get(0) == null ? -1 : RoundTrip.sourceLine(incExprent.get(0));
+        int condLine = conditionExprent.get(0) == null ? -1 : RoundTrip.sourceLine(conditionExprent.get(0));
+        if (incLine >= 0 && condLine >= 0 && incLine != condLine) {
+          TextBuffer body = ExprProcessor.jmpWrapper(first, indent + 1, false);
+          if (!endsWithTransfer(body)) {
+            if (initExprent.get(0) != null) {
+              buf.appendIndent(indent).append(initExprent.get(0).toJava(indent)).append(";").appendLineSeparator();
+            }
+            buf.appendIndent(indent).append("while (").append(conditionExprent.get(0).toJava(indent)).append(") {").appendLineSeparator();
+            buf.append(body);
+            buf.appendIndent(indent + 1).append(incExprent.get(0).toJava(indent + 1)).append(";").appendLineSeparator();
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            break;
+          }
+        }
         buf.appendIndent(indent);
         buf.pushNewlineGroup(indent, 1);
         buf.append("for (");
@@ -160,6 +176,20 @@ public class DoStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /** The last statement transfers control, so an update appended after it could not run. */
+  private static boolean endsWithTransfer(TextBuffer body) {
+    String[] lines = body.toString().split("\\R");
+    for (int i = lines.length - 1; i >= 0; i--) {
+      String s = lines[i].trim();
+      if (s.isEmpty() || s.equals("}") || s.equals("{")) {
+        continue;
+      }
+      return s.endsWith("continue;") || s.endsWith("break;") || s.endsWith("return;")
+        || s.startsWith("return ") && s.endsWith(";") || s.startsWith("throw ");
+    }
+    return false;
   }
 
   @Override
