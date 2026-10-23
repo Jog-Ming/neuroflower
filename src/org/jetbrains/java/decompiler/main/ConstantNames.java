@@ -902,6 +902,19 @@ public final class ConstantNames {
           || primitive.type == CodeConstants.CONSTANT_Double);
   }
 
+  /** The site key a pool value entry folds to, or null for an entry no literal names. */
+  private static String valueKey(PrimitiveConstant value) {
+    VariableType kind = switch (value.type) {
+      case CodeConstants.CONSTANT_Integer -> VariableType.INT;
+      case CodeConstants.CONSTANT_Long -> VariableType.LONG;
+      case CodeConstants.CONSTANT_Float -> VariableType.FLOAT;
+      case CodeConstants.CONSTANT_Double -> VariableType.DOUBLE;
+      case CodeConstants.CONSTANT_String -> VariableType.STRING;
+      default -> null;
+    };
+    return kind == null || value.value == null ? null : kind + "|" + value.value;
+  }
+
   /** Whether a constant equal to the pool entry at {@code index} already sat before it. */
   private static boolean hasEarlierEqual(StructClass cls, int index) {
     List<PooledConstant> pool = cls.getPool().getPool();
@@ -1198,9 +1211,12 @@ public final class ConstantNames {
    * {@code lower} and {@code successor} to place the site.
    */
   private record PairSite(int classIndex, long successor, long lower, int open, int close,
-                          String member, Set<String> pooled) {
+                          String member, String successorKey, Set<String> pooled) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
+      if (key.equals(successorKey)) {
+        return true; // the naming entered this very value; the pair's neighbour is it
+      }
       if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
         return true; // a boolean folds to an immediate
       }
@@ -1248,17 +1264,24 @@ public final class ConstantNames {
       if (owner.equals(cls.qualifiedName) || setup.contains(i) || catchTypes.contains(owner)) {
         continue; // the class is entered as itself, a catch type or a class-setup entry
       }
-      if (!(pool.get(i + 2) instanceof LinkConstant link)) {
-        continue;
+      boolean call = false;
+      String member = null;
+      LinkConstant link = pool.get(i + 2) instanceof LinkConstant value ? value : null;
+      if (link != null) {
+        call = link.type == CodeConstants.CONSTANT_Methodref
+          || link.type == CodeConstants.CONSTANT_InterfaceMethodref;
+        boolean field = link.type == CodeConstants.CONSTANT_Fieldref;
+        if (!call && !field) {
+          continue; // the entry after the pair is neither a call nor a field reference
+        }
+        if (owner.equals(link.classname)) {
+          continue; // the pair is that reference's operand
+        }
+        member = field ? link.elementname : null;
       }
-      boolean call = link.type == CodeConstants.CONSTANT_Methodref
-        || link.type == CodeConstants.CONSTANT_InterfaceMethodref;
-      if (!call && link.type != CodeConstants.CONSTANT_Fieldref) {
-        continue; // the entry after the pair is neither a call nor a field reference
-      }
-      if (owner.equals(link.classname)) {
-        continue; // the pair is that reference's operand
-      }
+      // Any other entry after the pair is the next entry the generation created: the naming that
+      // entered the pair was the last pool-entering event before it, so a site in the generation
+      // gap between the neighbouring entries' first uses reproduces the same order.
       FirstUse use = firstUses.get(i + 2);
       if (use == null) {
         continue;
@@ -1294,8 +1317,9 @@ public final class ConstantNames {
           continue;
         }
       }
+      String successorKey = pool.get(i + 2) instanceof PrimitiveConstant pv ? valueKey(pv) : null;
       pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], open, close,
-        call ? null : link.elementname, pooledKeys(cls, i)));
+        member, successorKey, pooledKeys(cls, i)));
     }
     return pairs;
   }
@@ -1549,8 +1573,15 @@ public final class ConstantNames {
             }
             continue;
           }
-          if ((coordinate >>> 32) != (pair.successor() >>> 32)
-              || (coordinate & 0xffffffffL) >= (pair.successor() & 0xffffffffL)) {
+          boolean sameRank = (coordinate >>> 32) == (pair.successor() >>> 32);
+          long offset = coordinate & 0xffffffffL;
+          long successorOffset = pair.successor() & 0xffffffffL;
+          // A value successor is the entry the naming itself entered, so the literal's own point
+          // is the successor's point; a reference is created after its arguments and needs a
+          // strictly earlier site.
+          boolean atOrBefore = offset < successorOffset
+            || (pair.member() == null && offset == successorOffset);
+          if (!sameRank || !atOrBefore) {
             continue; // another method, or after the reference was generated
           }
           if (pair.open() < 0 && coordinate <= pair.lower()) {
@@ -1621,6 +1652,52 @@ public final class ConstantNames {
       return position >= lineStart(text, space.min()) && position <= lineEnd(text, space.max());
     }
     return false;
+  }
+
+  /**
+   * The constant whose owner's pair proves this site.
+   *
+   * <p>The pool entered the owner's Class and name immediately before the entry that follows the
+   * pair. A literal generated in the gap between the neighbouring entries' first uses is that
+   * naming, even when other owners declare the same value: their Class entries have no pair there.
+   */
+  private static Constant pairOwner(List<Constant> constants, int position, Placement placement) {
+    if (placement == null || placement.pairs() == null || placement.spaces() == null) {
+      return null;
+    }
+    long coordinate = siteCoordinate(placement.spaces(), position);
+    if (coordinate == NO_COORDINATE) {
+      return null;
+    }
+    for (Constant constant : constants) {
+      PairSite pair = placement.pairs().get(constant.owner());
+      if (pair == null || pair.open() >= 0) {
+        continue; // a call pair places its site inside the argument list, not by the gap
+      }
+      if (gapAdmits(pair, position, placement)) {
+        return constant;
+      }
+    }
+    return null;
+  }
+
+  /** Whether the generation gap of a reference-free pair admits this printed site. */
+  private static boolean gapAdmits(PairSite pair, int position, Placement placement) {
+    if (placement.spaces() == null) {
+      return false;
+    }
+    long coordinate = siteCoordinate(placement.spaces(), position);
+    if (coordinate == NO_COORDINATE) {
+      return false;
+    }
+    long offset = coordinate & 0xffffffffL;
+    long successorOffset = pair.successor() & 0xffffffffL;
+    // A value successor is the entry the naming itself entered, so the literal's own point is the
+    // successor's point; a reference is created after its arguments and needs an earlier site.
+    boolean atOrBefore = offset < successorOffset
+      || (pair.member() == null && offset == successorOffset);
+    return (coordinate >>> 32) == (pair.successor() >>> 32) && atOrBefore
+      && coordinate > pair.lower();
   }
 
   /** Whether some site already names this owner in the class text. */
@@ -3246,8 +3323,9 @@ public final class ConstantNames {
     // so the recorded position of the instruction is one past the opening quote.
     int anchor = key.startsWith(VariableType.STRING.name() + "|")
       || key.startsWith(VariableType.CHAR.name() + "|") ? start + 1 : start;
-    Constant constant = constants.size() == 1
-      ? constants.get(0) : selectProvable(constants, anchor, placement, own);
+    Constant paired = constants.size() > 1 ? pairOwner(constants, anchor, placement) : null;
+    Constant constant = paired != null ? paired
+      : constants.size() == 1 ? constants.get(0) : selectProvable(constants, anchor, placement, own);
     if (constant == null) {
       return;
     }
