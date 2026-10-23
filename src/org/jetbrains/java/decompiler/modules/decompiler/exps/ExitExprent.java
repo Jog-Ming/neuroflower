@@ -21,6 +21,17 @@ import java.util.BitSet;
 import java.util.List;
 
 public class ExitExprent extends Exprent {
+  /** The functional method's return type while a lambda body's returns are printed. */
+  private static final ThreadLocal<VarType> LAMBDA_RETURN_TARGET = new ThreadLocal<>();
+
+  public static void enterLambdaReturn(VarType target) {
+    LAMBDA_RETURN_TARGET.set(target);
+  }
+
+  public static void exitLambdaReturn() {
+    LAMBDA_RETURN_TARGET.remove();
+  }
+
   public enum Type {
     RETURN, THROW
   }
@@ -79,6 +90,19 @@ public class ExitExprent extends Exprent {
         VarType ret = retType;
         if (methodDescriptor != null && methodDescriptor.genericInfo != null && methodDescriptor.genericInfo.returnType != null) {
           ret = methodDescriptor.genericInfo.returnType;
+        }
+        VarType lambdaReturn = LAMBDA_RETURN_TARGET.get();
+        if (lambdaReturn != null && value instanceof InvocationExprent) {
+          // A call returned from a lambda body is checked against the functional method's
+          // return type; the synthetic method's own signature is erased. Other values keep
+          // their own cast decisions, which the target would wrongly relax.
+          ret = lambdaReturn;
+          InvocationExprent.enterLambdaBody(value);
+          try {
+            value.getInferredExprType(lambdaReturn);
+          } finally {
+            InvocationExprent.exitLambdaBody();
+          }
         }
         buf.append(' ');
 

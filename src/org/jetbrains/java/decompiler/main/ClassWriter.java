@@ -350,7 +350,13 @@ public class ClassWriter implements StatementWriter {
                         }
                       }
                     }
-                    TextBuffer codeBuffer = firstExpr.toJava(indent);
+                    ExitExprent.enterLambdaReturn(bodyTarget);
+                    TextBuffer codeBuffer;
+                    try {
+                      codeBuffer = firstExpr.toJava(indent);
+                    } finally {
+                      ExitExprent.exitLambdaReturn();
+                    }
 
                     // The target's lambda body may start on a later line than the expression
                     // that creates the lambda; an expression lambda prints inline otherwise.
@@ -400,7 +406,17 @@ public class ClassWriter implements StatementWriter {
         if ((!simpleLambda && !written) || lambdaToAnonymous) {
           buffer.append(" {").appendLineSeparator();
 
-          methodLambdaToJava(node, wrapper, mt, buffer, indent + 1, !lambdaToAnonymous);
+          VarType lambdaReturn = functionalReturn;
+          if (lambdaReturn instanceof GenericType wildcard) {
+            lambdaReturn = wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS
+              ? GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO) : null;
+          }
+          ExitExprent.enterLambdaReturn(lambdaReturn);
+          try {
+            methodLambdaToJava(node, wrapper, mt, buffer, indent + 1, !lambdaToAnonymous);
+          } finally {
+            ExitExprent.exitLambdaReturn();
+          }
 
           buffer.appendIndent(indent).append("}");
         }

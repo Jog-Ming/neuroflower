@@ -90,6 +90,10 @@ public class InvocationExprent extends Exprent {
   private boolean isInvocationInstance = false;
   /** The invocation whose receiver is currently being typed; set only for the duration. */
   private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
+  /** Whether the outer call's own target is the enclosing method's declared return type. */
+  private static final ThreadLocal<Boolean> OUTER_SOURCE_TARGET = new ThreadLocal<>();
+  /** This call's own expected result was the enclosing method's declared return type. */
+  private boolean resultIsDeclaredReturn;
   /** The expression whose value is a single-expression lambda body being typed against its
    * functional return type; a variable only the target determines must be pinned there. */
   private static final ThreadLocal<Exprent> LAMBDA_BODY = new ThreadLocal<>();
@@ -261,6 +265,7 @@ public class InvocationExprent extends Exprent {
     // Clear existing state
     genericArgs.clear();
     genericsMap.clear();
+    resultIsDeclaredReturn = isDeclaredReturnTarget(upperBound);
     this.remappedInstType = null;
     this.witnessQualifier = false;
 
@@ -408,6 +413,8 @@ public class InvocationExprent extends Exprent {
 
           VarType instUB = mthCls.getSignature() != null ? mthCls.getSignature().genericType.remap(upperBoundsMap) : upperBound;
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          Boolean priorSourceTarget = OUTER_SOURCE_TARGET.get();
+          OUTER_SOURCE_TARGET.set(isDeclaredReturnTarget(upperBound));
           InvocationExprent priorMapDemand = OPTIONAL_MAP_DEMAND.get();
           VarType priorMapDemandType = OPTIONAL_MAP_DEMAND_TYPE.get();
           VarType optionalDemand = optionalWildcardArgument();
@@ -428,6 +435,7 @@ public class InvocationExprent extends Exprent {
           }
           finally {
             OUTER_INVOCATION.set(priorOuter);
+            OUTER_SOURCE_TARGET.set(priorSourceTarget);
             OPTIONAL_MAP_DEMAND.set(priorMapDemand);
             OPTIONAL_MAP_DEMAND_TYPE.set(priorMapDemandType);
           }
@@ -772,6 +780,12 @@ public class InvocationExprent extends Exprent {
               // The recorded expected type names the arguments this call's own value must carry,
               // and the printer's own inference landed on a different one.
             }
+            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && passThroughReceiverDemand(fparams, ret, upperBound, bounds)) {
+              // The outer call returns its receiver's own type variable unchanged and its own
+              // result is the method's declared return type, so the receiver's argument must be
+              // that recorded type; a method reference there is not pertinent to javac.
+            }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
               && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
               // A call inferred to an enclosing method's or class's type variable can need the
@@ -977,6 +991,8 @@ public class InvocationExprent extends Exprent {
 
           instance.setInvocationInstance();
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
+          Boolean priorSourceTarget = OUTER_SOURCE_TARGET.get();
+          OUTER_SOURCE_TARGET.set(resultIsDeclaredReturn);
           InvocationExprent priorMapDemand = OPTIONAL_MAP_DEMAND.get();
           VarType priorMapDemandType = OPTIONAL_MAP_DEMAND_TYPE.get();
           VarType optionalDemand = optionalWildcardArgument();
@@ -992,6 +1008,7 @@ public class InvocationExprent extends Exprent {
           }
           finally {
             OUTER_INVOCATION.set(priorOuter);
+            OUTER_SOURCE_TARGET.set(priorSourceTarget);
             OPTIONAL_MAP_DEMAND.set(priorMapDemand);
             OPTIONAL_MAP_DEMAND_TYPE.set(priorMapDemandType);
           }
@@ -1704,6 +1721,27 @@ public class InvocationExprent extends Exprent {
         Set<VarType> unbound = unboundArguments.get(i);
         if (unbound != null) {
           UNBOUND_ARGUMENT.get().push(new UnboundArgument(RoundTrip.currentMethod(), unbound));
+        }
+        // Give an argument the call's recorded parameter type (its own type variables solved):
+        // a constructor there can only infer the expected arguments from that target.
+        if (mask == null && start == 0 && desc != null && desc.getSignature() != null && genericsMap != null
+          && desc.getSignature().parameterTypes.size() == descriptor.params.length
+          && lstParameters.size() == descriptor.params.length && !genericsMap.isEmpty()
+          && lstParameters.get(i) instanceof NewExprent created && !created.isLambda()) {
+          VarType declaredParameter = desc.getSignature().parameterTypes.get(i);
+          Map<VarType, VarType> substitution = new HashMap<>();
+          for (String fp : desc.getSignature().typeParameters) {
+            VarType value = genericsMap.get(GenericType.parse("T" + fp + ";"));
+            if (value != null) {
+              substitution.put(GenericType.parse("T" + fp + ";"), value);
+            }
+          }
+          if (!substitution.isEmpty()) {
+            VarType argumentTarget = declaredParameter.remap(substitution);
+            if (argumentTarget != null && argumentTarget.isGeneric() && !argumentTarget.equals(declaredParameter)) {
+              lstParameters.get(i).getInferredExprType(argumentTarget);
+            }
+          }
         }
         VarType argumentType = types[i];
         if (unbound != null && !unbound.isEmpty() && argumentType != null
@@ -3368,6 +3406,104 @@ public class InvocationExprent extends Exprent {
       lambdaBodyWitness = new ArrayList<>(witness);
     }
     return true;
+  }
+
+  /**
+   * A receiver whose outer call returns the receiver class's own type variable unchanged
+   * ({@code Optional.orElseGet} returns T of its {@code Optional<T>} receiver) and whose own
+   * result is the enclosing method's declared return type: that return value is the receiver's
+   * type argument, so a source that compiled could not have inferred anything else. The call
+   * must take a method reference, which javac does not use for inference.
+   */
+  private boolean passThroughReceiverDemand(List<String> fparams, VarType ret, VarType upperBound,
+                                            Map<VarType, List<VarType>> bounds) {
+    if (!Boolean.TRUE.equals(OUTER_SOURCE_TARGET.get())
+      || !isInvocationInstance || fparams.isEmpty() || ret == null || upperBound == null || desc == null
+      || desc.getSignature() == null || !ret.isGeneric() || !upperBound.isGeneric()
+      || ret.type != CodeType.OBJECT || upperBound.type != CodeType.OBJECT
+      || ret.arrayDim != 0 || upperBound.arrayDim != 0
+      || !ret.value.equals(upperBound.value)
+      || ((GenericType) upperBound).getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    InvocationExprent outer = OUTER_INVOCATION.get();
+    if (outer == null || outer == this || outer.desc == null || outer.desc.getSignature() == null
+      || !outer.desc.getSignature().typeParameters.isEmpty()) {
+      return false;
+    }
+    VarType outerRet = outer.desc.getSignature().returnType;
+    if (outerRet == null || outerRet.type != CodeType.GENVAR || outerRet.arrayDim != 0) {
+      return false;
+    }
+    StructClass outerClass = DecompilerContext.getStructContext().getClass(outer.classname);
+    if (outerClass == null || outerClass.getSignature() == null
+      || !outerClass.getSignature().fparameters.contains(outerRet.value)) {
+      return false;
+    }
+    boolean methodReference = false;
+    for (Exprent argument : lstParameters) {
+      if (argument instanceof NewExprent ref && ref.isMethodReference()) {
+        methodReference = true;
+      }
+    }
+    if (!methodReference) {
+      return false;
+    }
+    Map<VarType, VarType> projected = new HashMap<>();
+    ((GenericType) ret).mapGenVarsTo((GenericType) upperBound, projected);
+    if (projected.isEmpty()) {
+      return false;
+    }
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    boolean demanded = false;
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType value = genericsMap.get(variable);
+      VarType expected = projected.get(variable);
+      if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS) {
+        expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
+      } else if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() != GenericType.WILDCARD_NO) {
+        expected = null;
+      }
+      if (expected != null && isNameableWitness(expected, named, true)
+        && (value == null || !satisfiesUpperBound(value, expected)
+            || sameType(value, expected))) {
+        value = expected;
+        demanded = true;
+      }
+      if (!isNameableWitness(value, named, true)) {
+        return false;
+      }
+      witness.add(value);
+    }
+    if (!demanded || !erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /** True when the target applied is the enclosing method's recorded return type. */
+  private static boolean isDeclaredReturnTarget(VarType upperBound) {
+    if (upperBound == null || upperBound.type != CodeType.OBJECT || upperBound.arrayDim != 0) {
+      return false;
+    }
+    StructMethod method = RoundTrip.currentMethod();
+    if (method == null || method.getSignature() == null) {
+      return false;
+    }
+    VarType declared = method.getSignature().returnType;
+    if (declared == null) {
+      return false;
+    }
+    if (upperBound instanceof GenericType generic && declared instanceof GenericType declaredGeneric) {
+      return generic.equalsExact(declaredGeneric);
+    }
+    return upperBound.equals(declared);
   }
 
   /** True for a witness value every type variable of which is in scope at the call. */

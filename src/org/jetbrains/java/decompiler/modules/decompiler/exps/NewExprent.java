@@ -62,6 +62,9 @@ public class NewExprent extends Exprent {
   // Type arguments the class file proved for a constructor call whose diamond javac would
   // otherwise close on a narrower type than the recorded method reference needs.
   private List<VarType> forcedConstructorArgs;
+  // The recovered arguments are subtypes of what the expected type needs at an invariant
+  // position: only a diamond can let javac infer the expected arguments from the target.
+  private boolean targetedDiamond;
 
   public NewExprent(VarType newType, ListStack<Exprent> stack, int arrayDim, BitSet bytecodeOffsets) {
     this(newType, getDimensions(arrayDim, stack), bytecodeOffsets);
@@ -123,6 +126,9 @@ public class NewExprent extends Exprent {
               ret = constructor.getInferredExprType(upperBound);
             } finally {
               InvocationExprent.exitPoly();
+            }
+            if (expectsWiderArguments(upperBound)) {
+              targetedDiamond = true;
             }
             return ret.type != CodeType.VOID ? ret : getExprType();
           }
@@ -555,6 +561,14 @@ public class NewExprent extends Exprent {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
           List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs : constructor.getGenericArgs();
+          if (targetedDiamond && forcedConstructorArgs == null) {
+            // The recovered arguments are only subtypes of the expected ones; printing them
+            // would pin javac to a type the target rejects, so the source wrote the diamond.
+            buf.append("<>");
+            constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
+            buf.append('(').append(constructor.appendParamList(indent)).append(')');
+            return buf;
+          }
           // A receiver has no target type. A diamond printed because the value sits inside an
           // enclosing argument list would infer its arguments from the constructor's arguments
           // alone, and when those leave a variable unconstrained javac closes it on its bound:
@@ -1243,6 +1257,103 @@ public class NewExprent extends Exprent {
   }
 
   /**
+   * The recovered constructor arguments do not satisfy the expected type at an invariant
+   * position, but they are subtypes of the expected ones and the constructor takes the class's
+   * own type variables: only a diamond lets javac infer the expected arguments from the target.
+   */
+  private boolean expectsWiderArguments(VarType upperBound) {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND) || constructor == null
+      || !(upperBound instanceof GenericType target) || target.type != CodeType.OBJECT
+      || target.arrayDim != 0 || target.getWildcard() != GenericType.WILDCARD_NO
+      || !target.value.equals(newType.value)) {
+      return false;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(newType.value);
+    if (cls == null || cls.getSignature() == null) {
+      return false;
+    }
+    GenericClassDescriptor signature = cls.getSignature();
+    List<VarType> targetArgs = target.getArguments();
+    if (targetArgs.size() != signature.fparameters.size()) {
+      return false;
+    }
+    StructMethod desc = constructor.getDesc();
+    if (desc == null) {
+      return false;
+    }
+    if (desc.getSignature() != null && desc.getSignature().parameterTypes.size() == signature.fparameters.size()) {
+      // The constructor's own Signature names the class's variables: a diamond can infer them.
+      for (String fp : signature.fparameters) {
+        boolean present = false;
+        for (VarType parameter : desc.getSignature().parameterTypes) {
+          if (parameter != null && parameter.type == CodeType.GENVAR && parameter.arrayDim == 0
+            && parameter.value.equals(fp)) {
+            present = true;
+          }
+        }
+        if (!present) {
+          return false;
+        }
+      }
+    } else {
+      // No constructor Signature: the erased parameters must still be the class's variables'
+      // bounds, in order, for the target to drive inference through them.
+      VarType[] parameters = MethodDescriptor.parseDescriptor(desc.getDescriptor()).params;
+      if (parameters.length != signature.fparameters.size()) {
+        return false;
+      }
+      for (int i = 0; i < parameters.length; i++) {
+        List<VarType> declared = i < signature.fbounds.size() ? signature.fbounds.get(i) : null;
+        VarType bound = declared == null || declared.isEmpty() || declared.get(0).type == CodeType.GENVAR
+          ? VarType.VARTYPE_OBJECT : declared.get(0);
+        if (bound.type == CodeType.OBJECT) {
+          if (!parameters[i].equals(VarType.VARTYPE_OBJECT)) {
+            return false;
+          }
+        } else if (!parameters[i].equals(new VarType(bound.type, bound.arrayDim, bound.value))) {
+          return false;
+        }
+      }
+    }
+    List<VarType> recovered = constructor.getGenericArgs();
+    if (recovered.size() != targetArgs.size()) {
+      return false;
+    }
+    boolean differs = false;
+    for (int i = 0; i < recovered.size(); i++) {
+      VarType mine = recovered.get(i);
+      VarType want = targetArgs.get(i);
+      if (mine == null || want == null) {
+        return false;
+      }
+      if (mine.type == CodeType.GENVAR || want.type == CodeType.GENVAR) {
+        if (mine.equals(want)) {
+          continue;
+        }
+        return false;
+      }
+      if (mine.type != CodeType.OBJECT || want.type != CodeType.OBJECT) {
+        return false;
+      }
+      if (sameDiamondType(mine, want)) {
+        continue;
+      }
+      if (!DecompilerContext.getStructContext().instanceOf(mine.value, want.value)) {
+        return false;
+      }
+      differs = true;
+    }
+    return differs;
+  }
+
+  private static boolean sameDiamondType(VarType a, VarType b) {
+    if (a instanceof GenericType generic) {
+      return generic.equalsExact(b);
+    }
+    return b != null && !(b instanceof GenericType) && a.equals(b);
+  }
+
+  /**
    * A bound method reference's recorded instantiated type proves the receiver's parameterized
    * type. The metafactory's instantiated method type is the functional method javac adapted, and
    * when its return type is a class but the referenced method's erased return is Object while its
@@ -1253,6 +1364,7 @@ public class NewExprent extends Exprent {
    * printing the recorded argument there keeps javac's inference of the constructor from closing
    * on Object and rejecting the reference. Nothing is forced unless every recorded fact agrees.
    */
+
   private void forceRecordedReceiverType(Exprent receiver) {
     ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
     if (node == null || node.lambdaInformation == null || !node.lambdaInformation.is_method_reference
