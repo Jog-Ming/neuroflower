@@ -8,6 +8,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructRecordComponent;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 import java.util.*;
 
@@ -222,6 +223,14 @@ public final class IfPatternMatchProcessor {
     
     VarType storeType = left.getInferredExprType(null);
 
+    // javac accepts an instanceof type only when the corresponding cast needs no unchecked
+    // conversion (JLS 15.20.2 via 5.5.1): wildcards, the matched expression's own arguments
+    // under a supertype, or a source erasure in the pattern's hierarchy. A type variable
+    // against an unrelated interface is a pattern javac refuses; keep the cast form.
+    if (!isLegalPatternType(source.getInferredExprType(null), storeType)) {
+      return false;
+    }
+
     // Add the exprent to the instanceof exprent and remove it from the inside of the if statement
     iof.getLstOperands().add(2, left);
     head.getExprents().remove(0);
@@ -229,6 +238,58 @@ public final class IfPatternMatchProcessor {
       iof.getLstOperands().set(1, new ConstExprent(storeType, null, iof.getLstOperands().get(1).bytecode));
     }
     return true;
+  }
+
+  /**
+   * Whether javac accepts this generic type as an instanceof pattern. The pattern's cast must
+   * need no unchecked conversion (JLS 15.20.2 via 5.5.1): the pattern is a wildcard type, every
+   * argument is a wildcard, the source carries the same arguments under a supertype, or the
+   * source's erasure sits in the pattern's hierarchy (the printer can hold an erased type where
+   * the declaration it prints is parameterized). Two unrelated interfaces make the cast
+   * unchecked and javac refuses the pattern; there the cast form has to be kept.
+   */
+  private static boolean isLegalPatternType(VarType source, VarType pattern) {
+    if (!(pattern instanceof GenericType generic) || generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return true;
+    }
+
+    List<VarType> args = generic.getArguments();
+    if (args.isEmpty()) {
+      return true;
+    }
+
+    boolean wildcards = true;
+    for (VarType arg : args) {
+      // An unbounded wildcard parses as a null argument; bounded ones carry a wildcard flag.
+      if (arg != null && (!(arg instanceof GenericType argType) || argType.getWildcard() == GenericType.WILDCARD_NO)) {
+        wildcards = false;
+        break;
+      }
+    }
+    if (wildcards) {
+      return true;
+    }
+
+    if (!(source instanceof GenericType sourceType)) {
+      // The printer's static type can be erased where the source declaration it prints is
+      // parameterized (a method parameter's signature lives in the method, not the variable).
+      // The erasure relation is what the cast can rest on: a pattern on a supertype's own
+      // hierarchy keeps the arguments unverifiable but the cast possible, while two unrelated
+      // interfaces make it unchecked and javac refuses the pattern.
+      return source == null
+        || DecompilerContext.getStructContext().instanceOf(generic.value, source.value)
+        || DecompilerContext.getStructContext().instanceOf(source.value, generic.value);
+    }
+    List<VarType> sourceArgs = sourceType.getArguments();
+    if (sourceArgs.size() != args.size()) {
+      return false;
+    }
+    for (int i = 0; i < args.size(); i++) {
+      if (!args.get(i).equals(sourceArgs.get(i))) {
+        return false;
+      }
+    }
+    return DecompilerContext.getStructContext().instanceOf(generic.value, sourceType.value);
   }
 
   // Finds all assignments and their associated variables in a statement's predecessors.
