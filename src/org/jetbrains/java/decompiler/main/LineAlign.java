@@ -76,6 +76,7 @@ public final class LineAlign {
     TreeMap<Integer, Integer> shifts = new TreeMap<>();
     Set<Integer> conflicted = new HashSet<>();
     Set<Integer> entryLines = new HashSet<>();
+    Map<Integer, List<int[]>> candidates = new TreeMap<>();
     for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> tracerEntry : tracers.entrySet()) {
       String className = tracerEntry.getKey().a;
       String methodKey = tracerEntry.getKey().b;
@@ -100,7 +101,7 @@ public final class LineAlign {
         continue;
       }
       if (gapAlign) {
-        addMethodConstraints(table, mapping, lines, shifts, conflicted, entryLines);
+        addMethodConstraints(table, mapping, lines, candidates, entryLines);
         continue;
       }
       for (Map.Entry<Integer, Integer> entry : mapping.entrySet()) {
@@ -117,6 +118,7 @@ public final class LineAlign {
     // class declaration's line. Without this constraint the declaration never moves, and every
     // class with a default constructor stays shifted by however far the original header was.
     addImplicitConstructorConstraints(tracers, lines, shifts, conflicted, entryLines, root);
+    resolveCandidates(candidates, shifts, conflicted);
 
     if (DecompilerContext.getOption(IFernflowerPreferences.ML_BREAKS)
         || System.getenv("NEUROFLOWER_ML_BREAKS") != null) {
@@ -654,8 +656,13 @@ public final class LineAlign {
    * mapping; both keep their own line, as any other entry does.
    */
   private static void addMethodConstraints(StructLineNumberTableAttribute table,
-      Map<Integer, Integer> mapping, String[] lines, TreeMap<Integer, Integer> shifts,
-      Set<Integer> conflicted, Set<Integer> entryLines) {
+      Map<Integer, Integer> mapping, String[] lines, Map<Integer, List<int[]>> candidates,
+      Set<Integer> entryLines) {
+    int[] raw = table.getRawData();
+    Set<Integer> exact = new HashSet<>();
+    for (int i = 0; i + 1 < raw.length; i += 2) {
+      exact.add(raw[i]);
+    }
     List<int[]> entries = new ArrayList<>(mapping.size());
     for (Map.Entry<Integer, Integer> entry : mapping.entrySet()) {
       int ours = entry.getValue() + 1; // one based line in this file
@@ -663,7 +670,7 @@ public final class LineAlign {
       if (target < 0 || ours < 1 || ours > lines.length) {
         continue;
       }
-      entries.add(new int[]{entry.getKey(), ours, target});
+      entries.add(new int[]{entry.getKey(), ours, target, exact.contains(entry.getKey()) ? 1 : 0});
     }
     entries.sort((a, b) -> Integer.compare(a[0], b[0]));
     int previousLine = -1;
@@ -672,13 +679,52 @@ public final class LineAlign {
       if (entry[1] < previousLine && entry[2] >= highest && entry[2] <= highest + 1) {
         highest = entry[2];
         entryLines.add(previousLine);
-        add(shifts, conflicted, previousLine, entry[2] - previousLine);
+        candidate(candidates, previousLine, entry[2] - previousLine, entry[3]);
         continue;
       }
       previousLine = entry[1];
       highest = Math.max(highest, entry[2]);
       entryLines.add(entry[1]);
-      add(shifts, conflicted, entry[1], entry[2] - entry[1]);
+      candidate(candidates, entry[1], entry[2] - entry[1], entry[3]);
+    }
+  }
+
+  private static void candidate(Map<Integer, List<int[]>> candidates, int line, int shift, int exact) {
+    candidates.computeIfAbsent(line, k -> new ArrayList<>()).add(new int[]{shift, exact});
+  }
+
+  /**
+   * Settles every line the method walk produced a constraint for.
+   *
+   * <p>A line whose instructions all agree keeps that shift. When they do not, the disagreement is
+   * usually one instruction that inherited its line from an earlier LineNumberTable entry and is
+   * printed on another line than the entry's own instruction: a chain link's receiver, or the store
+   * of an expression spanning several lines. Such an inherited line describes the entry it came
+   * from, not the text printed beside it. The instructions that have an entry of their own are the
+   * ones whose text this printed line actually holds, so their shift is taken when they agree;
+   * otherwise the line stays conflicted and unmoved.
+   */
+  private static void resolveCandidates(Map<Integer, List<int[]>> candidates,
+      TreeMap<Integer, Integer> shifts, Set<Integer> conflicted) {
+    for (Map.Entry<Integer, List<int[]>> line : candidates.entrySet()) {
+      Set<Integer> all = new java.util.TreeSet<>();
+      Set<Integer> exact = new java.util.TreeSet<>();
+      for (int[] candidate : line.getValue()) {
+        all.add(candidate[0]);
+        if (candidate[1] != 0) {
+          exact.add(candidate[0]);
+        }
+      }
+      if (all.size() == 1) {
+        add(shifts, conflicted, line.getKey(), all.iterator().next());
+      }
+      else if (exact.size() == 1) {
+        add(shifts, conflicted, line.getKey(), exact.iterator().next());
+      }
+      else {
+        shifts.remove(line.getKey());
+        conflicted.add(line.getKey());
+      }
     }
   }
 
