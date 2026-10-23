@@ -1088,7 +1088,8 @@ public class InvocationExprent extends Exprent {
           }
           buf.append(".");
           // Adds generic arguments to the invocation, so .m() becomes .<T>m()
-          this.appendParameters(buf, witnessContradictsRecordedMethodReference() ? Collections.emptyList() : genericArgs);
+          this.appendParameters(buf, witnessContradictsRecordedMethodReference() || witnessContradictsLambdaValue()
+            ? Collections.emptyList() : genericArgs);
         }
 
         buf.addBytecodeMapping(bytecode);
@@ -3555,6 +3556,61 @@ public class InvocationExprent extends Exprent {
    * violates this cannot come from any compiling source, so it is the printer's own inference
    * and is dropped, letting javac infer the type from the argument the source passed.
    */
+  /**
+   * A witness for a variable at a functional argument's return position must accept the value
+   * the recorded lambda body produces. Ingredient's encode lambda returns {@code i.values}, a
+   * HolderSet, while a target-seeded witness pinned Optional.map's variable to the narrower
+   * HolderSet.Direct; printing it contradicts the lambda's own body and javac rejects the call.
+   */
+  private boolean witnessContradictsLambdaValue() {
+    if (genericArgs.isEmpty() || desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    List<String> fparams = desc.getSignature().typeParameters;
+    if (fparams.size() != genericArgs.size()) {
+      return false;
+    }
+    Map<VarType, VarType> witness = new HashMap<>();
+    Set<VarType> methodVars = fparamTypes(fparams);
+    for (int i = 0; i < fparams.size(); i++) {
+      witness.put(GenericType.parse("T" + fparams.get(i) + ";"), genericArgs.get(i));
+    }
+    List<VarType> declared = desc.getSignature().parameterTypes;
+    int count = Math.min(declared.size(), lstParameters.size());
+    for (int i = 0; i < count; i++) {
+      if (!(lstParameters.get(i) instanceof NewExprent lambda) || !lambda.isLambda() || lambda.isMethodReference()) {
+        continue;
+      }
+      Set<VarType> covariant = new HashSet<>();
+      Set<VarType> other = new HashSet<>();
+      collectVariance(declared.get(i), true, covariant, other);
+      covariant.removeAll(other);
+      covariant.retainAll(methodVars);
+      if (covariant.size() != 1) {
+        continue;
+      }
+      VarType value = witness.get(covariant.iterator().next());
+      if (value == null || value.type != CodeType.OBJECT || value.arrayDim != 0) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+      if (node == null) {
+        continue;
+      }
+      VarType bodyRet = recordedLambdaValueType(node);
+      if (bodyRet == null || bodyRet.type != CodeType.OBJECT || bodyRet.arrayDim != 0 || sameType(value, bodyRet)) {
+        continue;
+      }
+      // A strict subtype of the body's recorded type cannot be what the lambda returns; a
+      // supertype accepts the body and is no contradiction.
+      if (DecompilerContext.getStructContext().instanceOf(value.value, bodyRet.value)
+        && !DecompilerContext.getStructContext().instanceOf(bodyRet.value, value.value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private boolean witnessContradictsRecordedMethodReference() {
     if (genericArgs.isEmpty() || desc == null || desc.getSignature() == null) {
       return false;
