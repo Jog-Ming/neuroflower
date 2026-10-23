@@ -341,7 +341,7 @@ public final class ConstantNames {
       List.of(), null, Set.of(), Map.of(), Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
-  private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max) {
+  private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
   }
 
   /** The first instruction that references a pool entry, in javac's code generation order. */
@@ -731,7 +731,7 @@ public final class ConstantNames {
         min = Math.min(min, position);
         max = Math.max(max, position);
       }
-      spaces.add(new SiteSpace(rank, entry.getValue(), min, max));
+      spaces.add(new SiteSpace(rank, entry.getValue(), min, max, entry.getKey().b));
     }
     return spaces;
   }
@@ -1190,9 +1190,15 @@ public final class ConstantNames {
     return remaining.isEmpty();
   }
 
-  /** A folded-constant naming the pool records as a free-standing Class+name pair. */
-  private record PairSite(int classIndex, long successor, int open, int close,
-                          Set<String> pooled) {
+  /**
+   * A folded-constant naming the pool records as a free-standing Class+name pair.
+   *
+   * <p>{@code open}/{@code close} are the argument list of the call the pair precedes; a field
+   * reference has no argument list and stores -1 in both, leaving the generation-order gap between
+   * {@code lower} and {@code successor} to place the site.
+   */
+  private record PairSite(int classIndex, long successor, long lower, int open, int close,
+                          String member, Set<String> pooled) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
@@ -1242,11 +1248,16 @@ public final class ConstantNames {
       if (owner.equals(cls.qualifiedName) || setup.contains(i) || catchTypes.contains(owner)) {
         continue; // the class is entered as itself, a catch type or a class-setup entry
       }
-      if (!(pool.get(i + 2) instanceof LinkConstant link)
-          || (link.type != CodeConstants.CONSTANT_Methodref
-              && link.type != CodeConstants.CONSTANT_InterfaceMethodref)
-          || owner.equals(link.classname)) {
-        continue; // no reference follows the pair, or the pair is that reference's operand
+      if (!(pool.get(i + 2) instanceof LinkConstant link)) {
+        continue;
+      }
+      boolean call = link.type == CodeConstants.CONSTANT_Methodref
+        || link.type == CodeConstants.CONSTANT_InterfaceMethodref;
+      if (!call && link.type != CodeConstants.CONSTANT_Fieldref) {
+        continue; // the entry after the pair is neither a call nor a field reference
+      }
+      if (owner.equals(link.classname)) {
+        continue; // the pair is that reference's operand
       }
       FirstUse use = firstUses.get(i + 2);
       if (use == null) {
@@ -1256,28 +1267,35 @@ public final class ConstantNames {
       // A direct instruction use of the owner's Class entry (new, checkcast, an array type) says
       // the entry already existed when that instruction was generated. The pool puts the entry
       // before this reference, so only a direct use after the reference leaves the pair as the
-      // entry's origin: a naming in the reference's argument list. An earlier one would explain
-      // the entry, and the pair would prove nothing.
+      // entry's origin: a naming in the reference's argument list, or in the expression whose
+      // value the field access stores. An earlier one would explain the entry, and the pair would
+      // prove nothing.
       FirstUse direct = firstUses.get(i);
       if (direct != null && coordinate(direct.order(), direct.offset()) <= point) {
         continue;
       }
-      if (coordinates(firstUses, i, early, -1)[1] != point) {
+      long[] bounds = coordinates(firstUses, i, early, -1);
+      if (bounds[1] != point) {
         continue; // a higher entry was created before this reference; the pair is not its naming
       }
-      Integer printed = position(cls, use, positions);
-      if (printed == null) {
-        continue;
+      int open = -1;
+      int close = -1;
+      if (call) {
+        Integer printed = position(cls, use, positions);
+        if (printed == null) {
+          continue;
+        }
+        open = nextOpenParen(text, printed);
+        if (open < 0) {
+          continue;
+        }
+        close = matchingParen(text, open);
+        if (close < 0) {
+          continue;
+        }
       }
-      int open = nextOpenParen(text, printed);
-      if (open < 0) {
-        continue;
-      }
-      int close = matchingParen(text, open);
-      if (close < 0) {
-        continue;
-      }
-      pairs.putIfAbsent(owner, new PairSite(i, point, open, close, pooledKeys(cls, i)));
+      pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], open, close,
+        call ? null : link.elementname, pooledKeys(cls, i)));
     }
     return pairs;
   }
@@ -1511,18 +1529,32 @@ public final class ConstantNames {
           continue;
         }
         Site best = null;
+        Site fieldBest = null;
+        int fieldMatches = 0;
         long bestCoordinate = NO_COORDINATE;
         for (Site site : candidates) {
-          if (site.start() <= pair.open() || site.start() >= pair.close()) {
+          if (pair.open() >= 0 && (site.start() <= pair.open() || site.start() >= pair.close())) {
             continue; // outside the call's argument list
           }
           long coordinate = siteCoordinate(rules.placement().spaces(), site.start());
           if (coordinate == NO_COORDINATE) {
+            // A field initializer's folded literal is printed in the class body, where the
+            // printer maps no instruction point for it. The field reference right after the pair
+            // names the field, and that field's own initializer is the only place the literal
+            // can sit: its <field-init> line is the site the pool orders.
+            if (pair.open() < 0 && fieldInitializerSite(text, rules.placement().spaces(),
+                site.start(), pair)) {
+              fieldBest = site;
+              fieldMatches++;
+            }
             continue;
           }
           if ((coordinate >>> 32) != (pair.successor() >>> 32)
               || (coordinate & 0xffffffffL) >= (pair.successor() & 0xffffffffL)) {
             continue; // another method, or after the reference was generated
+          }
+          if (pair.open() < 0 && coordinate <= pair.lower()) {
+            continue; // before the previous entry's first use; the naming would move it
           }
           if (best == null || coordinate > bestCoordinate) {
             best = site;
@@ -1531,6 +1563,9 @@ public final class ConstantNames {
         }
         if (best != null) {
           addSiteOnce(sites, best);
+        }
+        else if (fieldBest != null && fieldMatches == 1) {
+          addSiteOnce(sites, fieldBest);
         }
       }
     }
@@ -1566,6 +1601,26 @@ public final class ConstantNames {
         }
       }
     }
+  }
+
+  /**
+   * Whether the site is printed on the line of the {@code <field-init>} buffer the successor field
+   * reference writes, in the constructor that generated it.
+   */
+  private static boolean fieldInitializerSite(String text, List<SiteSpace> spaces, int position,
+                                              PairSite pair) {
+    if (spaces == null || pair.member() == null) {
+      return false;
+    }
+    int rank = (int) (pair.successor() >>> 32);
+    String key = "<field-init " + pair.member() + ">";
+    for (SiteSpace space : spaces) {
+      if (space.rank() != rank || !key.equals(space.key())) {
+        continue;
+      }
+      return position >= lineStart(text, space.min()) && position <= lineEnd(text, space.max());
+    }
+    return false;
   }
 
   /** Whether some site already names this owner in the class text. */
