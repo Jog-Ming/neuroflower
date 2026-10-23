@@ -35,6 +35,9 @@ work stands — belong in project memory.
   available type is an erasure, a capture, or an unknown, print nothing. A raw or erased type changes
   the generic shape and can alter inference elsewhere, so producing one is a bug even where it
   compiles and even if the tree score rises.
+- **The compile gate is deterministic.** A file that fails to compile is repaired only by facts
+  recorded in the class file or by static language rules — never by a model, and never by compiling
+  candidates and keeping one. A repair that would need either is reported as blocked instead.
 - **Never `sleep` to wait.** A long command is launched in the background and its completion
   notification is the wait; a short readiness check polls with a bounded number of attempts and a
   timeout. Never a blind `sleep N` before a check.
