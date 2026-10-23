@@ -101,6 +101,7 @@ public class DoStatement extends Statement {
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
 
+    int varDefsStart = buf.length();
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
     if (isLabeled()) {
@@ -141,8 +142,18 @@ public class DoStatement extends Statement {
         if (incLine >= 0 && condLine >= 0 && incLine != condLine) {
           TextBuffer body = ExprProcessor.jmpWrapper(first, indent + 1, false);
           if (!endsWithTransfer(body)) {
-            if (initExprent.get(0) != null) {
-              buf.appendIndent(indent).append(initExprent.get(0).toJava(indent)).append(";").appendLineSeparator();
+            Exprent init = initExprent.get(0);
+            if (init instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assign
+              && assign.getLeft() instanceof VarExprent left
+              && !varDefinitions.isEmpty() && varDefinitions.get(varDefinitions.size() - 1) instanceof VarExprent decl
+              && decl.getIndex() == left.getIndex()) {
+              // The original declared and initialized in one statement; keep that shape.
+              buf.setLength(varDefsStart);
+              buf.append(ExprProcessor.listToJava(varDefinitions.subList(0, varDefinitions.size() - 1), indent));
+              buf.appendIndent(indent).append(decl.toJava(indent)).append(" = ")
+                .append(assign.getRight().toJava(indent)).append(";").appendLineSeparator();
+            } else if (init != null) {
+              buf.appendIndent(indent).append(init.toJava(indent)).append(";").appendLineSeparator();
             }
             buf.appendIndent(indent).append("while (").append(conditionExprent.get(0).toJava(indent)).append(") {").appendLineSeparator();
             buf.append(body);
