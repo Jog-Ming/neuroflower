@@ -267,6 +267,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_SAME_LINE_JOIN = "rt-same-line-join";
 
+  @Name("Round Trip: Gap Alignment")
+  @Description("Lay line alignment out one anchor gap at a time and reclaim padding parked at earlier gaps.")
+  @ShortName("rtga")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_GAP_ALIGN = "rt-gap-align";
+
   @Name("Round Trip: Switch Order")
   @Description("Print case bodies in the original source's line order, not the switch's key order.")
   @ShortName("rtswo")
@@ -565,6 +571,7 @@ public interface IFernflowerPreferences {
     defaults.put(ROUND_TRIP_DEMAND_WITNESS, "1");
     defaults.put(ROUND_TRIP_BUILDER_INFERENCE, "1");
     defaults.put(ROUND_TRIP_SAME_LINE_JOIN, "1");
+    defaults.put(ROUND_TRIP_GAP_ALIGN, "1");
     defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
     defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");
     defaults.put(ROUND_TRIP_GENVAR_ARGS, "1");

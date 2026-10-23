@@ -72,6 +72,7 @@ public final class LineAlign {
       }
     }
 
+    boolean gapAlign = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GAP_ALIGN);
     TreeMap<Integer, Integer> shifts = new TreeMap<>();
     Set<Integer> conflicted = new HashSet<>();
     Set<Integer> entryLines = new HashSet<>();
@@ -96,6 +97,10 @@ public final class LineAlign {
       }
       StructLineNumberTableAttribute table = lineTable(className, methodKey);
       if (table == null) {
+        continue;
+      }
+      if (gapAlign) {
+        addMethodConstraints(table, mapping, lines, shifts, conflicted, entryLines);
         continue;
       }
       for (Map.Entry<Integer, Integer> entry : mapping.entrySet()) {
@@ -129,46 +134,52 @@ public final class LineAlign {
     List<Integer> removals = new ArrayList<>();
     List<Integer> joins = new ArrayList<>();
 
-
-    int previous = 0;
-    int previousIndex = -1;
-    for (Map.Entry<Integer, Integer> entry : shifts.entrySet()) {
-      int index = entry.getKey() - 1;
-      int target = entry.getValue();
-      if (index < 0 || index > lines.length) {
+    if (gapAlign) {
+      if (!walkGaps(lines, shifts, entryLines, inserts, removals, joins)) {
         return text;
       }
-      if (target > previous) {
-        if (insideTextBlock(lines, index)) {
+    }
+    else {
+      int previous = 0;
+      int previousIndex = -1;
+      for (Map.Entry<Integer, Integer> entry : shifts.entrySet()) {
+        int index = entry.getKey() - 1;
+        int target = entry.getValue();
+        if (index < 0 || index > lines.length) {
           return text;
         }
-        inserts.add(new int[]{index, target - previous});
-      } else if (target < previous) {
-        int want = previous - target;
-        int need = want;
-        int lowest = previousIndex;
-        for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
-          if (removable(lines, i)) {
-            removals.add(i);
-            need--;
+        if (target > previous) {
+          if (insideTextBlock(lines, index)) {
+            return text;
+          }
+          inserts.add(new int[]{index, target - previous});
+        } else if (target < previous) {
+          int want = previous - target;
+          int need = want;
+          int lowest = previousIndex;
+          for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
+            if (removable(lines, i)) {
+              removals.add(i);
+              need--;
+            }
+          }
+          for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
+            // A join moves line i onto line i-1, so neither may be a line another edit deletes.
+            if (joinable(lines, i, entryLines) && !removals.contains(i) && !removals.contains(i - 1)
+                && !joins.contains(i)) {
+              joins.add(i);
+              need--;
+            }
+          }
+          target = previous - (want - need);
+          if (debug && need > 0) {
+            System.err.println("underpaid line " + entry.getKey() + " want " + want + " unpaid " + need
+              + " from " + lowest + " to " + index);
           }
         }
-        for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
-          // A join moves line i onto line i-1, so neither may be a line another edit deletes.
-          if (joinable(lines, i, entryLines) && !removals.contains(i) && !removals.contains(i - 1)
-              && !joins.contains(i)) {
-            joins.add(i);
-            need--;
-          }
-        }
-        target = previous - (want - need);
-        if (debug && need > 0) {
-          System.err.println("underpaid line " + entry.getKey() + " want " + want + " unpaid " + need
-            + " from " + lowest + " to " + index);
-        }
+        previous = target;
+        previousIndex = index;
       }
-      previous = target;
-      previousIndex = index;
     }
     if (debug) {
       System.err.println("align " + text.hashCode() + " shifts " + shifts.size()
@@ -628,6 +639,142 @@ public final class LineAlign {
       shifts.remove(line);
       conflicted.add(line);
     }
+  }
+
+  /**
+   * Builds the anchors one method at a time, in bytecode order.
+   *
+   * <p>An instruction can be recorded on a line earlier than the entry before it only when the
+   * printer mapped it at a statement boundary rather than where its text sits: a lifted
+   * initializer maps its last instruction to the declaration's line, and the store a switch
+   * merges out of its arms maps to the header's. The instruction's text is then on the line the
+   * previous entry closes, and the original's line continues that entry's by at most one. Such
+   * a record moves its target there. A target that moves back belongs to an invocation printed
+   * before its own arguments, and one that jumps ahead belongs to a synthetic closing-brace
+   * mapping; both keep their own line, as any other entry does.
+   */
+  private static void addMethodConstraints(StructLineNumberTableAttribute table,
+      Map<Integer, Integer> mapping, String[] lines, TreeMap<Integer, Integer> shifts,
+      Set<Integer> conflicted, Set<Integer> entryLines) {
+    List<int[]> entries = new ArrayList<>(mapping.size());
+    for (Map.Entry<Integer, Integer> entry : mapping.entrySet()) {
+      int ours = entry.getValue() + 1; // one based line in this file
+      int target = table.findLineNumber(entry.getKey());
+      if (target < 0 || ours < 1 || ours > lines.length) {
+        continue;
+      }
+      entries.add(new int[]{entry.getKey(), ours, target});
+    }
+    entries.sort((a, b) -> Integer.compare(a[0], b[0]));
+    int previousLine = -1;
+    int highest = -1;
+    for (int[] entry : entries) {
+      if (entry[1] < previousLine && entry[2] >= highest && entry[2] <= highest + 1) {
+        highest = entry[2];
+        entryLines.add(previousLine);
+        add(shifts, conflicted, previousLine, entry[2] - previousLine);
+        continue;
+      }
+      previousLine = entry[1];
+      highest = Math.max(highest, entry[2]);
+      entryLines.add(entry[1]);
+      add(shifts, conflicted, entry[1], entry[2] - entry[1]);
+    }
+  }
+
+  /**
+   * Places the anchors one gap at a time: two consecutive anchors must be as many lines apart
+   * as they are in the original. A gap that is too short gets padding before the later anchor;
+   * one that is too long loses blank or joinable lines between them. Only when a method's own
+   * anchors cannot pay a gap does the walk reclaim padding parked in an earlier gap.
+   *
+   * <p>Returns false when an insertion would fall inside a text block, in which case the buffer
+   * must stay as printed.
+   */
+  private static boolean walkGaps(String[] lines, TreeMap<Integer, Integer> shifts,
+      Set<Integer> entryLines, List<int[]> inserts, List<Integer> removals, List<Integer> joins) {
+    List<int[]> placed = new ArrayList<>(); // {index, paid shift, required shift}
+    int previous = 0;
+    int previousIndex = -1;
+    for (Map.Entry<Integer, Integer> entry : shifts.entrySet()) {
+      int index = entry.getKey() - 1;
+      int desired = entry.getValue();
+      if (index < 0 || index > lines.length) {
+        return false;
+      }
+      int paid = desired;
+      if (desired > previous) {
+        if (insideTextBlock(lines, index)) {
+          return false;
+        }
+        inserts.add(new int[]{index, desired - previous});
+      }
+      else if (desired < previous) {
+        int want = previous - desired;
+        int need = want;
+        int lowest = previousIndex;
+        for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
+          if (removable(lines, i) && !removals.contains(i)) {
+            removals.add(i);
+            need--;
+          }
+        }
+        for (int i = Math.min(index - 1, lines.length - 1); i > lowest && need > 0; i--) {
+          // A join moves line i onto line i-1, so neither may be a line another edit deletes.
+          if (joinable(lines, i, entryLines) && !removals.contains(i) && !removals.contains(i - 1)
+              && !joins.contains(i)) {
+            joins.add(i);
+            need--;
+          }
+        }
+        if (need > 0) {
+          need -= reclaim(lines, need, previousIndex, placed, removals, joins);
+        }
+        paid = previous - (want - need);
+        if (debug && need > 0) {
+          System.err.println("gap underpaid line " + entry.getKey() + " want " + want + " unpaid " + need
+            + " from " + lowest + " to " + index);
+        }
+      }
+      placed.add(new int[]{index, paid, desired});
+      previous = paid;
+      previousIndex = index;
+    }
+    return true;
+  }
+
+  /**
+   * Deletes blank or padding lines from gaps before the previous anchor to pay a gap that has
+   * nothing left of its own. Every anchor that follows a deleted line is lifted one line, so a
+   * line may only be taken while all of them are still above their own targets: the lift then
+   * moves them closer instead of past them. Returns how many lines were taken.
+   */
+  private static int reclaim(String[] lines, int need, int previousIndex, List<int[]> placed,
+      List<Integer> removals, List<Integer> joins) {
+    int found = 0;
+    int anchor = placed.size() - 1;
+    int limit = Integer.MAX_VALUE;
+    for (int i = previousIndex - 1; i >= 0 && need > 0; i--) {
+      while (anchor >= 0 && placed.get(anchor)[0] > i) {
+        int[] entry = placed.get(anchor--);
+        limit = Math.min(limit, entry[1] - entry[2]); // paid minus required: how far it can rise
+      }
+      if (limit <= 0) {
+        break;
+      }
+      // A join planned on line i or i-1 claims this one; deleting it would take text with it.
+      if (removable(lines, i) && !removals.contains(i)
+          && !joins.contains(i) && !joins.contains(i + 1)) {
+        removals.add(i);
+        found++;
+        need--;
+        limit--;
+        for (int k = anchor + 1; k < placed.size(); k++) {
+          placed.get(k)[1]--;
+        }
+      }
+    }
+    return found;
   }
 
   private static boolean joinable(String[] lines, int index, Set<Integer> entryLines) {
