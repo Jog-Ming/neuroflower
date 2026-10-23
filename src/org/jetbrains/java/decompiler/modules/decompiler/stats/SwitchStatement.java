@@ -3,6 +3,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.SwitchInstruction;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
@@ -10,13 +11,17 @@ import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
+import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
+import org.jetbrains.java.decompiler.struct.gen.TypeFamily;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.util.StartEndPair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -264,6 +269,14 @@ public class SwitchStatement extends Statement {
     if (size < 2 || !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SWITCH_ORDER)) {
       return order;
     }
+    // The target's arm blocks record the source order directly when the switch instruction's keys
+    // are the labels themselves: a plain int switch or a direct ordinal switch. A `$SwitchMap`
+    // enum switch keys its table with synthetic numbers and a string switch keys it with hashes,
+    // so there the labels prove nothing; those switches and pattern switches stay untouched.
+    List<Integer> byOffset = offsetOrder();
+    if (byOffset != null) {
+      return byOffset;
+    }
     // Pattern labels, guards and `case null` have ordering rules of their own; only a plain
     // constant switch may be written in an order the switch instruction does not define.
     if (isPattern() || caseValues.stream().flatMap(List::stream)
@@ -301,6 +314,91 @@ public class SwitchStatement extends Statement {
         + java.util.Arrays.toString(lines) + " -> " + order);
     }
     return order;
+  }
+
+  /**
+   * The arm order the target's switch instruction records, or null when its layout does not record
+   * one. Javac lays the arm blocks out in source order, and when every table key is the case label
+   * itself (a plain int switch, or an enum switched directly on its ordinal) the block offsets are
+   * the source order. A shared default, a label whose key is not the label, or an arm with no
+   * instruction of its own makes the offsets unusable.
+   */
+  private List<Integer> offsetOrder() {
+    int size = caseStatements.size();
+    if (!(first instanceof BasicBlockStatement head)
+      || !(head.getBlock().getLastInstruction() instanceof SwitchInstruction instruction)) {
+      return null;
+    }
+    List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    int[] keys = instruction.getValues();
+    int[] offsets = new int[size];
+    int defaultIndex = -1;
+    for (int i = 0; i < size; i++) {
+      Statement stat = caseStatements.get(i);
+      if (stat == null) {
+        return null;
+      }
+      List<StatEdge> edges = caseEdges.get(i);
+      List<Exprent> values = caseValues.get(i);
+      for (int j = 0; j < edges.size(); j++) {
+        StatEdge edge = edges.get(j);
+        int index = successors.indexOf(edge);
+        if (index < 0) {
+          return null;
+        }
+        if (edge == defaultEdge) {
+          if (edges.size() > 1 || defaultIndex >= 0) {
+            return null;
+          }
+          defaultIndex = i;
+          continue;
+        }
+        Exprent value = j < values.size() ? values.get(j) : null;
+        if (index == 0 || index - 1 >= keys.length || value == null || !labelIsKey(value, keys[index - 1])) {
+          return null;
+        }
+      }
+      offsets[i] = RoundTrip.firstOffset(stat);
+      if (offsets[i] < 0) {
+        return null;
+      }
+    }
+
+    List<Integer> order = new ArrayList<>(size);
+    for (int i = 0; i < size; i++) {
+      order.add(i);
+    }
+    order.sort(Comparator.comparingInt(i -> offsets[i]));
+    for (int i = 1; i < size; i++) {
+      if (offsets[order.get(i - 1)] == offsets[order.get(i)]) {
+        return null;
+      }
+    }
+    return order;
+  }
+
+  /** Whether a printed case label names the switch instruction's key at that position. */
+  private static boolean labelIsKey(Exprent value, int key) {
+    if (value instanceof ConstExprent constant) {
+      return constant.getConstType().typeFamily == TypeFamily.INTEGER && constant.getIntValue() == key;
+    }
+    if (value instanceof FieldExprent field && field.isStatic()) {
+      StructClass owner = DecompilerContext.getStructContext().getClass(field.getClassname());
+      if (owner == null || !owner.hasModifier(CodeConstants.ACC_ENUM)) {
+        return false;
+      }
+      int ordinal = 0;
+      for (StructField member : owner.getFields()) {
+        if (!member.hasModifier(CodeConstants.ACC_ENUM)) {
+          continue;
+        }
+        if (member.getName().equals(field.getName())) {
+          return ordinal == key;
+        }
+        ordinal++;
+      }
+    }
+    return false;
   }
 
   @Override
