@@ -555,8 +555,14 @@ public class NewExprent extends Exprent {
         int start = enumConst ? 2 : 0;
         if (!enumConst || start < constructor.getLstParameters().size()) {
           List<VarType> args = forcedConstructorArgs != null ? forcedConstructorArgs : constructor.getGenericArgs();
+          // A receiver has no target type. A diamond printed because the value sits inside an
+          // enclosing argument list would infer its arguments from the constructor's arguments
+          // alone, and when those leave a variable unconstrained javac closes it on its bound:
+          // the chained receiver then loses the parameterization the caller needs. The original
+          // wrote the raw type in that position, and erasure makes the two spellings identical.
+          boolean receiverDiamond = args.isEmpty() && isQualifier;
           if (args.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
-              && InvocationExprent.inArgument() && hasTypeParameters(newType)) {
+              && InvocationExprent.inArgument() && hasTypeParameters(newType) && !receiverDiamond) {
             // No recovered type arguments, but javac infers them from the context; the original
             // wrote the diamond, and a raw type would break the caller's inference.
             buf.append("<>");
