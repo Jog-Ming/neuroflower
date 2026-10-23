@@ -46,6 +46,242 @@ public final class BuilderInference {
   }
 
   /**
+   * Solves a static call's type arguments from the method reference it alone passes. javac does
+   * not use a method reference for applicability, so a call that gets no target type (a receiver
+   * expression) infers the functional interface's variables to their bounds and rejects the
+   * reference; the source had to pin them. Both the implementation method (the recorded
+   * MethodHandle) and the functional interface's own Signature are in the class files, and their
+   * declared shapes fix the variables: the interface method's instantiated parameters and result
+   * are unified with the implementation's. A variable the implementation declares itself is not
+   * nameable at the call site; it is written as the unbounded wildcard, the one type that stands
+   * for every instantiation. Returns the values keyed as {@code T<name>;}, or null when the call
+   * is not this shape, the reference is not the only argument, or any value is not nameable.
+   */
+  public static @Nullable Map<VarType, VarType> solveMethodReference(InvocationExprent call, List<String> fparams) {
+    if (SOLVING.get()) {
+      return null;
+    }
+    SOLVING.set(Boolean.TRUE);
+    try {
+      return solveMethodReferenceInner(call, fparams);
+    }
+    catch (RuntimeException e) {
+      return null;
+    }
+    finally {
+      SOLVING.set(Boolean.FALSE);
+    }
+  }
+
+  private static @Nullable Map<VarType, VarType> solveMethodReferenceInner(InvocationExprent call, List<String> fparams) {
+    if (call.getFunctype() == InvocationExprent.Type.INIT || call.getInvocationType() != InvocationExprent.InvocationType.STATIC
+      || fparams.isEmpty() || !call.isReceiverPosition() || !call.isRecordedCallSite()) {
+      return null;
+    }
+    StructMethod callee = call.getDesc();
+    if (callee == null || callee.getSignature() == null) {
+      return null;
+    }
+    List<VarType> declaredParams = callee.getSignature().parameterTypes;
+    if (declaredParams.size() != 1 || !(declaredParams.get(0) instanceof GenericType samType)
+      || call.getLstParameters().size() != 1
+      || !(call.getLstParameters().get(0) instanceof NewExprent reference)
+      || !reference.isMethodReference()) {
+      return null;
+    }
+    ClassNode referenceNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(reference.getNewType().value);
+    if (referenceNode == null || referenceNode.lambdaInformation == null
+      || !referenceNode.lambdaInformation.is_method_reference) {
+      return null;
+    }
+    // The functional interface's own declared method, and the implementation the MethodHandle
+    // records. Both are looked up by the exact recorded descriptor, so an overload cannot be
+    // mistaken for either.
+    StructClass samClass = DecompilerContext.getStructContext().getClass(samType.value);
+    if (samClass == null || samClass.getSignature() == null) {
+      return null;
+    }
+    List<String> interfaceParams = samClass.getSignature().fparameters;
+    List<VarType> interfaceArgs = samType.getArguments();
+    if (interfaceParams.isEmpty() || interfaceParams.size() != interfaceArgs.size()) {
+      return null;
+    }
+    // The recorded method descriptor is the instantiated functional method type, not the
+    // interface's own erased one; the method is the interface's single abstract member of that
+    // name and arity.
+    int samArity = MethodDescriptor.parseDescriptor(referenceNode.lambdaInformation.method_descriptor).params.length;
+    StructMethod samMethod = null;
+    for (StructMethod candidate : samClass.getMethods()) {
+      if (!referenceNode.lambdaInformation.method_name.equals(candidate.getName())
+        || candidate.hasModifier(CodeConstants.ACC_STATIC)
+        || !candidate.hasModifier(CodeConstants.ACC_ABSTRACT)
+        || MethodDescriptor.parseDescriptor(candidate.getDescriptor()).params.length != samArity) {
+        continue;
+      }
+      if (samMethod != null) {
+        return null;
+      }
+      samMethod = candidate;
+    }
+    if (samMethod == null || samMethod.getSignature() == null
+      || !samMethod.getSignature().typeParameters.isEmpty()) {
+      return null;
+    }
+    StructClass content = DecompilerContext.getStructContext().getClass(referenceNode.lambdaInformation.content_class_name);
+    if (content == null || (content.getSignature() != null && !content.getSignature().fparameters.isEmpty())) {
+      // The implementation's own class type variables would leak into the witness; only a
+      // non-generic declaring class leaves the solution nameable.
+      return null;
+    }
+    StructMethod implementation = content.getMethodRecursive(referenceNode.lambdaInformation.content_method_name,
+      referenceNode.lambdaInformation.content_method_descriptor);
+    if (implementation == null || implementation.getSignature() == null
+      || !implementation.hasModifier(CodeConstants.ACC_STATIC)
+      || implementation.getSignature().typeParameters.isEmpty()) {
+      // A reference to a non-generic method records its own instantiated type, so javac infers
+      // the interface's variables from it; only the implementation's own type variables are
+      // unnameable at the call site and force the source witness.
+      return null;
+    }
+
+    Map<VarType, VarType> interfaceMap = new HashMap<>();
+    for (int i = 0; i < interfaceParams.size(); i++) {
+      VarType argument = interfaceArgs.get(i);
+      if (argument == null) {
+        return null;
+      }
+      interfaceMap.put(GenericType.parse("T" + interfaceParams.get(i) + ";"), argument);
+    }
+    GenericMethodDescriptor samSignature = samMethod.getSignature();
+    GenericMethodDescriptor implSignature = implementation.getSignature();
+    List<VarType> samParams = new ArrayList<>(samSignature.parameterTypes.size());
+    for (VarType parameter : samSignature.parameterTypes) {
+      VarType instantiated = parameter.remap(interfaceMap);
+      if (instantiated == null) {
+        return null;
+      }
+      samParams.add(instantiated);
+    }
+    VarType samReturn = samSignature.returnType.remap(interfaceMap);
+    if (samReturn == null || samParams.size() != implSignature.parameterTypes.size()) {
+      return null;
+    }
+
+    // A type variable the implementation declares itself is not nameable at the call site; its
+    // name may collide with a variable of the caller, which would make the solution ambiguous.
+    Map<VarType, List<VarType>> named = call.getNamedGenerics();
+    for (String name : implSignature.typeParameters) {
+      if (named.containsKey(GenericType.parse("T" + name + ";"))) {
+        return null;
+      }
+    }
+
+    Unifier unifier = new Unifier();
+    for (int i = 0; i < samParams.size(); i++) {
+      if (!unifier.unify(samParams.get(i), implSignature.parameterTypes.get(i))) {
+        return null;
+      }
+    }
+    if (!unifier.unify(samReturn, implSignature.returnType)) {
+      return null;
+    }
+
+    // The substituted interface signature must erase to the method the MethodHandle records:
+    // this is the recorded functional shape, checked after every variable is solved.
+    MethodDescriptor recorded = MethodDescriptor.parseDescriptor(referenceNode.lambdaInformation.content_method_descriptor);
+    if (recorded.params.length != samParams.size()) {
+      return null;
+    }
+    for (int i = 0; i < samParams.size(); i++) {
+      VarType erased = eraseSolved(samParams.get(i), unifier);
+      if (erased == null || !erased.equals(recorded.params[i])) {
+        return null;
+      }
+    }
+    VarType erasedReturn = eraseSolved(samReturn, unifier);
+    if (erasedReturn == null || !erasedReturn.equals(recorded.ret)) {
+      return null;
+    }
+
+    Map<VarType, VarType> solved = new HashMap<>();
+    boolean[] wildcarded = new boolean[1];
+    for (String name : fparams) {
+      VarType variable = GenericType.parse("T" + name + ";");
+      VarType value = wildcardUnnameable(unifier.substitute(variable), named, wildcarded);
+      if (value == null || !isNameable(value, named)) {
+        return null;
+      }
+      solved.put(variable, value);
+    }
+    if (!wildcarded[0]) {
+      // No implementation variable survived into the witness: javac can infer these values, and
+      // a source need not have pinned them.
+      return null;
+    }
+    return solved;
+  }
+
+  /**
+   * The erasure of a substituted signature type: a type variable that remains unsolved has no
+   * bound the call could have written, and any type argument is dropped as the descriptor does.
+   */
+  private static @Nullable VarType eraseSolved(VarType type, Unifier unifier) {
+    VarType resolved = unifier.resolve(type);
+    if (resolved == null) {
+      return null;
+    }
+    if (resolved.type == CodeType.GENVAR) {
+      return null;
+    }
+    if (resolved.type == CodeType.OBJECT) {
+      return new VarType(CodeType.OBJECT, resolved.arrayDim, resolved.value);
+    }
+    return resolved;
+  }
+
+  /**
+   * Replaces every variable not nameable at the call site with the unbounded wildcard. A null
+   * result means the whole type is such a variable, which a source cannot write as a witness.
+   */
+  private static @Nullable VarType wildcardUnnameable(VarType type, Map<VarType, List<VarType>> named, boolean[] wildcarded) {
+    if (type == null) {
+      return null;
+    }
+    if (type.type == CodeType.GENVAR) {
+      if (isNameable(type, named)) {
+        return type;
+      }
+      wildcarded[0] = true;
+      return null;
+    }
+    if (!(type instanceof GenericType generic)) {
+      return type;
+    }
+    List<VarType> arguments = generic.getArguments();
+    if (arguments.isEmpty()) {
+      return type;
+    }
+    List<VarType> substituted = new ArrayList<>(arguments.size());
+    boolean changed = false;
+    for (VarType argument : arguments) {
+      if (argument == null) {
+        substituted.add(null);
+        continue;
+      }
+      VarType value = wildcardUnnameable(argument, named, wildcarded);
+      if (value != argument) {
+        changed = true;
+      }
+      substituted.add(value);
+    }
+    if (!changed) {
+      return type;
+    }
+    return new GenericType(type.type, type.arrayDim, type.value, generic.getParent(),
+      Collections.unmodifiableList(substituted), generic.getWildcard());
+  }
+
+  /**
    * Returns the solved value of the call's type variable, keyed as {@code T<name>;}, or null when
    * the call is not the builder shape or the solution is not fully determined, printable and in
    * scope. The caller seeds its generic map with the result.

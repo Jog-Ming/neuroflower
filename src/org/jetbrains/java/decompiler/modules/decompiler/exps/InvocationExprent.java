@@ -317,6 +317,19 @@ public class InvocationExprent extends Exprent {
           }
         }
 
+        // A receiver call that passes only a method reference: javac gives the receiver no target
+        // and does not use the reference for applicability, so the functional interface's
+        // variables default to their bounds and the reference is rejected. The reference's
+        // implementation Signature and the interface's own Signature fix them.
+        boolean referenceDemand = false;
+        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+          Map<VarType, VarType> referenceInference = BuilderInference.solveMethodReference(this, fparams);
+          if (referenceInference != null) {
+            referenceInference.forEach(genericsMap::putIfAbsent);
+            referenceDemand = true;
+          }
+        }
+
         if (!classname.equals(desc.getClassQualifiedName())) {
           Map<String, Map<VarType, VarType>> hierarchy = mthCls.getAllGenerics();
           if (hierarchy.containsKey(desc.getClassQualifiedName())) {
@@ -782,6 +795,11 @@ public class InvocationExprent extends Exprent {
             }
             else if (receiverWildcardDemand) {
               // The witness was set by receiverWildcardTargetDemand above.
+            }
+            else if (referenceDemand) {
+              // The reference's implementation Signature fixed the variables the arguments leave
+              // to the target; a receiver call had to name them.
+              getGenericArgs(fparams, genericsMap, genericArgs);
             }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
               && receiverRecordedValueDemand(fparams, ret, bounds)) {
@@ -4492,6 +4510,11 @@ public class InvocationExprent extends Exprent {
       desc = cl != null ? cl.getMethodRecursive(name, stringDescriptor) : null;
     }
     return desc;
+  }
+
+  /** Whether this call's value is the receiver of an enclosing call, so javac gives it no target. */
+  boolean isReceiverPosition() {
+    return isInvocationInstance;
   }
 
   public void setInvocationInstance() {
