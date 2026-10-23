@@ -1638,7 +1638,13 @@ public class InvocationExprent extends Exprent {
       // A later argument line is always a break the source had. An earlier one is normally the
       // enclosing statement's marker inherited by the argument's pushes, but not when the argument
       // itself has an entry there: then its own expression started that line.
-      if (callLine >= 0 && firstLine >= 0 && firstLine != callLine
+      // A lambda expression has no table entry of its own: its invokedynamic inherits the
+      // enclosing call's line, while its body is a method whose first line says where the text
+      // sits. Breaking before such an argument would only move the `->`, not the body.
+      boolean lambdaArgument = start < lstParameters.size()
+        && lstParameters.get(start) instanceof NewExprent created
+        && created.isLambda() && !created.isMethodReference();
+      if (!lambdaArgument && callLine >= 0 && firstLine >= 0 && firstLine != callLine
           && (firstLine > callLine || RoundTrip.lineStartsHere(lstParameters.get(start)))) {
         buf.appendLineSeparator();
       } else {
