@@ -479,7 +479,7 @@ public class NewExprent extends Exprent {
         // table entry can interpolate to an earlier line when the call spans lines.
         int callLine = InvocationExprent.enclosingCallLine();
         new ClassWriter().classLambdaToJava(child, buf, methodObject, indent,
-          callLine >= 0 ? callLine : RoundTrip.sourceLine(this), methodReferenceQualifier());
+          callLine >= 0 ? callLine : RoundTrip.sourceLine(this), methodReferenceQualifier(), getFunctionalReturnType());
       }
       else if (!selfReference) {
         String regionClass = child == null || child.classStruct == null ? null : child.classStruct.qualifiedName;

@@ -43,6 +43,7 @@ import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericsChecker;
 import org.jetbrains.java.decompiler.util.*;
 import org.jetbrains.java.decompiler.util.collections.VBStyleCollection;
@@ -177,7 +178,7 @@ public class ClassWriter implements StatementWriter {
   }
 
   public void classLambdaToJava(ClassNode node, TextBuffer buffer, Exprent method_object, int indent,
-                                int creationLine, VarType referenceQualifier) {
+                                int creationLine, VarType referenceQualifier, VarType functionalReturn) {
     ClassWrapper wrapper = node.getWrapper();
     if (wrapper == null) {
       return;
@@ -329,6 +330,26 @@ public class ClassWriter implements StatementWriter {
                   StructMethod outerStruct = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
                   DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, methodWrapper.methodStruct);
                   try {
+                    // The functional method's recorded return type is the target of an
+                    // expression body: a poly call there can need the witness the source wrote
+                    // for a type variable the arguments leave to the target.
+                    VarType bodyTarget = functionalReturn;
+                    if (bodyTarget instanceof GenericType wildcard) {
+                      bodyTarget = wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS
+                        ? GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO) : null;
+                    }
+                    if (bodyTarget != null && bodyTarget.type == CodeType.OBJECT && bodyTarget.arrayDim == 0) {
+                      Exprent value = firstExpr instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+                        ? exit.getValue() : firstExpr;
+                      if (value != null) {
+                        InvocationExprent.enterLambdaBody(value);
+                        try {
+                          value.getInferredExprType(bodyTarget);
+                        } finally {
+                          InvocationExprent.exitLambdaBody();
+                        }
+                      }
+                    }
                     TextBuffer codeBuffer = firstExpr.toJava(indent);
 
                     // The target's lambda body may start on a later line than the expression

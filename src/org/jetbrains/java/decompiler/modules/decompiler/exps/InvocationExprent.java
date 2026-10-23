@@ -90,6 +90,11 @@ public class InvocationExprent extends Exprent {
   private boolean isInvocationInstance = false;
   /** The invocation whose receiver is currently being typed; set only for the duration. */
   private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
+  /** The expression whose value is a single-expression lambda body being typed against its
+   * functional return type; a variable only the target determines must be pinned there. */
+  private static final ThreadLocal<Exprent> LAMBDA_BODY = new ThreadLocal<>();
+  /** The witness the lambda-body target pass proved, kept across the print-time re-inference. */
+  private List<VarType> lambdaBodyWitness;
   /**
    * The map invocation whose type argument an enclosing {@code Optional.orElse}/{@code orElseGet}
    * argument pins, and the recorded wildcard type that pins it. Set only while the receiver
@@ -763,7 +768,7 @@ public class InvocationExprent extends Exprent {
               // receiver's type argument is invariant in it: the recorded type pins the variable.
             }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
-              && targetProjectionDemand(fparams, ret, upperBound, bounds)) {
+              && targetProjectionDemand(fparams, ret, upperBound, bounds, LAMBDA_BODY.get() == this)) {
               // The recorded expected type names the arguments this call's own value must carry,
               // and the printer's own inference landed on a different one.
             }
@@ -881,6 +886,9 @@ public class InvocationExprent extends Exprent {
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
+    if (genericArgs.isEmpty() && lambdaBodyWitness != null) {
+      genericArgs.addAll(lambdaBodyWitness);
+    }
 
     if (wasLazyCondy) {
       buf.append("/* $VF: constant dynamic replaced with non-lazy method call */ ");
@@ -1387,6 +1395,14 @@ public class InvocationExprent extends Exprent {
   }
   private static final ThreadLocal<StructMethod[]> ARGUMENT_AT =
     ThreadLocal.withInitial(() -> new StructMethod[64]);
+
+  public static void enterLambdaBody(Exprent body) {
+    LAMBDA_BODY.set(body);
+  }
+
+  public static void exitLambdaBody() {
+    LAMBDA_BODY.remove();
+  }
 
   public static boolean inArgument() {
     return ARGUMENT.get()[0] > 0;
@@ -3296,7 +3312,7 @@ public class InvocationExprent extends Exprent {
    * printer otherwise; every value must be nameable here and reproduce the erased descriptor.
    */
   private boolean targetProjectionDemand(List<String> fparams, VarType ret, VarType upperBound,
-                                         Map<VarType, List<VarType>> bounds) {
+                                         Map<VarType, List<VarType>> bounds, boolean lambdaBody) {
     if (isInvocationInstance || fparams.isEmpty() || ret == null || upperBound == null || desc == null
       || desc.getSignature() == null || !ret.isGeneric() || !upperBound.isGeneric()
       || ret.type != CodeType.OBJECT || upperBound.type != CodeType.OBJECT
@@ -3311,6 +3327,10 @@ public class InvocationExprent extends Exprent {
       return false;
     }
     Map<VarType, List<VarType>> named = getNamedGenerics();
+    Set<String> mentioned = new HashSet<>();
+    for (VarType parameter : desc.getSignature().parameterTypes) {
+      collectTypeVariables(parameter, mentioned);
+    }
     boolean demanded = false;
     List<VarType> witness = new ArrayList<>(fparams.size());
     for (String fp : fparams) {
@@ -3326,7 +3346,11 @@ public class InvocationExprent extends Exprent {
         expected = null;
       }
       if (expected != null && isNameableWitness(expected, named, true)
-        && (value == null || !satisfiesUpperBound(value, expected))) {
+        && (value == null || !satisfiesUpperBound(value, expected)
+            || (lambdaBody && !mentioned.contains(fp)))) {
+        // In a lambda body javac types the expression against an inference variable, not the
+        // surrounding target: a variable no argument mentions would default, so the source
+        // named the target's value itself.
         value = expected;
         demanded = true;
       }
@@ -3340,6 +3364,9 @@ public class InvocationExprent extends Exprent {
     }
     genericArgs.clear();
     genericArgs.addAll(witness);
+    if (lambdaBody) {
+      lambdaBodyWitness = new ArrayList<>(witness);
+    }
     return true;
   }
 
