@@ -1480,6 +1480,30 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
+    // A generic call whose type variables our inference could only leave at their erasure (the
+    // value's type is the raw class) against a parameterized target: javac re-infers the call
+    // from the target and cannot solve the callee's own variables. The call's recorded return
+    // Signature names the instantiation once its unnameable variables are wildcarded, and when
+    // that instantiation is exactly the target, the source cast to the erased form first and
+    // then to the target. Both erase to the target's class, so no checkcast can appear.
+    if (!doubleCast && !doCastGenerics && !doCast && !castRaw && !doCastNull && !doCastNarrowing && !castAlways
+      && leftType instanceof GenericType erasureTarget && erasureTarget.getWildcard() == GenericType.WILDCARD_NO
+      && erasureTarget.arrayDim == 0 && !erasureTarget.getArguments().isEmpty()
+      && !invalidGenericInstantiation(leftType) && unboundedClassParameters(erasureTarget.value)
+      && exprent instanceof InvocationExprent erasureCall
+      && rightType != null && rightType.type == CodeType.OBJECT && !rightType.isGeneric()
+      && erasureTarget.value.equals(rightType.value)) {
+      boolean[] wildcarded = new boolean[1];
+      VarType named = wildcardUnnameableInView(erasureCall.getDeclaredGenericReturnType(),
+        exprent.getNamedGenerics(), wildcarded);
+      if (wildcarded[0] && named instanceof GenericType namedType
+        && namedType.getWildcard() == GenericType.WILDCARD_NO
+        && namedType.equalsExact(erasureTarget)) {
+        doubleCastTarget = erasureTarget;
+        doubleCast = true;
+      }
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics || doubleCast;
 
     if (castNull == NullCastType.DONT_CAST_AT_ALL && rightType.type == CodeType.NULL) {
@@ -1590,7 +1614,7 @@ public class ExprProcessor implements CodeConstants {
       return null;
     }
     if (type.type == CodeType.GENVAR) {
-      if (named.containsKey(type.resizeArrayDim(0))) {
+      if (Exprent.isTypeVariableNameable(type.resizeArrayDim(0), named)) {
         return type;
       }
       captured[0] = true;

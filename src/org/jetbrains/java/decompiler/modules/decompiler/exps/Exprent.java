@@ -311,6 +311,11 @@ public abstract class Exprent implements IMatchable {
    * reference the type variables its class or an enclosing class declares, even though those are
    * in {@link #getNamedGenerics()}: a witness or a qualifier written there would not compile.
    */
+  /** Public view of {@link #isInScopeTypeVariable} for printers outside this package. */
+  public static boolean isTypeVariableNameable(VarType type, Map<VarType, List<VarType>> named) {
+    return isInScopeTypeVariable(type, named);
+  }
+
   protected static boolean isInScopeTypeVariable(VarType type, Map<VarType, List<VarType>> named) {
     if (type == null || type.type != CodeType.GENVAR || !named.containsKey(type)) {
       return false;
