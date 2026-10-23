@@ -2491,6 +2491,17 @@ public class InvocationExprent extends Exprent {
         return false;
       }
 
+      if (current instanceof GenericType currentWildcard && currentWildcard.getWildcard() != GenericType.WILDCARD_NO
+        && to.type == CodeType.GENVAR && named.containsKey(to.resizeArrayDim(0))) {
+        // A wildcard the argument contributed is a capture javac cannot name; the sibling
+        // argument's recorded type variable is the concrete binding the call was written with
+        // (swapTo's Codec<? extends X> against the T the value argument carries).
+        putGenericMapping(from, to, named, bounds);
+        if (to.equals(genericsMap.get(from))) {
+          return true;
+        }
+      }
+
       if (current.type != CodeType.GENVAR && to.type == CodeType.GENVAR) {
         if (named.containsKey(to.resizeArrayDim(0))) {
           VarType bound = named.get(to.resizeArrayDim(0)).get(0);
