@@ -734,10 +734,25 @@ public class ClassWriter implements StatementWriter {
           }
           member[2] = line;
         }
+        // A member class with no line and no member class to be ranked against has no evidence
+        // of where it sat among the methods: the plan's own order is the class file's, which
+        // lists member classes after every member. Give it a line after all of them rather than
+        // the last method's, which its NestMembers rank would otherwise sort it in front of.
+        boolean rankedMemberClass = false;
+        for (int[] member : plan) {
+          if (member[0] == 2 && member.length > 4 && member[4] != Integer.MAX_VALUE && member[2] >= 0) {
+            rankedMemberClass = true;
+            break;
+          }
+        }
+        boolean tailMembers = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_MEMBER_TAIL);
         // Members with no line of their own stay next to the neighbour that has one.
         int carried = -1;
         for (int[] member : plan) {
           if (member[2] < 0) {
+            if (tailMembers && member[0] == 2 && !rankedMemberClass) {
+              continue; // the backward pass puts it after every lined member
+            }
             member[2] = carried;
           } else {
             carried = member[2];

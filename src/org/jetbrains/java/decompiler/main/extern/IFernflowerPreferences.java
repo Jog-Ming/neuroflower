@@ -231,6 +231,12 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
 
+  @Name("Round Trip: Member Tail")
+  @Description("Place a member class with no line table and no ranked sibling after every lined member.")
+  @ShortName("rtmt")
+  @Type(DecompilerOption.Type.BOOLEAN)
+  String ROUND_TRIP_MEMBER_TAIL = "rt-member-tail";
+
   @Name("ML: Line Breaks")
   @Description("Run the line-start model and log its agreement with the target's line table.")
   @ShortName("mlb")
@@ -578,6 +584,7 @@ public interface IFernflowerPreferences {
     defaults.put(LINE_ALIGN, "1");
     defaults.put(ROUND_TRIP_SWITCH_ORDER, "1");
     defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
+    defaults.put(ROUND_TRIP_MEMBER_TAIL, "1");
     defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
     defaults.put(ROUND_TRIP_CONSTANT_SITES, "1");
     defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
