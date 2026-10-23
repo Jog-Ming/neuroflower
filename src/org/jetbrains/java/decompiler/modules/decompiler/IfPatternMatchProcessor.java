@@ -1,6 +1,7 @@
 package org.jetbrains.java.decompiler.modules.decompiler;
 
 import org.jetbrains.java.decompiler.main.DecompilerContext;
+import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
@@ -467,6 +468,13 @@ public final class IfPatternMatchProcessor {
                   foundVar = var;
                 }
               }
+            } else if (inner.getExprents().size() == 1 && inner.getExprents().get(0) instanceof InvocationExprent invok
+              && invok.getClassname().equals(type.value) && invok.getName().equals(c.getName())) {
+              // The component is bound but never used, so the printer dropped the dead store and
+              // the extraction is a bare call. An unused binding leaves no local variable entry,
+              // so the pattern needs a fresh name here and nothing else depends on it.
+              foundVar = new VarExprent(DecompilerContext.getCounterContainer().getCounterAndIncrement(CounterContainer.VAR_COUNTER),
+                invok.getExprType(), DecompilerContext.getVarProcessor());
             }
           }
         }
