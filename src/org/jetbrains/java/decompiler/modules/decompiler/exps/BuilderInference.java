@@ -46,6 +46,301 @@ public final class BuilderInference {
   }
 
   /**
+   * Solves the receiver's class type variable of an instance call that takes only a method
+   * reference, and writes the solution into the expected-type map the receiver is inferred with.
+   * {@code StreamCodec.apply(ByteBufCodecs::optional)} is the shape: javac gives the receiver
+   * expression no target, so codec's own variable defaults to its bound, while the reference's
+   * recorded Signature (optional's, {@code StreamCodec<? super B,V> -> StreamCodec<B,Optional<V>>})
+   * and the call's functional interface bind the receiver's value type to the type the call's
+   * other type arguments already fix. Before unifying, the implementation's type variables are
+   * alpha-renamed so names shared with the caller or the interface cannot collide.
+   *
+   * @param known the call's type arguments already solved from its target, keyed as
+   *              {@code T<name>;}
+   * @param target the expected-type map of the call, into which the receiver's variable is written
+   * @return whether any receiver class variable was fixed
+   */
+  public static boolean solveReceiverFromReference(InvocationExprent call, List<String> fparams,
+                                                   Map<VarType, VarType> known, Map<VarType, VarType> target) {
+    if (SOLVING.get()) {
+      return false;
+    }
+    SOLVING.set(Boolean.TRUE);
+    try {
+      return solveReceiverFromReferenceInner(call, fparams, known, target);
+    }
+    catch (RuntimeException e) {
+      return false;
+    }
+    finally {
+      SOLVING.set(Boolean.FALSE);
+    }
+  }
+
+  private static boolean solveReceiverFromReferenceInner(InvocationExprent call, List<String> fparams,
+                                                         Map<VarType, VarType> known, Map<VarType, VarType> target) {
+    if (call.getFunctype() == InvocationExprent.Type.INIT
+      || call.getInvocationType() == InvocationExprent.InvocationType.STATIC
+      || call.getInvocationType() == InvocationExprent.InvocationType.DYNAMIC
+      || call.getInvocationType() == InvocationExprent.InvocationType.CONSTANT_DYNAMIC
+      || fparams.isEmpty() || call.getInstance() == null || !call.isRecordedCallSite()
+      || call.getLstParameters().size() != 1
+      || !(call.getLstParameters().get(0) instanceof NewExprent reference)
+      || !reference.isMethodReference()) {
+      return false;
+    }
+    StructMethod callee = call.getDesc();
+    if (callee == null || callee.getSignature() == null || callee.getSignature().parameterTypes.size() != 1
+      || !(callee.getSignature().parameterTypes.get(0) instanceof GenericType samType)) {
+      return false;
+    }
+    StructClass calleeClass = DecompilerContext.getStructContext().getClass(call.getClassname());
+    if (calleeClass == null || calleeClass.getSignature() == null) {
+      return false;
+    }
+    ClassNode referenceNode = DecompilerContext.getClassProcessor().getMapRootClasses().get(reference.getNewType().value);
+    if (referenceNode == null || referenceNode.lambdaInformation == null
+      || !referenceNode.lambdaInformation.is_method_reference) {
+      return false;
+    }
+    StructClass samClass = DecompilerContext.getStructContext().getClass(samType.value);
+    if (samClass == null || samClass.getSignature() == null) {
+      return false;
+    }
+    List<String> interfaceParams = samClass.getSignature().fparameters;
+    List<VarType> interfaceArgs = samType.getArguments();
+    if (interfaceParams.isEmpty() || interfaceParams.size() != interfaceArgs.size()) {
+      return false;
+    }
+    int samArity = MethodDescriptor.parseDescriptor(referenceNode.lambdaInformation.method_descriptor).params.length;
+    StructMethod samMethod = null;
+    for (StructMethod candidate : samClass.getMethods()) {
+      if (!referenceNode.lambdaInformation.method_name.equals(candidate.getName())
+        || candidate.hasModifier(CodeConstants.ACC_STATIC)
+        || !candidate.hasModifier(CodeConstants.ACC_ABSTRACT)
+        || MethodDescriptor.parseDescriptor(candidate.getDescriptor()).params.length != samArity) {
+        continue;
+      }
+      if (samMethod != null) {
+        return false;
+      }
+      samMethod = candidate;
+    }
+    if (samMethod == null || samMethod.getSignature() == null || !samMethod.getSignature().typeParameters.isEmpty()) {
+      return false;
+    }
+    StructClass content = DecompilerContext.getStructContext().getClass(referenceNode.lambdaInformation.content_class_name);
+    if (content == null || (content.getSignature() != null && !content.getSignature().fparameters.isEmpty())) {
+      return false;
+    }
+    StructMethod implementation = content.getMethodRecursive(referenceNode.lambdaInformation.content_method_name,
+      referenceNode.lambdaInformation.content_method_descriptor);
+    if (implementation == null || implementation.getSignature() == null
+      || !implementation.hasModifier(CodeConstants.ACC_STATIC)
+      || implementation.getSignature().typeParameters.isEmpty()) {
+      return false;
+    }
+
+    Map<VarType, VarType> interfaceMap = new HashMap<>();
+    for (int i = 0; i < interfaceParams.size(); i++) {
+      VarType argument = interfaceArgs.get(i);
+      if (argument == null) {
+        return false;
+      }
+      interfaceMap.put(GenericType.parse("T" + interfaceParams.get(i) + ";"), argument);
+    }
+    // Tag the call side too: a class variable of the callee (Optional's T) and a variable the
+    // caller's target mentions can share a name while being different variables.
+    Map<VarType, VarType> sideRename = sideRename(calleeClass, fparams);
+    GenericMethodDescriptor samSignature = samMethod.getSignature();
+    List<VarType> samParams = new ArrayList<>(samSignature.parameterTypes.size());
+    for (VarType parameter : samSignature.parameterTypes) {
+      VarType instantiated = parameter.remap(interfaceMap);
+      if (instantiated == null) {
+        return false;
+      }
+      samParams.add(instantiated.remap(sideRename));
+    }
+    VarType samReturn = samSignature.returnType.remap(interfaceMap);
+    if (samReturn == null) {
+      return false;
+    }
+    samReturn = samReturn.remap(sideRename);
+    GenericMethodDescriptor implSignature = implementation.getSignature();
+    if (samParams.size() != implSignature.parameterTypes.size()) {
+      return false;
+    }
+
+    // Tag the implementation's type variables so a name it shares with the caller's class or
+    // method (optional's B against StreamCodec's B) cannot be mistaken for the same variable.
+    Map<VarType, VarType> rename = renameTypeVariables(implSignature.typeParameters);
+    List<VarType> implParams = new ArrayList<>(implSignature.parameterTypes.size());
+    for (VarType parameter : implSignature.parameterTypes) {
+      implParams.add(parameter.remap(rename));
+    }
+    VarType implReturn = implSignature.returnType.remap(rename);
+
+    Unifier unifier = new Unifier();
+    for (int i = 0; i < samParams.size(); i++) {
+      if (!unifier.unify(samParams.get(i), implParams.get(i))) {
+        return false;
+      }
+    }
+    if (!unifier.unify(samReturn, implReturn)) {
+      return false;
+    }
+
+    // The call's own target already solved some of the interface's type arguments (the method's
+    // O); those values solve the implementation's variables, and through them the receiver's.
+    boolean informed = false;
+    for (int i = 0; i < interfaceParams.size(); i++) {
+      VarType argument = interfaceArgs.get(i);
+      if (argument == null || argument.type != CodeType.GENVAR || !fparams.contains(argument.value)) {
+        continue;
+      }
+      VarType value = known.get(argument);
+      if (value == null || GenericType.DUMMY_VAR.equals(value)) {
+        continue;
+      }
+      VarType solved = unifier.substitute(argument.remap(sideRename));
+      if (solved == null || !unifier.unify(solved, value)) {
+        return false;
+      }
+      informed = true;
+    }
+    if (!informed) {
+      return false;
+    }
+
+    // The substituted interface signature must erase to the method the MethodHandle records.
+    MethodDescriptor recorded = MethodDescriptor.parseDescriptor(referenceNode.lambdaInformation.content_method_descriptor);
+    if (recorded.params.length != samParams.size()) {
+      return false;
+    }
+    for (int i = 0; i < samParams.size(); i++) {
+      VarType erased = eraseWithWildcards(samParams.get(i), unifier);
+      if (erased == null || !erased.equals(recorded.params[i])) {
+        return false;
+      }
+    }
+    VarType erasedReturn = eraseWithWildcards(samReturn, unifier);
+    if (erasedReturn == null || !erasedReturn.equals(recorded.ret)) {
+      return false;
+    }
+
+    Map<VarType, List<VarType>> named = call.getNamedGenerics();
+    List<String> classParams = calleeClass.getSignature().fparameters;
+    boolean seeded = false;
+    for (int i = 0; i < interfaceParams.size(); i++) {
+      VarType argument = interfaceArgs.get(i);
+      if (argument == null || argument.type != CodeType.GENVAR || !classParams.contains(argument.value)) {
+        continue;
+      }
+      VarType solved = unifier.substitute(argument.remap(sideRename));
+      if (solved == null || GenericType.DUMMY_VAR.equals(solved) || containsTaggedVariable(solved)
+        || !isNameable(solved, named) || !isConcrete(solved)) {
+        // A value that still mentions any type variable is the printer's own chain inference,
+        // not something the recorded signatures fix; only a closed type is written down.
+        continue;
+      }
+      VarType prior = target.get(argument);
+      if (prior != null && !GenericType.DUMMY_VAR.equals(prior)) {
+        continue;
+      }
+      target.put(argument, solved);
+      seeded = true;
+    }
+    return seeded;
+  }
+
+  /**
+   * The erasure of a substituted signature type for a comparison with the recorded method
+   * descriptor. A variable the signature left unsolved erases to Object: its own bound cannot
+   * change the erasure of a position inside a parameterized type, and a bare variable position
+   * is rejected by the caller's descriptor comparison instead.
+   */
+  private static @Nullable VarType eraseWithWildcards(VarType type, Unifier unifier) {
+    VarType resolved = unifier.resolve(type);
+    if (resolved == null) {
+      return null;
+    }
+    if (resolved.type == CodeType.GENVAR) {
+      return new VarType(CodeType.OBJECT, resolved.arrayDim, "java/lang/Object");
+    }
+    if (resolved.type == CodeType.OBJECT) {
+      return new VarType(CodeType.OBJECT, resolved.arrayDim, resolved.value);
+    }
+    return resolved;
+  }
+
+  /** Whether a type still mentions a variable renamed for either side of the unification. */
+  private static boolean containsTaggedVariable(VarType type) {
+    if (type == null) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return type.value.startsWith(RENAME_PREFIX) || type.value.startsWith(SIDE_PREFIX);
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (containsTaggedVariable(argument)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** A type with no type variable, wildcard or unbound argument anywhere inside it. */
+  private static boolean isConcrete(VarType type) {
+    if (type == null || type == GenericType.DUMMY_VAR || type.type == CodeType.GENVAR) {
+      return false;
+    }
+    if (!(type instanceof GenericType generic)) {
+      return true;
+    }
+    if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    for (VarType argument : generic.getArguments()) {
+      if (argument != null && !isConcrete(argument)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static final String RENAME_PREFIX = "vf$";
+  private static final String SIDE_PREFIX = "vs$";
+
+  /** The call side's variables: the callee's class type parameters and the method's own. */
+  private static Map<VarType, VarType> sideRename(StructClass calleeClass, List<String> fparams) {
+    List<String> names = new ArrayList<>(calleeClass.getSignature().fparameters);
+    for (String name : fparams) {
+      if (!names.contains(name)) {
+        names.add(name);
+      }
+    }
+    Map<VarType, VarType> rename = new HashMap<>();
+    for (String name : names) {
+      rename.put(GenericType.parse("T" + name + ";"), GenericType.parse("T" + SIDE_PREFIX + name + ";"));
+    }
+    return rename;
+  }
+
+  /**
+   * Alpha-renaming for one side of a unification: same-named type variables of two different
+   * declarations are different variables, so each is renamed to a name no declaration can hold.
+   */
+  private static Map<VarType, VarType> renameTypeVariables(List<String> names) {
+    Map<VarType, VarType> rename = new HashMap<>();
+    for (String name : names) {
+      rename.put(GenericType.parse("T" + name + ";"), GenericType.parse("T" + RENAME_PREFIX + name + ";"));
+    }
+    return rename;
+  }
+
+  /**
    * Solves a static call's type arguments from the method reference it alone passes. javac does
    * not use a method reference for applicability, so a call that gets no target type (a receiver
    * expression) infers the functional interface's variables to their bounds and rejects the
@@ -175,14 +470,21 @@ public final class BuilderInference {
         return null;
       }
     }
+    // Tag the implementation's variables so names it shares with the interface side cannot be
+    // mistaken for the same variable during unification.
+    Map<VarType, VarType> rename = renameTypeVariables(implSignature.typeParameters);
+    List<VarType> implParams = new ArrayList<>(implSignature.parameterTypes.size());
+    for (VarType parameter : implSignature.parameterTypes) {
+      implParams.add(parameter.remap(rename));
+    }
 
     Unifier unifier = new Unifier();
     for (int i = 0; i < samParams.size(); i++) {
-      if (!unifier.unify(samParams.get(i), implSignature.parameterTypes.get(i))) {
+      if (!unifier.unify(samParams.get(i), implParams.get(i))) {
         return null;
       }
     }
-    if (!unifier.unify(samReturn, implSignature.returnType)) {
+    if (!unifier.unify(samReturn, implSignature.returnType.remap(rename))) {
       return null;
     }
 
@@ -569,8 +871,11 @@ public final class BuilderInference {
     }
 
     boolean unify(VarType pattern, VarType actual) {
-      VarType left = resolve(pattern);
-      VarType right = resolve(actual);
+      // Variance markers are not structure: a wildcard's bound constrains the position, and
+      // keeping the marker would bind an implementation variable to a type mentioning itself
+      // (`? super B` against `B`), which no substitution can unfold.
+      VarType left = strip(resolve(pattern));
+      VarType right = strip(resolve(actual));
       if (left == null || right == null) {
         return false;
       }

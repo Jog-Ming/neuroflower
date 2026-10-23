@@ -418,6 +418,15 @@ public class InvocationExprent extends Exprent {
           mthCls.getSignature().fparameters.stream().map(p -> "T" + p + ";").map(GenericType::parse).filter(t -> !upperBoundsMap.containsKey(t)).forEach(t -> upperBoundsMap.put(t, GenericType.DUMMY_VAR));
         }
 
+        // An instance call that takes only a method reference: the reference's recorded
+        // implementation Signature, unified with the functional interface's, fixes the receiver
+        // class variable from the type arguments the call's own target already solved. javac
+        // gives a receiver expression no target, so only an explicit witness on the receiver
+        // could have carried that type.
+        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+          BuilderInference.solveReceiverFromReference(this, fparams, upperBoundsMap, upperBoundsMap);
+        }
+
         VarType instType = null;
 
         // types gathered from the instance have the highest priority
