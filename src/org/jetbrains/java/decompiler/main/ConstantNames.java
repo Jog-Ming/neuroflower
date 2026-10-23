@@ -1579,12 +1579,12 @@ public final class ConstantNames {
           // A value successor is the entry the naming itself entered, so the literal's own point
           // is the successor's point; a reference is created after its arguments and needs a
           // strictly earlier site.
-          boolean atOrBefore = offset < successorOffset
-            || (pair.member() == null && offset == successorOffset);
+          boolean atValue = pair.member() == null && offset == successorOffset;
+          boolean atOrBefore = offset < successorOffset || atValue;
           if (!sameRank || !atOrBefore) {
             continue; // another method, or after the reference was generated
           }
-          if (pair.open() < 0 && coordinate <= pair.lower()) {
+          if (pair.open() < 0 && !atValue && coordinate <= pair.lower()) {
             continue; // before the previous entry's first use; the naming would move it
           }
           if (best == null || coordinate > bestCoordinate) {
@@ -1694,10 +1694,13 @@ public final class ConstantNames {
     long successorOffset = pair.successor() & 0xffffffffL;
     // A value successor is the entry the naming itself entered, so the literal's own point is the
     // successor's point; a reference is created after its arguments and needs an earlier site.
-    boolean atOrBefore = offset < successorOffset
-      || (pair.member() == null && offset == successorOffset);
+    boolean atValue = pair.member() == null && offset == successorOffset;
+    boolean atOrBefore = offset < successorOffset || atValue;
+    // At the value's own point the naming creates the pair right before it, so every lower entry
+    // already exists; the first-use lower bound is a proxy only and can lie above this point when
+    // an early entry is first used in a later method.
     return (coordinate >>> 32) == (pair.successor() >>> 32) && atOrBefore
-      && coordinate > pair.lower();
+      && (atValue || coordinate > pair.lower());
   }
 
   /** Whether some site already names this owner in the class text. */
