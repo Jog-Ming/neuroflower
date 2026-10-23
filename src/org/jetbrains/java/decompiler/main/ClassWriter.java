@@ -799,15 +799,53 @@ public class ClassWriter implements StatementWriter {
           }
         }
         boolean tailMembers = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_MEMBER_TAIL);
-        // Members with no line of their own stay next to the neighbour that has one.
+        int maxFieldLine = -1;
+        for (int[] member : plan) {
+          if (member[0] == 0 && member[2] >= 0) {
+            maxFieldLine = Math.max(maxFieldLine, member[2]);
+          }
+        }
+        // The legacy arrangement, kept to restore an unlined method that the rule below would
+        // otherwise move across a member class (RecipeProvider's buildRecipes past Runner).
+        int planSize = plan.size();
+        int[] original = new int[planSize];
+        int[] legacy = new int[planSize];
+        for (int i = 0; i < planSize; i++) {
+          original[i] = plan.get(i)[2];
+          legacy[i] = original[i];
+        }
+        int legacyCarry = -1;
+        for (int i = 0; i < planSize; i++) {
+          if (legacy[i] < 0) {
+            if (tailMembers && plan.get(i)[0] == 2 && !rankedMemberClass) {
+              continue;
+            }
+            legacy[i] = legacyCarry;
+          } else {
+            legacyCarry = legacy[i];
+          }
+        }
+        legacyCarry = Integer.MAX_VALUE;
+        for (int i = planSize - 1; i >= 0; i--) {
+          if (legacy[i] < 0) {
+            legacy[i] = legacyCarry;
+          } else {
+            legacyCarry = legacy[i];
+          }
+        }
+        // A constructor's line is the class or initializer anchor, not a declaration position:
+        // when a field follows it, carrying it to an unlined member pulls that member in front of
+        // the field the source declared first (RuleTest's CODEC). Without such a field the old
+        // behaviour stands.
         int carried = -1;
+        // Members with no line of their own stay next to the neighbour that has one.
         for (int[] member : plan) {
           if (member[2] < 0) {
             if (tailMembers && member[0] == 2 && !rankedMemberClass) {
               continue; // the backward pass puts it after every lined member
             }
             member[2] = carried;
-          } else {
+          } else if (!(isCtorMember(member, methods) && maxFieldLine > member[2])) {
             carried = member[2];
           }
         }
@@ -816,8 +854,21 @@ public class ClassWriter implements StatementWriter {
           int[] member = plan.get(i);
           if (member[2] < 0) {
             member[2] = carried;
-          } else {
+          } else if (!(isCtorMember(member, methods) && maxFieldLine > member[2])) {
             carried = member[2];
+          }
+        }
+        // An unlined method the rule moved past a member class goes back to its legacy line.
+        for (int i = 0; i < planSize; i++) {
+          if (original[i] >= 0 || plan.get(i)[0] != 1 || plan.get(i)[2] <= legacy[i]) {
+            continue;
+          }
+          for (int j = 0; j < planSize; j++) {
+            if (plan.get(j)[0] == 2 && node.nested.get(plan.get(j)[1]).type == ClassNode.Type.MEMBER
+              && legacy[j] > legacy[i] && legacy[j] <= plan.get(i)[2]) {
+              plan.get(i)[2] = legacy[i];
+              break;
+            }
           }
         }
         // Fields keep their declaration order: a forward reference from an initializer to a later
@@ -2498,6 +2549,15 @@ public class ClassWriter implements StatementWriter {
    * initializer before the first method whose lambdas are numbered after its own.
    */
   /** The original source line a method starts on, from its own line table. */
+  /** Whether a member is a constructor or static block. */
+  private static boolean isCtorMember(int[] member, VBStyleCollection<StructMethod, String> methods) {
+    if (member[0] != 1) {
+      return false;
+    }
+    String name = methods.get(member[1]).getName();
+    return CodeConstants.INIT_NAME.equals(name) || CodeConstants.CLINIT_NAME.equals(name);
+  }
+
   private static int methodLine(StructMethod method) {
     return lineAt(method, 0);
   }
