@@ -30,6 +30,11 @@ work stands — belong in project memory.
   an empty measurement.
 - **A blocked class is reported with its token pair.** Never write it off as a decompiler limitation;
   record the exact tokens that diverge.
+- **Never print an erased type.** A repair may print a type only when every type argument is recorded
+  and nameable: no wildcard captures, no erased stand-ins, no unresolved type variables. If the only
+  available type is an erasure, a capture, or an unknown, print nothing. A raw or erased type changes
+  the generic shape and can alter inference elsewhere, so producing one is a bug even where it
+  compiles and even if the tree score rises.
 - **Never `sleep` to wait.** A long command is launched in the background and its completion
   notification is the wait; a short readiness check polls with a bounded number of attempts and a
   timeout. Never a blind `sleep N` before a check.
