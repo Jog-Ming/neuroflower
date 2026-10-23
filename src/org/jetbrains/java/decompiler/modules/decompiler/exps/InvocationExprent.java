@@ -3990,6 +3990,28 @@ public class InvocationExprent extends Exprent {
           return true;
         }
       }
+      // The functional method's return: a reference's recorded instantiated return must be
+      // assignable to the witness's substitution there, or javac rejects the reference
+      // (DrawingModel::new under an M witness of BabyDrownedModel). A witness the recorded
+      // argument contradicts cannot be the source's.
+      VarType samReturn = sam.getSignature().returnType;
+      if (samReturn != null && samReturn.type == CodeType.GENVAR && samReturn.arrayDim == 0) {
+        int index = ifaceParams.indexOf(samReturn.value);
+        if (index >= 0 && index < actual.size()) {
+          VarType argument = actual.get(index);
+          if (variables.contains(argument)) {
+            VarType substituted = argument.remap(witness);
+            VarType recordedReturn = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor).ret;
+            if (substituted != null && substituted.type == CodeType.OBJECT && substituted.arrayDim == 0
+              && recordedReturn != null && recordedReturn.type == CodeType.OBJECT && recordedReturn.arrayDim == 0
+              && DecompilerContext.getStructContext().getClass(substituted.value) != null
+              && DecompilerContext.getStructContext().getClass(recordedReturn.value) != null
+              && !DecompilerContext.getStructContext().instanceOf(recordedReturn.value, substituted.value)) {
+              return true;
+            }
+          }
+        }
+      }
     }
     return false;
   }
