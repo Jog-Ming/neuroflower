@@ -1162,13 +1162,27 @@ public class ExprProcessor implements CodeConstants {
     return -1;
   }
 
+  /** The block already left through a switch-expression yield; a jump print would be dead. */
+  private static boolean yieldsFromBlock(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (exprent instanceof YieldExprent) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   public static TextBuffer jmpWrapper(Statement stat, int indent, boolean semicolon) {
     TextBuffer buf = stat.toJava(indent);
 
     List<StatEdge> lstSuccs = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
     if (lstSuccs.size() == 1) {
       StatEdge edge = lstSuccs.get(0);
-      if (edge.getType() != StatEdge.TYPE_REGULAR && edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)) {
+      if (edge.getType() != StatEdge.TYPE_REGULAR && edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)
+        && !yieldsFromBlock(stat)) {
         int jumpOffset = addDeletedGotoInstructionMapping(stat, buf);
         // The target starts no line at the jump when the source ended the previous statement with
         // `break;`/`continue;` on the same line; keep it there.
