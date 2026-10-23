@@ -1,18 +1,26 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
+import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Pattern;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
+import org.jetbrains.java.decompiler.struct.gen.VarType;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 
 // Loop statement
 public class DoStatement extends Statement {
@@ -145,6 +153,7 @@ public class DoStatement extends Statement {
       case FOR_EACH:
         buf.appendIndent(indent).append("for (").append(initExprent.get(0).toJava(indent));
         incExprent.get(0).getInferredExprType(null); //TODO: Find a better then null? For now just calls it to clear casts if needed
+        narrowForEachCast(incExprent.get(0), initExprent.get(0).getInferredExprType(null));
         buf.append(" : ").append(incExprent.get(0).toJava(indent)).append(") {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
         buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -211,6 +220,76 @@ public class DoStatement extends Statement {
     getPatterns(getConditionExprent(), vars);
 
     return vars;
+  }
+
+  /**
+   * A for-each over an expression whose recorded checkcast names a raw generic type prints the
+   * cast with the type arguments the loop variable proves. A raw cast leaves javac's inference
+   * on Object and the loop variable cannot be assigned; the erased checkcast a generic source
+   * cast emits is exactly the one the target recorded. The arguments are solved by unifying the
+   * cast class's recorded {@code Iterable} view with {@code Iterable<element>} — a container's
+   * own argument need not be the element ({@code HolderSet<E>} iterates {@code Holder<E>}).
+   */
+  private static void narrowForEachCast(Exprent iterable, VarType elementType) {
+    if (!(iterable instanceof FunctionExprent cast) || cast.getFuncType() != FunctionType.CAST
+      || !cast.isRecordedCheckcast() || cast.getLstOperands().size() != 2
+      || elementType == null || elementType.type != CodeType.OBJECT || elementType.arrayDim != 0
+      || !(cast.getLstOperands().get(1) instanceof ConstExprent typeConst)) {
+      return;
+    }
+    VarType castType = typeConst.getConstType();
+    if (castType == null || castType.type != CodeType.OBJECT || castType.arrayDim != 0
+      || castType.isGeneric()) {
+      return;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(castType.value);
+    if (cls == null || cls.getSignature() == null) {
+      return;
+    }
+    GenericType view = cls.getSignature().genericType;
+    VarType iterableType = GenericType.getGenericSuperType(view,
+      new VarType(CodeType.OBJECT, 0, "java/lang/Iterable"));
+    if (!(iterableType instanceof GenericType iterableView) || iterableView.getArguments().size() != 1) {
+      return;
+    }
+    Map<VarType, VarType> solved = new HashMap<>();
+    iterableView.mapGenVarsTo(new GenericType(CodeType.OBJECT, 0, "java/lang/Iterable", null,
+      List.of(elementType), GenericType.WILDCARD_NO), solved);
+    for (String parameter : cls.getSignature().fparameters) {
+      VarType value = solved.get(GenericType.parse("T" + parameter + ";"));
+      if (!isNameableForEachType(value)) {
+        return;
+      }
+    }
+    VarType narrowed = view.remap(solved);
+    if (narrowed != null && (narrowed.isGeneric() || cls.getSignature().fparameters.isEmpty())) {
+      typeConst.setConstType(narrowed);
+    } else {
+      return;
+    }
+    // The recorded cast is part of the loop expression's source; it must print even though the
+    // decompiler's own inference finds it redundant (a raw cast loses the element type).
+    cast.setNeedsCast(true);
+  }
+
+  /** A type a for-each cast can name: no free variable, wildcard or raw generic anywhere. */
+  private static boolean isNameableForEachType(VarType type) {
+    if (type == null || type == GenericType.DUMMY_VAR || type.type == CodeType.GENVAR) {
+      return false;
+    }
+    if (type instanceof GenericType generic) {
+      if (generic.getWildcard() != GenericType.WILDCARD_NO) {
+        return false;
+      }
+      for (VarType argument : generic.getArguments()) {
+        if (!isNameableForEachType(argument)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(type.value);
+    return cls == null || cls.getSignature() == null || cls.getSignature().fparameters.isEmpty();
   }
 
   private static void getPatterns(Exprent cond, List<VarExprent> vars) {

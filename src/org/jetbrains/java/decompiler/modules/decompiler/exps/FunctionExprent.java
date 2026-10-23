@@ -151,6 +151,8 @@ public class FunctionExprent extends Exprent {
   private boolean needsCast = true;
   /** The cast is the compiler's conversion of an erased generic value back to its recorded type. */
   private boolean compilerCast = false;
+  /** The cast was born from a checkcast instruction: the target's own source wrote it. */
+  private boolean recordedCheckcast = false;
   private boolean disableNewlineGroupCreation = false;
 
   public FunctionExprent(FunctionType funcType, ListStack<Exprent> stack, BitSet bytecodeOffsets) {
@@ -526,6 +528,7 @@ public class FunctionExprent extends Exprent {
     }
     FunctionExprent func = new FunctionExprent(funcType, lst, bytecode);
     func.setImplicitType(implicitType);
+    func.recordedCheckcast = recordedCheckcast;
 
     return func;
   }
@@ -917,6 +920,15 @@ public class FunctionExprent extends Exprent {
 
   public void setNeedsCast(boolean needsCast) {
     this.needsCast = needsCast;
+  }
+
+  /** Marks a cast created from a checkcast instruction, i.e. one the original source wrote. */
+  public void setRecordedCheckcast() {
+    this.recordedCheckcast = true;
+  }
+
+  public boolean isRecordedCheckcast() {
+    return recordedCheckcast;
   }
 
   public void setInvocationInstance() {

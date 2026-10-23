@@ -484,7 +484,11 @@ public class ExprProcessor implements CodeConstants {
         case opc_instanceof:
           stack.push(new ConstExprent(new VarType(pool.getPrimitiveConstant(instr.operand(0)).getString(), true), null, null));
         case opc_arraylength:
-          pushEx(stack, exprlist, new FunctionExprent(mapConsts.get(instr.opcode), stack, bytecode_offsets));
+          FunctionExprent recorded = new FunctionExprent(mapConsts.get(instr.opcode), stack, bytecode_offsets);
+          if (instr.opcode == opc_checkcast) {
+            recorded.setRecordedCheckcast();
+          }
+          pushEx(stack, exprlist, recorded);
           break;
         case opc_getstatic:
         case opc_getfield:
