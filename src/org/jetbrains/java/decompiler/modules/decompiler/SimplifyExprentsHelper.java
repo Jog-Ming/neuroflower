@@ -1036,7 +1036,8 @@ public class SimplifyExprentsHelper {
               if (found) {
                 List<Exprent> data = new ArrayList<>(statement.getFirst().getExprents());
 
-                List<Exprent> operands = Arrays.asList(statement.getHeadexprent().getCondition(), ifAssign.getRight(), elseAssign.getRight());
+                List<Exprent> operands = ternaryOperands(statement,
+                  ifStatement, elseStatement, ifAssign.getRight(), elseAssign.getRight());
                 data.add(new AssignmentExprent(ifVar, new FunctionExprent(FunctionType.TERNARY, operands, ifHeadExprBytecode), ifHeadExprBytecode));
                 statement.setExprents(data);
 
@@ -1078,10 +1079,9 @@ public class SimplifyExprentsHelper {
               List<Exprent> data = new ArrayList<>(statement.getFirst().getExprents());
 
               data.add(new ExitExprent(ifExit.getExitType(), new FunctionExprent(FunctionType.TERNARY,
-                Arrays.asList(
-                  statement.getHeadexprent().getCondition(),
-                  ifExit.getValue(),
-                  elseExit.getValue()), ifHeadExprBytecode), ifExit.getRetType(), ifHeadExprBytecode, ifExit.getMethodDescriptor()));
+                ternaryOperands(statement, ifStatement, elseStatement,
+                  ifExit.getValue(), elseExit.getValue()), ifHeadExprBytecode),
+                ifExit.getRetType(), ifHeadExprBytecode, ifExit.getMethodDescriptor()));
               statement.setExprents(data);
 
               StatEdge retEdge = ifStatement.getAllSuccessorEdges().get(0);
@@ -1102,6 +1102,20 @@ public class SimplifyExprentsHelper {
 
   private static boolean isIff(Exprent exp) {
     return exp instanceof FunctionExprent && ((FunctionExprent) exp).getFuncType() == FunctionType.TERNARY;
+  }
+
+  /**
+   * The operands of the ternary this if/else becomes. The target's branch opcode and arm lines say
+   * which arm was written first; when they contradict the model, the source wrote the negated
+   * condition with the arms swapped, exactly as the if/else printer would.
+   */
+  private static List<Exprent> ternaryOperands(IfStatement statement, Statement ifArm, Statement elseArm,
+                                               Exprent thenValue, Exprent elseValue) {
+    Exprent condition = statement.getHeadexprent().getCondition();
+    if (RoundTrip.swapIfArms(statement.getHeadexprent()) || RoundTrip.swapIfArmsByLine(ifArm, elseArm)) {
+      return Arrays.asList(RoundTrip.negateCondition(condition), elseValue, thenValue);
+    }
+    return Arrays.asList(condition, thenValue, elseValue);
   }
 
   private static boolean collapseInlinedClass14(Statement stat) {

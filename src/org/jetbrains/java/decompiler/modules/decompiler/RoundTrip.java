@@ -371,6 +371,26 @@ public final class RoundTrip {
         // `x == null` is false when non-null: the skip branch is ifnonnull.
         return type == FunctionExprent.FunctionType.EQ ? CodeConstants.opc_ifnonnull : CodeConstants.opc_ifnull;
       }
+      if ((type == FunctionExprent.FunctionType.EQ || type == FunctionExprent.FunctionType.NE)
+          && function.getLstOperands().size() == 2) {
+        // javac folds a comparison against a boolean constant into the boolean's own test:
+        // `x != false` and `x == true` are x (ifeq), `x == false` and `x != true` are !x (ifne).
+        Boolean constant = null;
+        Exprent other = null;
+        Boolean left0 = booleanConstant(function.getLstOperands().get(0));
+        Boolean right0 = booleanConstant(function.getLstOperands().get(1));
+        if (left0 != null) {
+          constant = left0;
+          other = function.getLstOperands().get(1);
+        } else if (right0 != null) {
+          constant = right0;
+          other = function.getLstOperands().get(0);
+        }
+        if (constant != null && other != null && isPlainBoolean(other)) {
+          boolean positive = (type == FunctionExprent.FunctionType.NE) != constant;
+          return positive ? lastBranch(other) : complement(lastBranch(other));
+        }
+      }
       if (type == FunctionExprent.FunctionType.INSTANCEOF) {
         return CodeConstants.opc_ifeq;
       }
@@ -460,6 +480,16 @@ public final class RoundTrip {
 
   private static boolean isNull(Exprent exprent) {
     return exprent instanceof ConstExprent constant && constant.isNull();
+  }
+
+  /** The value of a boolean constant, or null when the exprent is not one. */
+  private static Boolean booleanConstant(Exprent exprent) {
+    if (exprent instanceof ConstExprent constant && constant.getExprType() != null
+        && constant.getExprType().typeFamily == TypeFamily.BOOLEAN
+        && constant.getValue() instanceof Integer value) {
+      return value != 0;
+    }
+    return null;
   }
 
   private static boolean isPlainBoolean(Exprent exprent) {
