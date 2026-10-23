@@ -538,8 +538,15 @@ public class ClassWriter implements StatementWriter {
         ? methodObject.getInferredExprType(md_content.params[0])
         : md_lambda.params[0];
       String owner = prefix == 0 && receiverCast != null ? receiverCast : target.classname;
-      if (receiverType == null || receiverType.type != CodeType.OBJECT
-          || !DecompilerContext.getStructContext().instanceOf(receiverType.value, owner)) {
+      // A checkcast the bridge applies to its forwarded receiver is javac's own adaptation of an
+      // unbound reference whose parameter is an intersection type: the source named the cast's
+      // type, and the reference was applicable there through the parameter's recorded bounds.
+      // The cast to the method's own owner is that record, and the erasure of the functional
+      // parameter (Enum) is not an instance of it.
+      boolean castProvesReceiver = prefix == 0 && receiverCast != null && receiverCast.equals(target.classname);
+      if (!castProvesReceiver
+        && (receiverType == null || receiverType.type != CodeType.OBJECT
+            || !DecompilerContext.getStructContext().instanceOf(receiverType.value, owner))) {
         return false;
       }
     }

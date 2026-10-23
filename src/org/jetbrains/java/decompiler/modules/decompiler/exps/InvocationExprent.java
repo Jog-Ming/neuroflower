@@ -887,6 +887,15 @@ public class InvocationExprent extends Exprent {
             }
           }
 
+          // A witness that is only the erasure of a type variable the argument itself records
+          // at that position is the metafactory's adapted parameter type, not a type the source
+          // named: printing it pins the call to the erasure and loses the variable javac would
+          // infer (Arrays.<Enum>stream(E[]) instead of stream(E[]), which then rejects a
+          // StringRepresentable:: reference). No witness is the recorded form.
+          if (!genericArgs.isEmpty() && witnessRepeatsErasure(fparams)) {
+            genericArgs.clear();
+          }
+
           if (newRet != ret && newRet != null && !(newRet.isGeneric() && ((GenericType)newRet).hasUnknownGenericType(named.keySet()))) {
             return newRet;
           }
@@ -4379,6 +4388,102 @@ public class InvocationExprent extends Exprent {
    * Substituting the witness into the declared generic signature and erasing must reproduce the
    * descriptor the pool recorded for the call; otherwise the witness names a different method.
    */
+  /**
+   * Whether a printed witness is only the erasure of a type variable the call's argument itself
+   * records at the position that names the witness's variable. A functional argument's recorded
+   * instantiated type is the erasure of its declared parameter type, so a witness built from it
+   * pins the call to the erasure and loses the variable javac infers from the argument
+   * ({@code Arrays.<Enum>stream(E[])} instead of {@code Arrays.stream(E[])}). The recorded
+   * Signature that carries the variable there is the argument's own type; no witness is the
+   * form both records admit.
+   */
+  private boolean witnessRepeatsErasure(List<String> fparams) {
+    if (desc == null || desc.getSignature() == null || fparams.size() != genericArgs.size()
+      || lstParameters.isEmpty()) {
+      return false;
+    }
+    List<VarType> parameters = desc.getSignature().parameterTypes;
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    int count = Math.min(parameters.size(), lstParameters.size());
+    for (int i = 0; i < fparams.size(); i++) {
+      VarType witness = genericArgs.get(i);
+      if (witness == null || witness.type != CodeType.OBJECT || witness.isGeneric()
+        || witness.arrayDim != 0 || witness.value == null) {
+        continue;
+      }
+      VarType variable = GenericType.parse("T" + fparams.get(i) + ";");
+      for (int p = 0; p < count; p++) {
+        if (!mentionsVariable(parameters.get(p), variable.value)) {
+          continue;
+        }
+        Exprent argument = lstParameters.get(p);
+        while (argument instanceof FunctionExprent cast && cast.getFuncType() == FunctionType.CAST
+          && !cast.getLstOperands().isEmpty()) {
+          // The recorded checkcast names the erasure; the value under it records the variable.
+          argument = cast.getLstOperands().get(0);
+        }
+        Set<VarType> argumentVariables = new HashSet<>();
+        collectVariables(argument.getInferredExprType(null), argumentVariables);
+        for (VarType argumentVariable : argumentVariables) {
+          if (!isInScopeTypeVariable(argumentVariable, named)) {
+            continue;
+          }
+          List<VarType> bounds = named.get(argumentVariable);
+          if (bounds == null || bounds.isEmpty()) {
+            continue;
+          }
+          String erasure = erasureName(bounds.get(0));
+          if (erasure != null && erasure.equals(witness.value)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Whether a declared type names a type variable of the given name anywhere inside it. */
+  private static boolean mentionsVariable(VarType type, String name) {
+    if (type == null) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return name.equals(type.value);
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (mentionsVariable(argument, name)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Every type variable a recorded type mentions, keyed as the caller's named generics are. */
+  private static void collectVariables(VarType type, Set<VarType> out) {
+    if (type == null) {
+      return;
+    }
+    if (type.type == CodeType.GENVAR) {
+      out.add(GenericType.parse("T" + type.value + ";"));
+      return;
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        collectVariables(argument, out);
+      }
+    }
+  }
+
+  /** The erasure of a type variable's first bound, or null when it is not a class. */
+  private static String erasureName(VarType bound) {
+    if (bound == null || bound.type != CodeType.OBJECT) {
+      return bound != null && bound.type == CodeType.GENVAR ? "java/lang/Object" : null;
+    }
+    return bound.value;
+  }
+
   private boolean erasureMatchesDescriptor(List<String> fparams, List<VarType> witness,
                                            Map<VarType, List<VarType>> bounds) {
     if (desc == null || desc.getSignature() == null) {
