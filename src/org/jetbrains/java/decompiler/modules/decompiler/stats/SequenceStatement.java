@@ -212,6 +212,11 @@ public class SequenceStatement extends Statement {
                  && patternNot.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT)
           && !ifStatement.isLabeled()
           && ifStatement.getIfstat() != null
+          // A try-with-resources body that ends in the moved exit cannot complete normally, and
+          // the hidden close handler rethrows, so the try statement cannot either: the statement
+          // after it becomes unreachable. Plain try/catch and try/finally still complete through
+          // their handlers, so the source after them stays reachable.
+          && !isResourceBody()
           && !(stats.get(i + 1).getExprents() != null && stats.get(i + 1).getExprents().isEmpty())) {
         Exprent exit = singleExit(ifStatement.getIfstat());
         if (exit instanceof ExitExprent headExit
@@ -343,6 +348,11 @@ public class SequenceStatement extends Statement {
       }
     }
     return true;
+  }
+
+  /** True when this sequence is the body of a try-with-resources statement. */
+  private boolean isResourceBody() {
+    return getParent() instanceof CatchStatement catchStatement && !catchStatement.getResources().isEmpty();
   }
 
   /** True when any of these statements prints anything. */
