@@ -3,31 +3,613 @@
 
 package org.jetbrains.java.decompiler.modules.decompiler;
 
+import org.jetbrains.java.decompiler.main.DecompilerContext;
+import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.FieldExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.NewExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.SynchronizedStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * javac allocates local slots in declaration order. A source that declares a variable without an
  * initializer before another local's declaration still gives it the lower slot, even though our
  * printer emits the bare declaration at its first assignment. The target's LocalVariableTable is
  * the evidence: when a bare declaration sits after a declaration whose slot is higher, the source
- * must have written it earlier. Moving the bare declaration left within its exprent list only
- * reorders declarations and never moves an initializer, so evaluation order is unchanged.
+ * must have written it earlier.
+ *
+ * <p>Moving a declaration within one exprent list never changes evaluation order, so it needs no
+ * analysis. Moving it across statements to the start of its sequence widens the region in which
+ * the variable is in scope: the hoist is only taken when no use of the variable is reachable
+ * from the sequence start without an assignment (a definite-assignment walk over the statement
+ * structure), when no other local shares its printed name, and when the region contains no field
+ * access of that name that the new local would capture.
  */
 public final class LocalDeclarationOrder {
   private LocalDeclarationOrder() {
   }
 
   public static void reorder(Statement root) {
-    reorderStat(root);
+    MethodWrapper wrapper = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    VarProcessor varproc = wrapper == null ? null : wrapper.varproc;
+    String method = wrapper == null ? "?" : wrapper.classStruct.qualifiedName + "." + wrapper.methodStruct.getName()
+      + wrapper.methodStruct.getDescriptor();
+
+    NameTable names = NameTable.build(root);
+    hoistAcrossStatements(root, varproc, names, method);
+    reorderWithinList(root);
   }
 
-  private static void reorderStat(Statement stat) {
+  // *****************************************************************************
+  // cross-statement hoist
+  // *****************************************************************************
+
+  private static void hoistAcrossStatements(Statement stat, VarProcessor varproc, NameTable names, String method) {
+    if (stat.type == Statement.StatementType.SEQUENCE) {
+      hoistInSequence(stat, varproc, names, method);
+    }
+    for (Statement child : stat.getStats()) {
+      hoistAcrossStatements(child, varproc, names, method);
+    }
+  }
+
+  /**
+   * The declarations printed directly in one sequence, in printed order: a statement's own
+   * variable definitions, a basic block's exprents, and the pre-if exprents of an if header.
+   * Declarations inside an arm, a loop body or a switch are in a nested block and are not part of
+   * this sequence's declaration order.
+   */
+  private static List<Position> declarationOrder(Statement seq, VarProcessor varproc) {
+    List<Position> order = new ArrayList<>();
+    addPositions(order, seq.getVarDefinitions(), varproc);
+    for (Statement child : seq.getStats()) {
+      if (child.type == Statement.StatementType.GENERAL || child.type == Statement.StatementType.DUMMY_EXIT) {
+        continue;
+      }
+      addPositions(order, child.getVarDefinitions(), varproc);
+      if (child.type == Statement.StatementType.BASIC_BLOCK) {
+        List<Exprent> exprents = child.getExprents();
+        if (exprents != null) {
+          addPositions(order, exprents, varproc);
+        }
+      }
+      else if (child instanceof IfStatement ifStatement) {
+        Statement head = ifStatement.getFirst();
+        if (head != null && head.type == Statement.StatementType.BASIC_BLOCK) {
+          addPositions(order, head.getVarDefinitions(), varproc);
+          List<Exprent> exprents = head.getExprents();
+          if (exprents != null) {
+            addPositions(order, exprents, varproc);
+          }
+        }
+      }
+    }
+    return order;
+  }
+
+  private static void addPositions(List<Position> order, List<Exprent> exprents, VarProcessor varproc) {
+    for (int i = 0; i < exprents.size(); i++) {
+      Exprent exprent = exprents.get(i);
+      if (exprent != null) {
+        order.add(new Position(exprent, exprents, declarationSlot(exprent, varproc)));
+      }
+    }
+  }
+
+  private static void hoistInSequence(Statement seq, VarProcessor varproc, NameTable names, String method) {
+    if (seq.isLabeled()) {
+      // A labeled sequence prints its varDefinitions before `label: {`, so a declaration moved
+      // into them escapes the block and could capture a name used after it.
+      return;
+    }
+    List<Position> order = declarationOrder(seq, varproc);
+    List<Position> hoisted = new ArrayList<>();
+    Position delegation = findDelegation(order);
+    boolean delegationHidden = delegation == null && hasConstructorDelegation(seq);
+
+    for (int i = 0; i < order.size(); i++) {
+      Position position = order.get(i);
+      if (!(position.exprent instanceof VarExprent var) || !isRealDefinition(var)) {
+        continue;
+      }
+      int slot = position.slot;
+      if (slot < 0) {
+        continue;
+      }
+
+      Position earliest = null;
+      for (int j = 0; j < i; j++) {
+        if (order.get(j).slot > slot) {
+          earliest = order.get(j);
+          break;
+        }
+      }
+      if (earliest == null || earliest.list == position.list) {
+        // Nothing earlier to precede, or the plain within-list pass owns this move.
+        continue;
+      }
+      if (!names.uniqueName(var)) {
+        debug(method, var, "rejected: another local prints as " + var.getName());
+        continue;
+      }
+      if (mentionsField(seq, var.getName())) {
+        debug(method, var, "rejected: the sequence names a field " + var.getName());
+        continue;
+      }
+      if (delegationHidden) {
+        debug(method, var, "rejected: constructor delegation");
+        continue;
+      }
+      Da da = new Da(var);
+      if (!da.check(seq)) {
+        debug(method, var, "rejected: not definitely assigned at a use");
+        continue;
+      }
+
+      debug(method, var, "hoisted from slot-" + slot + " past slot-" + earliest.slot);
+      hoisted.add(position);
+    }
+
+    if (hoisted.isEmpty()) {
+      return;
+    }
+
+    for (Position position : hoisted) {
+      removeIdentity(position.list, position.exprent);
+    }
+    hoisted.sort((a, b) -> Integer.compare(a.slot, b.slot));
+
+    if (delegation != null) {
+      // `this(...)`/`super(...)` must stay the constructor's first statement; the source
+      // declared the hoisted locals right after it.
+      List<Exprent> body = delegation.list;
+      int at = indexOfIdentity(body, delegation.exprent) + 1;
+      if (at <= 0) {
+        at = body.size(); // unreachable: never place a declaration before the delegation
+      }
+      for (Position position : hoisted) {
+        body.add(at++, position.exprent);
+      }
+      return;
+    }
+
+    for (Position position : hoisted) {
+      List<Exprent> definitions = seq.getVarDefinitions();
+      int at = definitions.size();
+      for (int i = 0; i < definitions.size(); i++) {
+        int slot = declarationSlot(definitions.get(i), varproc);
+        if (slot > position.slot) {
+          at = i;
+          break;
+        }
+      }
+      definitions.add(at, position.exprent);
+    }
+  }
+
+  private static int indexOfIdentity(List<Exprent> list, Exprent exprent) {
+    for (int i = 0; i < list.size(); i++) {
+      if (list.get(i) == exprent) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** The constructor delegation among the sequence's own statements, or null. */
+  private static Position findDelegation(List<Position> order) {
+    for (Position position : order) {
+      if (position.exprent instanceof InvocationExprent invocation
+        && invocation.getFunctype() == InvocationExprent.Type.INIT
+        && !(invocation.getInstance() instanceof NewExprent)) {
+        return position;
+      }
+    }
+    return null;
+  }
+
+  private static void removeIdentity(List<Exprent> list, Exprent exprent) {
+    for (int i = 0; i < list.size(); i++) {
+      if (list.get(i) == exprent) {
+        list.remove(i);
+        return;
+      }
+    }
+  }
+
+  /** A {@code this(...)}/super{@code (...)} delegation must stay the constructor's first statement. */
+  private static boolean hasConstructorDelegation(Statement stat) {
+    for (Exprent exprent : stat.getVarDefinitions()) {
+      if (hasDelegation(exprent)) {
+        return true;
+      }
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (hasDelegation(exprent)) {
+          return true;
+        }
+      }
+    }
+    for (Exprent exprent : stat.getStatExprents()) {
+      if (exprent != null && hasDelegation(exprent)) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (hasConstructorDelegation(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean hasDelegation(Exprent exprent) {
+    if (exprent == null) {
+      return false;
+    }
+    for (Exprent inner : exprent.getAllExprents(true, true)) {
+      if (inner instanceof InvocationExprent invocation
+        && invocation.getFunctype() == InvocationExprent.Type.INIT
+        && !(invocation.getInstance() instanceof NewExprent)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean mentionsField(Statement stat, String name) {
+    for (Exprent exprent : stat.getVarDefinitions()) {
+      if (mentionsField(exprent, name)) {
+        return true;
+      }
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (mentionsField(exprent, name)) {
+          return true;
+        }
+      }
+    }
+    for (Exprent exprent : stat.getStatExprents()) {
+      if (exprent != null && mentionsField(exprent, name)) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (mentionsField(child, name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean mentionsField(Exprent exprent, String name) {
+    if (exprent == null) {
+      return false;
+    }
+    for (Exprent inner : exprent.getAllExprents(true, true)) {
+      if (inner instanceof FieldExprent field && field.getName().equals(name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // *****************************************************************************
+  // definite assignment
+  // *****************************************************************************
+
+  /**
+   * Whether one variable is definitely assigned at every use after the declaration has been
+   * moved to the start of the sequence. Conservative where the printed shape is hard to model:
+   * a loop may run zero times, a handler may see a partially assigned try body, and a switch
+   * arm may be entered after another arm's fall-through.
+   */
+  private static final class Da {
+    private final VarVersionPair target;
+    private boolean violated;
+
+    Da(VarExprent target) {
+      this.target = target.getVarVersionPair();
+    }
+
+    boolean check(Statement seq) {
+      stat(seq, false);
+      return !violated;
+    }
+
+    private boolean stat(Statement stat, boolean assigned) {
+      for (Exprent exprent : stat.getVarDefinitions()) {
+        assigned = exprent(exprent, assigned);
+      }
+
+      List<Exprent> exprents = stat.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          assigned = exprent(exprent, assigned);
+        }
+        return assigned;
+      }
+
+      switch (stat.type) {
+        case ROOT: {
+          Statement first = stat.getFirst();
+          return first == null ? assigned : stat(first, assigned);
+        }
+        case SEQUENCE: {
+          for (Statement child : stat.getStats()) {
+            assigned = stat(child, assigned);
+          }
+          return assigned;
+        }
+        case IF: {
+          IfStatement ifStatement = (IfStatement)stat;
+          Statement head = ifStatement.getFirst();
+          if (head != null) {
+            assigned = stat(head, assigned);
+          }
+          assigned = exprent(ifStatement.getHeadexprent(), assigned);
+          boolean thenState = ifStatement.getIfstat() == null ? assigned : stat(ifStatement.getIfstat(), assigned);
+          boolean elseState = ifStatement.getElsestat() == null ? assigned : stat(ifStatement.getElsestat(), assigned);
+          return thenState && elseState;
+        }
+        case DO: {
+          DoStatement loop = (DoStatement)stat;
+          boolean entry = assigned;
+          Exprent init = loop.getInitExprent();
+          if (init != null) {
+            entry = exprent(init, entry);
+          }
+          // Header expressions run before the first body statement only for a while loop; the
+          // others run after it, but checking their uses against the entry state is conservative.
+          switch (loop.getLooptype()) {
+            case WHILE:
+            case DO_WHILE:
+              exprent(loop.getConditionExprent(), entry);
+              break;
+            case FOR:
+              exprent(loop.getConditionExprent(), entry);
+              exprent(loop.getIncExprent(), entry);
+              break;
+            case FOR_EACH:
+              exprent(loop.getIncExprent(), entry);
+              break;
+            default:
+              break;
+          }
+          Statement body = loop.getFirst();
+          if (body != null) {
+            stat(body, entry);
+          }
+          // The loop may run zero times, and a break may leave it from any iteration.
+          return entry;
+        }
+        case SWITCH: {
+          SwitchStatement switchStatement = (SwitchStatement)stat;
+          Statement head = switchStatement.getFirst();
+          if (head != null) {
+            assigned = stat(head, assigned);
+          }
+          for (Exprent exprent : switchStatement.getStatExprents()) {
+            if (exprent != null) {
+              assigned = exprent(exprent, assigned);
+            }
+          }
+          boolean result = true;
+          for (Statement arm : switchStatement.getCaseStatements()) {
+            boolean armState = stat(arm, assigned);
+            result = result && armState;
+          }
+          if (switchStatement.getDefaultEdge() == null) {
+            result = result && assigned;
+          }
+          return result;
+        }
+        case SYNCHRONIZED: {
+          SynchronizedStatement sync = (SynchronizedStatement)stat;
+          Statement head = sync.getFirst();
+          if (head != null) {
+            assigned = stat(head, assigned);
+          }
+          for (Exprent exprent : sync.getStatExprents()) {
+            if (exprent != null) {
+              assigned = exprent(exprent, assigned);
+            }
+          }
+          Statement body = sync.getBody();
+          if (body != null) {
+            stat(body, assigned);
+          }
+          return assigned;
+        }
+        case TRY_CATCH: {
+          CatchStatement catchStatement = (CatchStatement)stat;
+          for (Exprent exprent : catchStatement.getStatExprents()) {
+            if (exprent != null) {
+              assigned = exprent(exprent, assigned);
+            }
+          }
+          Statement body = catchStatement.getFirst();
+          if (body != null) {
+            stat(body, assigned);
+          }
+          for (int i = 1; i < catchStatement.getStats().size(); i++) {
+            stat(catchStatement.getStats().get(i), assigned);
+          }
+          // A handler may run after any prefix of the try body.
+          return assigned;
+        }
+        case CATCH_ALL: {
+          CatchAllStatement catchAll = (CatchAllStatement)stat;
+          for (Exprent exprent : catchAll.getStatExprents()) {
+            if (exprent != null) {
+              assigned = exprent(exprent, assigned);
+            }
+          }
+          Statement body = catchAll.getFirst();
+          if (body != null) {
+            stat(body, assigned);
+          }
+          Statement handler = catchAll.getHandler();
+          if (handler != null) {
+            stat(handler, assigned);
+          }
+          return assigned;
+        }
+        default: {
+          for (Statement child : stat.getStats()) {
+            assigned = stat(child, assigned);
+          }
+          return assigned;
+        }
+      }
+    }
+
+    private boolean exprent(Exprent exprent, boolean assigned) {
+      if (exprent == null) {
+        return assigned;
+      }
+
+      if (exprent instanceof AssignmentExprent assignment) {
+        Exprent left = assignment.getLeft();
+        // The target location is evaluated before the value: an array's base and index first.
+        assigned = location(left, assigned);
+        if (assignment.getCondType() != null && isTarget(left) && !assigned) {
+          // A compound assignment reads the old value.
+          violated = true;
+        }
+        assigned = exprent(assignment.getRight(), assigned);
+        if (isTarget(left)) {
+          assigned = true;
+        }
+        return assigned;
+      }
+
+      if (exprent instanceof VarExprent var) {
+        if (!var.isStack() && !var.isDefinition() && isTarget(var) && !assigned) {
+          violated = true;
+        }
+        return assigned;
+      }
+
+      if (exprent instanceof FunctionExprent function && function.getFuncType().isPPMM()) {
+        for (Exprent operand : function.getLstOperands()) {
+          assigned = exprent(operand, assigned);
+        }
+        if (!function.getLstOperands().isEmpty() && isTarget(function.getLstOperands().get(0))) {
+          assigned = true;
+        }
+        return assigned;
+      }
+
+      if (exprent instanceof FunctionExprent function
+        && (function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND
+        || function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_OR
+        || function.getFuncType() == FunctionExprent.FunctionType.TERNARY)) {
+        List<Exprent> operands = function.getLstOperands();
+        if (operands.isEmpty()) {
+          return assigned;
+        }
+        // The first operand always runs; the others may be short-circuited away, so their
+        // assignments cannot be credited to the state after the expression.
+        boolean afterFirst = exprent(operands.get(0), assigned);
+        for (int i = 1; i < operands.size(); i++) {
+          exprent(operands.get(i), afterFirst);
+        }
+        return afterFirst;
+      }
+
+      for (Exprent child : exprent.getAllExprents(false)) {
+        assigned = exprent(child, assigned);
+      }
+      return assigned;
+    }
+
+    /** The parts of a store target, in evaluation order; a plain variable reads nothing. */
+    private boolean location(Exprent exprent, boolean assigned) {
+      if (exprent instanceof VarExprent) {
+        return assigned;
+      }
+      return exprent(exprent, assigned);
+    }
+
+    private boolean isTarget(Exprent exprent) {
+      return exprent instanceof VarExprent var && !var.isStack() && var.getVarVersionPair().equals(target);
+    }
+  }
+
+  // *****************************************************************************
+  // names
+  // *****************************************************************************
+
+  /** Every printed local name in the method, to detect a hoist that would capture another one. */
+  private static final class NameTable {
+    private final Map<String, Set<VarVersionPair>> byName = new HashMap<>();
+
+    static NameTable build(Statement root) {
+      NameTable table = new NameTable();
+      table.collect(root);
+      return table;
+    }
+
+    private void collect(Statement stat) {
+      addAll(stat.getVarDefinitions());
+      List<Exprent> exprents = stat.getExprents();
+      if (exprents != null) {
+        addAll(exprents);
+      }
+      addAll(stat.getStatExprents());
+      for (Statement child : stat.getStats()) {
+        collect(child);
+      }
+    }
+
+    private void addAll(List<Exprent> exprents) {
+      for (Exprent exprent : exprents) {
+        if (exprent == null) {
+          continue;
+        }
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          if (inner instanceof VarExprent var && !var.isStack()) {
+            byName.computeIfAbsent(var.getName(), name -> new HashSet<>()).add(var.getVarVersionPair());
+          }
+        }
+      }
+    }
+
+    boolean uniqueName(VarExprent var) {
+      Set<VarVersionPair> pairs = byName.get(var.getName());
+      return pairs != null && pairs.size() == 1 && pairs.contains(var.getVarVersionPair());
+    }
+  }
+
+  // *****************************************************************************
+  // within-list pass
+  // *****************************************************************************
+
+  private static void reorderWithinList(Statement stat) {
     List<Exprent> exprents = stat.getExprents();
     if (exprents != null) {
       for (int i = 1; i < exprents.size(); i++) {
@@ -39,7 +621,7 @@ public final class LocalDeclarationOrder {
         int j = i;
         while (j > 0) {
           Exprent previous = exprents.get(j - 1);
-          int previousSlot = declarationSlot(previous);
+          int previousSlot = declarationSlot(previous, null);
           if (previousSlot < 0 || previousSlot <= slot) {
             break;
           }
@@ -50,26 +632,42 @@ public final class LocalDeclarationOrder {
       }
     }
     for (Statement child : stat.getStats()) {
-      reorderStat(child);
+      reorderWithinList(child);
+    }
+  }
+
+  // *****************************************************************************
+  // slots
+  // *****************************************************************************
+
+  private static final class Position {
+    final Exprent exprent;
+    final List<Exprent> list;
+    final int slot;
+
+    Position(Exprent exprent, List<Exprent> list, int slot) {
+      this.exprent = exprent;
+      this.list = list;
+      this.slot = slot;
     }
   }
 
   /** The slot of a declaration statement that only names a variable, or -1. */
   private static int bareDeclarationSlot(Exprent exprent) {
     if (exprent instanceof VarExprent var && isRealDefinition(var)) {
-      return slotOf(var);
+      return slotOf(var, null);
     }
     return -1;
   }
 
   /** The slot of a bare or initialized declaration statement, or -1 for any other exprent. */
-  private static int declarationSlot(Exprent exprent) {
+  private static int declarationSlot(Exprent exprent, VarProcessor varproc) {
     if (exprent instanceof VarExprent var && isRealDefinition(var)) {
-      return slotOf(var);
+      return slotOf(var, varproc);
     }
     if (exprent instanceof AssignmentExprent assignment
       && assignment.getLeft() instanceof VarExprent var && isRealDefinition(var)) {
-      return slotOf(var);
+      return slotOf(var, varproc);
     }
     return -1;
   }
@@ -78,8 +676,23 @@ public final class LocalDeclarationOrder {
     return var.isDefinition() && !var.isStack();
   }
 
-  private static int slotOf(VarExprent var) {
+  private static int slotOf(VarExprent var, VarProcessor varproc) {
     LocalVariable lvt = var.getLVT();
-    return lvt == null ? -1 : lvt.getVersion().var;
+    if (lvt != null) {
+      return lvt.getVersion().var;
+    }
+    if (varproc != null) {
+      Integer original = varproc.getVarOriginalIndex(var.getIndex());
+      if (original != null) {
+        return original;
+      }
+    }
+    return -1;
+  }
+
+  private static void debug(String method, VarExprent var, String message) {
+    if (System.getenv("NEUROFLOWER_DECLORDER") != null) {
+      System.err.println("declorder " + method + " " + var.getName() + ": " + message);
+    }
   }
 }
