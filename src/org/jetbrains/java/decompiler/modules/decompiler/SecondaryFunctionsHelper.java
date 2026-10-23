@@ -476,11 +476,19 @@ public final class SecondaryFunctionsHelper {
               break;
             }
           }
-          if (operand != null && matching != null && RoundTrip.isCompoundTarget(left, matching)) {
-            asexpr.setRight(operand);
-            asexpr.setCondType(compound.getFuncType());
-            ret = exprent;
-            break;
+          if (operand != null && matching != null) {
+            if (RoundTrip.isCompoundTarget(left, matching)) {
+              asexpr.setRight(operand);
+              asexpr.setCondType(compound.getFuncType());
+              ret = exprent;
+              break;
+            }
+            // A field's compound form always duplicates the receiver; the target's sequence has
+            // no duplicate here, so the source wrote the expanded assignment and the stock
+            // simplification below would still fold it into the compound form.
+            if (left instanceof FieldExprent) {
+              return ret;
+            }
           }
         }
 
@@ -565,6 +573,10 @@ public final class SecondaryFunctionsHelper {
     List<Exprent> operands = function.getLstOperands();
     if (operands.size() != 2) {
       return null;
+    }
+    if (function.getFuncType() == FunctionType.STR_CONCAT) {
+      // Concatenation is not commutative: only `left + e` is `left += e`.
+      return left.equals(operands.get(0)) ? operands.get(1) : null;
     }
     switch (function.getFuncType()) {
       case ADD:
