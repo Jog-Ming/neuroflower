@@ -626,6 +626,9 @@ public class ClassWriter implements StatementWriter {
   public void writeClass(ClassNode node, TextBuffer buffer, int indent) {
     ClassNode outerNode = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
     DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
+    // A class body printed inside a lambda body is not that lambda: its returns belong to their
+    // own method, and the functional method's type can even be void there.
+    VarType outerLambdaReturn = ExitExprent.takeLambdaReturn();
 
     try {
       // last minute processing
@@ -970,6 +973,7 @@ public class ClassWriter implements StatementWriter {
       }
     }
     finally {
+      ExitExprent.restoreLambdaReturn(outerLambdaReturn);
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, outerNode);
     }
 

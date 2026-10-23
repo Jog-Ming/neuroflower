@@ -32,6 +32,19 @@ public class ExitExprent extends Exprent {
     LAMBDA_RETURN_TARGET.remove();
   }
 
+  /** Removes and returns the functional return target while a nested class body prints. */
+  public static VarType takeLambdaReturn() {
+    VarType target = LAMBDA_RETURN_TARGET.get();
+    LAMBDA_RETURN_TARGET.remove();
+    return target;
+  }
+
+  public static void restoreLambdaReturn(VarType target) {
+    if (target != null) {
+      LAMBDA_RETURN_TARGET.set(target);
+    }
+  }
+
   public enum Type {
     RETURN, THROW
   }
