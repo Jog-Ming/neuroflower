@@ -3264,10 +3264,13 @@ public final class ConstantNames {
       return;
     }
     if (lexical) {
-      // Names are resolved in source order, so a name printed earlier in this class would enter
-      // its Class entry first. Nothing may precede the owner that opens the pool.
+      // Names are resolved in source order, so a simple name printed earlier in this class would
+      // enter its Class entry first. Only another name resolved while the class's names were
+      // resolved competes for the pool's opening slot: a naming the code generation enters later
+      // cannot move the prefix pair.
       for (Site earlier : sites) {
-        if (earlier.start() < start && inside(placement.spans(), earlier.start())) {
+        if (earlier.start() < start && inside(placement.spans(), earlier.start())
+            && placement.lexical() != null && placement.lexical().contains(earlier.owner())) {
           return;
         }
       }
