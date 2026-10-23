@@ -736,11 +736,22 @@ public class InvocationExprent extends Exprent {
             // bound where javac has no target, and the recorded expected type rejects that
             // instantiation, so the source pinned it. Only the witness whose erasure reproduces
             // the pool's descriptor is used.
-            boolean returnOnlyDemand = suppress && !isNew
+            boolean returnOnlyDemand = !isNew
               && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
               && returnOnlyTypeVariableDemand(fparams, ret, bounds, upperBound, isNew);
 
-            if (!suppress || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
+            // A receiver call whose own arguments leave a type variable to the target: javac
+            // gives a receiver expression no target type, so the variable would default to its
+            // declared bound, while the recorded expected type (the enclosing chain's parameter
+            // Signature) fixes it to a wildcard instantiation's argument. A wildcard is never
+            // something javac infers, so the printer's wildcard is the target's, and only an
+            // explicit witness could have produced it.
+            boolean receiverWildcardDemand = !suppress && !isNew
+              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds);
+
+            if ((!suppress && !receiverWildcardDemand)
+              || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
               || receiverDemand || returnOnlyDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
               // The printer's own return type does not even fit the class of the expected type,
@@ -768,6 +779,9 @@ public class InvocationExprent extends Exprent {
                 // recorded metafactory type may still prove what the source passed.
                 tryDemandWitness(fparams, bounds);
               }
+            }
+            else if (receiverWildcardDemand) {
+              // The witness was set by receiverWildcardTargetDemand above.
             }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
               && receiverRecordedValueDemand(fparams, ret, bounds)) {
@@ -3345,6 +3359,62 @@ public class InvocationExprent extends Exprent {
   }
 
   /**
+   * A call in receiver position whose own arguments leave a type variable to the recorded
+   * expected type. javac gives a receiver expression no target type, so the variable can only
+   * default to its declared bound, while the enclosing chain's parameter Signature fixes it to
+   * a wildcard instantiation's argument: the source had to name the bound as an explicit witness.
+   * A wildcard type argument is never something javac infers, so a wildcard value here is the
+   * target's mapping, not the printer's own inference. Only a covariant ({@code ? extends}) bound
+   * is taken; the witness must be nameable at the call and reproduce the erased descriptor.
+   */
+  private boolean receiverWildcardTargetDemand(List<String> fparams, VarType ret, VarType upperBound,
+                                               Map<VarType, List<VarType>> bounds) {
+    if (!isInvocationInstance || fparams.isEmpty() || ret == null || upperBound == null || desc == null
+      || desc.getSignature() == null || !ret.isGeneric() || !upperBound.isGeneric()
+      || ret.type != CodeType.OBJECT || upperBound.type != CodeType.OBJECT
+      || ret.arrayDim != 0 || upperBound.arrayDim != 0
+      || !ret.value.equals(upperBound.value)
+      || ((GenericType) upperBound).getWildcard() != GenericType.WILDCARD_NO) {
+      return false;
+    }
+    Map<VarType, VarType> projected = new HashMap<>();
+    ((GenericType) ret).mapGenVarsTo((GenericType) upperBound, projected);
+    if (projected.isEmpty()) {
+      return false;
+    }
+    Map<VarType, List<VarType>> named = getNamedGenerics();
+    boolean demanded = false;
+    List<VarType> witness = new ArrayList<>(fparams.size());
+    for (String fp : fparams) {
+      VarType variable = GenericType.parse("T" + fp + ";");
+      VarType value = genericsMap.get(variable);
+      VarType expected = projected.get(variable);
+      if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS) {
+        expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
+      } else {
+        expected = null;
+      }
+      boolean fromTarget = value == null
+        || (value instanceof GenericType wildcard && wildcard.getWildcard() != GenericType.WILDCARD_NO);
+      if (expected != null && isNameableWitness(expected, named, true) && fromTarget) {
+        value = expected;
+        demanded = true;
+      }
+      if (!isNameableWitness(value, named, true)) {
+        return false;
+      }
+      witness.add(value);
+    }
+    if (!demanded || !erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(witness);
+    return true;
+  }
+
+  /**
    * A call whose whole value is what the recorded expected type constrains, while the printer's
    * own inference landed on an argument that invariant position rejects. The source had to name
    * the expected one (a method reference's implementation type, say, is narrower than what the
@@ -3374,6 +3444,7 @@ public class InvocationExprent extends Exprent {
       collectTypeVariables(parameter, mentioned);
     }
     boolean demanded = false;
+    boolean wildcardDemand = false;
     List<VarType> witness = new ArrayList<>(fparams.size());
     for (String fp : fparams) {
       VarType variable = GenericType.parse("T" + fp + ";");
@@ -3384,15 +3455,34 @@ public class InvocationExprent extends Exprent {
         // A covariant position accepts the bound itself as the witness.
         expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
       } else if (expected instanceof GenericType wildcard
+        && wildcard.getWildcard() == GenericType.WILDCARD_SUPER && sameType(value, wildcard)) {
+        // A contravariant position is a lower bound. When the printer's own value is that very
+        // wildcard, it came from the target mapping rather than from any argument, and the
+        // source named the bound.
+        expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
+      } else if (expected instanceof GenericType wildcard
         && wildcard.getWildcard() != GenericType.WILDCARD_NO) {
         expected = null;
       }
+      boolean wildcardValue = value instanceof GenericType genericValue
+        && genericValue.getWildcard() != GenericType.WILDCARD_NO;
+      // Only a bare type-variable parameter capture-converts the argument that fixes it; a
+      // variable nested deeper is inferred through the functional argument or the target, and
+      // javac handles the wildcard there.
+      boolean bareParameter = false;
+      for (VarType parameter : desc.getSignature().parameterTypes) {
+        if (isBareTypeVariable(parameter) && parameter.value.equals(fp)) {
+          bareParameter = true;
+          break;
+        }
+      }
       if (expected != null && isNameableWitness(expected, named, true)
         && (value == null || !satisfiesUpperBound(value, expected)
-            || (lambdaBody && !mentioned.contains(fp)))) {
+            || (lambdaBody && (!mentioned.contains(fp) || (wildcardValue && bareParameter))))) {
         // In a lambda body javac types the expression against an inference variable, not the
-        // surrounding target: a variable no argument mentions would default, so the source
-        // named the target's value itself.
+        // surrounding target: a variable no argument mentions would default, and a wildcard is
+        // never what javac infers, so the source named the target's value itself.
+        wildcardDemand |= wildcardValue;
         value = expected;
         demanded = true;
       }
@@ -3401,7 +3491,9 @@ public class InvocationExprent extends Exprent {
       }
       witness.add(value);
     }
-    if (!demanded || !erasureMatchesDescriptor(fparams, witness, bounds) || !isRecordedCallSite()) {
+    boolean erasureOk = wildcardDemand
+      ? signatureMatchesDescriptor(bounds) : erasureMatchesDescriptor(fparams, witness, bounds);
+    if (!demanded || !erasureOk || !isRecordedCallSite()) {
       return false;
     }
     genericArgs.clear();
@@ -4229,6 +4321,31 @@ public class InvocationExprent extends Exprent {
       }
     }
     return true;
+  }
+
+  /**
+   * Whether the declared signature's own erasure reproduces the descriptor the pool recorded for
+   * the call. A type variable erases to its declared bound; javac writes no type argument into a
+   * descriptor, so no witness can change it. Used where the witness is a wildcard's bound, which
+   * the substitution check cannot express without demanding that the variable itself be its bound.
+   */
+  private boolean signatureMatchesDescriptor(Map<VarType, List<VarType>> bounds) {
+    if (desc == null || desc.getSignature() == null) {
+      return false;
+    }
+    List<VarType> parameters = desc.getSignature().parameterTypes;
+    if (parameters.size() != descriptor.params.length) {
+      return false;
+    }
+    Map<VarType, VarType> noSubstitution = new HashMap<>();
+    for (int i = 0; i < parameters.size(); i++) {
+      VarType erased = erase(parameters.get(i), noSubstitution, bounds, new HashSet<>());
+      if (erased == null || !erased.equals(descriptor.params[i])) {
+        return false;
+      }
+    }
+    VarType erasedRet = erase(desc.getSignature().returnType, noSubstitution, bounds, new HashSet<>());
+    return erasedRet != null && erasedRet.equals(descriptor.ret);
   }
 
   /**

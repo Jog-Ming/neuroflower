@@ -319,6 +319,16 @@ public abstract class Exprent implements IMatchable {
       return false;
     }
     StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    ClassNode current = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    if (current != null && current.type == ClassNode.Type.LAMBDA && current.enclosingMethod != null
+      && current.parent != null && current.parent.getWrapper() != null) {
+      // The lambda body is a synthetic static method, but its source text sits in the enclosing
+      // method: that method's type parameters are the ones the source can name.
+      MethodWrapper host = current.parent.getWrapper().getMethods().getWithKey(current.enclosingMethod);
+      if (host != null && host.methodStruct != null) {
+        method = host.methodStruct;
+      }
+    }
     if (method == null) {
       return true;
     }
@@ -334,7 +344,6 @@ public abstract class Exprent implements IMatchable {
     // anonymous classes created in an instance context, and omits it for static contexts (a
     // static field's anonymous class has a no-argument constructor). A lambda is compiled into
     // its host class and kept as it was.
-    ClassNode current = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
     if (current == null || current.type == ClassNode.Type.LAMBDA) {
       return true;
     }
