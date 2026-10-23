@@ -535,7 +535,8 @@ public final class LineAlign {
         simple = simple.substring(dollar + 1);
       }
       if (!simple.isEmpty() && Character.isJavaIdentifierStart(simple.charAt(0))) {
-        declaration = classDeclarationLine(lines, simple, enclosingLine, firstMemberLine(className, tracers, lines));
+        declaration = classDeclarationLine(lines, simple, enclosingLine,
+          firstMemberLine(className, tracers, lines), declarationHint(node.classStruct, className, tracers));
         if (declaration >= 0) {
           anchorOne(node.classStruct, className, declaration, tracers, lines, shifts, conflicted, entryLines);
         }
@@ -652,17 +653,94 @@ public final class LineAlign {
     return first >= 0;
   }
 
-  private static int classDeclarationLine(String[] lines, String simple, int enclosing, int beforeMember) {
+  /**
+   * The line of this class's declaration in the printed file.
+   *
+   * <p>Several nested classes may share a simple name, so a file can hold more than one matching
+   * declaration. The last one before the class's first member used to be taken, which fails for a
+   * class with no members at all: the search then covers the rest of the file and lands on a
+   * sibling's declaration. The target's own line for the class's anchor -- its hidden constructor,
+   * its generated record members, or its enum's values() -- is where the declaration was, so the
+   * candidate closest to it is the right one whenever such a line exists.
+   */
+  private static int classDeclarationLine(String[] lines, String simple, int enclosing, int beforeMember,
+      int hint) {
     java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
       "\\b(?:class|record|enum|interface)\\s+" + java.util.regex.Pattern.quote(simple) + "\\b");
     int found = -1;
     int end = Math.min(lines.length, beforeMember - 1);
+    int closest = Integer.MAX_VALUE;
     for (int i = Math.max(0, enclosing); i < end; i++) {
-      if (pattern.matcher(lines[i]).find()) {
+      if (!pattern.matcher(lines[i]).find()) {
+        continue;
+      }
+      if (hint >= 0) {
+        int distance = Math.abs((i + 1) - hint);
+        if (distance < closest) {
+          closest = distance;
+          found = i + 1;
+        }
+      }
+      else {
         found = i + 1;
       }
     }
     return found;
+  }
+
+  /** The line the target attributes this class's declaration to, or minus one when it says nothing. */
+  private static int declarationHint(StructClass cls, String className,
+      Map<Pair<String, String>, BytecodeMappingTracer> tracers) {
+    if (cls == null) {
+      return -1;
+    }
+    if (cls.getRecordComponents() != null) {
+      for (String[] generated : RECORD_MEMBERS) {
+        String key = org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(
+          generated[0], generated[1]);
+        if (tracers.containsKey(Pair.of(className, key))) {
+          continue;
+        }
+        StructMethod method = cls.getMethod(generated[0], generated[1]);
+        StructLineNumberTableAttribute table = method == null ? null
+          : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+        int target = table == null ? -1 : table.findLineNumber(0);
+        if (target >= 0) {
+          return target;
+        }
+      }
+    }
+    if ((cls.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_ENUM) != 0) {
+      StructMethod values = cls.getMethod("values", "()[L" + className + ";");
+      StructLineNumberTableAttribute table = values == null ? null
+        : values.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+      int target = table == null ? -1 : table.findLineNumber(0);
+      if (target >= 0) {
+        return target;
+      }
+    }
+    for (StructMethod method : cls.getMethods()) {
+      boolean bridge = (method.getAccessFlags() & org.jetbrains.java.decompiler.code.CodeConstants.ACC_BRIDGE) != 0;
+      if (!"<init>".equals(method.getName()) && !bridge) {
+        continue;
+      }
+      BytecodeMappingTracer tracer = tracers.get(
+        Pair.of(className, org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(
+          method.getName(), method.getDescriptor())));
+      if (tracer != null && !tracer.getMapping().isEmpty()) {
+        continue;
+      }
+      StructLineNumberTableAttribute table =
+        method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+      if (table == null) {
+        continue;
+      }
+      int target = table.findLineNumber(0);
+      if (target >= 0) {
+        return target;
+      }
+    }
+    return -1;
   }
 
   /** The first line of the declaration block, annotations included; javac anchors bridges there. */
