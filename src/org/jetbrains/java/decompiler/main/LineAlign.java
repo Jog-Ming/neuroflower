@@ -1,6 +1,8 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 package org.jetbrains.java.decompiler.main;
 
+import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.collectors.BytecodeMappingTracer;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.struct.StructClass;
@@ -82,6 +84,13 @@ public final class LineAlign {
       String methodKey = tracerEntry.getKey().b;
       Map<Integer, Integer> mapping = tracerEntry.getValue().getMapping();
       if (methodKey.startsWith("<field-init ")) {
+        // The initializer's own offsets say which constructor generated it; that constructor's
+        // table places each declaration separately, so a block of fields is not stuck on one line.
+        StructLineNumberTableAttribute owner = initializerTable(className, mapping.keySet());
+        if (owner != null && gapAlign) {
+          addMethodConstraints(owner, mapping, lines, candidates, entryLines);
+          continue;
+        }
         Integer target = fieldInitLine(className, mapping.keySet());
         if (target == null) {
           continue;
@@ -346,6 +355,59 @@ public final class LineAlign {
    * constructors map those offsets to unrelated lines, so the line every offset agrees on is the
    * field's.
    */
+  /**
+   * The line table of the constructor a lifted field initializer was generated into, or null when
+   * several constructors contain its offsets or none does. The printer records the initializer
+   * once, at its declaration, while javac emitted it into every constructor that reaches it; the
+   * copy whose code covers every recorded offset is the one whose table places the declarations.
+   */
+  private static StructLineNumberTableAttribute initializerTable(String className,
+      java.util.Set<Integer> offsets) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(className);
+    if (cls == null || offsets.isEmpty()) {
+      return null;
+    }
+    StructLineNumberTableAttribute found = null;
+    for (StructMethod method : cls.getMethods()) {
+      if (!"<init>".equals(method.getName())) {
+        continue;
+      }
+      if (method.getInstructionSequence() == null) {
+        try {
+          method.expandData(cls);
+        }
+        catch (Exception e) {
+          continue;
+        }
+      }
+      FullInstructionSequence code = method.getInstructionSequence();
+      if (code == null || !coversOffsets(code, offsets)) {
+        continue;
+      }
+      if (found != null) {
+        return null;
+      }
+      found = method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    }
+    return found;
+  }
+
+  private static boolean coversOffsets(
+      FullInstructionSequence code, java.util.Set<Integer> offsets) {
+    java.util.Set<Integer> remaining = new HashSet<>(offsets);
+    for (Instruction instruction : code) {
+      // The tracer records operand bytes as well as instruction starts, so an offset is inside
+      // the method when any instruction covers it.
+      for (int offset = instruction.startOffset; offset < instruction.startOffset + instruction.length; offset++) {
+        remaining.remove(offset);
+      }
+      if (remaining.isEmpty()) {
+        return true;
+      }
+    }
+    return remaining.isEmpty();
+  }
+
   private static Integer fieldInitLine(String className, java.util.Set<Integer> offsets) {
     StructClass cls = DecompilerContext.getStructContext().getClass(className);
     if (cls == null) {
@@ -418,7 +480,7 @@ public final class LineAlign {
       int lastLine = -1;
       int run = -1;
       int index = 0;
-      for (org.jetbrains.java.decompiler.code.Instruction instruction : code) {
+      for (Instruction instruction : code) {
         Integer printed = mapping.get(instruction.startOffset);
         int target = table.findLineNumber(instruction.startOffset);
         if (System.getenv("NEUROFLOWER_ML_DEBUG") != null && index < 3) {
