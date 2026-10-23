@@ -39,6 +39,8 @@ public final class Decompiler {
 
   /** Trees kept per version; older ones are pruned after each decompile. */
   private static final int KEEP = 5;
+  /** What the decompiler prints where a method could not be decompiled. */
+  private static final String FAILED_MARKER = "$VF: Couldn't be decompiled";
 
   public Path tree(String version, int threads, boolean noCache, String only,
                    List<String> options) throws Exception {
@@ -85,28 +87,31 @@ public final class Decompiler {
     command.add(input.toString());
     command.add(staging.toString());
     long started = System.nanoTime();
-    Process process = new ProcessBuilder(command).inheritIO().start();
-    boolean finished;
-    try {
-      finished = process.waitFor(timeoutMinutes, java.util.concurrent.TimeUnit.MINUTES);
-    } catch (InterruptedException e) {
-      process.destroyForcibly();
-      Thread.currentThread().interrupt();
-      deleteTree(staging);
-      throw e;
+    runDecompiler(command, staging, timeoutMinutes);
+    // A method the decompiler fails on is printed as a stub that cannot compile. Such a run is
+    // occasionally produced where the same jar decompiles cleanly -- thread scheduling decides an
+    // internal order -- and caching it would make every later score inherit the failure. Retry
+    // once and keep the tree with fewer failed methods.
+    int failed = countFailedMethods(staging);
+    if (failed > 0) {
+      Path retry = dir.resolve("src.retry");
+      deleteTree(retry);
+      Files.createDirectories(retry);
+      List<String> retryCommand = new ArrayList<>(command);
+      retryCommand.set(retryCommand.size() - 1, retry.toString());
+      runDecompiler(retryCommand, retry, timeoutMinutes);
+      int retried = countFailedMethods(retry);
+      if (retried < failed) {
+        deleteTree(staging);
+        Files.move(retry, staging);
+        failed = retried;
+      }
+      else {
+        deleteTree(retry);
+      }
+      System.err.println("decompiler failed on " + failed + " method(s) after retry; kept the better run");
     }
     long elapsed = (System.nanoTime() - started) / 1_000_000;
-    if (!finished) {
-      process.destroyForcibly();
-      process.waitFor();
-      deleteTree(staging);
-      throw new IOException("decompiler timed out after " + timeoutMinutes + " minutes");
-    }
-    int status = process.exitValue();
-    if (status != 0) {
-      deleteTree(staging);
-      throw new IOException("decompiler exited with " + status);
-    }
     // A --no-cache run replaces an earlier tree of the same key; the old directory must go
     // before the staging one can take its name.
     deleteTree(src);
@@ -180,6 +185,54 @@ public final class Decompiler {
       }
     });
     return total;
+  }
+
+  /** Runs the decompiler over one input into {@code out}, with the per-version timeout. */
+  private static void runDecompiler(List<String> command, Path out, int timeoutMinutes) throws IOException {
+    Process process = new ProcessBuilder(command).inheritIO().start();
+    boolean finished;
+    try {
+      finished = process.waitFor(timeoutMinutes, java.util.concurrent.TimeUnit.MINUTES);
+    }
+    catch (InterruptedException e) {
+      process.destroyForcibly();
+      Thread.currentThread().interrupt();
+      deleteTree(out);
+      throw new IOException("decompiler interrupted", e);
+    }
+    if (!finished) {
+      process.destroyForcibly();
+      try {
+        process.waitFor();
+      }
+      catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      deleteTree(out);
+      throw new IOException("decompiler timed out after " + timeoutMinutes + " minutes");
+    }
+    int status = process.exitValue();
+    if (status != 0) {
+      deleteTree(out);
+      throw new IOException("decompiler exited with " + status);
+    }
+  }
+
+  /** Methods the decompiler gave up on, printed as stubs no compiler accepts. */
+  private static int countFailedMethods(Path root) throws IOException {
+    if (!Files.isDirectory(root)) {
+      return 0;
+    }
+    int failed = 0;
+    try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+      for (Path file : walk.filter(f -> f.toString().endsWith(".java")).toList()) {
+        String text = Files.readString(file);
+        for (int at = text.indexOf(FAILED_MARKER); at >= 0; at = text.indexOf(FAILED_MARKER, at + 1)) {
+          failed++;
+        }
+      }
+    }
+    return failed;
   }
 
   /** A jar with the class and everything named Class$..., so nested and anonymous classes come too. */
