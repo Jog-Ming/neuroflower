@@ -116,8 +116,8 @@ public final class ClassDiff {
       if (!code(theirs).equals(code(ours))) {
         diff.fail("code", entry.getKey() + " " + firstInstructionDifference(theirs, ours));
       }
-      List<Integer> originalLines = lnt(theirs);
-      List<Integer> ourLines = lnt(ours);
+      List<String> originalLines = lnt(theirs);
+      List<String> ourLines = lnt(ours);
       if (!originalLines.equals(ourLines)) {
         diff.fail("lnt", entry.getKey() + " " + lntSummary(originalLines, ourLines));
       }
@@ -420,31 +420,45 @@ public final class ClassDiff {
     return builder.toString();
   }
 
-  static List<Integer> lnt(MethodNode method) {
-    List<Integer> lines = new ArrayList<>();
+  /**
+   * The line table as {@code instruction position:line} pairs. The position is what the target's
+   * bytecode actually anchors the line at, so an entry with the right line number but a different
+   * anchor still differs: the two class files are not the same file.
+   */
+  static List<String> lnt(MethodNode method) {
+    Map<LabelNode, Integer> positions = new HashMap<>();
+    int position = 0;
+    for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+      if (insn instanceof LabelNode label) {
+        positions.putIfAbsent(label, position);
+      } else if (!(insn instanceof LineNumberNode) && !(insn instanceof FrameNode)) {
+        position++;
+      }
+    }
+    List<String> lines = new ArrayList<>();
     for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
       if (insn instanceof LineNumberNode line) {
-        lines.add(line.line);
+        lines.add(positions.getOrDefault(line.start, -1) + ":" + line.line);
       }
     }
     return lines;
   }
 
   /** Whether the divergence is one offset for the whole method, which a padding pass can solve. */
-  private static String lntSummary(List<Integer> original, List<Integer> ours) {
+  private static String lntSummary(List<String> original, List<String> ours) {
     if (original.size() != ours.size()) {
       return "entries " + original.size() + " vs " + ours.size();
     }
     if (original.isEmpty()) {
       return "entries differ";
     }
-    int first = original.get(0) - ours.get(0);
+    int first = lineOf(original, 0) - lineOf(ours, 0);
     boolean constant = true;
     int min = Integer.MAX_VALUE;
     int max = Integer.MIN_VALUE;
     java.util.Set<Integer> distinct = new java.util.TreeSet<>();
     for (int i = 0; i < original.size(); i++) {
-      int delta = original.get(i) - ours.get(i);
+      int delta = lineOf(original, i) - lineOf(ours, i);
       distinct.add(delta);
       min = Math.min(min, delta);
       max = Math.max(max, delta);
@@ -456,6 +470,11 @@ public final class ClassDiff {
       return "constant shift " + first;
     }
     return "deltas " + min + ".." + max + " (" + distinct.size() + " distinct)";
+  }
+
+  private static int lineOf(List<String> entries, int index) {
+    String entry = entries.get(index);
+    return Integer.parseInt(entry.substring(entry.indexOf(':') + 1));
   }
 
   private static String lvt(MethodNode method) {

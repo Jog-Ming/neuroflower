@@ -74,7 +74,7 @@ public final class Verifier {
     COMPILER.get().getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8));
 
   /** Bump when the comparison changes: it is part of the cache key, not of the source hash. */
-  private static final String COMPARATOR_VERSION = "8";
+  private static final String COMPARATOR_VERSION = "9";
 
   private final Workspace workspace;
   private final Minecraft minecraft;
