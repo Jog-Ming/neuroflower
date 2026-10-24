@@ -1577,7 +1577,17 @@ public class ExprProcessor implements CodeConstants {
         : castRaw ? new VarType(leftType.type, leftType.arrayDim, leftType.value) : leftType;
       buffer.append('(').appendCastTypeName(castType).append(')');
       if (doubleCast) {
-        buffer.append('(').appendCastTypeName(erasedWildcardForm(doubleCastTarget)).append(')');
+        // The first step widens the value to the strictest type the second cast accepts: the
+        // target class with its one argument as an upper bound (`Type<? extends Pair<?, ?>>`).
+        // When the target itself is the wildcarded erasure (`Dynamic<?>`), no first step exists
+        // and printing it again would only repeat the same cast.
+        VarType inner = strictDoubleCastInner(doubleCastTarget);
+        if (inner == null) {
+          inner = erasedWildcardForm(doubleCastTarget);
+        }
+        if (!getCastTypeName(inner).equals(getCastTypeName(castType))) {
+          buffer.append('(').appendCastTypeName(inner).append(')');
+        }
       }
     }
 
@@ -1646,6 +1656,22 @@ public class ExprProcessor implements CodeConstants {
       }
     }
     return false;
+  }
+
+  /**
+   * The strictest type a double cast's first step can widen to, or null when the target names no
+   * argument. A single upper-bounded argument is the form that still accepts the target cast: the
+   * value is castable to the target class with its argument as an upper bound, and that in turn to
+   * the target itself.
+   */
+  private static VarType strictDoubleCastInner(VarType target) {
+    if (!(target instanceof GenericType generic) || generic.getArguments().size() != 1
+        || generic.getArguments().get(0) == null) {
+      return null;
+    }
+    VarType bound = GenericType.withWildcard(generic.getArguments().get(0), GenericType.WILDCARD_EXTENDS);
+    return new GenericType(CodeType.OBJECT, 0, target.value, null,
+      java.util.Collections.singletonList(bound), GenericType.WILDCARD_NO);
   }
 
   /**
