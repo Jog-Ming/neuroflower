@@ -30,6 +30,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instruction end offset by start offset; the live sequence is released before printing. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Per method: handler bytecode offset -> first offset after its protected range. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> HANDLER_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Returns already printed as guard exits; the same instruction must not print a second time. */
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> CONSUMED_GUARD_EXITS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
@@ -107,6 +109,26 @@ public final class RoundTrip {
     BRANCHES.put(method, branches);
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
+    java.util.Map<Integer, Integer> handlerEnds = new java.util.HashMap<>();
+    org.jetbrains.java.decompiler.code.ExceptionTable table = seq.exceptionTable();
+    if (table != null) {
+      for (org.jetbrains.java.decompiler.code.ExceptionHandler handler : table.getHandlers()) {
+        int handlerIndex = handler.handler();
+        int toIndex = handler.to();
+        if (handlerIndex < 0 || handlerIndex >= seq.length() || toIndex < 0 || toIndex >= seq.length()) {
+          continue;
+        }
+        // Only a try body that falls through ends with javac's skip-goto; that goto carries the
+        // enclosing try statement's closing-brace line. Where the body returns or throws, the
+        // range ends at the handler itself, whose line is the catch clause's, not the brace's.
+        Instruction exit = seq.getInstr(toIndex);
+        if (exit.opcode != CodeConstants.opc_goto && exit.opcode != CodeConstants.opc_goto_w) {
+          continue;
+        }
+        handlerEnds.put(seq.getInstr(handlerIndex).startOffset, exit.startOffset);
+      }
+    }
+    HANDLER_ENDS.put(method, handlerEnds);
     GOTO_TARGETS.put(method, gotos);
     BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
@@ -570,6 +592,14 @@ public final class RoundTrip {
     }
     int offset = exprent.bytecode.previousSetBit(Integer.MAX_VALUE);
     return lnt.findLineNumber(offset) != (offset <= 0 ? -1 : lnt.findLineNumber(offset - 1));
+  }
+
+  /** The first offset after the protected range of the handler at this offset, or -1. */
+  public static int handlerExitOffset(int handlerOffset) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : HANDLER_ENDS.get(method);
+    Integer end = ends == null ? null : ends.get(handlerOffset);
+    return end == null ? -1 : end;
   }
 
   /** The target's source line for a bytecode offset, or -1. */

@@ -254,8 +254,18 @@ public class CatchStatement extends Statement {
           }
         }
       }
-      buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, false)).appendIndent(indent)
-        .append("}");
+      buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, false)).appendIndent(indent);
+      // javac attributes the instruction after a try's protected range to the last catch's
+      // closing brace. Map that offset to the brace so the aligner pads the arm to the line
+      // the table records instead of leaving the brace on its unaligned line.
+      if (i == stats.size() - 1 && handlerOffset != null) {
+        int exitOffset = RoundTrip.handlerExitOffset(handlerOffset);
+        if (exitOffset >= 0 && RoundTrip.lineAtOffset(exitOffset) > 0
+            && RoundTrip.lineAtOffset(exitOffset) != RoundTrip.lineAtOffset(exitOffset - 1)) {
+          buf.addBytecodeMapping(exitOffset);
+        }
+      }
+      buf.append("}");
       if (tail != null) {
         buf.appendLineSeparator();
         buf.append(ExprProcessor.listToJava(tail, indent));
