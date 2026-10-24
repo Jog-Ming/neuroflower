@@ -757,6 +757,15 @@ public class ClassWriter implements StatementWriter {
           if (block >= 0) {
             line = block;
             enumBlock = true;
+          } else {
+            // A plain class's static block is not at <clinit> offset 0: the field initializers
+            // are inlined first, each on its own declaration line. The block starts at the first
+            // entry that no field accounts for; ranking it by offset 0 would pull it in front of
+            // every method declared between the last field and the block.
+            int own = staticBlockOwnLine(wrapper, cl);
+            if (own >= 0) {
+              line = own;
+            }
           }
         }
         if (enumBlock) {
@@ -2651,6 +2660,37 @@ public class ClassWriter implements StatementWriter {
     for (int i = 2; i + 3 < raw.length; i += 2) {
       if (raw[i + 1] < raw[i - 1]) {
         return raw[i + 3];
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The line a plain class's static block starts on: the first {@code <clinit>} line table entry
+   * whose line is not one of the static field initializers' declaration lines. The initializers
+   * are inlined at the head of {@code <clinit>}, each attributed to its own field's line; the
+   * block's first statement is the first entry left over.
+   */
+  private static int staticBlockOwnLine(ClassWrapper wrapper, StructClass cl) {
+    StructMethod clinit = cl.getMethod(CodeConstants.CLINIT_NAME, "()V");
+    StructLineNumberTableAttribute table = clinit == null ? null
+      : clinit.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    java.util.Set<Integer> fieldLines = new java.util.HashSet<>();
+    for (StructField fd : cl.getFields()) {
+      if (fd.hasModifier(CodeConstants.ACC_STATIC)) {
+        int fieldLine = fieldLine(wrapper, cl, fd);
+        if (fieldLine >= 0) {
+          fieldLines.add(fieldLine);
+        }
+      }
+    }
+    int[] raw = table.getRawData();
+    for (int i = 1; i < raw.length; i += 2) {
+      if (!fieldLines.contains(raw[i])) {
+        return raw[i];
       }
     }
     return -1;
