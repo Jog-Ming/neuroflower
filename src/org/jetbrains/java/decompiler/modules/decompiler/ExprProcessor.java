@@ -1675,6 +1675,19 @@ public class ExprProcessor implements CodeConstants {
   }
 
   /**
+   * A declared type with every type variable wildcarded, or null when the type itself is one.
+   *
+   * <p>A method reference records its instantiated type erased, so a type variable the source
+   * pinned is only recoverable from the referenced method's declaration. The wildcard is the one
+   * nameable form of an argument no source spelled, and writing it back is byte-neutral.
+   */
+  public static VarType wildcardUnnameableType(VarType type) {
+    boolean[] captured = new boolean[1];
+    VarType value = wildcardUnnameableInView(type, java.util.Collections.emptyMap(), captured);
+    return captured[0] ? value : null;
+  }
+
+  /**
    * Replaces every type variable not recorded at the call site with the unbounded wildcard,
    * reporting whether any was replaced: such a position is a capture, the value our inference
    * could not name.

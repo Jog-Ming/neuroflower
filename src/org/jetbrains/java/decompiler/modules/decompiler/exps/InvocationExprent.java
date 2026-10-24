@@ -817,9 +817,15 @@ public class InvocationExprent extends Exprent {
             // explicit witness could have produced it.
             boolean receiverWildcardDemand = !suppress && !isNew
               && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
-              && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds);
+              && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds, false);
+            // A method reference cannot name a wildcard return type, so where the target projection
+            // carries one at an invariant position javac cannot infer it even when the printer's
+            // own return type already fits the expected class.
+            boolean receiverMethodRefDemand = suppress && !isNew
+              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds, true);
 
-            if ((!suppress && !receiverWildcardDemand)
+            if ((!suppress && !receiverWildcardDemand && !receiverMethodRefDemand)
               || DecompilerContext.getOption(IFernflowerPreferences.EXPLICIT_GENERIC_ARGUMENTS)
               || receiverDemand || returnOnlyDemand) {
               getGenericArgs(fparams, genericsMap, genericArgs);
@@ -849,7 +855,7 @@ public class InvocationExprent extends Exprent {
                 tryDemandWitness(fparams, bounds);
               }
             }
-            else if (receiverWildcardDemand) {
+            else if (receiverWildcardDemand || receiverMethodRefDemand) {
               // The witness was set by receiverWildcardTargetDemand above.
             }
             else if (referenceDemand) {
@@ -3823,6 +3829,38 @@ public class InvocationExprent extends Exprent {
     return "java/util/Optional".equals(receiver.classname) && "map".equals(receiver.name) ? receiver : null;
   }
 
+  /**
+   * The return type of this call's method reference, with its own type variables wildcarded.
+   *
+   * <p>javac infers a method reference's return type from the referenced method, so a source that
+   * reached a wildcard projection (`Single<?>` from `Single::fromEntry`) must have named it. A
+   * reference whose return already carries a wildcard names nothing this proves.
+   */
+  private VarType methodReferenceWildcardReturn() {
+    for (Exprent argument : lstParameters) {
+      if (!(argument instanceof NewExprent lambda) || !lambda.isLambda() || !lambda.isMethodReference()) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+      if (node == null || !node.lambdaInformation.is_content_method_static) {
+        // A bound instance reference inherits the receiver's type variables, so its return can
+        // carry a variable that is in scope; only an unbound (static) reference's return is a
+        // fresh instantiation no source can spell with a wildcard.
+        continue;
+      }
+      StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+      StructMethod referenced = content == null ? null : content.getMethod(
+        node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor);
+      if (referenced != null && referenced.getSignature() != null) {
+        VarType wildcarded = ExprProcessor.wildcardUnnameableType(referenced.getSignature().returnType);
+        if (wildcarded != null) {
+          return wildcarded;
+        }
+      }
+    }
+    return null;
+  }
+
   /** Whether a type mentions a wildcard at any depth. */
   private static boolean hasWildcardArgument(GenericType type) {
     for (VarType argument : type.getArguments()) {
@@ -4012,7 +4050,7 @@ public class InvocationExprent extends Exprent {
    * is taken; the witness must be nameable at the call and reproduce the erased descriptor.
    */
   private boolean receiverWildcardTargetDemand(List<String> fparams, VarType ret, VarType upperBound,
-                                               Map<VarType, List<VarType>> bounds) {
+                                               Map<VarType, List<VarType>> bounds, boolean methodRefOnly) {
     if (!isInvocationInstance || fparams.isEmpty() || ret == null || upperBound == null || desc == null
       || desc.getSignature() == null || !ret.isGeneric() || !upperBound.isGeneric()
       || ret.type != CodeType.OBJECT || upperBound.type != CodeType.OBJECT
@@ -4033,14 +4071,27 @@ public class InvocationExprent extends Exprent {
       VarType variable = GenericType.parse("T" + fp + ";");
       VarType value = genericsMap.get(variable);
       VarType expected = projected.get(variable);
-      if (expected instanceof GenericType wildcard
+      boolean wildcardProjection = false;
+      if (!methodRefOnly && expected instanceof GenericType wildcard
         && wildcard.getWildcard() == GenericType.WILDCARD_EXTENDS) {
         expected = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
-      } else {
+      }
+      else if (methodRefOnly && expected instanceof GenericType parameterized
+          && parameterized.getWildcard() == GenericType.WILDCARD_NO
+          && hasWildcardArgument(parameterized)
+          && parameterized.equalsExact(methodReferenceWildcardReturn())) {
+        // Only a method reference leaves javac unable to reach the wildcard projection: its
+        // return type is inferred from the referenced method and never carries a wildcard. A
+        // lambda's body can name the wildcard type itself, and a witness there overrides the
+        // target's own inference (a Dynamic<?> lambda broke unrelated chains).
+        wildcardProjection = true;
+      }
+      else {
         expected = null;
       }
       boolean fromTarget = value == null
-        || (value instanceof GenericType wildcard && wildcard.getWildcard() != GenericType.WILDCARD_NO);
+        || (value instanceof GenericType wildcard && wildcard.getWildcard() != GenericType.WILDCARD_NO)
+        || wildcardProjection;
       if (expected != null && isNameableWitness(expected, named, true) && fromTarget) {
         value = expected;
         demanded = true;
