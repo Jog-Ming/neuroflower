@@ -5,6 +5,7 @@ import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.struct.attr.StructExceptionsAttribute;
@@ -117,7 +118,16 @@ public class ExitExprent extends Exprent {
             InvocationExprent.exitLambdaBody();
           }
         }
-        buf.append(' ');
+        // The return instruction carries the line of the `return` keyword; the value's first
+        // instruction carries the line the expression starts on. When the source broke the line
+        // right after the keyword, the expression is recorded one line later.
+        int valueLine = firstValueLine(value);
+        int returnLine = RoundTrip.sourceLine(this);
+        if (valueLine >= 0 && returnLine >= 0 && valueLine > returnLine) {
+          buf.appendLineSeparator().appendIndent(indent + 1);
+        } else {
+          buf.append(' ');
+        }
 
         ExprProcessor.getCastedExprent(value, ret, buf, indent, ExprProcessor.NullCastType.DONT_CAST_AT_ALL, false, false, false);
       }
@@ -156,6 +166,36 @@ public class ExitExprent extends Exprent {
 
       return buf.append(value.toJava(indent)).prepend("throw ");
     }
+  }
+
+  /**
+   * The line the returned expression starts on: the line of its earliest instruction, when the
+   * expression's lines rise from there. A pattern's {@code instanceof} records its subject on the
+   * last line of the pattern and its binding on an earlier one, so a non-monotonic map cannot say
+   * where the source started the expression and is left alone.
+   */
+  private static int firstValueLine(Exprent value) {
+    if (value == null) {
+      return -1;
+    }
+    int minOffset = -1;
+    int firstLine = -1;
+    int minLine = -1;
+    for (Exprent part : value.getAllExprents(true, true)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int offset = part.bytecode.nextSetBit(0);
+      int line = RoundTrip.lineAtOffset(offset);
+      if (minOffset < 0 || offset < minOffset) {
+        minOffset = offset;
+        firstLine = line;
+      }
+      if (line >= 0 && (minLine < 0 || line < minLine)) {
+        minLine = line;
+      }
+    }
+    return firstLine >= 0 && firstLine == minLine ? firstLine : -1;
   }
 
   @Override
