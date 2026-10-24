@@ -92,9 +92,22 @@ public final class Workspace {
   /** Writes a file through a temporary sibling and an atomic rename. */
   public static void write(Path target, byte[] bytes) throws IOException {
     Files.createDirectories(target.getParent());
-    Path temp = target.resolveSibling(target.getFileName() + ".tmp");
+    // Several versions are scored in parallel processes, and two of them touch the same marker
+    // files. A shared temporary name lets one process move the other's file away mid-write, which
+    // Windows reports as an access denial on the rename.
+    Path temp = target.resolveSibling(target.getFileName() + ".tmp-"
+      + ProcessHandle.current().pid() + "-" + java.util.UUID.randomUUID());
     Files.write(temp, bytes);
-    Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    try {
+      Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    } catch (IOException e) {
+      try {
+        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+      } catch (IOException again) {
+        Files.deleteIfExists(temp);
+        throw again;
+      }
+    }
   }
 
   public static void write(Path target, String text) throws IOException {

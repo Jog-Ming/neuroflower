@@ -39,6 +39,8 @@ public final class Decompiler {
 
   /** Trees kept per version; older ones are pruned after each decompile. */
   private static final int KEEP = 5;
+  /** A tree used this recently may belong to a score running in another process. */
+  private static final long PRUNE_GRACE_MILLIS = 10 * 60 * 1000L;
   /** What the decompiler prints where a method could not be decompiled. */
   private static final String FAILED_MARKER = "$VF: Couldn't be decompiled";
 
@@ -264,28 +266,57 @@ public final class Decompiler {
   }
 
   /** Deletes the oldest cached trees, keeping {@link #KEEP} per version. */
-  public void prune() throws IOException {
+  public void prune() {
     if (!Files.isDirectory(workspace.trees)) {
       return;
     }
+    // Several versions are scored concurrently, each in its own process, and every one of them
+    // prunes. The lock makes the scan and the deletes one critical section; a process that finds
+    // it held simply leaves the cache alone.
+    Path lockPath = workspace.trees.resolve(".prune.lock");
+    try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(lockPath,
+        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE)) {
+      java.nio.channels.FileLock lock = channel.tryLock();
+      if (lock == null) {
+        return;
+      }
+      try {
+        pruneLocked();
+      } finally {
+        lock.release();
+      }
+    } catch (IOException | RuntimeException e) {
+      // Trimming the cache is an optimisation; it must never fail a decompile or a score.
+    }
+  }
+
+  private void pruneLocked() throws IOException {
     record Tree(Path dir, long used) {
     }
+    long now = System.currentTimeMillis();
     Map<String, List<Tree>> byVersion = new java.util.LinkedHashMap<>();
     try (var list = Files.list(workspace.trees)) {
       for (Path dir : list.toList()) {
-        long used = 0;
-        String version = "unknown";
+        if (!Files.isDirectory(dir)) {
+          continue; // the lock file and deletion tombstones live here too
+        }
         Path meta = dir.resolve("meta.json");
-        if (Files.exists(meta)) {
-          try {
-            var json = Workspace.readJson(meta);
-            used = json.get("lastUsed").getAsLong();
-            if (json.has("version")) {
-              version = json.get("version").getAsString();
-            }
-          } catch (RuntimeException ignored) {
-            // A tree without a readable meta is treated as oldest.
-          }
+        if (!Files.exists(meta)) {
+          // A tree is moved into place before its meta is written. Another process can see that
+          // window, and a tree it cannot identify is not its to delete.
+          continue;
+        }
+        long used;
+        String version;
+        try {
+          var json = Workspace.readJson(meta);
+          used = json.get("lastUsed").getAsLong();
+          version = json.has("version") ? json.get("version").getAsString() : null;
+        } catch (IOException | RuntimeException e) {
+          continue; // a meta being written is not evidence that the tree is old
+        }
+        if (version == null) {
+          continue;
         }
         byVersion.computeIfAbsent(version, k -> new ArrayList<>()).add(new Tree(dir, used));
       }
@@ -293,19 +324,43 @@ public final class Decompiler {
     for (List<Tree> trees : byVersion.values()) {
       trees.sort(Comparator.comparingLong(Tree::used).reversed());
       for (int i = KEEP; i < trees.size(); i++) {
+        if (now - trees.get(i).used() < PRUNE_GRACE_MILLIS) {
+          continue; // another process may be scoring this tree right now
+        }
         delete(trees.get(i).dir());
       }
     }
   }
 
-  static void delete(Path dir) throws IOException {
+  /**
+   * Removes a tree by first renaming it away, so a scorer still walking the old path cannot add
+   * files behind the deletion; failure to remove it is ignored for the same reason.
+   */
+  static void delete(Path dir) {
     if (!Files.exists(dir)) {
       return;
     }
-    try (var walk = Files.walk(dir)) {
-      for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
-        Files.deleteIfExists(path);
+    Path tombstone = dir.resolveSibling(dir.getFileName() + ".delete-"
+      + java.util.UUID.randomUUID().toString().replace("-", ""));
+    try {
+      Files.move(dir, tombstone, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    } catch (IOException e) {
+      try {
+        Files.move(dir, tombstone);
+      } catch (IOException again) {
+        return; // in use: leave it for a later prune
       }
+    }
+    try (var walk = Files.walk(tombstone)) {
+      for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+        try {
+          Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+          // a concurrent writer won this file; the tombstone is retried by a later prune
+        }
+      }
+    } catch (IOException ignored) {
+      // leftovers stay in the tombstone and are invisible to the cache lookup
     }
   }
 
