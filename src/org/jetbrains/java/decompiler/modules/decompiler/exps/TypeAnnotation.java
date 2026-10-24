@@ -177,9 +177,13 @@ public class TypeAnnotation {
           buffer.append(".");
         }
 
-        // If we're past the point of being allowed to place annotations, start unwinding the queue
+        // If we're past the point of being allowed to place annotations, start unwinding the
+        // queue. A top-level annotation names the whole type, and a qualified type name can only
+        // carry it on its simple name: anywhere before that annotates a scoping construct, which
+        // javac rejects.
         if (i >= startIdx) {
-          stepwiseWriteAnnotations(buffer, typeAnnotations, filter, v -> v.kind() == TypeAnnotation.PathKind.DEEPER_NESTED);
+          stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter,
+            v -> v.kind() == TypeAnnotation.PathKind.DEEPER_NESTED, i == fullClasses.size() - 1);
         }
 
         buffer.appendClass(name, false, clazz.replace(".", "/"));
@@ -251,12 +255,19 @@ public class TypeAnnotation {
   }
 
   private static void stepwiseWriteAnnotations(TextBuffer buffer, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<TypeAnnotation.PathValue> canProceed) {
-    stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter, canProceed);
+    stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter, canProceed, true);
   }
 
   private static void stepwiseWriteAnnotations(TextBuffer buffer, boolean extraSpace, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<PathValue> canProceed) {
+    stepwiseWriteAnnotations(buffer, extraSpace, typeAnnotations, filter, canProceed, true);
+  }
+
+  private static void stepwiseWriteAnnotations(TextBuffer buffer, boolean extraSpace, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<PathValue> canProceed, boolean topLevelNow) {
     for (Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent> anno : typeAnnotations) {
       if (anno.a.isEmpty()) {
+        if (!topLevelNow) {
+          continue; // a qualified name carries a top-level annotation on its simple name only
+        }
         if (!anno.b.didWriteAlready()) {
           anno.b.setDidWriteAlready(true);
 
