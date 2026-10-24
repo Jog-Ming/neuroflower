@@ -172,6 +172,8 @@ public final class ConstantNames {
     }
     expressionSites(text, rootSpans, root, sites);
     initializerSites(text, rootSpans, root, sites);
+    deadNamings(text, rootSpans, rootRules, root.classStruct, packageName, sites,
+      anonymousPadding(root.classStruct));
     for (Map.Entry<String, List<int[]>> entry : spansByClass.entrySet()) {
       ClassNode node = byName.get(entry.getKey());
       if (node == null) {
@@ -183,6 +185,7 @@ public final class ConstantNames {
       }
       expressionSites(text, entry.getValue(), node, sites);
       initializerSites(text, entry.getValue(), node, sites);
+      deadNamings(text, entry.getValue(), classRules, node.classStruct, packageName, sites, 0);
     }
     if (sites.isEmpty()) {
       return text;
@@ -4327,6 +4330,237 @@ public final class ConstantNames {
     return duplicated.contains(constant.owner())
       ? placement.provesExactly(constant.owner(), position)
       : placement.proves(constant.owner(), position);
+  }
+
+  /**
+   * Prints the dead reference a class's own pool proves the original source contained.
+   *
+   * <p>A {@code Class} entry at the very start of the pool is entered while the class body is
+   * resolved, before any code is generated: only a reference to one of that class's compile-time
+   * constants, folded away in a constant condition, does that. The decompiler cannot recover the
+   * statement that held it, but an initializer block whose condition folds to false leaves the
+   * same entry and no instruction. A synthetic switch-map holder numbered above one additionally
+   * records anonymous classes that consumed numbers without producing a class file, so the same
+   * dead block carries that many unused anonymous declarations.
+   */
+  private static void deadNamings(String text, List<int[]> spans, Rules rules, StructClass own,
+                                  String packageName, List<Site> sites, int anonymous) {
+    if (own == null || spans.isEmpty()) {
+      return;
+    }
+    if (own.getRecordComponents() != null
+        || (own.getAccessFlags() & (CodeConstants.ACC_INTERFACE | CodeConstants.ACC_ANNOTATION
+        | CodeConstants.ACC_ENUM)) != 0) {
+      return; // this body has no instance initializer block
+    }
+    List<Map.Entry<Integer, String>> conditions = new ArrayList<>();
+    if (rules != null && !rules.missing().isEmpty()) {
+      Map<String, Integer> indices = classIndices(own);
+      Set<Integer> prefix = prefixClassIndices(own);
+      for (String owner : rules.missing()) {
+        Integer index = indices.get(owner);
+        if (index == null || !prefix.contains(index) || siteWithin(sites, owner, spans)) {
+          continue;
+        }
+        String condition = deadCondition(owner, own.qualifiedName, packageName);
+        if (condition != null) {
+          conditions.add(Map.entry(index, condition));
+        }
+      }
+      conditions.sort(Map.Entry.comparingByKey());
+    }
+    if (conditions.isEmpty() && anonymous <= 0) {
+      return;
+    }
+    int at = classBodyOpen(text, spans.get(0), own);
+    if (at < 0) {
+      return;
+    }
+    StringBuilder block = new StringBuilder(" {");
+    for (int i = 0; i < conditions.size(); i++) {
+      block.append(" if (").append(conditions.get(i).getValue()).append(") {");
+      if (i == 0) {
+        appendAnonymous(block, anonymous);
+      }
+      block.append(" }");
+    }
+    if (conditions.isEmpty()) {
+      block.append(" if (false) {");
+      appendAnonymous(block, anonymous);
+      block.append(" }");
+    }
+    block.append(" }");
+    addSiteOnce(sites, new Site(at, at, block.toString(), "@dead"));
+  }
+
+  private static void appendAnonymous(StringBuilder block, int count) {
+    for (int i = 0; i < count; i++) {
+      block.append(" java.lang.Runnable drop").append(i)
+        .append(" = new java.lang.Runnable() { public void run() { } };");
+    }
+  }
+
+  /** A condition over one of the owner's constants that is false where javac folds it. */
+  private static String deadCondition(String owner, String ownName, String packageName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    if (cls == null) {
+      return null;
+    }
+    String qualifier = solverQualifier(owner, packageName);
+    if (qualifier == null) {
+      return null;
+    }
+    for (StructField field : cls.getFields()) {
+      int access = field.getAccessFlags();
+      if ((access & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      boolean accessible = (access & CodeConstants.ACC_PUBLIC) != 0
+        || ((access & CodeConstants.ACC_PRIVATE) == 0 && packageName.equals(packageOf(owner)))
+        || ((access & CodeConstants.ACC_PRIVATE) != 0 && nestOf(owner).equals(nestOf(ownName)));
+      if (!accessible) {
+        continue;
+      }
+      StructConstantValueAttribute attribute =
+        field.getAttribute(StructGeneralAttribute.ATTRIBUTE_CONSTANT_VALUE);
+      if (attribute == null) {
+        continue;
+      }
+      PrimitiveConstant value = cls.getPool().getPrimitiveConstant(attribute.getIndex());
+      if (value == null || !(value.value instanceof Number number)) {
+        continue;
+      }
+      VariableType kind = kind(field.getDescriptor());
+      if (kind == null) {
+        continue;
+      }
+      String name = qualifier + "." + field.getName();
+      switch (kind) {
+        case BOOLEAN:
+          return number.intValue() != 0 ? "!" + name : name;
+        case INT:
+        case BYTE:
+        case SHORT:
+        case CHAR: {
+          long integral = number.longValue();
+          return name + " == " + (integral == Integer.MAX_VALUE ? integral - 1 : integral + 1);
+        }
+        case LONG: {
+          long integral = number.longValue();
+          return name + " == " + (integral == Long.MAX_VALUE ? integral - 1 : integral + 1) + "L";
+        }
+        default:
+          break;
+      }
+    }
+    return null;
+  }
+
+  /** The pool indices of the leading {@code Class, Utf8} pairs, entered before any code. */
+  private static Set<Integer> prefixClassIndices(StructClass cls) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    Set<Integer> prefix = new HashSet<>();
+    int index = 1;
+    while (index + 1 < pool.size()
+        && pool.get(index) instanceof PrimitiveConstant entry && entry.type == CodeConstants.CONSTANT_Class
+        && pool.get(index + 1) instanceof PrimitiveConstant name && name.type == CodeConstants.CONSTANT_Utf8) {
+      prefix.add(index);
+      index += 2;
+    }
+    return prefix;
+  }
+
+  private static boolean siteWithin(List<Site> sites, String owner, List<int[]> spans) {
+    for (Site site : sites) {
+      if (!site.owner().equals(owner)) {
+        continue;
+      }
+      for (int[] span : spans) {
+        if (site.start() >= span[0] && site.start() < span[1]) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static int classBodyOpen(String text, int[] span, StructClass own) {
+    String qualified = own.qualifiedName;
+    String simple = qualified.substring(qualified.lastIndexOf('/') + 1);
+    int dollar = simple.lastIndexOf('$');
+    if (dollar >= 0) {
+      simple = simple.substring(dollar + 1);
+    }
+    if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))) {
+      return -1; // an anonymous or local class has no declaration to add a block to
+    }
+    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+      "\\b(?:class|interface|enum|record)\\s+" + java.util.regex.Pattern.quote(simple) + "\\b");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    matcher.region(span[0], span[1]);
+    if (!matcher.find()) {
+      return -1;
+    }
+    int brace = text.indexOf('{', matcher.end());
+    return brace >= 0 && brace < span[1] ? brace + 1 : -1;
+  }
+
+  /**
+   * How many anonymous classes the original source had that produced no class file.
+   *
+   * <p>javac numbers a synthetic switch-map holder after every anonymous class entered before it,
+   * including classes in compile-time-dead code that are never emitted. When the holder is the
+   * only numbered class this class has and its number is above one, the missing numbers were such
+   * dead classes.
+   */
+  private static int anonymousPadding(StructClass own) {
+    if (own == null) {
+      return 0;
+    }
+    StructInnerClassesAttribute inner = own.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
+    if (inner == null || inner.getEntries() == null) {
+      return 0;
+    }
+    String prefix = own.qualifiedName + "$";
+    int holder = -1;
+    for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
+      if (entry.innerName == null || !entry.innerName.startsWith(prefix)) {
+        continue;
+      }
+      String tail = entry.innerName.substring(prefix.length());
+      int digits = 0;
+      while (digits < tail.length() && Character.isDigit(tail.charAt(digits))) {
+        digits++;
+      }
+      if (digits == 0) {
+        continue;
+      }
+      if (digits < tail.length() || holder >= 0 || !switchMapHolder(entry.innerName)) {
+        return 0; // a local class, a second anonymous class, or an ordinary one
+      }
+      holder = Integer.parseInt(tail);
+    }
+    return holder >= 2 ? holder - 1 : 0;
+  }
+
+  private static boolean switchMapHolder(String name) {
+    StructClass holder = DecompilerContext.getStructContext().getClass(name);
+    if (holder == null || (holder.getAccessFlags() & CodeConstants.ACC_SYNTHETIC) == 0) {
+      return false;
+    }
+    boolean map = false;
+    for (StructField field : holder.getFields()) {
+      if (field.getName().startsWith("$SwitchMap$")) {
+        map = true;
+      }
+    }
+    for (StructMethod method : holder.getMethods()) {
+      if (!"<clinit>".equals(method.getName())) {
+        return false;
+      }
+    }
+    return map;
   }
 
   /**
