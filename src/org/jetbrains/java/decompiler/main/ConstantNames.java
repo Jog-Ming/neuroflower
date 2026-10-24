@@ -3838,10 +3838,14 @@ public final class ConstantNames {
         }
       }
     }
+    Constant excluded = null;
     if (ownConstant != null && insideInitializer(ownInitializers, start)) {
       for (int[] range : ownInitializers.getOrDefault(ownConstant.name(), List.of())) {
         if (start >= range[0] && start < range[1]) {
-          ownConstant = null; // a constant cannot be named inside its own initializer
+          // The field's own initializer cannot name it. It stays out of the selection entirely,
+          // so another owner's constant of the same value is no longer ambiguous with it.
+          excluded = ownConstant;
+          ownConstant = null;
           break;
         }
       }
@@ -3865,10 +3869,15 @@ public final class ConstantNames {
     // so the recorded position of the instruction is one past the opening quote.
     int anchor = key.startsWith(VariableType.STRING.name() + "|")
       || key.startsWith(VariableType.CHAR.name() + "|") ? start + 1 : start;
-    Constant paired = constants.size() > 1 ? pairOwner(constants, anchor, placement) : null;
+    List<Constant> usable = constants;
+    if (excluded != null) {
+      usable = new ArrayList<>(constants);
+      usable.remove(excluded);
+    }
+    Constant paired = usable.size() > 1 ? pairOwner(usable, anchor, placement) : null;
     Constant constant = ownCandidate ? ownConstant
       : paired != null ? paired
-      : constants.size() == 1 ? constants.get(0) : selectProvable(constants, anchor, placement, own);
+      : usable.size() == 1 ? usable.get(0) : selectProvable(usable, anchor, placement, own);
     if (constant == null) {
       return;
     }
