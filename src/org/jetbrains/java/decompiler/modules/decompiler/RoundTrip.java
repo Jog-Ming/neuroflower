@@ -952,6 +952,58 @@ public final class RoundTrip {
     return found;
   }
 
+  /**
+   * The strict guard layout: every conditional branch of the head targets one void return that is
+   * exactly one instruction before the body, and the head block's last instruction is a goto to
+   * that body (the `goto body / return / body:` layout the source's early-return guard compiles to).
+   */
+  public static boolean guardReturnLayout(Statement headBlock, Exprent head, Statement arm) {
+    StructMethod method = currentMethod();
+    if (method == null || headBlock == null || head == null || head.bytecode == null || arm == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    BitSet returns = VOID_RETURNS.get(method);
+    if (ends == null || targets == null || returns == null) {
+      return false;
+    }
+    int bodyStart = firstOffset(arm);
+    if (bodyStart < 0) {
+      return false;
+    }
+    Integer common = null;
+    for (int offset = head.bytecode.nextSetBit(0); offset >= 0; offset = head.bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end == null) {
+        continue;
+      }
+      Integer target = targets.get(end);
+      if (target == null) {
+        continue;
+      }
+      if (common == null) {
+        common = target;
+      } else if (!common.equals(target)) {
+        return false;
+      }
+    }
+    if (common == null || !returns.get(common) || common + 1 != bodyStart) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() == bodyStart && ends.get(entry.getKey()) != null
+          && ends.get(entry.getKey()) == common) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** True when the arm's last instruction is a goto that lands beyond the tail's end. */
   public static boolean armJumpsPast(Statement arm, Statement tail) {
     StructMethod method = currentMethod();

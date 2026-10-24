@@ -226,6 +226,30 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { body; return; }` at the method tail under the strict guard layout: the source
+      // wrote `if (!C) { return; } body` (goto body / return / body:).
+      if (!hasContent(stats.subList(i + 1, stats.size())) && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled()
+          && ifStatement.getIfstat() instanceof SequenceStatement thenSeq
+          && !thenSeq.getStats().isEmpty()
+          && bareReturn(thenSeq.getStats().get(thenSeq.getStats().size() - 1)) != null
+          && RoundTrip.guardReturnLayout(ifStatement.getFirst(), ifStatement.getHeadexprent(), thenSeq)) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        List<Statement> hoisted = thenSeq.getStats();
+        for (int k = 0; k < hoisted.size() - 1; k++) {
+          buf.append(ExprProcessor.jmpWrapper(hoisted.get(k), indent, false));
+        }
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body } return X;` where the body's last instruction jumps past the return:
       // the source wrote `if (C) { body } else { return X; }`.
       if (i + 1 == stats.size() - 1 && st instanceof IfStatement ifStatement
@@ -356,6 +380,17 @@ public class SequenceStatement extends Statement {
     if (exprents != null && exprents.size() == 1
         && exprents.get(0) instanceof ExitExprent exit
         && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW)) {
+      return exit;
+    }
+    return null;
+  }
+
+  /** The statement when it is a single bare {@code return;} (no value), else null. */
+  private static ExitExprent bareReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null && exprents.size() == 1
+        && exprents.get(0) instanceof ExitExprent exit
+        && exit.getExitType() == ExitExprent.Type.RETURN && exit.getValue() == null) {
       return exit;
     }
     return null;
