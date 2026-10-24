@@ -705,8 +705,14 @@ public class VarDefinitionHelper {
           Integer index = varproc.getVarOriginalIndex(var.getIndex());
           if (index != null) {
             if (this_vars.containsKey(index)) {
+              VarVersionPair survivor = this_vars.get(index);
+              if (getMergedType(new VarVersionPair(var), survivor) == null) {
+                // The two variables share no common type, so the remap cannot succeed. Removing
+                // this declaration would leave its uses naming a variable that no longer exists.
+                continue;
+              }
               stat.getVarDefinitions().remove(x);
-              return new VPPEntry(var, this_vars.get(index));
+              return new VPPEntry(var, survivor);
             }
             this_vars.put(index, new VarVersionPair(var));
             leaked.put(index, new VarVersionPair(var));
