@@ -259,7 +259,15 @@ public class ClassWriter implements StatementWriter {
                     Exprent size = newExp.getLstDims().get(newExp.getLstDims().size() - 1);
                     if (size instanceof VarExprent) {
                       VarExprent sizeVar = (VarExprent) size;
-                      if (sizeVar.getIndex() == (node.lambdaInformation.is_content_method_static ? 0 : 1)) {
+                      // The synthetic method receives the captured values before the lambda's own
+                      // parameters, so the array size is the lambda parameter only when its slot is
+                      // the first of the trailing functional parameters: `size -> new T[capacity]`
+                      // captures capacity and keeps the lambda form.
+                      int lambdaSlot = node.lambdaInformation.is_content_method_static ? 0 : 1;
+                      for (int i = 0; i < md_content.params.length - md_lambda.params.length; i++) {
+                        lambdaSlot += md_content.params[i].stackSize;
+                      }
+                      if (sizeVar.getIndex() == lambdaSlot) {
                         VarType returnType = md_lambda.ret;
                         buffer.appendCastTypeName(returnType);
                         buffer.append("::new");
