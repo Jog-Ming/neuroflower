@@ -1472,6 +1472,17 @@ public class ClassWriter implements StatementWriter {
         if (initializer.bytecode != null) {
           buffer.addBytecodeMapping(initializer.bytecode);
         }
+        // A chained initializer's creation prologue (the `new`) is the receiver chain's root,
+        // and the target attributes it to the declaration's line; the top-level set omits it,
+        // so the declaration would have no anchor. Creations inside arguments belong to their
+        // own chain lines and must not be claimed here.
+        Exprent root = initializer;
+        while (root instanceof InvocationExprent invocation && invocation.getInstance() != null) {
+          root = invocation.getInstance();
+        }
+        if (root instanceof NewExprent created && created.bytecode != null) {
+          buffer.addBytecodeMapping(created.bytecode);
+        }
         buffer.append(" = ");
 
         if (initializer instanceof ConstExprent) {
