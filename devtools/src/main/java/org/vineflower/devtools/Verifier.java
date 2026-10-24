@@ -46,10 +46,25 @@ public final class Verifier {
                             boolean extra) {
   }
 
-  public record FileResult(String source, List<ClassResult> classes, List<String> errors, boolean cached) {
+  public record FileResult(String source, List<ClassResult> classes, List<String> errors, boolean cached,
+                           Metrics metrics) {
   }
 
-  record Compiled(boolean ok, Map<String, byte[]> outputs, List<String> errors) {
+  /**
+   * Source-quality counters of one file or tree. Raw types, redundant single casts and unchecked
+   * operations come from javac's lint; double casts come from the text matcher, since javac has no
+   * warning for them.
+   */
+  public record Metrics(int raw, int redundantCasts, int unchecked, int doubleCasts) {
+    public static final Metrics ZERO = new Metrics(0, 0, 0, 0);
+
+    public Metrics plus(Metrics other) {
+      return new Metrics(raw + other.raw, redundantCasts + other.redundantCasts,
+        unchecked + other.unchecked, doubleCasts + other.doubleCasts);
+    }
+  }
+
+  record Compiled(boolean ok, Map<String, byte[]> outputs, List<String> errors, Metrics metrics) {
   }
 
   /** One compiler and one file manager per worker: scanning the classpath is the expensive part. */
@@ -59,7 +74,7 @@ public final class Verifier {
     COMPILER.get().getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8));
 
   /** Bump when the comparison changes: it is part of the cache key, not of the source hash. */
-  private static final String COMPARATOR_VERSION = "6";
+  private static final String COMPARATOR_VERSION = "8";
 
   private final Workspace workspace;
   private final Minecraft minecraft;
@@ -130,6 +145,9 @@ public final class Verifier {
     }
 
     Compiled compiled = compile(source, classpath, release);
+    SourceMetrics.Counts sourceCounts = SourceMetrics.casts(new String(bytes, StandardCharsets.UTF_8));
+    Metrics metrics = new Metrics(compiled.metrics().raw(), compiled.metrics().redundantCasts(),
+      compiled.metrics().unchecked(), sourceCounts.doubleCasts());
 
     List<ClassResult> classes = new ArrayList<>();
     List<String> errors = new ArrayList<>();
@@ -152,7 +170,7 @@ public final class Verifier {
         classes.add(new ClassResult(diff.name, diff.matches, diff.details, true, false));
       }
     }
-    FileResult result = new FileResult(source.toString(), classes, errors, false);
+    FileResult result = new FileResult(source.toString(), classes, errors, false, metrics);
     writeCache(cached, result);
     return result;
   }
@@ -179,9 +197,12 @@ public final class Verifier {
   }
 
   private static List<String> options(List<Path> classpath, int release) {
+    // The lint categories feed the source-quality counters; they are measured, not acted on. A
+    // diagnostic collector receives them instead of the console, so no -nowarn is needed.
     return List.of(
       "--release", Integer.toString(release),
-      "-g", "-parameters", "-nowarn", "-proc:none", "-implicit:none",
+      "-g", "-parameters", "-proc:none", "-implicit:none",
+      "-Xlint:rawtypes,cast,unchecked",
       "-classpath", join(classpath));
   }
 
@@ -236,25 +257,45 @@ public final class Verifier {
     boolean ok = compiler.getTask(null, memory, diagnostics, options(classpath, release), null,
       files.getJavaFileObjects(source)).call();
     List<String> errors = new ArrayList<>();
-    if (!ok) {
-      for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
-        if (diagnostic.getKind() == Diagnostic.Kind.ERROR && errors.size() < 8) {
+    int raw = 0;
+    int redundantCasts = 0;
+    int unchecked = 0;
+    for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+      if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
+        if (!ok && errors.size() < 8) {
           errors.add(diagnostic.getLineNumber() + ":"
             + diagnostic.getMessage(Locale.ROOT).split("\n")[0]);
         }
+        continue;
+      }
+      if (diagnostic.getKind() != Diagnostic.Kind.WARNING
+          && diagnostic.getKind() != Diagnostic.Kind.MANDATORY_WARNING) {
+        continue;
+      }
+      String code = diagnostic.getCode();
+      if (code.startsWith("compiler.warn.raw.")) {
+        raw++;
+      }
+      else if (code.startsWith("compiler.warn.redundant.cast")) {
+        redundantCasts++;
+      }
+      else if (code.startsWith("compiler.warn.unchecked")
+          || code.startsWith("compiler.warn.prob.found.req")) {
+        unchecked++;
       }
     }
+    Metrics metrics = new Metrics(raw, redundantCasts, unchecked, 0);
     if (ok) {
       try {
-        Workspace.write(cached, serialize(memory.outputs));
+        Workspace.write(cached, serialize(memory.outputs, metrics));
       } catch (IOException ignored) {
         // The cache is an optimisation; a failed write must not fail the compile.
       }
     }
-    return new Compiled(ok, ok ? memory.outputs : Map.of(), errors);
+    return new Compiled(ok, ok ? memory.outputs : Map.of(), errors, metrics);
   }
 
-  private static byte[] serialize(Map<String, byte[]> outputs) throws IOException {
+  private static byte[] serialize(Map<String, byte[]> outputs, Metrics metrics) throws IOException {
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream data = new DataOutputStream(bytes)) {
       data.writeInt(outputs.size());
@@ -263,6 +304,9 @@ public final class Verifier {
         data.writeInt(entry.getValue().length);
         data.write(entry.getValue());
       }
+      data.writeInt(metrics.raw());
+      data.writeInt(metrics.redundantCasts());
+      data.writeInt(metrics.unchecked());
     }
     return bytes.toByteArray();
   }
@@ -277,7 +321,8 @@ public final class Verifier {
         data.readFully(bytes);
         outputs.put(name, bytes);
       }
-      return new Compiled(true, outputs, List.of());
+      Metrics metrics = new Metrics(data.readInt(), data.readInt(), data.readInt(), 0);
+      return new Compiled(true, outputs, List.of(), metrics);
     }
   }
 
@@ -340,8 +385,10 @@ public final class Verifier {
     int fully = 0;
     int extras = 0;
     int failingFiles = 0;
+    Metrics totals = Metrics.ZERO;
     List<String> worst = new ArrayList<>();
     for (FileResult result : results) {
+      totals = totals.plus(result.metrics());
       if (!result.errors().isEmpty()) {
         failingFiles++;
       }
@@ -389,6 +436,8 @@ public final class Verifier {
       System.out.printf(Locale.ROOT, "%-12s %8d %7.1f%%%n", attribute, count,
         classes == 0 ? 0.0 : 100.0 * count / classes);
     }
+    System.out.printf(Locale.ROOT, "metrics raw %d  cast %d  double %d  unchecked %d%n",
+      totals.raw(), totals.redundantCasts(), totals.doubleCasts(), totals.unchecked());
     if (failingFiles > 0) {
       System.out.println("files that did not compile: " + failingFiles);
     }
@@ -399,7 +448,7 @@ public final class Verifier {
       }
     }
 
-    appendIndex(version, target, files, cached, classes, compiled, fully, matches, elapsed);
+    appendIndex(version, target, files, cached, classes, compiled, fully, matches, elapsed, totals);
 
 
     if (json) {
@@ -418,6 +467,12 @@ public final class Verifier {
       JsonObject attributeJson = new JsonObject();
       matches.forEach(attributeJson::addProperty);
       report.add("attributes", attributeJson);
+      JsonObject metricsJson = new JsonObject();
+      metricsJson.addProperty("raw", totals.raw());
+      metricsJson.addProperty("redundantCasts", totals.redundantCasts());
+      metricsJson.addProperty("doubleCasts", totals.doubleCasts());
+      metricsJson.addProperty("unchecked", totals.unchecked());
+      report.add("metrics", metricsJson);
       JsonArray fileArray = new JsonArray();
       for (FileResult result : results) {
         JsonObject fileJson = new JsonObject();
@@ -456,7 +511,8 @@ public final class Verifier {
 
   /** One line per run: small enough to keep forever, enough to compare runs and plot progress. */
   private void appendIndex(String version, Path target, int files, int cached, int classes, int compiled,
-                           int fully, Map<String, Integer> matches, long elapsed) throws IOException {
+                           int fully, Map<String, Integer> matches, long elapsed, Metrics totals)
+    throws IOException {
     Path index = workspace.reports.resolve("index.tsv");
     boolean fresh = !Files.exists(index);
     StringBuilder line = new StringBuilder();
@@ -465,7 +521,7 @@ public final class Verifier {
       for (String attribute : ClassDiff.ATTRIBUTES) {
         line.append('\t').append(attribute);
       }
-      line.append("\ttree\n");
+      line.append("\ttree\traw\tcast\tdouble\tunchecked\n");
     }
     line.append(System.currentTimeMillis()).append('\t').append(version).append('\t')
       .append(classes).append('\t').append(compiled).append('\t').append(fully).append('\t')
@@ -473,7 +529,12 @@ public final class Verifier {
     for (String attribute : ClassDiff.ATTRIBUTES) {
       line.append('\t').append(matches.getOrDefault(attribute, 0));
     }
-    line.append('\t').append(target).append('\n');
+    line.append('\t').append(target)
+      .append('\t').append(totals.raw())
+      .append('\t').append(totals.redundantCasts())
+      .append('\t').append(totals.doubleCasts())
+      .append('\t').append(totals.unchecked())
+      .append('\n');
     Files.createDirectories(index.getParent());
     Files.writeString(index, line, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
   }
@@ -578,7 +639,17 @@ public final class Verifier {
     if (json.has("errors")) {
       json.getAsJsonArray("errors").forEach(e -> errors.add(e.getAsString()));
     }
-    return new FileResult(source.toString(), classes, errors, true);
+    Metrics metrics = Metrics.ZERO;
+    if (json.has("metrics")) {
+      JsonObject object = json.getAsJsonObject("metrics");
+      metrics = new Metrics(intOf(object, "raw"), intOf(object, "redundantCasts"),
+        intOf(object, "unchecked"), intOf(object, "doubleCasts"));
+    }
+    return new FileResult(source.toString(), classes, errors, true, metrics);
+  }
+
+  private static int intOf(JsonObject object, String key) {
+    return object.has(key) ? object.get(key).getAsInt() : 0;
   }
 
   private void writeCache(Path cached, FileResult result) throws IOException {
@@ -601,6 +672,12 @@ public final class Verifier {
     JsonArray errors = new JsonArray();
     result.errors().forEach(errors::add);
     json.add("errors", errors);
+    JsonObject metrics = new JsonObject();
+    metrics.addProperty("raw", result.metrics().raw());
+    metrics.addProperty("redundantCasts", result.metrics().redundantCasts());
+    metrics.addProperty("unchecked", result.metrics().unchecked());
+    metrics.addProperty("doubleCasts", result.metrics().doubleCasts());
+    json.add("metrics", metrics);
     Workspace.writeJson(cached, json);
   }
 
