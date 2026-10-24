@@ -2319,7 +2319,7 @@ public final class ConstantNames {
     String simple = simpleName(owner);
     boolean nested = owner.contains("$");
     boolean inScope = nestOf(owner).equals(nestOf(site.qualifiedName))
-      || imports.contains(simple)
+      || imports.contains(owner.replace('/', '.'))
       || (!nested && packageName.equals(packageOf(owner)));
     if (inScope) {
       return simple;
@@ -3175,6 +3175,9 @@ public final class ConstantNames {
         }
         int dot = name.lastIndexOf('.');
         imports.add(dot < 0 ? name : name.substring(dot + 1));
+        if (dot >= 0) {
+          imports.add(name); // the dotted form proves which class a simple name denotes
+        }
       }
     }
     return imports;
@@ -3565,7 +3568,7 @@ public final class ConstantNames {
       // A nested class's simple name is in scope only inside its own nest or through an explicit
       // import; elsewhere it needs its outer class, which a same-package check alone would miss.
       boolean inScope = nestOf(constant.owner()).equals(nestOf(own))
-        || imports.contains(name)
+        || imports.contains(constant.owner().replace('/', '.'))
         || (!nested && packageName.equals(packageOf(constant.owner())));
       String qualifier;
       if (inScope) {
