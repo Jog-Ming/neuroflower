@@ -2,6 +2,8 @@
 package org.jetbrains.java.decompiler.modules.decompiler;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.decompiler.CancelationManager;
@@ -467,7 +469,7 @@ public final class InitializerProcessor {
               String fieldKey = InterpreterUtil.makeUniqueKey(fExpr.getName(), fExpr.getDescriptor().descriptorString);
               int fidx = cl.getFields().getIndexByKey(fieldKey);
               if (prev_fidx <= fidx && isExprentIndependent(fExpr, assignExpr.getRight(), lstMethodWrappers.get(i), cl, whitelist, new ArrayList<>() /* TODO */, new ArrayList<>(),  fidx, false)
-                && declaredBeforeConstructor(lstMethodWrappers.get(i).methodStruct, exprent, isAnonymous)) {
+                && declaredBeforeConstructor(cl, lstMethodWrappers.get(i).methodStruct, exprent, isAnonymous)) {
                 prev_fidx = fidx;
                 if (fieldWithDescr == null) {
                   fieldWithDescr = fieldKey;
@@ -521,8 +523,8 @@ public final class InitializerProcessor {
    * class cannot declare one at all, and its synthetic constructor forwards the superclass's
    * parameters, so it is never treated as written.
    */
-  private static boolean declaredBeforeConstructor(StructMethod method, Exprent exprent, boolean isAnonymous) {
-    if (isAnonymous || !writtenConstructor(method)) {
+  private static boolean declaredBeforeConstructor(StructClass cl, StructMethod method, Exprent exprent, boolean isAnonymous) {
+    if (isAnonymous || !writtenConstructor(method, cl)) {
       return true;
     }
     if (exprent.bytecode == null || exprent.bytecode.isEmpty()) {
@@ -537,18 +539,52 @@ public final class InitializerProcessor {
     return line < 0 || ctorStart < 0 || ctorEnd < 0 || line < ctorStart || line > ctorEnd;
   }
 
-  private static boolean writtenConstructor(StructMethod method) {
+  private static boolean writtenConstructor(StructMethod method, StructClass cl) {
     StructMethodParametersAttribute parameters =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_METHOD_PARAMETERS);
-    if (parameters == null) {
-      return false;
-    }
-    for (StructMethodParametersAttribute.Entry entry : parameters.getEntries()) {
-      if ((entry.myAccessFlags & (CodeConstants.ACC_SYNTHETIC | CodeConstants.ACC_MANDATED)) == 0) {
-        return true;
+    if (parameters != null) {
+      for (StructMethodParametersAttribute.Entry entry : parameters.getEntries()) {
+        if ((entry.myAccessFlags & (CodeConstants.ACC_SYNTHETIC | CodeConstants.ACC_MANDATED)) == 0) {
+          return true;
+        }
       }
     }
-    return false;
+    // A no-arg constructor lists no parameters either way. One the source wrote ends at a
+    // closing brace that javac records as a position of its own, so the return instruction
+    // starts a line entry; the synthesized one ends on its last initializer's line with none.
+    // The expansion says elsewhere whether a method's body has been processed, so it is
+    // released again and the state is left as it was found.
+    boolean expanded = method.getInstructionSequence() != null;
+    try {
+      if (!expanded) {
+        method.expandData(cl);
+      }
+      FullInstructionSequence code = method.getInstructionSequence();
+      StructLineNumberTableAttribute table =
+        method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+      if (code == null || table == null) {
+        return false;
+      }
+      int last = -1;
+      for (Instruction instruction : code) {
+        last = instruction.startOffset;
+      }
+      int[] raw = table.getRawData();
+      for (int i = 0; i + 1 < raw.length; i += 2) {
+        if (raw[i] == last) {
+          return true;
+        }
+      }
+      return false;
+    }
+    catch (Exception e) {
+      return false;
+    }
+    finally {
+      if (!expanded) {
+        method.releaseResources();
+      }
+    }
   }
 
   private static Exprent processDynamicInitializer(Exprent expr) {
