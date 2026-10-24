@@ -103,9 +103,12 @@ public final class Verifier {
     // two source sets, and evicting the other side each time would make every run a cold one.
     if (only == null && Files.isDirectory(target)) {
       // Nine versions with ~7k sources each fit at once; a smaller cap makes every sweep a cold
-      // compile for the versions that fell out.
-      pruneCompileCache(compileCache, ".json", 200_000);
-      pruneCompileCache(workspace.cache.resolve("classes"), ".bin", 150_000);
+      // compile for the versions that fell out. The walk stats every entry, which costs minutes
+      // on Windows, so a day's grace between prunes keeps the scoring loop cheap.
+      if (pruneDue(workspace)) {
+        pruneCompileCache(compileCache, ".json", 200_000);
+        pruneCompileCache(workspace.cache.resolve("classes"), ".bin", 150_000);
+      }
     }
 
     long totalClasses = Files.isDirectory(target) && only == null
@@ -476,6 +479,19 @@ public final class Verifier {
   }
 
   /** Keeps entries that were used recently; the cap bounds a very large A/B matrix. */
+  /** Whether a day has passed since the cache was last pruned. */
+  private static boolean pruneDue(Workspace workspace) throws IOException {
+    Path marker = workspace.cache.resolve("last-prune");
+    long now = System.currentTimeMillis();
+    if (Files.isRegularFile(marker)
+        && now - Files.getLastModifiedTime(marker).toMillis() < 24L * 60 * 60 * 1000) {
+      return false;
+    }
+    Files.createDirectories(marker.getParent());
+    Files.writeString(marker, Long.toString(now));
+    return true;
+  }
+
   private static void pruneCompileCache(Path compileCache, String suffix, int maxEntries) throws IOException {
     if (!Files.isDirectory(compileCache)) {
       return;
