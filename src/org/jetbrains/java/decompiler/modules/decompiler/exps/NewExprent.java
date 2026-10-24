@@ -915,6 +915,19 @@ public class NewExprent extends Exprent {
     return null;
   }
 
+  /** The parameter slot of an enclosed lambda's method that carries this name, or -1. */
+  private static int namedParameterSlot(ClassNode child, MethodWrapper enclosed, String name) {
+    MethodDescriptor descriptor = MethodDescriptor.parseDescriptor(child.lambdaInformation.content_method_descriptor);
+    int slot = child.lambdaInformation.is_content_method_static ? 0 : 1;
+    for (VarType parameter : descriptor.params) {
+      if (name.equals(enclosed.varproc.getVarName(new VarVersionPair(slot, 0)))) {
+        return slot;
+      }
+      slot += parameter.stackSize;
+    }
+    return -1;
+  }
+
   private void setLambdaGenericTypes() {
     if (inferredLambdaType != null) {
       ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(newType.value);
@@ -993,8 +1006,21 @@ public class NewExprent extends Exprent {
                     if (childNode.type == ClassNode.Type.LAMBDA && !childNode.lambdaInformation.is_method_reference) {
                       MethodWrapper enclosedMethod = wrapper.getMethodWrapper(childNode.lambdaInformation.content_method_name, childNode.lambdaInformation.content_method_descriptor);
 
-                      if (enclosedMethod != null && paramName.equals(enclosedMethod.varproc.getVarName(vpp))) {
-                        enclosedMethod.varproc.setVarType(vpp, infType);
+                      if (enclosedMethod != null) {
+                        // A captured variable becomes a leading parameter of the enclosed synthetic
+                        // method at a slot of its own; its name, not the outer index, finds it. Only
+                        // an erased type is refined: a parameter that already carries generics got
+                        // them from its own call site, and overriding those changes the printed
+                        // casts of an unrelated chain.
+                        int slot = namedParameterSlot(childNode, enclosedMethod, paramName);
+                        if (slot >= 0) {
+                          VarVersionPair enclosedPair = new VarVersionPair(slot, 0);
+                          VarType enclosedType = enclosedMethod.varproc.getVarType(enclosedPair);
+                          if (enclosedType == null
+                              || (enclosedType.type == CodeType.OBJECT && !enclosedType.isGeneric())) {
+                            enclosedMethod.varproc.setVarType(enclosedPair, infType);
+                          }
+                        }
                       }
                     }
                   }
