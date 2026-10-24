@@ -334,9 +334,102 @@ public class MergeHelper {
     }
   }
 
+  /**
+   * A try/catch loop body can keep its update in a catch clause whose block falls through to the
+   * back edge: the try always returns, so the increment only runs when that catch catches. Lift
+   * it back into the for header, which is where the jar's layout puts it.
+   */
+  private static boolean matchCatchIncrement(DoStatement stat) {
+    Statement first = stat.getFirst();
+    while (first instanceof SequenceStatement && first.getStats().size() == 1) {
+      first = first.getFirst();
+    }
+    if (first.type != Statement.StatementType.TRY_CATCH) {
+      return false;
+    }
+    Statement incBlock = null;
+    Exprent inc = null;
+    List<Statement> children = first.getStats();
+    for (int i = 1; i < children.size() && inc == null; i++) {
+      Statement blk = getLastDirectData(children.get(i));
+      if (blk == null || blk.getExprents() == null || blk.getExprents().isEmpty()) {
+        continue;
+      }
+      Exprent last = blk.getExprents().get(blk.getExprents().size() - 1);
+      boolean shape = last instanceof AssignmentExprent
+        || last instanceof FunctionExprent f && (f.getFuncType() == FunctionType.PPI || f.getFuncType() == FunctionType.IPP);
+      if (!shape) {
+        continue;
+      }
+      boolean continues = false;
+      for (StatEdge edge : blk.getAllSuccessorEdges()) {
+        if (edge.getType() == StatEdge.TYPE_CONTINUE && edge.getDestination() == stat) {
+          continues = true;
+        }
+      }
+      if (continues) {
+        incBlock = blk;
+        inc = last;
+      }
+    }
+    if (inc == null) {
+      return false;
+    }
+
+    boolean hasinit = false;
+    Statement pre = null;
+    Statement current = stat;
+    while (true) {
+      Statement parent = current.getParent();
+      if (parent == null) {
+        break;
+      }
+      if (parent instanceof SequenceStatement) {
+        if (current == parent.getFirst()) {
+          current = parent;
+        } else {
+          pre = current.getNeighbours(StatEdge.TYPE_REGULAR, EdgeDirection.BACKWARD).get(0);
+          if (!(pre instanceof BasicBlockStatement)) {
+            pre = null;
+            break;
+          }
+          pre = getLastDirectData(pre);
+          if (pre != null && !pre.getExprents().isEmpty()
+            && pre.getExprents().get(pre.getExprents().size() - 1) instanceof AssignmentExprent) {
+            hasinit = true;
+          }
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+
+    stat.setLooptype(DoStatement.Type.FOR);
+    if (hasinit && pre != null) {
+      Exprent init = pre.getExprents().remove(pre.getExprents().size() - 1);
+      if (stat.getInitExprent() != null) {
+        init.addBytecodeOffsets(stat.getInitExprent().bytecode);
+      }
+      stat.setInitExprent(init);
+    }
+    incBlock.getExprents().remove(inc);
+    if (stat.getIncExprent() != null) {
+      inc.addBytecodeOffsets(stat.getIncExprent().bytecode);
+    }
+    stat.setIncExprent(inc);
+    return true;
+  }
+
   protected static void matchFor(DoStatement stat) {
     Exprent lastDoExprent, initDoExprent;
     Statement lastData, preData = null;
+
+    // A try/catch body can keep its update in a catch clause that falls through to the back
+    // edge: the try always returns, so the increment only runs when that catch catches.
+    if (matchCatchIncrement(stat)) {
+      return;
+    }
 
     // get last exprent
     lastData = getLastDirectData(stat.getFirst());
