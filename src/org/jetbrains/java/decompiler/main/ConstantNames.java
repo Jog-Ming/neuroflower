@@ -2010,7 +2010,7 @@ public final class ConstantNames {
    * is printed parenthesised so the surrounding expression keeps its precedence.
    */
   private static Site solvedSite(String key, int start, int end, String own, List<String> imports,
-                                 String packageName, Placement placement) {
+                                 String packageName, Placement placement, boolean[] exactProof) {
     if (placement == null || placement.pairs() == null || placement.spaces() == null) {
       return null;
     }
@@ -2049,6 +2049,9 @@ public final class ConstantNames {
         continue;
       }
       boolean referenceSuccessor = pair.successorKey() == null;
+      if (exactProof != null) {
+        exactProof[0] = !referenceSuccessor;
+      }
       if (referenceSuccessor && pair.open() >= 0
           && (start <= pair.open() || start >= pair.close())) {
         // The pair's next entry is the reference the argument list produced. A naming inside the
@@ -3844,10 +3847,14 @@ public final class ConstantNames {
       }
     }
     boolean ownCandidate = ownConstant != null;
-    Site solved = allowSolved && !ownCandidate && placement != null && placement.pairs() != null
+    boolean[] exactProof = new boolean[1];
+    Site solved = allowSolved && placement != null && placement.pairs() != null
       && !placement.pairs().isEmpty() && prefix.isEmpty()
-      ? solvedSite(key, start, end, own, imports, packageName, placement) : null;
-    if (solved != null) {
+      ? solvedSite(key, start, end, own, imports, packageName, placement, exactProof) : null;
+    // The class's own constant keeps precedence over a naming placed by the generation gap: its
+    // Class entry is in the pool regardless, so the gap proves less about it. A value successor
+    // is the exact folded value, though, and settles which owner the source named.
+    if (solved != null && (exactProof[0] || !ownCandidate)) {
       addSiteOnce(sites, solved);
       return;
     }
