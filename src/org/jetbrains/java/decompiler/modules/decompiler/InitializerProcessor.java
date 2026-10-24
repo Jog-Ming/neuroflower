@@ -21,6 +21,7 @@ import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructMethodParametersAttribute;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
@@ -465,7 +466,8 @@ public final class InitializerProcessor {
 
               String fieldKey = InterpreterUtil.makeUniqueKey(fExpr.getName(), fExpr.getDescriptor().descriptorString);
               int fidx = cl.getFields().getIndexByKey(fieldKey);
-              if (prev_fidx <= fidx && isExprentIndependent(fExpr, assignExpr.getRight(), lstMethodWrappers.get(i), cl, whitelist, new ArrayList<>() /* TODO */, new ArrayList<>(),  fidx, false)) {
+              if (prev_fidx <= fidx && isExprentIndependent(fExpr, assignExpr.getRight(), lstMethodWrappers.get(i), cl, whitelist, new ArrayList<>() /* TODO */, new ArrayList<>(),  fidx, false)
+                && declaredBeforeConstructor(lstMethodWrappers.get(i).methodStruct, exprent, isAnonymous)) {
                 prev_fidx = fidx;
                 if (fieldWithDescr == null) {
                   fieldWithDescr = fieldKey;
@@ -502,6 +504,51 @@ public final class InitializerProcessor {
         return;
       }
     }
+  }
+
+  /**
+   * A field initializer's recorded line is its declaration, which can sit anywhere in the class;
+   * a constructor statement's line always lies between the declaration's line and the closing
+   * brace the return instruction carries. Only a line outside that span proves the code was
+   * lifted out of the constructor; inside it, the source wrote the assignment in the body and
+   * lifting it would print the code after the constructor.
+   * <p>
+   * A constructor the source did not write has no span of its own: javac names the class
+   * declaration (or the first enum constant) at offset 0, and every true initializer's line is
+   * necessarily greater. Such a constructor is recognized by its parameters, all synthetic or
+   * mandated: only a written declaration lists a name without either flag. A default no-arg
+   * constructor has no parameter attribute at all and is treated the same way. An anonymous
+   * class cannot declare one at all, and its synthetic constructor forwards the superclass's
+   * parameters, so it is never treated as written.
+   */
+  private static boolean declaredBeforeConstructor(StructMethod method, Exprent exprent, boolean isAnonymous) {
+    if (isAnonymous || !writtenConstructor(method)) {
+      return true;
+    }
+    if (exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return true;
+    }
+    int line = RoundTrip.lineAt(method, exprent.bytecode.nextSetBit(0));
+    int ctorStart = RoundTrip.lineAt(method, 0);
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    int[] raw = table == null ? null : table.getRawData();
+    int ctorEnd = raw == null || raw.length < 2 ? -1 : raw[raw.length - 1];
+    return line < 0 || ctorStart < 0 || ctorEnd < 0 || line < ctorStart || line > ctorEnd;
+  }
+
+  private static boolean writtenConstructor(StructMethod method) {
+    StructMethodParametersAttribute parameters =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_METHOD_PARAMETERS);
+    if (parameters == null) {
+      return false;
+    }
+    for (StructMethodParametersAttribute.Entry entry : parameters.getEntries()) {
+      if ((entry.myAccessFlags & (CodeConstants.ACC_SYNTHETIC | CodeConstants.ACC_MANDATED)) == 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static Exprent processDynamicInitializer(Exprent expr) {
