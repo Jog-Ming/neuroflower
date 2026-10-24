@@ -99,6 +99,8 @@ public class InvocationExprent extends Exprent {
   private static final ThreadLocal<Exprent> LAMBDA_BODY = new ThreadLocal<>();
   /** While printing a `new T(...) { ... }` creation's arguments, a chain break is not a source break. */
   private static final ThreadLocal<Boolean> ANONYMOUS_CREATION = ThreadLocal.withInitial(() -> Boolean.FALSE);
+  /** The argument now being printed starts a source line (the enclosing printer broke before it). */
+  private static final ThreadLocal<Boolean> ARG_AT_LINE_START = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
   public static void enterAnonymousCreation() {
     ANONYMOUS_CREATION.set(Boolean.TRUE);
@@ -1776,6 +1778,7 @@ public class InvocationExprent extends Exprent {
     // there; otherwise the invoke's inherited line is the only line the call is known to have.
     boolean firstStartsLine = start < lstParameters.size() && RoundTrip.lineStartsHere(lstParameters.get(start));
     int openingLine = callerOpeningLine >= 0 ? callerOpeningLine : firstStartsLine ? firstLine : callLine;
+    boolean breakBeforeFirst = false;
     if (!lstParameters.isEmpty()) {
       buf.pushNewlineGroup(indent, 1);
       // A later argument line is always a break the source had. An earlier one is normally the
@@ -1802,9 +1805,17 @@ public class InvocationExprent extends Exprent {
         elementStartsLater = element instanceof InvocationExprent && callLine >= 0 && line >= 0
           && line <= callLine && RoundTrip.sourceLineEnd(element) > callLine;
       }
-      boolean explicitStart = callLine >= 0 && firstLine >= 0 && firstLine != callLine
-        && (firstLine > callLine || RoundTrip.lineStartsHere(lstParameters.get(start)));
-      if (!lambdaArgument && (elementStartsLater || explicitStart)) {
+      int firstEnd = firstArgument == null ? -1 : RoundTrip.sourceLineEnd(firstArgument);
+      // A first argument whose own invoke sits on a later line than the call was written on its
+      // own line after the opening parenthesis, even though the value it loads inherits the
+      // statement's line. A nested call in that position has its invoke later than its own
+      // argument's inherited line; that is not a break after its parenthesis.
+      boolean explicitStart = callLine >= 0 && firstLine >= 0
+        && (firstLine > callLine
+          || firstLine != callLine && RoundTrip.lineStartsHere(lstParameters.get(start))
+             && !(ARG_AT_LINE_START.get() && firstLine < callLine && firstEnd == firstLine));
+      breakBeforeFirst = !lambdaArgument && (elementStartsLater || explicitStart);
+      if (breakBeforeFirst) {
         buf.appendLineSeparator();
       } else {
         buf.appendPossibleNewline();
@@ -1870,14 +1881,6 @@ public class InvocationExprent extends Exprent {
             argumentType = argumentType.remap(shadowed);
           }
         }
-        try {
-          ExprProcessor.getCastedExprent(lstParameters.get(i), argumentType, buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
-        } finally {
-          if (unbound != null) {
-            UNBOUND_ARGUMENT.get().pop();
-          }
-        }
-
         int line = RoundTrip.sourceLine(lstParameters.get(i));
         // A constructor argument's own offsets stop at its new; the invoke at the end of its
         // argument list is what the target's table places on the last line of the expression.
@@ -1896,6 +1899,18 @@ public class InvocationExprent extends Exprent {
         int previous = prevEndGate ? previousEnd : previousLine;
         boolean forced = !firstParameter && line >= 0 && previous >= 0 && line > previous
           && (!callLineGate || openingLine < 0 || line > openingLine);
+
+        boolean savedAtLineStart = ARG_AT_LINE_START.get();
+        ARG_AT_LINE_START.set(i == start ? breakBeforeFirst : forced);
+        try {
+          ExprProcessor.getCastedExprent(lstParameters.get(i), argumentType, buff, indent, ambiguous ? ExprProcessor.NullCastType.CAST : ExprProcessor.NullCastType.DONT_CAST_AT_ALL, ambiguous, true, true);
+        } finally {
+          ARG_AT_LINE_START.set(savedAtLineStart);
+          if (unbound != null) {
+            UNBOUND_ARGUMENT.get().pop();
+          }
+        }
+
 
         // the last "new Object[0]" in the vararg call is not printed
         if (buff.length() > 0) {
