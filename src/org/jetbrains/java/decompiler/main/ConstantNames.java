@@ -2052,14 +2052,6 @@ public final class ConstantNames {
       if (exactProof != null) {
         exactProof[0] = !referenceSuccessor;
       }
-      if (referenceSuccessor && pair.open() >= 0
-          && (start <= pair.open() || start >= pair.close())) {
-        // The pair's next entry is the reference the argument list produced. A naming inside the
-        // list is generated after every earlier entry and before the reference, and the pair's
-        // adjacency proves nothing else was entered in between; only there can it stand. When the
-        // reference was never printed (a constructor call), the generation gap places the site.
-        continue;
-      }
       if (referenceSuccessor) {
         long sitePoint = siteCoordinate(placement.spaces(), start);
         if (sitePoint == NO_COORDINATE || sitePoint <= pair.after()) {
