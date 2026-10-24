@@ -97,6 +97,12 @@ public class InvocationExprent extends Exprent {
   /** The expression whose value is a single-expression lambda body being typed against its
    * functional return type; a variable only the target determines must be pinned there. */
   private static final ThreadLocal<Exprent> LAMBDA_BODY = new ThreadLocal<>();
+  /** The enclosing expression proved this static call starts on the line after its qualifier. */
+  private boolean qualifierBreak;
+
+  public void setQualifierBreak(boolean qualifierBreak) {
+    this.qualifierBreak = qualifierBreak;
+  }
   /** While printing a `new T(...) { ... }` creation's arguments, a chain break is not a source break. */
   private static final ThreadLocal<Boolean> ANONYMOUS_CREATION = ThreadLocal.withInitial(() -> Boolean.FALSE);
   /** The argument now being printed starts a source line (the enclosing printer broke before it). */
@@ -1205,6 +1211,10 @@ public class InvocationExprent extends Exprent {
               || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass() && instance instanceof InvocationExprent
                  && RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1)) {
             buf.appendLineSeparator().appendIndent(indent);
+          } else if (instance == null && qualifierBreak) {
+            // The parent (a ternary) proved from the line table that the qualifier ends its line.
+            qualifierBreak = false;
+            buf.appendLineSeparator().appendIndent(indent + 1);
           }
           buf.append(".");
           // Adds generic arguments to the invocation, so .m() becomes .<T>m()

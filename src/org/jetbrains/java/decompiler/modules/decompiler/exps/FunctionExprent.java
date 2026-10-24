@@ -242,6 +242,17 @@ public class FunctionExprent extends Exprent {
     }
   }
 
+  /**
+   * A static call whose recorded line is exactly the line after the preceding text proves the
+   * source put its qualifier at the end of that line; the invocation breaks before its dot.
+   */
+  private static void markQualifierBreak(int previousLine, Exprent operand) {
+    if (operand instanceof InvocationExprent invocation && invocation.isStatic()) {
+      invocation.setQualifierBreak(previousLine >= 0
+        && RoundTrip.sourceLine(invocation) == previousLine + 1);
+    }
+  }
+
   @Override
   public VarType getInferredExprType(VarType upperBound) {
     if (funcType == FunctionType.CAST) {
@@ -696,12 +707,14 @@ public class FunctionExprent extends Exprent {
         }
         InvocationExprent.enterPoly();
         try {
+          markQualifierBreak(RoundTrip.sourceLine(this), lstOperands.get(1));
           buf.append(wrapOperandString(lstOperands.get(1), true, indent));
           if (RoundTrip.newlineBetween(lstOperands.get(1), lstOperands.get(2))) {
             buf.appendLineSeparator().appendIndent(indent + 1).append(": ");
           } else {
             buf.appendPossibleNewline(" ").append(": ");
           }
+          markQualifierBreak(RoundTrip.sourceLineEnd(lstOperands.get(1)), lstOperands.get(2));
           buf.append(wrapOperandString(lstOperands.get(2), true, indent));
         } finally {
           InvocationExprent.exitPoly();
