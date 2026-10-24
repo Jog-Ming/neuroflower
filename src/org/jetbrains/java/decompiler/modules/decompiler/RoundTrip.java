@@ -48,12 +48,15 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> GOTO_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Instructions that store or discard the stack's value: a call's result ends its statement here. */
+  private static final java.util.Map<StructMethod, BitSet> VALUE_SINKS = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
   /** Remember where a method's void returns are; the instruction sequence is gone by print time. */
   public static void recordMethod(StructMethod method, FullInstructionSequence seq) {
     BitSet returns = new BitSet();
+    BitSet sinks = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
     java.util.Map<Integer, int[]> sites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
@@ -65,6 +68,11 @@ public final class RoundTrip {
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode >= CodeConstants.opc_istore && instr.opcode <= CodeConstants.opc_astore
+        || instr.opcode == CodeConstants.opc_putfield || instr.opcode == CodeConstants.opc_putstatic
+        || instr.opcode == CodeConstants.opc_pop || instr.opcode == CodeConstants.opc_pop2) {
+        sinks.set(instr.startOffset);
+      }
       if (instr.opcode == CodeConstants.opc_goto) {
         gotos.put(instr.startOffset, instr.startOffset + instr.operand(0));
       }
@@ -104,6 +112,7 @@ public final class RoundTrip {
       }
     }
     VOID_RETURNS.put(method, returns);
+    VALUE_SINKS.put(method, sinks);
     CONTINUE_GUARDS.put(method, guards);
     CONTINUE_SITES.put(method, sites);
     BRANCHES.put(method, branches);
@@ -665,6 +674,58 @@ public final class RoundTrip {
     StructLineNumberTableAttribute lnt =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
     return lnt == null ? -1 : lnt.findLineNumber(offset);
+  }
+
+  /**
+   * The start offset of the last instruction an exprent maps, or -1. An exprent's bitset also
+   * covers the bytes of its instructions, so only the registered starts count.
+   */
+  public static int lastInstructionStart(BitSet bytecode) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null || bytecode == null) {
+      return -1;
+    }
+    for (int offset = bytecode.previousSetBit(Integer.MAX_VALUE); offset >= 0;
+         offset = bytecode.previousSetBit(offset - 1)) {
+      if (ends.containsKey(offset)) {
+        return offset;
+      }
+    }
+    return -1;
+  }
+
+  /** Whether the instruction right after {@code offset} stores or discards the call's value. */
+  public static boolean valueConsumedAfter(int offset) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    BitSet sinks = VALUE_SINKS.get(method);
+    Integer next = ends == null ? null : ends.get(offset);
+    return next != null && sinks != null && sinks.get(next);
+  }
+
+  /** The target's first exact line-table entry strictly after {@code offset}, or -1. */
+  public static int entryOffsetAfter(int offset) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return -1;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    int[] raw = table.getRawData();
+    int best = -1;
+    for (int i = 0; i + 1 < raw.length; i += 2) {
+      if (raw[i] > offset && (best < 0 || raw[i] < best)) {
+        best = raw[i];
+      }
+    }
+    return best;
   }
 
   /** True when the target's table starts a source line at this bytecode offset. */

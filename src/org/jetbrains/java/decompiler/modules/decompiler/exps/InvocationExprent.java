@@ -1311,6 +1311,30 @@ public class InvocationExprent extends Exprent {
     return buf;
   }
 
+  /**
+   * Whether the source put this call's closing parenthesis on a line of its own. A call that ends
+   * a statement and whose last argument sits on a later line than the call has one line between
+   * that argument and the next recorded entry; the original spent it on the closing `)`, which
+   * javac records nowhere but which places the following brace on the recorded line.
+   */
+  private boolean closingParenStartsLine(TextBuffer printed) {
+    if (bytecode == null || bytecode.isEmpty()) {
+      return false;
+    }
+    int invoke = RoundTrip.lastInstructionStart(bytecode);
+    int callLine = RoundTrip.lineAtOffset(invoke);
+    int endLine = printedEndLine(printed);
+    if (lstParameters != null && !lstParameters.isEmpty()) {
+      int lastLine = RoundTrip.sourceLineEnd(lstParameters.get(lstParameters.size() - 1));
+      endLine = Math.max(endLine, lastLine);
+    }
+    if (callLine < 0 || endLine <= callLine || !RoundTrip.valueConsumedAfter(invoke)) {
+      return false;
+    }
+    int next = RoundTrip.entryOffsetAfter(invoke);
+    return next >= 0 && RoundTrip.lineAtOffset(next) == endLine + 2;
+  }
+
   private void appendInstCast(TextBuffer buf, VarType leftType, TextBuffer res) {
     buf.append("((").appendCastTypeName(leftType).append(")");
 
@@ -2131,7 +2155,9 @@ public class InvocationExprent extends Exprent {
 
     if (!lstParameters.isEmpty()) {
       buf.popNewlineGroup();
-      if (previousLine >= 0 && callLine >= 0 && previousLine != callLine
+      if (closingParenStartsLine(buf)) {
+        buf.appendLineSeparator().appendIndent(indent);
+      } else if (previousLine >= 0 && callLine >= 0 && previousLine != callLine
           && (!RoundTrip.selector("arg-entry")
               || RoundTrip.lineStartsHere(lstParameters.get(lstParameters.size() - 1)))) {
         buf.appendLineSeparator();
