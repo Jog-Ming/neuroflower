@@ -1539,6 +1539,9 @@ public class InvocationExprent extends Exprent {
   }
 
   private static final ThreadLocal<int[]> CALL_LINE = ThreadLocal.withInitial(() -> new int[]{-1});
+  /** The call that contained the one now printing: its line, and the method that line belongs to. */
+  private static final ThreadLocal<int[]> OUTER_CALL_LINE = ThreadLocal.withInitial(() -> new int[]{-1});
+  private static final ThreadLocal<StructMethod[]> OUTER_CALL_AT = ThreadLocal.withInitial(() -> new StructMethod[]{null});
 
   /** The target line of the innermost call whose arguments are being printed, or -1. */
   public static int enclosingCallLine() {
@@ -1757,6 +1760,10 @@ public class InvocationExprent extends Exprent {
 
   public TextBuffer appendParamList(int indent) {
     int savedCallLine = CALL_LINE.get()[0];
+    int savedOuterLine = OUTER_CALL_LINE.get()[0];
+    StructMethod savedOuterAt = OUTER_CALL_AT.get()[0];
+    OUTER_CALL_LINE.get()[0] = savedCallLine;
+    OUTER_CALL_AT.get()[0] = RoundTrip.currentMethod();
     CALL_LINE.get()[0] = RoundTrip.sourceLineEnd(this);
     int depth = ++ARGUMENT.get()[0];
     if (depth <= ARGUMENT_AT.get().length) {
@@ -1767,6 +1774,8 @@ public class InvocationExprent extends Exprent {
     } finally {
       ARGUMENT.get()[0]--;
       CALL_LINE.get()[0] = savedCallLine;
+      OUTER_CALL_LINE.get()[0] = savedOuterLine;
+      OUTER_CALL_AT.get()[0] = savedOuterAt;
     }
   }
 
@@ -2031,8 +2040,18 @@ public class InvocationExprent extends Exprent {
         && (firstLine > callLine
           || firstLine != callLine && RoundTrip.lineStartsHere(lstParameters.get(start))
              && !(ARG_AT_LINE_START.get() && firstLine < callLine && firstEnd == firstLine));
+      // A constructor's call token sits on its `new`, not on the init invocation, which javac
+      // records on the line of the last instruction of the argument list. The first argument's
+      // own invoke names the line its text starts on; javac still lays the receiver's loads on
+      // the `new` line, so breaking there reproduces the table when the source began the
+      // argument on its own line. The `new` instruction itself inherits the preceding entry's
+      // line, so when the creation is itself an argument the enclosing call's line is the one
+      // its text sits on, and a later first argument only says a chain inside it broke.
+      boolean insideCall = OUTER_CALL_LINE.get()[0] >= 0 && OUTER_CALL_AT.get()[0] == RoundTrip.currentMethod();
+      boolean constructorStartLater = callerOpeningLine >= 0 && !insideCall && start < lstParameters.size()
+        && RoundTrip.sourceLine(lstParameters.get(start)) > callerOpeningLine;
       breakBeforeFirst = (!lambdaArgument || lambdaStartsLater)
-        && (elementStartsLater || explicitStart || lambdaStartsLater);
+        && (elementStartsLater || explicitStart || constructorStartLater || lambdaStartsLater);
       if (breakBeforeFirst) {
         buf.appendLineSeparator();
       } else {
