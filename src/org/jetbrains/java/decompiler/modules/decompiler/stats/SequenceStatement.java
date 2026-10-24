@@ -170,6 +170,31 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `while (cond) { body } tail...` where the tail fills the exit block between the condition
+      // and the body and the back edge jumps behind it: the source wrote
+      // `while (true) { if (!cond) { tail } body }`.
+      if (i + 1 < stats.size() && st instanceof DoStatement loop
+          && loop.getLooptype() == DoStatement.Type.WHILE
+          && loop.getConditionExprent() != null
+          && !(loop.getConditionExprent() instanceof FunctionExprent and
+               && and.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND)
+          && loop.getFirst() != null
+          && RoundTrip.guardExitBeforeBody(loop.getConditionExprent(), stats.get(i + 1),
+               stats.get(stats.size() - 1), loop.getFirst())) {
+        Exprent guard = RoundTrip.negateCondition(loop.getConditionExprent());
+        buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("if (").append(guard.toJava(indent + 1)).append(") {").appendLineSeparator();
+        for (int k = i + 1; k < stats.size(); k++) {
+          buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 2, true));
+        }
+        buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(loop.getFirst(), indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        i = stats.size();
+        continue;
+      }
+
       // `if (C) { body } rest` where the target's table puts a void return between the condition
       // and the body, before the body's line: the source wrote `if (!C) { rest; return; } body`.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement

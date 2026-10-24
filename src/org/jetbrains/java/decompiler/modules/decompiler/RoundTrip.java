@@ -1004,6 +1004,96 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when the loop's condition was written inside the body as a break guard: the condition's
+   * own conditional branch targets the exit rather than the body's start, and an unconditional
+   * goto inside the body jumps back to that start -- while (true) { ... if (!cond) break; }.
+   */
+  public static boolean loopGuardInsideBody(Exprent condition, Statement body) {
+    StructMethod method = currentMethod();
+    if (method == null || condition == null || condition.bytecode == null || body == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || branchStarts == null || gotos == null) {
+      return false;
+    }
+    int bodyStart = firstOffset(body);
+    if (bodyStart < 0) {
+      return false;
+    }
+    // The condition's own branch may be a set bit of its bytecode, or start exactly where the
+    // last condition instruction ends. BRANCH_STARTS is the map keyed by the branch's start.
+    Integer conditionTarget = ownBranchTarget(condition, branchStarts);
+    if (conditionTarget == null) {
+      int lastBit = -1;
+      for (int offset = condition.bytecode.nextSetBit(0); offset >= 0; offset = condition.bytecode.nextSetBit(offset + 1)) {
+        if (ends.containsKey(offset) && offset > lastBit) {
+          lastBit = offset;
+        }
+      }
+      Integer branchStart = lastBit < 0 ? null : ends.get(lastBit);
+      conditionTarget = branchStart == null ? null : branchStarts.get(branchStart);
+    }
+    // A do-while's conditional back edge targets the body's start; a break guard targets the exit.
+    if (conditionTarget == null || conditionTarget == bodyStart) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() == bodyStart && entry.getKey() > bodyStart) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The remainder-loop layout: the condition's branch targets the body, the tail's statements fill
+   * the exit block between the condition and the body, and the back edge jumps behind the tail.
+   * The source wrote {@code while (true) { if (!cond) { tail } body }}.
+   */
+  public static boolean guardExitBeforeBody(Exprent condition, Statement tailFirst, Statement tailLast, Statement body) {
+    StructMethod method = currentMethod();
+    if (method == null || condition == null || condition.bytecode == null || tailFirst == null
+        || tailLast == null || body == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || branchStarts == null || gotos == null) {
+      return false;
+    }
+    int bodyStart = firstOffset(body);
+    int tailStart = firstOffset(tailFirst);
+    int tailEnd = lastEnd(tailLast);
+    if (bodyStart < 0 || tailStart < 0 || tailEnd < 0 || tailEnd != bodyStart) {
+      return false;
+    }
+    Integer conditionTarget = ownBranchTarget(condition, branchStarts);
+    if (conditionTarget == null) {
+      int lastBit = -1;
+      for (int offset = condition.bytecode.nextSetBit(0); offset >= 0; offset = condition.bytecode.nextSetBit(offset + 1)) {
+        if (ends.containsKey(offset) && offset > lastBit) {
+          lastBit = offset;
+        }
+      }
+      Integer branchStart = lastBit < 0 ? null : ends.get(lastBit);
+      conditionTarget = branchStart == null ? null : branchStarts.get(branchStart);
+    }
+    if (conditionTarget == null || conditionTarget != bodyStart) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getKey() > tailEnd && entry.getValue() <= tailStart) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** True when the arm's last instruction is a goto that lands beyond the tail's end. */
   public static boolean armJumpsPast(Statement arm, Statement tail) {
     StructMethod method = currentMethod();

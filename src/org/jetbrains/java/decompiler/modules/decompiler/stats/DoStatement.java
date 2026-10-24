@@ -115,6 +115,33 @@ public class DoStatement extends Statement {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
       case DO_WHILE:
+        if (conditionExprent.get(0) != null && RoundTrip.loopGuardInsideBody(conditionExprent.get(0), first)) {
+          // The source kept the test inside the body as a break guard.
+          Exprent bodyHead = firstExprent(first);
+          VarExprent moved = null;
+          if (bodyHead instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assign
+            && assign.getLeft() instanceof VarExprent left
+            && !varDefinitions.isEmpty() && varDefinitions.get(varDefinitions.size() - 1) instanceof VarExprent decl
+            && decl.getIndex() == left.getIndex()) {
+            // The variable's scope starts inside the loop; its declaration belongs there, and the
+            // creation's position changes javac's back-edge layout.
+            moved = decl;
+            buf.setLength(varDefsStart);
+            buf.append(ExprProcessor.listToJava(varDefinitions.subList(0, varDefinitions.size() - 1), indent));
+          }
+          buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+          if (moved != null) {
+            buf.appendIndent(indent + 1).append(moved.toJava(indent + 1)).append(";").appendLineSeparator();
+          }
+          buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
+          buf.appendIndent(indent + 1).append("if (")
+            .append(RoundTrip.negateCondition(conditionExprent.get(0)).toJava(indent + 1))
+            .append(") {").appendLineSeparator();
+          buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+          buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          break;
+        }
         buf.appendIndent(indent).append("do {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
         buf.appendIndent(indent).append("} while (");
@@ -190,6 +217,21 @@ public class DoStatement extends Statement {
   }
 
   /** The last statement transfers control, so an update appended after it could not run. */
+  /** The first exprent printed in the statement's tree, descending into its first child. */
+  private static Exprent firstExprent(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null && !exprents.isEmpty()) {
+      return exprents.get(0);
+    }
+    for (Statement child : stat.getStats()) {
+      Exprent found = firstExprent(child);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
   private static boolean endsWithTransfer(TextBuffer body) {
     String[] lines = body.toString().split("\\R");
     for (int i = lines.length - 1; i >= 0; i--) {
