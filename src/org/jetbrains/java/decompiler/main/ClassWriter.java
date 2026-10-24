@@ -2356,10 +2356,23 @@ public class ClassWriter implements StatementWriter {
         if (offset == lastPc) {
           return false; // the last entry starts an initializer instruction
         }
-        int line = lines.findLineNumber(offset);
-        if (line >= 0) {
-          fieldLines.add(line);
+      }
+      // The declaration line is the line the initializer's text starts on, which is its
+      // earliest instruction's: the stored expression's own bits can begin with a later link
+      // of a chain.
+      int first = -1;
+      for (Exprent part : initializer.getAllExprents(true, true)) {
+        if (part.bytecode == null || part.bytecode.isEmpty()) {
+          continue;
         }
+        int start = part.bytecode.nextSetBit(0);
+        if (first < 0 || start < first) {
+          first = start;
+        }
+      }
+      int line = first < 0 ? -1 : lines.findLineNumber(first);
+      if (line >= 0) {
+        fieldLines.add(line);
       }
     }
     boolean explicit = !fieldLines.contains(lastLine);

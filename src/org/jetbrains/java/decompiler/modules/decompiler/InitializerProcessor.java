@@ -436,6 +436,24 @@ public final class InitializerProcessor {
       return;
     }
 
+    // A synthesized constructor's return carries the last initializer's declaration line, which
+    // is the line of one of the assignments below; a written one's carries its closing brace.
+    List<Set<Integer>> leadingLines = new ArrayList<>();
+    for (int i = 0; i < lstFirst.size(); i++) {
+      Set<Integer> lines = new HashSet<>();
+      StructMethod owner = lstMethodWrappers.get(i).methodStruct;
+      for (Exprent exprent : lstFirst.get(i).subList(isAnonymous ? 0 : 1, lstFirst.get(i).size())) {
+        if (!(exprent instanceof AssignmentExprent) || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+          break;
+        }
+        int line = firstLine(owner, exprent);
+        if (line >= 0) {
+          lines.add(line);
+        }
+      }
+      leadingLines.add(lines);
+    }
+
     // The value stored below is the first constructor's own expression, so its bytecode offsets
     // are offsets into that constructor. The printer must read the target's lines for them from
     // the same method: no other table describes where the initializer's text sat.
@@ -469,7 +487,7 @@ public final class InitializerProcessor {
               String fieldKey = InterpreterUtil.makeUniqueKey(fExpr.getName(), fExpr.getDescriptor().descriptorString);
               int fidx = cl.getFields().getIndexByKey(fieldKey);
               if (prev_fidx <= fidx && isExprentIndependent(fExpr, assignExpr.getRight(), lstMethodWrappers.get(i), cl, whitelist, new ArrayList<>() /* TODO */, new ArrayList<>(),  fidx, false)
-                && declaredBeforeConstructor(cl, lstMethodWrappers.get(i).methodStruct, exprent, isAnonymous)) {
+                && declaredBeforeConstructor(cl, lstMethodWrappers.get(i).methodStruct, exprent, isAnonymous, leadingLines.get(i))) {
                 prev_fidx = fidx;
                 if (fieldWithDescr == null) {
                   fieldWithDescr = fieldKey;
@@ -523,8 +541,8 @@ public final class InitializerProcessor {
    * class cannot declare one at all, and its synthetic constructor forwards the superclass's
    * parameters, so it is never treated as written.
    */
-  private static boolean declaredBeforeConstructor(StructClass cl, StructMethod method, Exprent exprent, boolean isAnonymous) {
-    if (isAnonymous || !writtenConstructor(method, cl)) {
+  private static boolean declaredBeforeConstructor(StructClass cl, StructMethod method, Exprent exprent, boolean isAnonymous, Set<Integer> leadingLines) {
+    if (isAnonymous || !writtenConstructor(method, cl, leadingLines)) {
       return true;
     }
     if (exprent.bytecode == null || exprent.bytecode.isEmpty()) {
@@ -539,7 +557,22 @@ public final class InitializerProcessor {
     return line < 0 || ctorStart < 0 || ctorEnd < 0 || line < ctorStart || line > ctorEnd;
   }
 
-  private static boolean writtenConstructor(StructMethod method, StructClass cl) {
+  /** The target line of an assignment's first instruction, its right-hand side included. */
+  private static int firstLine(StructMethod method, Exprent exprent) {
+    int offset = -1;
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int start = part.bytecode.nextSetBit(0);
+      if (offset < 0 || start < offset) {
+        offset = start;
+      }
+    }
+    return offset < 0 ? -1 : RoundTrip.lineAt(method, offset);
+  }
+
+  private static boolean writtenConstructor(StructMethod method, StructClass cl, Set<Integer> leadingLines) {
     StructMethodParametersAttribute parameters =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_METHOD_PARAMETERS);
     if (parameters != null) {
@@ -549,11 +582,12 @@ public final class InitializerProcessor {
         }
       }
     }
-    // A no-arg constructor lists no parameters either way. One the source wrote ends at a
-    // closing brace that javac records as a position of its own, so the return instruction
-    // starts a line entry; the synthesized one ends on its last initializer's line with none.
-    // The expansion says elsewhere whether a method's body has been processed, so it is
-    // released again and the state is left as it was found.
+    // A no-arg constructor lists no parameters either way. At the return instruction, javac
+    // records a line only when it differs from the previous entry: a written constructor ends
+    // at its closing brace, while a synthesized one ends on the declaration line of its last
+    // initializer, which is one of the leading assignments. The expansion says elsewhere
+    // whether a method's body has been processed, so it is released again and the state is left
+    // as it was found.
     boolean expanded = method.getInstructionSequence() != null;
     try {
       if (!expanded) {
@@ -572,7 +606,7 @@ public final class InitializerProcessor {
       int[] raw = table.getRawData();
       for (int i = 0; i + 1 < raw.length; i += 2) {
         if (raw[i] == last) {
-          return true;
+          return !leadingLines.contains(raw[i + 1]);
         }
       }
       return false;
