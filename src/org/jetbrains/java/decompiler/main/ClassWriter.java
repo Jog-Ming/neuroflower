@@ -358,6 +358,25 @@ public class ClassWriter implements StatementWriter {
                       ExitExprent.exitLambdaReturn();
                     }
 
+                    // A block lambda records a line entry at its implicit return: that entry is
+                    // the closing brace's line. An expression lambda's return has no entry of
+                    // its own, so only an exact entry selects the block form.
+                    var dummy = root.getDummyExit();
+                    int retOffset = dummy == null || dummy.bytecode == null
+                      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
+                    int closingLine = retOffset < 0 ? -1 : RoundTrip.lineAtOffset(retOffset);
+                    int bodyExprLine = RoundTrip.sourceLine(firstExpr);
+                    boolean closingEntry = retOffset >= 0 && closingLine >= 0
+                      && closingLine != RoundTrip.lineAtOffset(retOffset - 1);
+                    if (closingEntry && bodyExprLine >= 0 && closingLine > bodyExprLine
+                      && RoundTrip.sourceLineEnd(firstExpr) < closingLine
+                      && !containsLambda(firstExpr)) {
+                      buffer.append(" {").appendLineSeparator();
+                      methodLambdaToJava(node, wrapper, mt, buffer, indent + 1, !lambdaToAnonymous);
+                      buffer.appendIndent(indent).append("}");
+                      simpleLambda = true;
+                      written = true;
+                    } else {
                     // The target's lambda body may start on a later line than the expression
                     // that creates the lambda; an expression lambda prints inline otherwise.
                     boolean breakBody = creationLine >= 0
@@ -373,6 +392,7 @@ public class ClassWriter implements StatementWriter {
 
                     codeBuffer.addBytecodeMapping(root.getDummyExit().bytecode);
                     buffer.append(codeBuffer, node.classStruct.qualifiedName, InterpreterUtil.makeUniqueKey(methodWrapper.methodStruct.getName(), methodWrapper.methodStruct.getDescriptor()));
+                    }
                   }
                   catch (CancelationManager.CanceledException e) {
                     throw e;
@@ -2567,6 +2587,19 @@ public class ClassWriter implements StatementWriter {
 
   private static int methodLine(StructMethod method) {
     return lineAt(method, 0);
+  }
+
+  /** Whether an expression carries a lambda argument anywhere inside it. */
+  private static boolean containsLambda(Exprent exprent) {
+    if (exprent instanceof NewExprent created && created.isLambda()) {
+      return true;
+    }
+    for (Exprent inner : exprent.getAllExprents(true)) {
+      if (inner instanceof NewExprent created && created.isLambda()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static int maxLine(StructLineNumberTableAttribute table) {
