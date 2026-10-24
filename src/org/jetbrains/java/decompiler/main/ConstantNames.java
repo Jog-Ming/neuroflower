@@ -198,7 +198,9 @@ public final class ConstantNames {
 
   /** What one class's text may name: its candidates and where the pool order places each owner. */
   private record Rules(Map<String, List<Constant>> candidates, Placement placement,
-                       Set<String> strict, String own, Map<String, List<int[]>> ownInitializers,
+                       Set<String> strict, Set<String> missing,
+                       Map<String, List<Constant>> compositeCandidates, Set<String> compositeOwners,
+                       String own, Map<String, List<int[]>> ownInitializers,
                        List<String> imports, String packageName) {
   }
 
@@ -642,6 +644,31 @@ public final class ConstantNames {
         }
       }
     }
+    // A Class entry the pool leaves unexplained may still be the one a flags-word naming entered:
+    // the source wrote several constants of that owner OR-ed together, and javac interned the
+    // owner's Class without a field reference. These owners are not offered to the ordinary scan;
+    // the composite pass uses the exact pool-order proof only.
+    Map<String, List<Constant>> compositeCandidates = new HashMap<>();
+    Set<String> compositeOwners = new LinkedHashSet<>();
+    for (String owner : present) {
+      if (explained.contains(owner) || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)
+          || lexical.contains(owner) || claimed.contains(owner)) {
+        continue;
+      }
+      Integer index = classIndices.get(owner);
+      if (index == null) {
+        continue;
+      }
+      if (!missing.contains(owner)) {
+        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+        Long naming = namingPoint(own, index, firstUses, positions);
+        if (naming != null) {
+          namingAt.put(owner, naming);
+        }
+      }
+      addOwnerCandidates(compositeCandidates, owner, nest, packageName, imports);
+      compositeOwners.add(owner);
+    }
     // A class the pool uses through a field or method names nothing by itself, but the position of
     // its Class entry still records where javac first entered it: an entry before the first such
     // use was interned by a folded constant naming, and the pool order bounds that site the same
@@ -704,7 +731,8 @@ public final class ConstantNames {
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
         activeValues),
-      strict, own.qualifiedName, ownInitializers(text, spans, own), imports, packageName);
+      strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
+      ownInitializers(text, spans, own), imports, packageName);
   }
 
   /**
@@ -1634,6 +1662,236 @@ public final class ConstantNames {
         }
       }
     }
+    compositeSites(text, spans, rules, sites);
+  }
+
+  /** One constant field of a pool-unexplained owner, for a bitwise combination. */
+  private record CompositeField(String name, long value) {
+  }
+
+  /**
+   * A literal no single constant folds to may still be a flags word: several constants of one
+   * owner combined by bitwise OR. Such an owner's {@code Class} entry exists only because the
+   * source named one of its constants, and the pool order proves where.
+   */
+  private static void compositeSites(String text, List<int[]> spans, Rules rules, List<Site> sites) {
+    if (rules.compositeOwners().isEmpty()) {
+      return;
+    }
+    Map<String, List<CompositeField>> byOwner = new LinkedHashMap<>();
+    for (Map.Entry<String, List<Constant>> entry : rules.compositeCandidates().entrySet()) {
+      String key = entry.getKey();
+      int bar = key.indexOf('|');
+      if (bar < 0 || !key.substring(0, bar).equals(VariableType.INT.name())) {
+        continue;
+      }
+      long value;
+      try {
+        value = Long.parseLong(key.substring(bar + 1));
+      }
+      catch (NumberFormatException e) {
+        continue;
+      }
+      if (value <= 0 || value > Integer.MAX_VALUE) {
+        continue;
+      }
+      for (Constant constant : entry.getValue()) {
+        if (!rules.compositeOwners().contains(constant.owner())) {
+          continue;
+        }
+        byOwner.computeIfAbsent(constant.owner(), k -> new ArrayList<>())
+          .add(new CompositeField(constant.name(), value));
+      }
+    }
+    if (byOwner.isEmpty()) {
+      return;
+    }
+    List<long[]> literals = intLiterals(text, spans);
+    Map<Long, Integer> counts = new HashMap<>();
+    for (long[] literal : literals) {
+      counts.merge(literal[2], 1, Integer::sum);
+    }
+    for (long[] literal : literals) {
+      long value = literal[2];
+      int start = (int)literal[0];
+      if (value <= 0 || counts.get(value) != 1 || hasSiteAt(sites, start)) {
+        continue;
+      }
+      Site match = compositeMatch(byOwner, rules, start, (int)literal[1], value);
+      if (match != null) {
+        addSiteOnce(sites, match);
+      }
+    }
+  }
+
+  private static Site compositeMatch(Map<String, List<CompositeField>> byOwner, Rules rules,
+                                     int start, int end, long value) {
+    Site found = null;
+    for (Map.Entry<String, List<CompositeField>> entry : byOwner.entrySet()) {
+      String owner = entry.getKey();
+      if (!rules.placement().provesExactly(owner, start)) {
+        continue;
+      }
+      List<CompositeField> picked = compositePick(entry.getValue(), value);
+      if (picked == null) {
+        continue;
+      }
+      String qualifier = solverQualifier(owner, rules.packageName());
+      if (qualifier == null) {
+        continue;
+      }
+      StringBuilder expression = new StringBuilder();
+      for (CompositeField field : picked) {
+        if (expression.length() > 0) {
+          expression.append(" | ");
+        }
+        expression.append(qualifier).append('.').append(field.name());
+      }
+      if (found != null) {
+        return null; // two owners or two combinations reproduce the word; neither is proven
+      }
+      found = new Site(start, end, "(" + expression + ")", owner);
+    }
+    return found;
+  }
+
+  /** The unique free-pair or free-triple OR of the owner's constants that equals the word. */
+  private static List<CompositeField> compositePick(List<CompositeField> fields, long word) {
+    List<CompositeField> best = null;
+    for (int a = 0; a < fields.size(); a++) {
+      CompositeField fa = fields.get(a);
+      if ((fa.value() & word) != fa.value() || fa.value() == word) {
+        continue;
+      }
+      for (int b = a + 1; b < fields.size(); b++) {
+        CompositeField fb = fields.get(b);
+        if ((fa.value() & fb.value()) != 0 || (fa.value() | fb.value()) != word) {
+          continue;
+        }
+        if (best != null) {
+          return null;
+        }
+        best = List.of(fa, fb);
+      }
+    }
+    if (best != null) {
+      return best;
+    }
+    for (int a = 0; a < fields.size(); a++) {
+      CompositeField fa = fields.get(a);
+      if ((fa.value() & word) != fa.value() || fa.value() == word) {
+        continue;
+      }
+      for (int b = a + 1; b < fields.size(); b++) {
+        CompositeField fb = fields.get(b);
+        if ((fa.value() & fb.value()) != 0) {
+          continue;
+        }
+        for (int c = b + 1; c < fields.size(); c++) {
+          CompositeField fc = fields.get(c);
+          if ((fb.value() & fc.value()) != 0 || (fa.value() & fc.value()) != 0
+              || (fa.value() | fb.value() | fc.value()) != word) {
+            continue;
+          }
+          if (best != null) {
+            return null;
+          }
+          best = List.of(fa, fb, fc);
+        }
+      }
+    }
+    return best;
+  }
+
+  private static boolean hasSiteAt(List<Site> sites, int start) {
+    for (Site site : sites) {
+      if (site.start() == start) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Every non-negative int literal of the class text, as {start, end, value}. */
+  private static List<long[]> intLiterals(String text, List<int[]> spans) {
+    List<long[]> literals = new ArrayList<>();
+    for (int[] span : spans) {
+      int i = span[0];
+      while (i < span[1]) {
+        char c = text.charAt(i);
+        char next = i + 1 < text.length() ? text.charAt(i + 1) : '\0';
+        if (c == '/' && next == '/') {
+          int nl = text.indexOf('\n', i);
+          i = nl < 0 ? span[1] : nl;
+          continue;
+        }
+        if (c == '/' && next == '*') {
+          int end = text.indexOf("*/", i + 2);
+          i = end < 0 ? span[1] : end + 2;
+          continue;
+        }
+        if (c == '"' || c == '\'') {
+          i = skipQuoted(text, i, c);
+          continue;
+        }
+        if (Character.isDigit(c) && (i == span[0] || !isIdentifierPart(text.charAt(i - 1)))) {
+          long[] value = new long[1];
+          int end = intLiteral(text, i, span[1], value);
+          if (end > 0) {
+            literals.add(new long[]{i, end, value[0]});
+            i = end;
+            continue;
+          }
+        }
+        i++;
+      }
+    }
+    return literals;
+  }
+
+  /** The end of a plain int literal at i, or -1; sets value[0]. No sign, dot or suffix. */
+  private static int intLiteral(String text, int i, int to, long[] value) {
+    int start = i;
+    long number;
+    if (text.charAt(i) == '0' && i + 1 < to
+        && (text.charAt(i + 1) == 'x' || text.charAt(i + 1) == 'X')) {
+      i += 2;
+      int digits = i;
+      while (i < to && Character.digit(text.charAt(i), 16) >= 0) {
+        i++;
+      }
+      if (i == digits) {
+        return -1;
+      }
+      try {
+        number = Long.parseLong(text.substring(digits, i), 16);
+      }
+      catch (NumberFormatException e) {
+        return -1;
+      }
+    }
+    else {
+      while (i < to && Character.isDigit(text.charAt(i))) {
+        i++;
+      }
+      if (i == start) {
+        return -1;
+      }
+      try {
+        number = Long.parseLong(text.substring(start, i));
+      }
+      catch (NumberFormatException e) {
+        return -1;
+      }
+    }
+    if (i < to && (text.charAt(i) == '.' || text.charAt(i) == 'e' || text.charAt(i) == 'E'
+        || text.charAt(i) == 'f' || text.charAt(i) == 'F' || text.charAt(i) == 'd'
+        || text.charAt(i) == 'D' || text.charAt(i) == 'l' || text.charAt(i) == 'L'
+        || isIdentifierPart(text.charAt(i)))) {
+      return -1;
+    }
+    value[0] = number;
+    return i;
   }
 
   /**
