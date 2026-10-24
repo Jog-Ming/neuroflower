@@ -40,6 +40,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Jump target of each conditional branch, by the end offset of the branch instruction. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Target of each goto, by its start offset. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> GOTO_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -54,9 +56,13 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> branchTargets = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode == CodeConstants.opc_goto) {
+        gotos.put(instr.startOffset, instr.startOffset + instr.operand(0));
+      }
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
       }
@@ -97,6 +103,7 @@ public final class RoundTrip {
     BRANCHES.put(method, branches);
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
+    GOTO_TARGETS.put(method, gotos);
     RETURN_STORES.put(method, returnStores);
   }
 
@@ -875,6 +882,61 @@ public final class RoundTrip {
               Integer end = ends.get(off);
               if (end != null && end > max) {
                 max = end;
+              }
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return max;
+  }
+
+  /** True when the arm's last instruction is a goto that lands beyond the tail's end. */
+  public static boolean armJumpsPast(Statement arm, Statement tail) {
+    StructMethod method = currentMethod();
+    if (method == null || arm == null || tail == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || gotos == null) {
+      return false;
+    }
+    int tailEnd = lastEnd(tail);
+    if (tailEnd < 0) {
+      return false;
+    }
+    int lastStart = lastStart(arm);
+    if (lastStart < 0) {
+      return false;
+    }
+    Integer target = gotos.get(lastStart);
+    return target != null && target > tailEnd;
+  }
+
+  private static int lastStart(Statement stat) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null) {
+      return -1;
+    }
+    int max = -1;
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(stat);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          for (Exprent inner : exprent.getAllExprents(true, true)) {
+            BitSet bits = inner.bytecode;
+            if (bits == null) {
+              continue;
+            }
+            for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+              if (ends.containsKey(off) && off > max) {
+                max = off;
               }
             }
           }
