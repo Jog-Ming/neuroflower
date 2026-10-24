@@ -97,7 +97,7 @@ public final class ConcatenationHelper {
           // TODO: remove this
           int index = parameters.size() == 1 ? 1 : 0;
 
-          parameters.add(index, new ConstExprent(VarType.VARTYPE_STRING, "", expr.bytecode));
+          parameters.add(index, new ConstExprent(VarType.VARTYPE_STRING, "", new BitSet()));
         }
 
         if (parameters.size() >= 2) {
@@ -186,7 +186,17 @@ public final class ConcatenationHelper {
 
     for (int i = 1; i < lstOperands.size(); i++) {
       Exprent oper = lstOperands.get(i);
-      FunctionExprent tmp = new FunctionExprent(FunctionType.STR_CONCAT, Arrays.asList(func, oper), bytecode);
+      // The node's offsets are those of its operands: the printer breaks a concat before an
+      // operand whose first instruction starts the target's next line, and the indy's own offset
+      // cannot tell where an operand begins.
+      BitSet offsets = new BitSet();
+      if (func.bytecode != null) {
+        offsets.or(func.bytecode);
+      }
+      if (oper.bytecode != null) {
+        offsets.or(oper.bytecode);
+      }
+      FunctionExprent tmp = new FunctionExprent(FunctionType.STR_CONCAT, Arrays.asList(func, oper), offsets);
       // Try to pick the non-string type. One is guaranteed to be string.
       tmp.setImplicitType(VarType.VARTYPE_STRING.equals(func.getExprType()) ? oper.getExprType() : func.getExprType());
       func = tmp;
@@ -229,7 +239,10 @@ public final class ConcatenationHelper {
             // Detected a special tag, flush all accumulated characters
             // as a constant first:
             if (acc.length() > 0) {
-              res.add(new ConstExprent(VarType.VARTYPE_STRING, acc.toString(), expr.bytecode));
+              // A recipe literal is printed as a constant operand of the concat; the indy offset
+              // belongs to the whole expression, not to this text, and would hide the line the
+              // neighboring operands start on.
+              res.add(new ConstExprent(VarType.VARTYPE_STRING, acc.toString(), new BitSet()));
               acc.setLength(0);
             }
 
@@ -252,7 +265,7 @@ public final class ConcatenationHelper {
 
         // Flush the remaining characters as constant:
         if (acc.length() > 0) {
-          res.add(new ConstExprent(VarType.VARTYPE_STRING, acc.toString(), expr.bytecode));
+          res.add(new ConstExprent(VarType.VARTYPE_STRING, acc.toString(), new BitSet()));
         }
 
         return res;
