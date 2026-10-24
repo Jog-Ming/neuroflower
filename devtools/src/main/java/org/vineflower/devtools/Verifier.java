@@ -477,6 +477,12 @@ public final class Verifier {
       for (FileResult result : results) {
         JsonObject fileJson = new JsonObject();
         fileJson.addProperty("source", result.source());
+        JsonObject fileMetrics = new JsonObject();
+        fileMetrics.addProperty("raw", result.metrics().raw());
+        fileMetrics.addProperty("redundantCasts", result.metrics().redundantCasts());
+        fileMetrics.addProperty("doubleCasts", result.metrics().doubleCasts());
+        fileMetrics.addProperty("unchecked", result.metrics().unchecked());
+        fileJson.add("metrics", fileMetrics);
         if (!result.errors().isEmpty()) {
           JsonArray errorArray = new JsonArray();
           result.errors().forEach(errorArray::add);
