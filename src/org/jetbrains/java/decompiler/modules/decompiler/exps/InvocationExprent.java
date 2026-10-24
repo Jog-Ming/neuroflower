@@ -1196,20 +1196,17 @@ public class InvocationExprent extends Exprent {
         }
 
         if (buf.length() > 0) {
-          // A chain link whose invoke the original put on a later line than the receiver's last
-          // instruction starts a line of its own. Inside an argument list javac attributes the
-          // invoke to the first argument's line, so the entry proves nothing about the dot there.
-          // Inside an argument list javac attributes the invoke to the first argument's line, so
-          // the entry proves nothing about the dot there -- unless the receiver is itself a
-          // chain link with its own entry: then the later invoke line is the source's own break.
-          // Inside an argument list javac attributes the invoke to the first argument's line, so
-          // an inherited entry proves nothing about the dot. A chain link whose line is exactly
-          // the receiver's end plus one is the source's own continuation line; a jump to a later
-          // statement line is the inherited argument entry, not a break.
-          if (instance != null && RoundTrip.newlineBetween(instance, this)
+          // A chain link whose invoke the original put on a later line than the receiver starts
+          // a line of its own. Inside an argument list javac attributes the invoke to the first
+          // argument's line, so an inherited entry proves nothing about the dot; the source's
+          // own break is a receiver with its own exact entry exactly one line before the link.
+          boolean chainBreak = instance != null && RoundTrip.newlineBetween(instance, this)
             && (!insideOwnArgumentList()
-              || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass() && instance instanceof InvocationExprent
-                 && RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1)) {
+              || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass()
+                 && (instance instanceof InvocationExprent
+                       && RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1
+                     || chainReceiverBreak(instance, this)));
+          if (chainBreak) {
             buf.appendLineSeparator().appendIndent(indent);
           } else if (instance == null && qualifierBreak) {
             // The parent (a ternary) proved from the line table that the qualifier ends its line.
@@ -1535,17 +1532,77 @@ public class InvocationExprent extends Exprent {
   }
 
   /**
+   * The target line of the argument's first printed token. A fluent chain prints its first link
+   * first, and the outermost invoke sits on the last one; the receiver before that link is only a
+   * load that inherits the statement's line. The first invocation in print order is the token
+   * the argument really starts with.
+   */
+  private static int firstPrintedLine(Exprent argument) {
+    Exprent current = argument;
+    int line = -1;
+    while (true) {
+      if (current instanceof FunctionExprent func && func.getFuncType() == FunctionExprent.FunctionType.CAST
+        && !func.getLstOperands().isEmpty()) {
+        current = func.getLstOperands().get(0);
+      } else if (current instanceof InvocationExprent invocation) {
+        line = RoundTrip.sourceLine(invocation);
+        if (invocation.getInstance() == null) {
+          break;
+        }
+        current = invocation.getInstance();
+      } else if (current instanceof FieldExprent field && field.getInstance() != null) {
+        current = field.getInstance();
+      } else {
+        break;
+      }
+    }
+    return line >= 0 ? line : RoundTrip.sourceLine(current);
+  }
+
+  /**
+   * A cast around the receiver hides the chain link from the adjacency test; the inner
+   * invocation's own invoke offset still carries an exact line-table entry, and the link exactly
+   * one line later is the source's own break.
+   */
+  private static boolean chainReceiverBreak(Exprent receiver, Exprent link) {
+    if (!(receiver instanceof FunctionExprent cast)
+      || cast.getFuncType() != FunctionExprent.FunctionType.CAST) {
+      return false;
+    }
+    Exprent inner = receiver;
+    while (inner instanceof FunctionExprent func
+      && func.getFuncType() == FunctionExprent.FunctionType.CAST
+      && !func.getLstOperands().isEmpty()) {
+      inner = func.getLstOperands().get(0);
+    }
+    if (!(inner instanceof InvocationExprent invocation) || invocation.bytecode == null
+      || invocation.bytecode.isEmpty()) {
+      return false;
+    }
+    // The receiver's invoke is its last bytecode offset; its line is the source's own line for
+    // that link, and the chained call exactly one line later is the source's break.
+    int last = invocation.bytecode.previousSetBit(Integer.MAX_VALUE);
+    return RoundTrip.lineAtOffset(last) == RoundTrip.sourceLine(link) - 1;
+  }
+
+  /** The method being printed belongs to an anonymous or local class body. */
+  private static boolean inAnonymousOrLocalClass() {
+    Object wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    if (!(wrapper instanceof org.jetbrains.java.decompiler.main.rels.MethodWrapper method)) {
+      return false;
+    }
+    // javac numbers anonymous and local classes, so only those have a digit after the last '$';
+    // a named nested class has its own name there.
+    String name = method.methodStruct.getClassQualifiedName();
+    int dollar = name.lastIndexOf('$');
+    return dollar >= 0 && dollar + 1 < name.length() && Character.isDigit(name.charAt(dollar + 1));
+  }
+
+  /**
    * Whether the printer is inside the argument list of the method it is printing. A lambda body
    * switches the current method, so a call written there is not subject to the enclosing call's
    * argument-line attribution.
    */
-  /** The method being printed belongs to an anonymous or local class body. */
-  private static boolean inAnonymousOrLocalClass() {
-    Object wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
-    return wrapper instanceof org.jetbrains.java.decompiler.main.rels.MethodWrapper method
-      && method.methodStruct.getClassQualifiedName().contains("$");
-  }
-
   public static boolean insideOwnArgumentList() {
     int depth = ARGUMENT.get()[0];
     return depth > 0 && ARGUMENT_AT.get()[depth - 1] == RoundTrip.currentMethod();
@@ -1783,7 +1840,10 @@ public class InvocationExprent extends Exprent {
     int previousLine = -1;
     int previousEnd = -1;
     int callLine = RoundTrip.sourceLineEnd(this);
-    int firstLine = start < lstParameters.size() ? RoundTrip.sourceLine(lstParameters.get(start)) : -1;
+    // A chain's outermost invoke sits on its last link and a cast's checkcast after its operand,
+    // so the argument's own first offset can name a later line; its first printed token is the
+    // line the argument starts on.
+    int firstLine = start < lstParameters.size() ? firstPrintedLine(lstParameters.get(start)) : -1;
     // The line the call's own token sits on: the first argument's, when javac started a line
     // there; otherwise the invoke's inherited line is the only line the call is known to have.
     boolean firstStartsLine = start < lstParameters.size() && RoundTrip.lineStartsHere(lstParameters.get(start));
