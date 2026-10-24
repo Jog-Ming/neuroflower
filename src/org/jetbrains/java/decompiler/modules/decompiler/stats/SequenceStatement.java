@@ -177,6 +177,32 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { body; return X; } rest` where the target branches to the body first: the source
+      // wrote `if (!C) { rest } else { body; return X; }`. Only when neither arm declares a
+      // local: moving a declaration across the arms would change its scope.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && !ifStatement.isPatternMatched()
+          && ifStatement.getIfstat() != null && endsWithReturn(ifStatement.getIfstat())
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && !RoundTrip.declaresLocal(ifStatement.getIfstat())
+          && stats.subList(i + 1, stats.size()).stream().noneMatch(RoundTrip::declaresLocal)
+          && RoundTrip.branchesToBody(ifStatement.getHeadexprent(), ifStatement.getIfstat())) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(
+          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null

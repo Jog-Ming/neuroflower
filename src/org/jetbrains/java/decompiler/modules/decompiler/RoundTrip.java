@@ -801,6 +801,90 @@ public final class RoundTrip {
     return negateCondition(condition);
   }
 
+  /**
+   * True when the head's last branch targets the then-arm's first instruction: the source wrote
+   * {@code if (!C) { rest } else { body }} and javac branched to the else arm, while the guard form
+   * {@code if (C) { body; return; } rest} branches past the if to the rest.
+   */
+  public static boolean branchesToBody(Exprent head, Statement body) {
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    if (ends == null || targets == null) {
+      return false;
+    }
+    int bodyStart = firstOffset(body);
+    if (bodyStart < 0) {
+      return false;
+    }
+    int lastStart = -1;
+    int lastTarget = -1;
+    for (int offset = head.bytecode.nextSetBit(0); offset >= 0; offset = head.bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end) && offset > lastStart) {
+        lastStart = offset;
+        lastTarget = targets.get(end);
+      }
+    }
+    return lastStart >= 0 && lastTarget == bodyStart;
+  }
+
+  /** True when a local variable's scope starts inside the statement's instruction range. */
+  public static boolean declaresLocal(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = firstOffset(stat);
+    int end = lastEnd(stat);
+    if (start < 0 || end < 0) {
+      return false;
+    }
+    return table.getRange(start, end)
+      .anyMatch(v -> v.getStart() >= start && v.getStart() <= end);
+  }
+
+  private static int lastEnd(Statement stat) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null) {
+      return -1;
+    }
+    int max = -1;
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(stat);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          for (Exprent inner : exprent.getAllExprents(true, true)) {
+            BitSet bits = inner.bytecode;
+            if (bits == null) {
+              continue;
+            }
+            for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+              Integer end = ends.get(off);
+              if (end != null && end > max) {
+                max = end;
+              }
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return max;
+  }
+
   private static void markGuardExit(StructMethod method, int offset) {
     CONSUMED_GUARD_EXITS.computeIfAbsent(method, key -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(offset);
   }
