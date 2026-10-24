@@ -792,7 +792,10 @@ public class TextBuffer {
       }
       myLineToOffsetMapping = newMap;
     }
-    myBytecodeOffsetMapping.replaceAll((key, value) -> value + shiftOffset);
+    // A prefix removal can put a mapping before the buffer's start (the lambda path strips the
+    // `return` of an expression body). The text it referred to is gone, so the mapping belongs
+    // at the new start; a negative position would resolve inside the preceding text instead.
+    myBytecodeOffsetMapping.replaceAll((key, value) -> Math.max(0, value + shiftOffset));
     myRootGroup.shift(shiftOffset);
   }
 
