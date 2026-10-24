@@ -55,7 +55,7 @@ public final class ConstantNames {
   }
 
   private enum VariableType {
-    INT, LONG, FLOAT, DOUBLE, STRING, BOOLEAN, CHAR
+    INT, LONG, FLOAT, DOUBLE, STRING, BOOLEAN, CHAR, BYTE, SHORT
   }
 
   private record Site(int start, int end, String replacement, String owner) {
@@ -3375,13 +3375,16 @@ public final class ConstantNames {
     return switch (descriptor) {
       // A byte or short constant folded into an int literal changes the expression's type when it
       // is named (Pair.of(5) infers Integer, Pair.of(BYTE_CONST) infers Byte), so those owners are
-      // never candidates for a plain integer literal.
+      // never candidates for a plain integer literal. They are candidates only where the printed
+      // source already casts the literal to that type, and the name replaces the whole cast.
       case "I" -> VariableType.INT;
       case "C" -> VariableType.CHAR;
       case "Z" -> VariableType.BOOLEAN;
       case "J" -> VariableType.LONG;
       case "F" -> VariableType.FLOAT;
       case "D" -> VariableType.DOUBLE;
+      case "B" -> VariableType.BYTE;
+      case "S" -> VariableType.SHORT;
       case "Ljava/lang/String;" -> VariableType.STRING;
       default -> null;
     };
@@ -3667,6 +3670,59 @@ public final class ConstantNames {
     return Character.isLetterOrDigit(c) || c == '_' || c == ')' || c == ']' || c == '"' || c == '\'' ? -1 : i;
   }
 
+  /** The primitive type of a cast written immediately before an integer literal, or null. */
+  private static VariableType primitiveCastKind(String text, int start) {
+    int i = start - 1;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    if (i < 0 || text.charAt(i) != ')') {
+      return null;
+    }
+    i--;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    int nameEnd = i + 1;
+    while (i >= 0 && Character.isLetter(text.charAt(i))) {
+      i--;
+    }
+    VariableType kind = switch (text.substring(i + 1, nameEnd)) {
+      case "byte" -> VariableType.BYTE;
+      case "short" -> VariableType.SHORT;
+      default -> null;
+    };
+    if (kind == null) {
+      return null;
+    }
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    return i >= 0 && text.charAt(i) == '(' ? kind : null;
+  }
+
+  /** The position of the opening parenthesis of the cast {@link #primitiveCastKind} found. */
+  private static int primitiveCastStart(String text, int start) {
+    int i = start - 1;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    if (i < 0 || text.charAt(i) != ')') {
+      return start;
+    }
+    i--;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    while (i >= 0 && Character.isLetter(text.charAt(i))) {
+      i--;
+    }
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    return i >= 0 && text.charAt(i) == '(' ? i : start;
+  }
+
   private static int scanNumber(String text, int start, List<Site> sites,
                                 Map<String, List<Constant>> candidates, List<String> imports,
                                 String packageName, String own, Map<String, List<int[]>> ownInitializers,
@@ -3758,6 +3814,19 @@ public final class ConstantNames {
       return i;
     }
     int siteStart = negative ? negativeAt : start;
+    // A byte or short constant can only be named where the printed source casts the literal to
+    // that type: the name then replaces the whole cast and the expression keeps its type. The
+    // plain integer site is not offered in that case, since an int constant would leave the cast
+    // and intern a different owner.
+    VariableType castKind = kind.equals(VariableType.INT.name()) ? primitiveCastKind(text, start) : null;
+    if (castKind != null) {
+      int before = sites.size();
+      addSite(sites, primitiveCastStart(text, start), i, castKind.name() + "|" + value, "", candidates, imports,
+        packageName, own, ownInitializers, placement, deferred, inWindow);
+      if (sites.size() > before) {
+        return i;
+      }
+    }
     addSite(sites, siteStart, i, kind + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
       placement, deferred, inWindow);
     if (kind.equals(VariableType.FLOAT.name())) {
