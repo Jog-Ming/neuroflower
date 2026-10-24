@@ -2161,12 +2161,15 @@ public final class ConstantNames {
       // stand between the pair and it in the pool.
       return sameRank && atValue;
     }
-    boolean before = offset < successorOffset;
-    if (pair.open() >= 0) {
+    // A naming may stand in an earlier method than the pair's successor: the coordinate orders
+    // methods by generation, so any site below the successor is still generated before it. Only
+    // the argument window is bound to the successor's own method.
+    boolean before = coordinate < pair.successor();
+    if (pair.open() >= 0 && sameRank) {
       boolean inArgs = position > pair.open() && position < pair.close();
-      return sameRank && (inArgs || before && coordinate > pair.lower());
+      return inArgs || before && coordinate > pair.lower();
     }
-    return sameRank && before && coordinate > pair.lower();
+    return before && coordinate > pair.lower();
   }
 
   /** Whether some site already names this owner in the class text. */
