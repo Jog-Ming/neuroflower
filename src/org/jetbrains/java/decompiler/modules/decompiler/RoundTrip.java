@@ -655,6 +655,55 @@ public final class RoundTrip {
     return braceLine >= 0 && handlerLine > braceLine;
   }
 
+  /**
+   * Whether a boolean operator's right operand starts on a line of its own. Both operands' own
+   * bitsets can cover only a short-circuit branch, laid on the line the whole expression ends
+   * on, so the line the operand's text begins and ends on is read from its parts.
+   */
+  public static boolean newlineBetweenOperands(Exprent before, Exprent after) {
+    if (!enabled()) {
+      return false;
+    }
+    int end = -1;
+    for (Exprent part : before.getAllExprents(true, false)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int line = lineAtOffset(part.bytecode.previousSetBit(Integer.MAX_VALUE));
+      if (line > end) {
+        end = line;
+      }
+    }
+    if (end < 0) {
+      end = sourceLineEnd(before);
+    }
+    // Only an operand whose own first instruction starts a line proves the source broke
+    // before it: a later entry inside the operand may belong to a line the operand's text
+    // began earlier (a chain broken before its first call, an argument on its own line).
+    int first = -1;
+    for (Exprent part : after.getAllExprents(true, true)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int offset = part.bytecode.nextSetBit(0);
+      if (first < 0 || offset < first) {
+        first = offset;
+      }
+    }
+    if (first < 0) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = lineAtOffset(first);
+    boolean startsLine = table.findLineNumber(first) != (first <= 0 ? -1 : table.findLineNumber(first - 1));
+    return startsLine && end >= 0 && start >= 0 && start > end;
+  }
+
   /** Whether the original source started the second expression on a later line than the first ended. */
   public static boolean newlineBetween(Exprent before, Exprent after) {
     int end = sourceLineEnd(before);
