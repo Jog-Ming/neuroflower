@@ -139,6 +139,7 @@ public class ConstExprent extends Exprent {
   private final boolean boolPermitted;
   private boolean wasCondy = false;
   private static final Map<String, Set<String>> POOL_CLASSES = new java.util.concurrent.ConcurrentHashMap<>();
+  private static final Map<String, Set<String>> POOL_NAMED = new java.util.concurrent.ConcurrentHashMap<>();
 
   /**
    * Whether one of the printer's named forms may be used here.
@@ -150,13 +151,13 @@ public class ConstExprent extends Exprent {
    */
   private static boolean ownerNamedInPool(TextBuffer printed) {
     if (printed.count("Math.", 0) > 0) {
-      return poolHasClass("java/lang/Math");
+      return poolHasNaming("java/lang/Math");
     }
     if (printed.count("Float.", 0) > 0) {
-      return poolHasClass("java/lang/Float");
+      return poolHasNaming("java/lang/Float");
     }
     if (printed.count("Double.", 0) > 0) {
-      return poolHasClass("java/lang/Double");
+      return poolHasNaming("java/lang/Double");
     }
     return true;
   }
@@ -178,6 +179,38 @@ public class ConstExprent extends Exprent {
       return classes;
     });
     return names.contains(owner);
+  }
+
+  /**
+   * Whether the class's pool holds a folded-constant naming of this owner.
+   *
+   * <p>A Class entry alone says nothing: a field or method reference enters one as its operand.
+   * A naming enters the Class, its name and then the constant's value, in that order, so the
+   * adjacent value is what distinguishes the two. The printer's un-inlined form is only the
+   * original's when the original named this owner's constant at all; otherwise the literal must
+   * stay, and the constant-names pass can name the owner the pool does prove.
+   */
+  private static boolean poolHasNaming(String owner) {
+    ClassNode node = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    StructClass cls = node == null ? null : node.classStruct;
+    if (cls == null) {
+      return true; // nothing records the original's form here; keep the printer's own choice
+    }
+    Set<String> named = POOL_NAMED.computeIfAbsent(cls.qualifiedName, name -> {
+      Set<String> owners = new HashSet<>();
+      List<PooledConstant> pool = cls.getPool().getPool();
+      for (int i = 1; i + 2 < pool.size(); i++) {
+        if (pool.get(i) instanceof PrimitiveConstant primitive
+            && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null
+            && primitive.index == i + 1
+            && pool.get(i + 2) instanceof PrimitiveConstant value
+            && value.type != CodeConstants.CONSTANT_Utf8) {
+          owners.add(primitive.getString());
+        }
+      }
+      return owners;
+    });
+    return named.contains(owner);
   }
 
   public ConstExprent(int val, boolean boolPermitted, BitSet bytecodeOffsets) {
