@@ -40,6 +40,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Jump target of each conditional branch, by the end offset of the branch instruction. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Target of each conditional branch, by its start offset. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_STARTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Target of each goto, by its start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> GOTO_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
@@ -57,6 +59,7 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
@@ -78,6 +81,7 @@ public final class RoundTrip {
         }
       }
       if (isConditional(instr.opcode)) {
+        branchStarts.put(instr.startOffset, instr.startOffset + instr.operand(0));
         branches.put(instr.startOffset + instr.length, instr.opcode);
         branchTargets.put(instr.startOffset + instr.length, instr.startOffset + instr.operand(0));
       }
@@ -104,6 +108,7 @@ public final class RoundTrip {
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
     GOTO_TARGETS.put(method, gotos);
+    BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
   }
 
@@ -890,6 +895,61 @@ public final class RoundTrip {
       queue.addAll(cur.getStats());
     }
     return max;
+  }
+
+  /**
+   * True when the condition's branches target both the exit block and the body, and the exit sits
+   * before the body: the source wrote the guard inside {@code while (true)}. A synthesized `&&`
+   * carries no offsets of its own, so each operand's branch is the one starting where the operand
+   * ends.
+   */
+  public static boolean guardBranches(Exprent condition, Statement exit, Statement body) {
+    StructMethod method = currentMethod();
+    if (method == null || condition == null || exit == null || body == null
+        || !(condition instanceof FunctionExprent function)
+        || function.getFuncType() != FunctionExprent.FunctionType.BOOLEAN_AND
+        || function.getLstOperands().size() != 2) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    if (ends == null || branchStarts == null) {
+      return false;
+    }
+    int exitStart = firstOffset(exit);
+    int bodyStart = firstOffset(body);
+    if (exitStart < 0 || bodyStart < 0 || exitStart >= bodyStart) {
+      return false;
+    }
+    boolean toExit = false;
+    boolean toBody = false;
+    for (Exprent operand : function.getLstOperands()) {
+      Integer target = ownBranchTarget(operand, branchStarts);
+      if (target == null) {
+        return false;
+      }
+      if (target == exitStart) {
+        toExit = true;
+      } else if (target == bodyStart) {
+        toBody = true;
+      }
+    }
+    return toExit && toBody;
+  }
+
+  private static Integer ownBranchTarget(Exprent operand, java.util.Map<Integer, Integer> branchStarts) {
+    BitSet bits = operand.bytecode;
+    if (bits == null) {
+      return null;
+    }
+    Integer found = null;
+    for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+      Integer target = branchStarts.get(off);
+      if (target != null) {
+        found = target;
+      }
+    }
+    return found;
   }
 
   /** True when the arm's last instruction is a goto that lands beyond the tail's end. */

@@ -147,6 +147,29 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `while (a && b) { body } return X;` where the exit block sits before the body and the
+      // condition's branches target both the exit and the body: the source wrote the guard
+      // inside `while (true)`.
+      if (i + 1 < stats.size() && st instanceof DoStatement loop
+          && loop.getLooptype() == DoStatement.Type.WHILE
+          && loop.getConditionExprent() instanceof FunctionExprent and
+          && and.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND
+          && and.getLstOperands().size() == 2
+          && loop.getFirst() != null
+          && singleExit(stats.get(i + 1)) != null
+          && RoundTrip.guardBranches(and, stats.get(i + 1), loop.getFirst())) {
+        Exprent guard = RoundTrip.negateCondition(and);
+        buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("if (").append(guard.toJava(indent + 1)).append(") {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 2, true));
+        buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(loop.getFirst(), indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        i++;
+        continue;
+      }
+
       // `if (C) { body } rest` where the target's table puts a void return between the condition
       // and the body, before the body's line: the source wrote `if (!C) { rest; return; } body`.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
