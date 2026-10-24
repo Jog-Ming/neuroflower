@@ -370,20 +370,15 @@ public class ConstExprent extends Exprent {
             }
           }
 
-          // Try to convert the double representation of the value to the float representation, to output the cleanest version of the value.
-          // This patch is based on work in ForgeFlower submitted by Pokechu22.
+          // A double constant is printed as a double. Shortening it to a float literal changes
+          // the literal's type, and any arithmetic it takes part in promotes to float instead.
           float floatRepresentation = (float) doubleVal;
           if (floatRepresentation == doubleVal) {
-            if (trimFloat(Float.toString(floatRepresentation), floatRepresentation).length() < trimDouble(Double.toString(doubleVal), doubleVal).length()) {
-              // Check the uninlined values to see if we have one of those
-              if (UNINLINED_FLOATS.containsKey(floatRepresentation)) {
-                TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
-                if (ownerNamedInPool(uninlined)) {
-                  return buf.append(uninlined);
-                }
+            if (UNINLINED_FLOATS.containsKey(floatRepresentation)) {
+              TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
+              if (ownerNamedInPool(uninlined)) {
+                return buf.append(uninlined);
               }
-              // Return the standard representation if the value is not able to be uninlined
-              return buf.append(trimFloat(Float.toString(floatRepresentation), floatRepresentation)).append("F");
             }
           }
         }
