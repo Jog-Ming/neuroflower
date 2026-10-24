@@ -877,13 +877,23 @@ public class ClassWriter implements StatementWriter {
         // the field the source declared first (RuleTest's CODEC). Without such a field the old
         // behaviour stands.
         int carried = -1;
+        // An interface has no constructor to anchor an unlined method, and a preceding static
+        // method's line is not where the source put it: the field's initializer line is the only
+        // declaration evidence left, and the source declared such methods after the field.
+        boolean noCtor = true;
+        for (int i : methodOrder) {
+          if (CodeConstants.INIT_NAME.equals(methods.get(i).getName())) {
+            noCtor = false;
+            break;
+          }
+        }
         // Members with no line of their own stay next to the neighbour that has one.
         for (int[] member : plan) {
           if (member[2] < 0) {
             if (tailMembers && member[0] == 2 && !rankedMemberClass) {
               continue; // the backward pass puts it after every lined member
             }
-            member[2] = carried;
+            member[2] = noCtor && member[0] == 1 && maxFieldLine > carried ? maxFieldLine : carried;
           } else if (!(isCtorMember(member, methods) && maxFieldLine > member[2])) {
             carried = member[2];
           }
