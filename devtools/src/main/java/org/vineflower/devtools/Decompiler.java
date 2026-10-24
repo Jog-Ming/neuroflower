@@ -75,7 +75,11 @@ public final class Decompiler {
 
     // The decompiler writes into a staging directory that only becomes the cached tree once it
     // finishes: a killed run must not leave a half tree that a later run would treat as complete.
-    Path staging = dir.resolve("src.part");
+    // Two runs can reach the same key at once (the same version scored twice, or a rerun beside a
+    // run that is still going), so the staging name is per process; a shared name lets one run
+    // publish files the other is still writing.
+    String run = ProcessHandle.current().pid() + "-" + java.util.UUID.randomUUID();
+    Path staging = dir.resolve("src.part-" + run);
     deleteTree(staging);
     Files.createDirectories(staging);
     List<String> command = new ArrayList<>();
@@ -96,7 +100,7 @@ public final class Decompiler {
     // once and keep the tree with fewer failed methods.
     int failed = countFailedMethods(staging);
     if (failed > 0) {
-      Path retry = dir.resolve("src.retry");
+      Path retry = dir.resolve("src.retry-" + run);
       deleteTree(retry);
       Files.createDirectories(retry);
       List<String> retryCommand = new ArrayList<>(command);
@@ -115,12 +119,26 @@ public final class Decompiler {
     }
     long elapsed = (System.nanoTime() - started) / 1_000_000;
     // A --no-cache run replaces an earlier tree of the same key; the old directory must go
-    // before the staging one can take its name.
-    deleteTree(src);
-    try {
-      Files.move(staging, src, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-    } catch (java.nio.file.AtomicMoveNotSupportedException | java.nio.file.FileAlreadyExistsException e) {
-      Files.move(staging, src);
+    // before the staging one can take its name. A cached run that lost a race to publish keeps
+    // the tree the other process published instead of replacing it under a running score.
+    if (noCache) {
+      deleteTree(src);
+    }
+    if (!noCache && Files.isDirectory(src)) {
+      deleteTree(staging);
+    }
+    else {
+      try {
+        Files.move(staging, src, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+      } catch (java.nio.file.FileAlreadyExistsException e) {
+        deleteTree(staging); // another process published this key first
+      } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+        try {
+          Files.move(staging, src);
+        } catch (java.nio.file.FileAlreadyExistsException again) {
+          deleteTree(staging);
+        }
+      }
     }
 
     meta = new JsonObject();
