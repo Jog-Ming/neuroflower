@@ -16,6 +16,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
@@ -107,6 +109,11 @@ public class InvocationExprent extends Exprent {
   private static final ThreadLocal<Boolean> ANONYMOUS_CREATION = ThreadLocal.withInitial(() -> Boolean.FALSE);
   /** The argument now being printed starts a source line (the enclosing printer broke before it). */
   private static final ThreadLocal<Boolean> ARG_AT_LINE_START = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+  /** Whether the argument being printed was placed at the start of its own line. */
+  public static boolean argumentStartedLine() {
+    return ARG_AT_LINE_START.get();
+  }
 
   public static void enterAnonymousCreation() {
     ANONYMOUS_CREATION.set(Boolean.TRUE);
@@ -1204,7 +1211,8 @@ public class InvocationExprent extends Exprent {
             && (!insideOwnArgumentList()
               || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass()
                  && (instance instanceof InvocationExprent
-                       && RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1
+                       && (RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1
+                           || RoundTrip.sourceLine(this) == printedEndLine(buf) + 1)
                      || chainReceiverBreak(instance, this)));
           if (chainBreak) {
             buf.appendLineSeparator().appendIndent(indent);
@@ -1559,6 +1567,69 @@ public class InvocationExprent extends Exprent {
     return line >= 0 ? line : RoundTrip.sourceLine(current);
   }
 
+  /** The first line of an expression lambda's body method, or -1 when it cannot be named. */
+  private static int lambdaBodyLine(NewExprent lambda) {
+    MethodWrapper body = expressionLambdaBody(lambda);
+    return body == null ? -1 : RoundTrip.methodLine(body.methodStruct);
+  }
+
+  /**
+   * The body method of a lambda that prints inline as a single expression, or null. A block body
+   * keeps its brace on the arrow's line, so moving the lambda to a line of its own would insert a
+   * line the target never had; only an expression body can be the raised argument.
+   */
+  private static MethodWrapper expressionLambdaBody(NewExprent lambda) {
+    VarType lambdaType = lambda.getNewType();
+    if (lambdaType == null) {
+      return null;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambdaType.value);
+    if (node == null || node.lambdaInformation == null || node.lambdaInformation.is_method_reference
+      || node.getWrapper() == null) {
+      return null;
+    }
+    MethodWrapper wrapper = node.getWrapper().getMethodWrapper(
+      node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor);
+    return wrapper != null && inlineExpressionBody(wrapper) ? wrapper : null;
+  }
+
+  /** Whether this lambda body prints as a single expression rather than a brace block. */
+  private static boolean inlineExpressionBody(MethodWrapper wrapper) {
+    if (!DecompilerContext.getOption(IFernflowerPreferences.INLINE_SIMPLE_LAMBDAS)
+      || wrapper.decompileError != null || wrapper.root == null) {
+      return false;
+    }
+    Statement firstStat = wrapper.root.getFirst();
+    if (!(firstStat instanceof BasicBlockStatement) || firstStat.getExprents() == null
+      || firstStat.getExprents().size() != 1) {
+      return false;
+    }
+    Exprent firstExpr = firstStat.getExprents().get(0);
+    if (firstExpr instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent left
+      && left.isDefinition()
+      || firstExpr instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.THROW) {
+      return false;
+    }
+    // The block form is chosen by the same evidence ClassWriter reads: a recorded closing-brace
+    // line after the body's own lines.
+    StructMethod struct = wrapper.methodStruct;
+    DummyExitStatement dummy = wrapper.root.getDummyExit();
+    int retOffset = dummy == null || dummy.bytecode == null
+      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
+    int closingLine = retOffset < 0 ? -1 : RoundTrip.lineAt(struct, retOffset);
+    boolean closingEntry = retOffset >= 0 && closingLine >= 0
+      && closingLine != RoundTrip.lineAt(struct, retOffset - 1);
+    int bodyLine = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
+      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.nextSetBit(0));
+    int bodyEnd = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
+      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.previousSetBit(Integer.MAX_VALUE));
+    if (closingEntry && bodyLine >= 0 && closingLine > bodyLine && bodyEnd < closingLine
+      && !ClassWriter.containsLambda(firstExpr)) {
+      return false;
+    }
+    return true;
+  }
+
   /**
    * A cast around the receiver hides the chain link from the adjacency test; the inner
    * invocation's own invoke offset still carries an exact line-table entry, and the link exactly
@@ -1583,6 +1654,53 @@ public class InvocationExprent extends Exprent {
     // that link, and the chained call exactly one line later is the source's break.
     int last = invocation.bytecode.previousSetBit(Integer.MAX_VALUE);
     return RoundTrip.lineAtOffset(last) == RoundTrip.sourceLine(link) - 1;
+  }
+
+  /**
+   * The target's source line for the last instruction printed in this text. An inlined lambda body
+   * carries its own method's mappings, so the printed end of a receiver can be later than the last
+   * instruction the enclosing method owns.
+   */
+  private static int printedEndLine(TextBuffer printed) {
+    int bestPosition = -1;
+    String bestClass = null;
+    String bestMethod = null;
+    int bestOffset = -1;
+    for (Map.Entry<Pair<String, String>, Map<Integer, Integer>> entry
+      : printed.getBytecodePositions().entrySet()) {
+      for (Map.Entry<Integer, Integer> mapping : entry.getValue().entrySet()) {
+        if (mapping.getValue() >= bestPosition) {
+          bestPosition = mapping.getValue();
+          bestClass = entry.getKey().a;
+          bestMethod = entry.getKey().b;
+          bestOffset = mapping.getKey();
+        }
+      }
+    }
+    int space = bestMethod == null ? -1 : bestMethod.indexOf(' ');
+    StructClass cls = bestClass == null ? null : DecompilerContext.getStructContext().getClass(bestClass);
+    if (cls == null || space < 0) {
+      return -1;
+    }
+    StructMethod method = cls.getMethod(bestMethod.substring(0, space), bestMethod.substring(space + 1));
+    if (method == null || blockLambdaMethod(bestClass, method)) {
+      return -1;
+    }
+    return RoundTrip.lineAt(method, bestOffset);
+  }
+
+  /**
+   * A block-bodied lambda prints its closing brace after the last instruction the table records;
+   * the brace's line is not in the class file, so the printed text cannot be said to end there.
+   */
+  private static boolean blockLambdaMethod(String className, StructMethod method) {
+    if (!method.getName().startsWith("lambda$")) {
+      return false;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(className);
+    MethodWrapper wrapper = node == null || node.getWrapper() == null
+      ? null : node.getWrapper().getMethodWrapper(method.getName(), method.getDescriptor());
+    return wrapper == null || !inlineExpressionBody(wrapper);
   }
 
   /** The method being printed belongs to an anonymous or local class body. */
@@ -1860,6 +1978,11 @@ public class InvocationExprent extends Exprent {
       boolean lambdaArgument = start < lstParameters.size()
         && lstParameters.get(start) instanceof NewExprent created
         && created.isLambda() && !created.isMethodReference();
+      // A lambda's invokedynamic inherits the call's line, but its body is a method whose first
+      // line says where the text sits: a body line later than the call means the source broke
+      // after the opening parenthesis.
+      int lambdaLine = lambdaArgument ? lambdaBodyLine((NewExprent) lstParameters.get(start)) : -1;
+      boolean lambdaStartsLater = lambdaLine >= 0 && callLine >= 0 && lambdaLine > callLine;
       // A varargs call's array holds the arguments; its elements are printed without a parameter
       // of their own. A first element whose own invoke is on a later line than the call started
       // the element on that later line: javac emits an invocation's line at its invoke, and the
@@ -1884,7 +2007,8 @@ public class InvocationExprent extends Exprent {
         && (firstLine > callLine
           || firstLine != callLine && RoundTrip.lineStartsHere(lstParameters.get(start))
              && !(ARG_AT_LINE_START.get() && firstLine < callLine && firstEnd == firstLine));
-      breakBeforeFirst = !lambdaArgument && (elementStartsLater || explicitStart);
+      breakBeforeFirst = (!lambdaArgument || lambdaStartsLater)
+        && (elementStartsLater || explicitStart || lambdaStartsLater);
       if (breakBeforeFirst) {
         buf.appendLineSeparator();
       } else {

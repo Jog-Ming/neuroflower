@@ -379,8 +379,11 @@ public class ClassWriter implements StatementWriter {
                     } else {
                     // The target's lambda body may start on a later line than the expression
                     // that creates the lambda; an expression lambda prints inline otherwise.
+                    // When the enclosing call already broke before this argument, the text starts
+                    // on the body's line and only the argument break remains.
                     boolean breakBody = creationLine >= 0
-                      && RoundTrip.methodLine(methodWrapper.methodStruct) > creationLine;
+                      && RoundTrip.methodLine(methodWrapper.methodStruct) > creationLine
+                      && !InvocationExprent.argumentStartedLine();
 
                     if (firstExpr instanceof ExitExprent)
                       codeBuffer.setStart(6); // skip return
@@ -2610,7 +2613,7 @@ public class ClassWriter implements StatementWriter {
   }
 
   /** Whether an expression carries a lambda argument anywhere inside it. */
-  private static boolean containsLambda(Exprent exprent) {
+  public static boolean containsLambda(Exprent exprent) {
     if (exprent instanceof NewExprent created && created.isLambda()) {
       return true;
     }

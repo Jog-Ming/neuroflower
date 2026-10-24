@@ -661,7 +661,7 @@ public final class RoundTrip {
     return lineAt(method, 0);
   }
 
-  private static int lineAt(StructMethod method, int offset) {
+  public static int lineAt(StructMethod method, int offset) {
     StructLineNumberTableAttribute lnt =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
     return lnt == null ? -1 : lnt.findLineNumber(offset);
