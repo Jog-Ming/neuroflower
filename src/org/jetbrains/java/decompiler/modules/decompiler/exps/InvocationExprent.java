@@ -2176,7 +2176,7 @@ public class InvocationExprent extends Exprent {
       buf.popNewlineGroup();
       if (closingParenStartsLine(buf)) {
         buf.appendLineSeparator().appendIndent(indent);
-      } else if (previousLine >= 0 && callLine >= 0 && previousLine != callLine
+      } else if (previousLine >= 0 && callLine >= 0 && previousLine > callLine
           && (!RoundTrip.selector("arg-entry")
               || RoundTrip.lineStartsHere(lstParameters.get(lstParameters.size() - 1)))) {
         buf.appendLineSeparator();
