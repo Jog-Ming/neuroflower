@@ -22,6 +22,13 @@ public class DirectoryResultSaver implements IResultSaver {
   @Override
   public void saveClassEntry(String path, String archiveName, String qualifiedName, String entryName, String content) {
     Path entryPath = this.root.resolve(entryName);
+    try {
+      // A class restored to the source file it was compiled in can sit one directory deeper
+      // than the package.
+      Files.createDirectories(entryPath.getParent());
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to save class", e);
+    }
 
     try (BufferedWriter writer = Files.newBufferedWriter(entryPath)) {
       if (content != null) {

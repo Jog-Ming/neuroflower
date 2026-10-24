@@ -19,6 +19,7 @@ import org.jetbrains.java.decompiler.main.plugins.PluginContext;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructContext;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructSourceFileAttribute;
 import org.jetbrains.java.decompiler.util.ClasspathScanner;
 import org.jetbrains.java.decompiler.util.JrtFinder;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -179,12 +180,35 @@ public class Fernflower implements IDecompiledData {
     }
     else {
       final int clazzIdx = entryName.lastIndexOf(".class");
-      if (clazzIdx == -1) {
-        return entryName + "." + extension;
-      } else {
-        return entryName.substring(0, clazzIdx) + "." + extension;
-      }
+      String name = clazzIdx == -1 ? entryName + "." + extension
+        : entryName.substring(0, clazzIdx) + "." + extension;
+      return "java".equals(extension) ? sourceFileName(cl, entryName, name) : name;
     }
+  }
+
+  /**
+   * javac records the compiled source file's name in every class it produced. A class can live
+   * in a file named after another class — a package-private type beside its public host — and
+   * the original name is the only way its bytes carry the same SourceFile attribute. Two such
+   * classes cannot share it, so a class whose source file is already a root class's own name
+   * goes into a directory of its own.
+   */
+  private String sourceFileName(StructClass cl, String entryName, String fallback) {
+    StructSourceFileAttribute source = cl.getAttribute(StructGeneralAttribute.ATTRIBUTE_SOURCE_FILE);
+    if (source == null) {
+      return fallback;
+    }
+    String fileName = source.getSourceFile(cl.getPool());
+    String simple = cl.qualifiedName.substring(cl.qualifiedName.lastIndexOf('/') + 1);
+    if (fileName == null || !fileName.endsWith(".java") || fileName.equals(simple + ".java")) {
+      return fallback;
+    }
+    int slash = entryName.lastIndexOf('/');
+    String directory = slash < 0 ? "" : entryName.substring(0, slash + 1);
+    String owner = cl.qualifiedName.substring(0, cl.qualifiedName.lastIndexOf('/') + 1)
+      + fileName.substring(0, fileName.length() - ".java".length());
+    return classProcessor.getMapRootClasses().containsKey(owner)
+      ? directory + simple + "/" + fileName : directory + fileName;
   }
 
   /** Restores named constants when the pool proves the original wrote one; never compiles. */

@@ -117,7 +117,9 @@ public final class Verifier {
   private FileResult scoreFile(Path source, Path originalClasses, List<Path> classpath, int release,
                                String stamp, Path compileCache) throws Exception {
     byte[] bytes = Files.readAllBytes(source);
-    String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + stamp);
+    // javac records the source file's own name in SourceFile; the same text under another
+    // name compiles to different bytes.
+    String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + source.getFileName() + "|" + stamp);
     Path cached = compileCache.resolve(key.substring(0, 2)).resolve(key + ".json");
     if (Files.exists(cached)) {
       Files.setLastModifiedTime(cached, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
@@ -212,7 +214,7 @@ public final class Verifier {
   static Compiled compile(Path source, List<Path> classpath, int release) throws IOException {
     byte[] sourceBytes = Files.readAllBytes(source);
     String key = Workspace.sha256(
-      Workspace.sha256(sourceBytes) + "|" + compileStamp(classpath, release));
+      Workspace.sha256(sourceBytes) + "|" + source.getFileName() + "|" + compileStamp(classpath, release));
     Path cached = classCache().resolve(key.substring(0, 2)).resolve(key + ".bin");
     if (Files.exists(cached)) {
       try {
