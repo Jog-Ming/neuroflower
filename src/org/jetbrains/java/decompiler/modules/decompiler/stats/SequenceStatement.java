@@ -128,7 +128,7 @@ public class SequenceStatement extends Statement {
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !st.isLabeled()
           && ifStatement.getIfstat() != null
-          && i == stats.size() - 1 && getParent() instanceof DoStatement
+          && i == stats.size() - 1 && endsLoopBody()
           && RoundTrip.printContinueGuard(ifStatement.getHeadexprent(), this)) {
         Exprent condition = ifStatement.getHeadexprent().getCondition();
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
@@ -483,6 +483,34 @@ public class SequenceStatement extends Statement {
   }
 
   /** True when this sequence is the body of a try-with-resources statement. */
+  /**
+   * Whether this sequence's completion reaches the loop head: it is the last thing every enclosing
+   * statement up to the loop runs, so a guard printed at its end skips nothing the loop still needs.
+   */
+  private boolean endsLoopBody() {
+    Statement stat = this;
+    for (Statement parent = stat.getParent(); parent != null; parent = stat.getParent()) {
+      if (parent instanceof DoStatement) {
+        return true;
+      }
+      if (parent instanceof SequenceStatement sequence) {
+        if (sequence.getStats().getLast() != stat) {
+          return false;
+        }
+      }
+      else if (parent instanceof IfStatement ifStatement) {
+        if (ifStatement.getIfstat() != stat) {
+          return false;
+        }
+      }
+      else {
+        return false;
+      }
+      stat = parent;
+    }
+    return false;
+  }
+
   private boolean isResourceBody() {
     return getParent() instanceof CatchStatement catchStatement && !catchStatement.getResources().isEmpty();
   }
