@@ -122,7 +122,7 @@ public final class ExitHelper {
           }
         }
 
-        if (dest != null) {
+        if (dest != null && !leavesGuardedRegion(ifBreakEdge != null ? ifBreakEdge : ifedge, ifst, dest)) {
           BasicBlockStatement newBlock = BasicBlockStatement.create();
           newBlock.setExprents(DecHelper.copyExprentList(dest.getExprents()));
 
@@ -200,7 +200,7 @@ public final class ExitHelper {
 
       StatEdge destedge = stat.getAllSuccessorEdges().get(0);
       Statement dest = isExitEdge(destedge);
-      if (dest == null) {
+      if (dest == null || leavesGuardedRegion(destedge, stat, dest)) {
         return ret;
       }
 
@@ -250,6 +250,28 @@ public final class ExitHelper {
     }
 
     return ret;
+  }
+
+  /**
+   * Whether this loop break leaves a region whose exit path runs hidden code: a try-with-resources
+   * close or a finally. The target's break jumps to that shared exit path, while the copied return
+   * inlines the cleanup at the return site and compiles to different instructions. Only a break out
+   * of a loop is kept: any other break is printed by its own label, which the copy dissolves.
+   */
+  private static boolean leavesGuardedRegion(StatEdge edge, Statement from, Statement dest) {
+    if (!(edge.closure instanceof DoStatement)) {
+      return false;
+    }
+    for (Statement parent = from.getParent(); parent != null; parent = parent.getParent()) {
+      if (parent.containsStatementStrict(dest)) {
+        return false;
+      }
+      if (parent instanceof CatchAllStatement
+        || parent instanceof CatchStatement catchStatement && !catchStatement.getResources().isEmpty()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static Statement isExitEdge(StatEdge edge) {
