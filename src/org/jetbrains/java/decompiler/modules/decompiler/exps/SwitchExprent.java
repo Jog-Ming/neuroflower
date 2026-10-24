@@ -224,17 +224,20 @@ public class SwitchExprent extends Exprent {
         return order;
       }
       List<StatEdge> edges = this.backing.getCaseEdges().get(i);
+      List<Exprent> values = this.backing.getCaseValues().get(i);
+      // A default block is the target of every key with no source label, so its edge list holds
+      // one edge per such key (and the printer skips those values). That is still the default's
+      // own block, and its offset orders it among the arms.
+      if (edges.contains(this.backing.getDefaultEdge())) {
+        if (defaultIndex >= 0) {
+          return order; // two defaults: leave it alone
+        }
+        defaultIndex = i;
+        continue;
+      }
       for (int j = 0; j < edges.size(); j++) {
-        if (edges.get(j) == this.backing.getDefaultEdge()) {
-          if (edges.size() > 1 || defaultIndex >= 0) {
-            return order; // default sharing an arm, or two defaults: leave it alone
-          }
-          defaultIndex = i;
-        } else {
-          List<Exprent> values = this.backing.getCaseValues().get(i);
-          if (j >= values.size() || !(values.get(j) instanceof ConstExprent) && !(values.get(j) instanceof FieldExprent)) {
-            return order; // patterns and other labels have ordering rules of their own
-          }
+        if (j >= values.size() || !(values.get(j) instanceof ConstExprent) && !(values.get(j) instanceof FieldExprent)) {
+          return order; // patterns and other labels have ordering rules of their own
         }
       }
       if (this.backing.getCaseGuards().size() > i && this.backing.getCaseGuards().get(i) != null) {
