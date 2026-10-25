@@ -3410,16 +3410,34 @@ public final class ConstantNames {
       if (cls == null) {
         return false;
       }
-      if ((cls.getAccessFlags() & CodeConstants.ACC_PUBLIC) == 0
-          && !packageName.equals(packageOf(name))) {
+      int dollar = name.lastIndexOf('$');
+      // A nested class's class-file flags say public while its InnerClasses entry carries the
+      // visibility the source declared (a protected or private member class). Naming it from
+      // another package is then a compile error, whatever the class file's own flag says.
+      int flags = dollar < 0 ? cls.getAccessFlags() : innerAccess(name, cls);
+      if ((flags & CodeConstants.ACC_PUBLIC) == 0 && !packageName.equals(packageOf(name))) {
         return false;
       }
-      int dollar = name.lastIndexOf('$');
       if (dollar < 0) {
         return true;
       }
       name = name.substring(0, dollar);
     }
+  }
+
+  /** The InnerClasses entry's flags for a nested class, falling back to the class file's own. */
+  private static int innerAccess(String name, StructClass cls) {
+    StructClass outer = DecompilerContext.getStructContext().getClass(name.substring(0, name.lastIndexOf('$')));
+    StructInnerClassesAttribute inner = outer == null ? null
+      : outer.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
+    if (inner != null) {
+      for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
+        if (name.equals(entry.innerName)) {
+          return entry.accessFlags;
+        }
+      }
+    }
+    return cls.getAccessFlags();
   }
 
   private static String simpleName(String internal) {
