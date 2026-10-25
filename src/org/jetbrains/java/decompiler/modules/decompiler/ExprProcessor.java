@@ -13,6 +13,7 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.plugins.PluginContext;
 import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
+import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdgeType;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.FieldDescriptor;
@@ -27,6 +28,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.StructContext;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructBootstrapMethodsAttribute;
@@ -40,6 +42,7 @@ import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.TextUtil;
 
@@ -1368,6 +1371,14 @@ public class ExprProcessor implements CodeConstants {
         && needsCaptureCast(leftType, invocation.getDeclaredGenericReturnType())) {
       doCastGenerics = true;
     }
+    // A target whose wildcard is a lower bound over a type variable of this scope (`? super S`)
+    // accepts no captured argument: javac cannot prove the value's capture is a supertype of S,
+    // whatever the value's own class is. The source cast the value to the declared target, and
+    // javac elides that checkcast when the erasures already match.
+    if (!doCastGenerics && !doCast && exprent instanceof InvocationExprent
+        && lowerBoundedWildcardTarget(leftType) && castableToErasure(exprent, leftType)) {
+      doCastGenerics = true;
+    }
     // A cast whose own type arguments violate the target's bounds cannot appear in a source that
     // compiled. The inference that produced it is wrong; passing the expression on lets javac infer
     // again, which is what the original source did.
@@ -1902,6 +1913,54 @@ public class ExprProcessor implements CodeConstants {
           && !named.containsKey(produced)) {
           return true;
         }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether a type variable can be written where the cast is printed. A class's own variables are
+   * not nameable from a static member, and a variable of an enclosing class is not either.
+   */
+  private static boolean nameableVariable(String name) {
+    MethodWrapper method = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    if (method == null || method.methodStruct == null) {
+      return false;
+    }
+    GenericMethodDescriptor signature = method.methodStruct.getSignature();
+    if (signature != null && signature.typeParameters.contains(name)) {
+      return true;
+    }
+    return !method.methodStruct.hasModifier(CodeConstants.ACC_STATIC);
+  }
+
+  /** Whether the value's erasure can be converted to the target's: the same class, a subtype, or Object. */
+  private static boolean castableToErasure(Exprent exprent, VarType target) {
+    VarType value = exprent.getExprType();
+    if (value == null || target.type != CodeType.OBJECT || target.arrayDim != 0 || target.value == null
+      || value.type != CodeType.OBJECT || value.arrayDim != 0 || value.value == null) {
+      return false;
+    }
+    if (value.value.equals(target.value) || "java/lang/Object".equals(value.value)) {
+      return true;
+    }
+    StructContext context = DecompilerContext.getStructContext();
+    return context != null && context.instanceOf(value.value, target.value);
+  }
+
+  /**
+   * Whether the type is an instantiation with a `? super T` argument naming a type variable that is
+   * in scope where the cast would be printed. A variable of the enclosing class is not nameable
+   * from a static member, and printing it would not compile.
+   */
+  private static boolean lowerBoundedWildcardTarget(VarType type) {
+    if (!(type instanceof GenericType generic) || generic.value == null) {
+      return false;
+    }
+    for (VarType argument : generic.getArguments()) {
+      if (argument instanceof GenericType wildcard && wildcard.getWildcard() == GenericType.WILDCARD_SUPER
+        && wildcard.type == CodeType.GENVAR && nameableVariable(wildcard.value)) {
+        return true;
       }
     }
     return false;
