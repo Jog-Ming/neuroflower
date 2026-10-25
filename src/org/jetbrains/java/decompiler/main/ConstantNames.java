@@ -3125,11 +3125,18 @@ public final class ConstantNames {
     }
     StructInnerClassesAttribute inner = cls.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
     if (inner != null) {
+      Map<String, Integer> classIndices = classIndices(cls);
       for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
         if (entry.innerName != null) {
           explained.add(entry.innerName);
         }
-        if (entry.enclosingName != null) {
+        // The attribute is written after every field and method, so it interns the inner class
+        // before the outer. An outer Class entry that sits below the inner one was interned
+        // earlier, by a folded constant naming in the code, and the attribute does not explain it.
+        Integer innerIndex = entry.innerName == null ? null : classIndices.get(entry.innerName);
+        Integer outerIndex = entry.enclosingName == null ? null : classIndices.get(entry.enclosingName);
+        if (entry.enclosingName != null
+            && (innerIndex == null || outerIndex == null || outerIndex > innerIndex)) {
           explained.add(entry.enclosingName);
         }
       }
@@ -4717,9 +4724,32 @@ public final class ConstantNames {
       boolean before = i == 0 || !isIdentifierPart(text.charAt(i - 1));
       int end = i + simple.length();
       boolean after = end >= text.length() || !isIdentifierPart(text.charAt(end));
-      if (before && after) {
+      if (before && after && !insideImport(text, i) && !afterAt(text, i)) {
         return true;
       }
+    }
+    return false;
+  }
+
+  /**
+   * An import names a class without interning it, and an annotation names a class through its
+   * descriptor: neither puts the class into the pool. A class the text reaches only that way is
+   * still evidence that the source named one of its constants.
+   */
+  private static boolean insideImport(String text, int position) {
+    int lineStart = text.lastIndexOf('\n', position) + 1;
+    String line = text.substring(lineStart, Math.min(text.length(), position));
+    return line.stripLeading().startsWith("import ");
+  }
+
+  /** Whether the nearest code character before this occurrence is an annotation's {@code @}. */
+  private static boolean afterAt(String text, int position) {
+    for (int i = position - 1; i >= 0; i--) {
+      char c = text.charAt(i);
+      if (c == ' ' || c == '\t') {
+        continue;
+      }
+      return c == '@';
     }
     return false;
   }
