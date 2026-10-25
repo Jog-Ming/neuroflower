@@ -525,6 +525,33 @@ public class FunctionExprent extends Exprent {
     return result;
   }
 
+  /**
+   * A cast javac inserts on its own: a self-typed call (`<T extends ArgumentBuilder<S,T>> T
+   * executes(...)`) erases to its bound, and the compiler casts the result back to the receiver's
+   * class before the next link uses it. The source never wrote that cast, the type it names is an
+   * erasure, and printing it raw makes the whole chain's inference fall back to the same bound.
+   * Recompiling the cast-free chain makes javac insert the very same checkcast.
+   */
+  private boolean selfTypedReceiverCast() {
+    if (!org.jetbrains.java.decompiler.modules.decompiler.RoundTrip.enabled() || lstOperands.size() < 2) {
+      return false;
+    }
+    VarType target = lstOperands.get(1).getExprType();
+    if (target == null || target.value == null || target.isGeneric()) {
+      return false;
+    }
+    if (!(lstOperands.get(0) instanceof InvocationExprent call) || call.getInstance() == null) {
+      return false;
+    }
+    VarType receiver = call.getInstance().getExprType();
+    if (receiver == null || !target.value.equals(receiver.value) || target.arrayDim != receiver.arrayDim) {
+      return false;
+    }
+    VarType declared = call.getDeclaredGenericReturnType();
+    return declared != null
+      && declared.type == org.jetbrains.java.decompiler.struct.gen.CodeType.GENVAR;
+  }
+
   @Override
   public List<Exprent> getAllExprents(List<Exprent> lst) {
     lst.addAll(this.lstOperands);
@@ -684,7 +711,8 @@ public class FunctionExprent extends Exprent {
       case IMM:
         return buf.append(wrapOperandString(lstOperands.get(0), true, indent).append(funcType.operator));
       case CAST:
-        if (!needsCast && (compilerCast || !RoundTrip.forceCast(this))) {
+        if (!needsCast && (compilerCast || !RoundTrip.forceCast(this))
+            || selfTypedReceiverCast()) {
           return buf.append(lstOperands.get(0).toJava(indent));
         }
         for (int i = 1; i < lstOperands.size(); i++) {
