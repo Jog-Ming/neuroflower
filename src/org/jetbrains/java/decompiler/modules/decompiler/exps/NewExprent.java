@@ -1593,6 +1593,13 @@ public class NewExprent extends Exprent {
     if (sam == null || sam.getSignature() == null || sam.getSignature().returnType == null) {
       return null;
     }
+    // A functional interface with no parameters gives javac nothing but the target to infer the
+    // reference's type arguments from; naming our own inference there pins whatever the printer
+    // happened to compute (ArrayList<E>::new where the stream's element type is what the
+    // collection must hold, and E belongs to the enclosing class).
+    if (sam.getSignature().parameterTypes.isEmpty()) {
+      return null;
+    }
     Map<VarType, VarType> map = new HashMap<>();
     iface.getSignature().genericType.mapGenVarsTo((GenericType) inferredLambdaType, map);
     VarType produced = unwrapWildcard(sam.getSignature().returnType.remap(map));
