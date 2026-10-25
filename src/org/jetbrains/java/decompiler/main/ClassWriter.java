@@ -369,16 +369,7 @@ public class ClassWriter implements StatementWriter {
                     // A block lambda records a line entry at its implicit return: that entry is
                     // the closing brace's line. An expression lambda's return has no entry of
                     // its own, so only an exact entry selects the block form.
-                    var dummy = root.getDummyExit();
-                    int retOffset = dummy == null || dummy.bytecode == null
-                      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
-                    int closingLine = retOffset < 0 ? -1 : RoundTrip.lineAtOffset(retOffset);
-                    int bodyExprLine = RoundTrip.sourceLine(firstExpr);
-                    boolean closingEntry = retOffset >= 0 && closingLine >= 0
-                      && closingLine != RoundTrip.lineAtOffset(retOffset - 1);
-                    if (closingEntry && bodyExprLine >= 0 && closingLine > bodyExprLine
-                      && RoundTrip.sourceLineEnd(firstExpr) < closingLine
-                      && !containsLambda(firstExpr)) {
+                    if (blockLambdaClosingLine(methodWrapper) >= 0) {
                       buffer.append(" {").appendLineSeparator();
                       methodLambdaToJava(node, wrapper, mt, buffer, indent + 1, !lambdaToAnonymous);
                       buffer.appendIndent(indent).append("}");
@@ -2644,6 +2635,41 @@ public class ClassWriter implements StatementWriter {
   }
 
   /** Whether an expression carries a lambda argument anywhere inside it. */
+  /**
+   * The line a block-printed lambda's closing brace sits on, or -1 when the body prints inline.
+   * A block lambda records a line entry at its implicit return: that entry is the closing brace's
+   * line, and an expression lambda's return has no entry of its own.
+   */
+  public static int blockLambdaClosingLine(MethodWrapper wrapper) {
+    if (wrapper == null || wrapper.root == null) {
+      return -1;
+    }
+    Statement firstStat = wrapper.root.getFirst();
+    if (!(firstStat instanceof BasicBlockStatement) || firstStat.getExprents() == null
+        || firstStat.getExprents().size() != 1) {
+      return -1;
+    }
+    Exprent firstExpr = firstStat.getExprents().get(0);
+    if (firstExpr instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent left
+        && left.isDefinition()
+        || firstExpr instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.THROW) {
+      return -1;
+    }
+    StructMethod struct = wrapper.methodStruct;
+    var dummy = wrapper.root.getDummyExit();
+    int retOffset = dummy == null || dummy.bytecode == null
+      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
+    int closingLine = retOffset < 0 ? -1 : RoundTrip.lineAt(struct, retOffset);
+    boolean closingEntry = retOffset >= 0 && closingLine >= 0
+      && closingLine != RoundTrip.lineAt(struct, retOffset - 1);
+    int bodyLine = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
+      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.nextSetBit(0));
+    int bodyEnd = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
+      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.previousSetBit(Integer.MAX_VALUE));
+    return closingEntry && bodyLine >= 0 && closingLine > bodyLine && bodyEnd < closingLine
+      ? closingLine : -1;
+  }
+
   public static boolean containsLambda(Exprent exprent) {
     if (exprent instanceof NewExprent created && created.isLambda()) {
       return true;

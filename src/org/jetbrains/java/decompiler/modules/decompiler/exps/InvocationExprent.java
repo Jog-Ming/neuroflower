@@ -1739,22 +1739,23 @@ public class InvocationExprent extends Exprent {
     }
     // The block form is chosen by the same evidence ClassWriter reads: a recorded closing-brace
     // line after the body's own lines.
-    StructMethod struct = wrapper.methodStruct;
-    DummyExitStatement dummy = wrapper.root.getDummyExit();
-    int retOffset = dummy == null || dummy.bytecode == null
-      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
-    int closingLine = retOffset < 0 ? -1 : RoundTrip.lineAt(struct, retOffset);
-    boolean closingEntry = retOffset >= 0 && closingLine >= 0
-      && closingLine != RoundTrip.lineAt(struct, retOffset - 1);
-    int bodyLine = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
-      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.nextSetBit(0));
-    int bodyEnd = firstExpr.bytecode == null || firstExpr.bytecode.isEmpty()
-      ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.previousSetBit(Integer.MAX_VALUE));
-    if (closingEntry && bodyLine >= 0 && closingLine > bodyLine && bodyEnd < closingLine
-      && !ClassWriter.containsLambda(firstExpr)) {
-      return false;
+    return ClassWriter.blockLambdaClosingLine(wrapper) < 0;
+  }
+
+  /** The line a block-printed lambda argument's closing brace sits on, or -1. */
+  private static int lambdaArgumentClosingLine(NewExprent lambda) {
+    VarType lambdaType = lambda.getNewType();
+    if (lambdaType == null) {
+      return -1;
     }
-    return true;
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambdaType.value);
+    if (node == null || node.lambdaInformation == null || node.lambdaInformation.is_method_reference
+        || node.getWrapper() == null) {
+      return -1;
+    }
+    MethodWrapper wrapper = node.getWrapper().getMethodWrapper(
+      node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor);
+    return wrapper == null ? -1 : ClassWriter.blockLambdaClosingLine(wrapper);
   }
 
   /**
@@ -2225,6 +2226,15 @@ public class InvocationExprent extends Exprent {
         int end = argument instanceof NewExprent created && created.getConstructor() != null
           ? RoundTrip.sourceLineEnd(created.getConstructor())
           : RoundTrip.sourceLineEnd(argument);
+        // A block lambda's text ends on its closing brace's line, which the target records on
+        // the lambda method's own table. The argument after it inherits that line, so the brace
+        // line is where this argument ended.
+        if (argument instanceof NewExprent lambda && lambda.isLambda() && !lambda.isMethodReference()) {
+          int closing = lambdaArgumentClosingLine(lambda);
+          if (closing >= 0) {
+            end = closing;
+          }
+        }
         // Only a later line is a break the original had; an equal or earlier one is inheritance
         // from the enclosing statement's marker. javac attributes the invoke to the first
         // argument's line, so a later argument at the call's own line was written on that line:
@@ -2236,6 +2246,10 @@ public class InvocationExprent extends Exprent {
         int previous = prevEndGate ? previousEnd : previousLine;
         boolean forced = !firstParameter && line >= 0 && previous >= 0 && line > previous
           && (!callLineGate || openingLine < 0 || line > openingLine);
+        // The target puts this argument on the line the previous one ends on, so the source did
+        // not break here: a width break would move the argument's own text onto a line it never
+        // had, and every entry that inherits this line would move with it.
+        boolean sameLine = !firstParameter && line >= 0 && previous >= 0 && line == previous;
 
         boolean savedAtLineStart = ARG_AT_LINE_START.get();
         ARG_AT_LINE_START.set(i == start ? breakBeforeFirst : forced);
@@ -2255,6 +2269,8 @@ public class InvocationExprent extends Exprent {
             buf.append(",");
             if (forced) {
               buf.appendLineSeparator();
+            } else if (sameLine) {
+              buf.append(" ");
             } else {
               buf.appendPossibleNewline(" ");
             }
