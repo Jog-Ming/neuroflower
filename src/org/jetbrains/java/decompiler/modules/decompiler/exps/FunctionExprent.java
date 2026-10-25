@@ -570,7 +570,12 @@ public class FunctionExprent extends Exprent {
     }
 
     TextBuffer buf = new TextBuffer();
-    buf.addBytecodeMapping(bytecode);
+    // A concat node's offsets are the union of its operands': registering them here would pin
+    // every operand's instruction to the line the whole expression starts on, hiding the lines
+    // the operand's own text begins. The operands register themselves where they print.
+    if (funcType != FunctionType.STR_CONCAT) {
+      buf.addBytecodeMapping(bytecode);
+    }
 
     // If we're an unsigned right shift or lower, this function can be represented as a single leftHand + functionType + rightHand operation.
     if (this.funcType.isArithmeticBinaryOperation()) {
