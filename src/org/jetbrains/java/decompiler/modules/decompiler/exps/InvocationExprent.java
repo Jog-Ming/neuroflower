@@ -1742,20 +1742,37 @@ public class InvocationExprent extends Exprent {
     return ClassWriter.blockLambdaClosingLine(wrapper) < 0;
   }
 
-  /** The line a block-printed lambda argument's closing brace sits on, or -1. */
-  private static int lambdaArgumentClosingLine(NewExprent lambda) {
+  /** The line a lambda argument's text ends on: its closing brace, or an expression body's end. */
+  private static int lambdaArgumentEndLine(NewExprent lambda) {
+    MethodWrapper body = lambdaBody(lambda);
+    if (body == null) {
+      return -1;
+    }
+    int closing = ClassWriter.blockLambdaClosingLine(body);
+    if (closing >= 0) {
+      return closing;
+    }
+    var dummy = body.root == null ? null : body.root.getDummyExit();
+    if (dummy == null || dummy.bytecode == null) {
+      return -1;
+    }
+    int exit = dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
+    return exit < 0 ? -1 : RoundTrip.lineAt(body.methodStruct, exit);
+  }
+
+  /** The synthetic method a lambda's body compiles to, or null. */
+  private static MethodWrapper lambdaBody(NewExprent lambda) {
     VarType lambdaType = lambda.getNewType();
     if (lambdaType == null) {
-      return -1;
+      return null;
     }
     ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambdaType.value);
     if (node == null || node.lambdaInformation == null || node.lambdaInformation.is_method_reference
         || node.getWrapper() == null) {
-      return -1;
+      return null;
     }
-    MethodWrapper wrapper = node.getWrapper().getMethodWrapper(
+    return node.getWrapper().getMethodWrapper(
       node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor);
-    return wrapper == null ? -1 : ClassWriter.blockLambdaClosingLine(wrapper);
   }
 
   /**
@@ -2230,9 +2247,9 @@ public class InvocationExprent extends Exprent {
         // the lambda method's own table. The argument after it inherits that line, so the brace
         // line is where this argument ended.
         if (argument instanceof NewExprent lambda && lambda.isLambda() && !lambda.isMethodReference()) {
-          int closing = lambdaArgumentClosingLine(lambda);
-          if (closing >= 0) {
-            end = closing;
+          int textEnd = lambdaArgumentEndLine(lambda);
+          if (textEnd >= 0) {
+            end = textEnd;
           }
         }
         // Only a later line is a break the original had; an equal or earlier one is inheritance
@@ -2244,8 +2261,15 @@ public class InvocationExprent extends Exprent {
         // ended; an argument that starts on it was written on the same source line.
         boolean prevEndGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_PREV_END);
         int previous = prevEndGate ? previousEnd : previousLine;
-        boolean forced = !firstParameter && line >= 0 && previous >= 0 && line > previous
-          && (!callLineGate || openingLine < 0 || line > openingLine);
+        // A lambda's invokedynamic inherits the call's line, but its body is a method of its own:
+        // a body line later than the call means the source wrote the lambda on that later line,
+        // and moving the argument there keeps the arrow with its body.
+        int argumentBodyLine = argument instanceof NewExprent lambda && lambda.isLambda()
+          && !lambda.isMethodReference() ? lambdaBodyLine((NewExprent) argument) : -1;
+        boolean lambdaLater = argumentBodyLine >= 0 && callLine >= 0 && argumentBodyLine > callLine;
+        boolean forced = !firstParameter
+          && (lambdaLater || line >= 0 && previous >= 0 && line > previous
+              && (!callLineGate || openingLine < 0 || line > openingLine));
         // The target puts this argument on the line the previous one ends on, so the source did
         // not break here: a width break would move the argument's own text onto a line it never
         // had, and every entry that inherits this line would move with it.
