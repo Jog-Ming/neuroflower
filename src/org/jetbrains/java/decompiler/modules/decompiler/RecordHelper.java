@@ -13,6 +13,7 @@ import org.jetbrains.java.decompiler.struct.*;
 import org.jetbrains.java.decompiler.struct.attr.StructAnnotationAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructAnnotationParameterAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructMethodParametersAttribute;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
@@ -274,8 +275,11 @@ public final class RecordHelper {
       varidx += md.params[i].stackSize;
     }
 
-    // Prune all field assignments from the canonical constructor
-    if (isCompactCanonicalConstructor(mw, cl)) {
+    // Prune all field assignments from the canonical constructor. A parameter the class file
+    // marks ACC_FINAL can only come from an explicit canonical constructor written with `final`
+    // (a compact constructor's parameters are recorded as mandated instead), so its assignments
+    // stay and the explicit form is printed.
+    if (!hasFinalParameter(mw) && isCompactCanonicalConstructor(mw, cl)) {
       mw.getOrBuildGraph().iterateExprents(exprent -> {
         if (exprent instanceof AssignmentExprent assignmentExprent && assignmentExprent.getLeft() instanceof FieldExprent field && field.getInstance() instanceof VarExprent variable && variable.getIndex() == 0) {
           return 2;
@@ -287,6 +291,20 @@ public final class RecordHelper {
       SecondaryFunctionsHelper.identifySecondaryFunctions(mw.root, mw.varproc);
       mw.isCompactRecordConstructor = true;
     }
+  }
+
+  private static boolean hasFinalParameter(MethodWrapper mw) {
+    StructMethodParametersAttribute parameters =
+      mw.methodStruct.getAttribute(StructGeneralAttribute.ATTRIBUTE_METHOD_PARAMETERS);
+    if (parameters == null) {
+      return false;
+    }
+    for (StructMethodParametersAttribute.Entry entry : parameters.getEntries()) {
+      if ((entry.myAccessFlags & CodeConstants.ACC_FINAL) != 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Checks for a block of assignments at the end that assigns all of the fields
