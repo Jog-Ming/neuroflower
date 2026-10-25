@@ -257,12 +257,20 @@ public final class LineAlign {
    * one and the same line can only mean the original wrote those statements on one line; the join
    * is proven by the table rather than guessed from a missing entry. Only offsets of one method are
    * joined, so two lambdas that happen to share a target line stay apart.
+   *
+   * <p>A line whose offsets include no entry start of their own is not a source line of the
+   * original: it inherits the line of the expression it continues, and joins it when the two
+   * settle on the same line. A line opening with a binary operator or a closing bracket cannot
+   * begin a statement, so a preceding line with no entry start of its own belongs to it.
    */
   private static String joinSameTargetLines(String text, String separator, String[] lines,
       Map<Pair<String, String>, BytecodeMappingTracer> tracers) {
     Map<Integer, Integer> target = new java.util.HashMap<>();
     Map<Integer, String> owner = new java.util.HashMap<>();
     Set<Integer> mixed = new HashSet<>();
+    Set<Integer> sharedOwner = new HashSet<>();
+    Map<Integer, Set<Integer>> targets = new java.util.HashMap<>();
+    Map<Integer, Set<Integer>> exact = new java.util.HashMap<>();
     for (Map.Entry<Pair<String, String>, BytecodeMappingTracer> tracerEntry : tracers.entrySet()) {
       String methodKey = tracerEntry.getKey().b;
       if (methodKey.startsWith("<field-init ")) {
@@ -271,6 +279,11 @@ public final class LineAlign {
       StructLineNumberTableAttribute table = lineTable(tracerEntry.getKey().a, methodKey);
       if (table == null) {
         continue;
+      }
+      int[] raw = table.getRawData();
+      Set<Integer> own = new HashSet<>();
+      for (int i = 0; i + 1 < raw.length; i += 2) {
+        own.add(raw[i]);
       }
       for (Map.Entry<Integer, Integer> entry : tracerEntry.getValue().getMapping().entrySet()) {
         int line = entry.getValue() + 1;
@@ -284,20 +297,37 @@ public final class LineAlign {
         }
         String method = owner.putIfAbsent(line, methodKey);
         if (method != null && !method.equals(methodKey)) {
+          sharedOwner.add(line);
           mixed.add(line);
+        }
+        targets.computeIfAbsent(line, k -> new java.util.TreeSet<>()).add(source);
+        if (own.contains(entry.getKey())) {
+          exact.computeIfAbsent(line, k -> new java.util.TreeSet<>()).add(source);
         }
       }
     }
     java.util.TreeSet<Integer> joins = new java.util.TreeSet<>();
     for (int line = 2; line <= lines.length; line++) {
-      Integer here = target.get(line);
-      Integer above = target.get(line - 1);
-      if (here == null || above == null || !here.equals(above)
-          || mixed.contains(line) || mixed.contains(line - 1)
-          || !owner.get(line).equals(owner.get(line - 1))) {
+      if (owner.get(line) == null || !owner.get(line).equals(owner.get(line - 1))
+          || sharedOwner.contains(line) || sharedOwner.contains(line - 1)
+          || !mergeableWithEvidence(lines, line)) {
         continue;
       }
-      if (mergeableWithEvidence(lines, line)) {
+      Integer here = target.get(line);
+      Integer above = target.get(line - 1);
+      boolean same = here != null && above != null && here.equals(above)
+        && !mixed.contains(line) && !mixed.contains(line - 1);
+      // A line the table gives no entry of its own is not a line of the original: every
+      // instruction printed on it inherits a line of the expression above, so the printer broke
+      // an expression the original kept on fewer lines. It belongs to the line above when the
+      // two settle on the same line, and to this one when the line above has no entry at all.
+      Integer resolved = resolvedTarget(line, targets, exact);
+      Integer aboveResolved = resolvedTarget(line - 1, targets, exact);
+      boolean inheritsAbove = !exact.containsKey(line) && resolved != null
+        && resolved.equals(aboveResolved);
+      boolean absorbsAbove = !exact.containsKey(line - 1) && aboveResolved == null
+        && resolved != null && targets.containsKey(line - 1) && continuesAbove(lines[line - 1]);
+      if (same || inheritsAbove || absorbsAbove) {
         joins.add(line);
       }
     }
@@ -320,6 +350,26 @@ public final class LineAlign {
       System.err.println("same-target joins " + joins.size());
     }
     return String.join(separator, edited);
+  }
+
+  /**
+   * The source line a printed line settles on, by the same rule the shift walk uses: its own
+   * entries first, else the one inherited line every offset agrees on.
+   */
+  private static Integer resolvedTarget(int line, Map<Integer, Set<Integer>> targets,
+      Map<Integer, Set<Integer>> exact) {
+    Set<Integer> own = exact.get(line);
+    if (own != null) {
+      return own.iterator().next();
+    }
+    Set<Integer> all = targets.get(line);
+    return all != null && all.size() == 1 ? all.iterator().next() : null;
+  }
+
+  /** A line that cannot begin a statement: it opens with a binary operator or a closing bracket. */
+  private static boolean continuesAbove(String line) {
+    String trimmed = line.trim();
+    return !trimmed.isEmpty() && "+-*/%&|^?:)".indexOf(trimmed.charAt(0)) >= 0;
   }
 
   /** A line that may be joined onto the one above: no comment, no blank, not in a text block. */
