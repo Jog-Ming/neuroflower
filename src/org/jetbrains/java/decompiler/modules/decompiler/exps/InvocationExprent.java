@@ -1307,7 +1307,11 @@ public class InvocationExprent extends Exprent {
           // a line of its own. Inside an argument list javac attributes the invoke to the first
           // argument's line, so an inherited entry proves nothing about the dot; the source's
           // own break is a receiver with its own exact entry exactly one line before the link.
+          // A lambda argument's body is another method, so the receiver's own offsets stop at the
+          // call that carries it; the receiver's text still ends on the body's last line, and a
+          // link on that line continues the receiver rather than starting a line of its own.
           boolean chainBreak = instance != null && RoundTrip.newlineBetween(instance, this)
+            && textEndLine(instance) < RoundTrip.sourceLine(this)
             && (!insideOwnArgumentList()
               || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass()
                  && (instance instanceof InvocationExprent
@@ -1740,6 +1744,20 @@ public class InvocationExprent extends Exprent {
     // The block form is chosen by the same evidence ClassWriter reads: a recorded closing-brace
     // line after the body's own lines.
     return ClassWriter.blockLambdaClosingLine(wrapper) < 0;
+  }
+
+  /** The line an expression's text ends on, counting the bodies of lambdas it passes. */
+  private static int textEndLine(Exprent exprent) {
+    int end = RoundTrip.sourceLineEnd(exprent);
+    for (Exprent inner : exprent.getAllExprents(true)) {
+      if (inner instanceof NewExprent lambda && lambda.isLambda() && !lambda.isMethodReference()) {
+        int bodyEnd = lambdaArgumentEndLine(lambda);
+        if (bodyEnd > end) {
+          end = bodyEnd;
+        }
+      }
+    }
+    return end;
   }
 
   /** The line a lambda argument's text ends on: its closing brace, or an expression body's end. */
