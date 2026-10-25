@@ -1771,11 +1771,18 @@ public class InvocationExprent extends Exprent {
       return closing;
     }
     var dummy = body.root == null ? null : body.root.getDummyExit();
-    if (dummy == null || dummy.bytecode == null) {
-      return -1;
+    int exit = dummy == null || dummy.bytecode == null
+      ? -1 : dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
+    if (exit >= 0) {
+      return RoundTrip.lineAt(body.methodStruct, exit);
     }
-    int exit = dummy.bytecode.previousSetBit(Integer.MAX_VALUE);
-    return exit < 0 ? -1 : RoundTrip.lineAt(body.methodStruct, exit);
+    // The dummy exit carries no offsets for every body shape; the last line the body's own table
+    // records is where its text ends then.
+    org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute table =
+      body.methodStruct.getAttribute(
+        org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    int[] raw = table == null ? null : table.getRawData();
+    return raw == null || raw.length < 2 ? -1 : raw[raw.length - 1];
   }
 
   /** The synthetic method a lambda's body compiles to, or null. */
