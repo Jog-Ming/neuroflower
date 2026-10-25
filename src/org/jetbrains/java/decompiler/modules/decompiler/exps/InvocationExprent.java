@@ -90,6 +90,8 @@ public class InvocationExprent extends Exprent {
   private int callerOpeningLine = -1;
   public boolean forceGenericQualfication = false;
   private final NullableConcurrentHashMap<VarType, VarType> genericsMap = new NullableConcurrentHashMap<>();
+  /** Type arguments recorded for a call whose variables the arguments leave unbound. */
+  private List<VarType> recordedGenericArgs;
   private boolean isInvocationInstance = false;
   /** The invocation whose receiver is currently being typed; set only for the duration. */
   private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
@@ -1187,6 +1189,41 @@ public class InvocationExprent extends Exprent {
             }
           }
 
+          // A record codec's field group is inferred from the forGetter lambda, and the field's
+          // recorded type is the only place its generic arguments exist. Handing the receiver that
+          // type lets the inference solve an accessor's type variable the arguments leave open.
+          if ("forGetter".equals(name) && lstParameters.size() == 1
+              && lstParameters.get(0) instanceof NewExprent getter && getter.isLambda()
+              && !getter.isMethodReference() && cl != null && cl.getSignature() != null
+              && cl.getSignature().fparameters.size() == 1) {
+            VarType recorded = lambdaBodyFieldType(getter);
+            if (recorded instanceof GenericType) {
+              java.util.Map<VarType, VarType> binding = new java.util.HashMap<>();
+              binding.put(GenericType.parse("T" + cl.getSignature().fparameters.get(0) + ";"), recorded);
+              VarType demand = cl.getSignature().genericType.remap(binding);
+              if (demand != null && demand != cl.getSignature().genericType) {
+                leftType = demand;
+              }
+              // `Codec.list(accessor())` beside a field of type List<C<A>>: the element's own
+              // argument is the accessor's only unbound variable, and its declared return type
+              // names where it goes.
+              if (recorded instanceof GenericType listed && listed.getArguments().size() == 1
+                  && listed.getArguments().get(0) instanceof GenericType element
+                  && element.getArguments().size() == 1
+                  && instance instanceof InvocationExprent optional
+                  && optional.getInstance() instanceof InvocationExprent listCall
+                  && "list".equals(listCall.getName())
+                  && "com/mojang/serialization/Codec".equals(listCall.getClassname())
+                  && listCall.getLstParameters().size() == 1
+                  && listCall.getLstParameters().get(0) instanceof InvocationExprent accessor
+                  && accessor.getDeclaredGenericReturnType() instanceof GenericType outerReturn
+                  && outerReturn.getArguments().size() == 1
+                  && outerReturn.getArguments().get(0) instanceof GenericType returned
+                  && returned.value.equals(element.value)) {
+                accessor.recordedGenericArgs = new ArrayList<>(element.getArguments());
+              }
+            }
+          }
           instance.setInvocationInstance();
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
           Boolean priorSourceTarget = OUTER_SOURCE_TARGET.get();
@@ -1327,8 +1364,10 @@ public class InvocationExprent extends Exprent {
           }
           buf.append(".");
           // Adds generic arguments to the invocation, so .m() becomes .<T>m()
+          List<VarType> printedArgs = genericArgs.isEmpty() && recordedGenericArgs != null
+            ? recordedGenericArgs : genericArgs;
           this.appendParameters(buf, witnessContradictsRecordedMethodReference() || witnessContradictsLambdaValue()
-            ? Collections.emptyList() : genericArgs);
+            ? Collections.emptyList() : printedArgs);
         }
 
         buf.addBytecodeMapping(bytecode);
@@ -1722,6 +1761,31 @@ public class InvocationExprent extends Exprent {
     MethodWrapper wrapper = node.getWrapper().getMethodWrapper(
       node.lambdaInformation.content_method_name, node.lambdaInformation.content_method_descriptor);
     return wrapper != null && inlineExpressionBody(wrapper) ? wrapper : null;
+  }
+
+  /** The recorded generic type of the field a forGetter lambda returns, or null. */
+  private static VarType lambdaBodyFieldType(NewExprent lambda) {
+    MethodWrapper body = lambdaBody(lambda);
+    if (body == null || body.root == null) {
+      return null;
+    }
+    Statement first = body.root.getFirst();
+    if (!(first instanceof BasicBlockStatement) || first.getExprents() == null
+        || first.getExprents().size() != 1) {
+      return null;
+    }
+    Exprent value = first.getExprents().get(0);
+    if (!(value instanceof ExitExprent exit) || exit.getExitType() != ExitExprent.Type.RETURN
+        || !(exit.getValue() instanceof FieldExprent field)) {
+      return null;
+    }
+    org.jetbrains.java.decompiler.struct.StructClass owner =
+      DecompilerContext.getStructContext().getClass(field.getClassname());
+    org.jetbrains.java.decompiler.struct.StructField member =
+      owner == null ? null : owner.getField(field.getName(), field.getDescriptor().descriptorString);
+    org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor signature =
+      member == null ? null : member.getSignature();
+    return signature == null ? null : signature.type;
   }
 
   /** Whether this lambda body prints as a single expression rather than a brace block. */
