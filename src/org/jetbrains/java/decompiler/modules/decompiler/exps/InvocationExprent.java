@@ -82,6 +82,7 @@ public class InvocationExprent extends Exprent {
   private LinkConstant bootstrapMethod;
   private List<PooledConstant> bootstrapArguments;
   private final List<VarType> genericArgs = new ArrayList<>();
+  private VarType inferredUpperBound;
   /** A witness this call prints that an unqualified name cannot carry: print the class too. */
   private boolean witnessQualifier = false;
   private VarType remappedInstType = null;
@@ -287,8 +288,59 @@ public class InvocationExprent extends Exprent {
   }
 
 
+  /** Whether the type mentions a type variable, i.e. something no target has fixed yet. */
+  private static boolean hasUnboundVariable(VarType type) {
+    if (type == null) {
+      return false;
+    }
+    if (type.type == CodeType.GENVAR) {
+      return true;
+    }
+    if (type instanceof GenericType generic) {
+      for (VarType argument : generic.getArguments()) {
+        if (hasUnboundVariable(argument)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The first target with every type variable the second one already fixed filled in. */
+  private static VarType mergeTargets(VarType primary, VarType fallback) {
+    if (!(primary instanceof GenericType first) || !(fallback instanceof GenericType second)
+      || first.value == null || !first.value.equals(second.value)
+      || first.getArguments().size() != second.getArguments().size()) {
+      return primary;
+    }
+    List<VarType> merged = new ArrayList<>(first.getArguments().size());
+    boolean changed = false;
+    for (int i = 0; i < first.getArguments().size(); i++) {
+      VarType here = first.getArguments().get(i);
+      VarType there = second.getArguments().get(i);
+      if (hasUnboundVariable(here) && there != null && !hasUnboundVariable(there)) {
+        merged.add(there);
+        changed = true;
+      } else {
+        merged.add(here);
+      }
+    }
+    return changed ? new GenericType(first.type, first.arrayDim, first.value, null, merged, first.getWildcard()) : primary;
+  }
+
   @Override
   public VarType getInferredExprType(VarType upperBound) {
+    // Printing re-infers the same call with a different target than the one it was first inferred
+    // against: an enclosing chain hands its receiver only its own still-open variables. Each pass
+    // fixes some of them, so the call keeps the target merged from every pass it has seen.
+    if (upperBound == null) {
+      upperBound = inferredUpperBound;
+    } else if (inferredUpperBound != null) {
+      upperBound = mergeTargets(upperBound, inferredUpperBound);
+      inferredUpperBound = upperBound;
+    } else {
+      inferredUpperBound = upperBound;
+    }
     if (desc == null) {
       StructClass cl = DecompilerContext.getStructContext().getClass(classname);
       desc = cl != null ? cl.getMethodRecursive(name, stringDescriptor) : null;
@@ -906,7 +958,7 @@ public class InvocationExprent extends Exprent {
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
             else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
-              && receiverRecordedValueDemand(fparams, ret, bounds)) {
+              && receiverRecordedValueDemand(fparams, ret, upperBound, bounds)) {
               // The printer has no value for some type variable of a call in receiver position.
               // The outer call's functional argument records the value it must return, and the
               // receiver's type argument is invariant in it: the recorded type pins the variable.
@@ -3993,7 +4045,7 @@ public class InvocationExprent extends Exprent {
    * those arguments). The witness is printed only when it is fully printable, its erasure
    * reproduces the call the pool recorded, and the call site belongs to this class.
    */
-  private boolean receiverRecordedValueDemand(List<String> fparams, VarType ret,
+  private boolean receiverRecordedValueDemand(List<String> fparams, VarType ret, VarType upperBound,
                                               Map<VarType, List<VarType>> bounds) {
     if (!isInvocationInstance || fparams.isEmpty() || ret == null || desc == null
       || ret.type != CodeType.OBJECT || !ret.isGeneric()) {
@@ -4068,6 +4120,18 @@ public class InvocationExprent extends Exprent {
       VarType value = bindings.get(variable);
       if (value == null) {
         value = genericsMap.get(variable);
+      }
+      // The printer defaults an unmentioned variable to its declared bound; the call's own target
+      // is the evidence that fixes it, and the recorded binding has nothing for that position.
+      if (upperBound != null && upperBound.isGeneric() && ret.isGeneric()
+        && ret.value != null && ret.value.equals(upperBound.value)) {
+        Map<VarType, VarType> projected = new HashMap<>();
+        ((GenericType)ret).mapGenVarsTo((GenericType)upperBound, projected);
+        VarType fromTarget = projected.get(variable);
+        if (fromTarget != null && !hasUnboundVariable(fromTarget) && isPrintableWitness(fromTarget)
+          && (value == null || isDeclaredBound(bounds.get(variable), value))) {
+          value = fromTarget;
+        }
       }
       if (!isPrintableWitness(value)) {
         return false;
