@@ -704,6 +704,45 @@ public final class RoundTrip {
     return startsLine && end >= 0 && start >= 0 && start > end;
   }
 
+  /**
+   * Whether a boolean operand begins the target's next line, judging by the operand's own first
+   * instruction. javac enters an invocation's line at its invoke, after its arguments, so an
+   * operand that starts with a call has no entry where its text starts; the call's own offset is
+   * the line the operand was written on.
+   */
+  public static boolean newlineBeforeOperand(Exprent before, Exprent after) {
+    if (!enabled() || after == null || !(after instanceof InvocationExprent)) {
+      return newlineBetweenOperands(before, after);
+    }
+    int first = after.bytecode == null || after.bytecode.isEmpty()
+      ? -1 : after.bytecode.nextSetBit(0);
+    if (first < 0) {
+      return newlineBetweenOperands(before, after);
+    }
+    int end = -1;
+    for (Exprent part : before.getAllExprents(true, false)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int line = lineAtOffset(part.bytecode.previousSetBit(Integer.MAX_VALUE));
+      if (line > end) {
+        end = line;
+      }
+    }
+    if (end < 0) {
+      end = sourceLineEnd(before);
+    }
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return false;
+    }
+    boolean startsLine = table.findLineNumber(first) != (first <= 0 ? -1 : table.findLineNumber(first - 1));
+    int start = lineAtOffset(first);
+    return startsLine && end >= 0 && start >= 0 && start > end;
+  }
+
   /** Whether the original source started the second expression on a later line than the first ended. */
   public static boolean newlineBetween(Exprent before, Exprent after) {
     int end = sourceLineEnd(before);

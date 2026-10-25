@@ -660,7 +660,7 @@ public class FunctionExprent extends Exprent {
       }
       buf.append(wrapOperandString(left, false, indent, true));
       boolean booleanBreak = (funcType == FunctionType.BOOLEAN_AND || funcType == FunctionType.BOOLEAN_OR)
-        && RoundTrip.newlineBetweenOperands(left, right);
+        && RoundTrip.newlineBeforeOperand(left, right);
       if (booleanBreak || RoundTrip.newlineBetween(left, right)) {
         buf.appendLineSeparator().appendIndent(indent + 1).append(funcType.operator).append(" ");
       } else {
