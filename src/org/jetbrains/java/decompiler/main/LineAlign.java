@@ -308,13 +308,15 @@ public final class LineAlign {
     }
     java.util.TreeSet<Integer> joins = new java.util.TreeSet<>();
     for (int line = 2; line <= lines.length; line++) {
-      if (owner.get(line) == null || !owner.get(line).equals(owner.get(line - 1))
-          || sharedOwner.contains(line) || sharedOwner.contains(line - 1)
+      if (owner.get(line) == null || sharedOwner.contains(line) || sharedOwner.contains(line - 1)
           || !mergeableWithEvidence(lines, line)) {
         continue;
       }
       Integer here = target.get(line);
       Integer above = target.get(line - 1);
+      // Two lines whose instructions the original's table puts on one and the same source line
+      // belong together even when the printer wrote them from two methods: an inline lambda's body
+      // starts on the line the enclosing expression continues, and both tables name that line.
       boolean same = here != null && above != null && here.equals(above)
         && !mixed.contains(line) && !mixed.contains(line - 1);
       // A line the table gives no entry of its own is not a line of the original: every
