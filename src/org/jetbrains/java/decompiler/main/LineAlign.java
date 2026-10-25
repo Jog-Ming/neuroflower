@@ -31,7 +31,12 @@ import java.util.TreeMap;
  * does not cost the file every other alignment.
  */
 public final class LineAlign {
-  static final String PADDING = "// line-number padding: restores the original LineNumberTable";
+  /**
+   * A blank line. Padding must not invent a comment: the source's own comments are unknown, and a
+   * comment line is a claim about text the class file does not record. A blank line shifts the
+   * following lines exactly the same way.
+   */
+  static final String PADDING = "";
   private static final String[][] RECORD_MEMBERS = {
     {"hashCode", "()I"},
     {"equals", "(Ljava/lang/Object;)Z"},
