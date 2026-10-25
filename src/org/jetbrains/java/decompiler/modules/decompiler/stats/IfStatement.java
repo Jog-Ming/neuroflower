@@ -285,6 +285,45 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (a) { if (b) { body } }` is folded into `if (a && b) { body }`: the same instructions,
+    // but javac marks a nested if statement's start and never marks the start of a boolean
+    // operand that only inherits the expression's line. When the target's table has an entry at
+    // an operand's first instruction, on a line later than the one before it ends, the source
+    // wrote the statements nested; print that run of ifs back.
+    if (ifstat != null && elsestat == null && !isLabeled() && condition instanceof IfExprent ifHead) {
+      List<Exprent> operands = booleanOperands(ifHead.getCondition());
+      if (operands.size() > 1) {
+        List<Integer> groups = new ArrayList<>();
+        groups.add(0);
+        for (int i = 1; i < operands.size(); i++) {
+          if (RoundTrip.newlineBetweenOperands(andOf(operands, 0, i), operands.get(i))) {
+            groups.add(i);
+          }
+        }
+        // A pattern variable declared by a later operand lives to the end of the same statement in
+        // the flat form; nesting puts its declaration inside a block, and javac then numbers local
+        // slots differently. The flat compile is the only one the table proves, so leave it.
+        boolean scoped = false;
+        for (int i = 1; i < operands.size(); i++) {
+          scoped |= declaresPattern(operands.get(i));
+        }
+        if (groups.size() > 1 && !scoped) {
+          for (int group = 0; group < groups.size(); group++) {
+            int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
+            IfExprent nested = (IfExprent) ifHead.copy();
+            nested.setCondition(andOf(operands, groups.get(group), to));
+            buf.appendIndent(indent + group).append(nested.toJava(indent + group))
+              .append(" {").appendLineSeparator();
+          }
+          buf.append(ExprProcessor.jmpWrapper(ifstat, indent + groups.size(), true));
+          for (int group = groups.size() - 1; group >= 0; group--) {
+            buf.appendIndent(indent + group).append("}").appendLineSeparator();
+          }
+          return buf;
+        }
+      }
+    }
+
     buf.appendIndent(indent);
     // Condition can be null in early processing stages
     if (condition != null) {
@@ -350,6 +389,47 @@ public class IfStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /** The operands of a boolean-and condition in the order the source wrote them. */
+  private static List<Exprent> booleanOperands(Exprent condition) {
+    List<Exprent> operands = new ArrayList<>();
+    collectOperands(condition, operands);
+    return operands;
+  }
+
+  private static void collectOperands(Exprent condition, List<Exprent> out) {
+    if (condition instanceof FunctionExprent function
+        && function.getFuncType() == FunctionType.BOOLEAN_AND
+        && function.getLstOperands().size() == 2) {
+      collectOperands(function.getLstOperands().get(0), out);
+      out.add(function.getLstOperands().get(1));
+    } else {
+      out.add(condition);
+    }
+  }
+
+  /** Whether the expression declares a pattern variable of its own. */
+  private static boolean declaresPattern(Exprent exprent) {
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** One operand, or the operands joined by `&&` again, as an if condition prints it. */
+  private static Exprent andOf(List<Exprent> operands, int from, int to) {
+    if (to - from == 1) {
+      return operands.get(from);
+    }
+    List<Exprent> pair = new ArrayList<>(2);
+    pair.add(andOf(operands, from, to - 1));
+    pair.add(operands.get(to - 1));
+    return new FunctionExprent(FunctionType.BOOLEAN_AND, pair, null);
   }
 
   private static boolean endsWithExit(Statement stat) {
