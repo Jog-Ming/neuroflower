@@ -1350,8 +1350,7 @@ public class InvocationExprent extends Exprent {
           boolean chainBreak = instance != null && RoundTrip.newlineBetween(instance, this)
             && textEndLine(instance) < RoundTrip.sourceLine(this)
             && (!insideOwnArgumentList()
-              || !ANONYMOUS_CREATION.get() && !inAnonymousOrLocalClass()
-                 && (instance instanceof InvocationExprent
+              || (instance instanceof InvocationExprent
                        && (RoundTrip.sourceLine(this) == RoundTrip.sourceLineEnd(instance) + 1
                            || RoundTrip.sourceLine(this) == printedEndLine(buf) + 1)
                      || chainReceiverBreak(instance, this)));
