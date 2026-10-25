@@ -2010,6 +2010,12 @@ public class ExprProcessor implements CodeConstants {
     if (left == null || right == null) {
       return false;
     }
+    // A lambda argument is typed by its target: javac infers its parameter and return types from
+    // the functional interface, so a cast around it is not evidence of a source cast and, when the
+    // call's own type argument was inferred from a sibling argument, names the wrong type.
+    if (ex instanceof NewExprent lambda && lambda.isLambda()) {
+      return false;
+    }
     // A cast is a source form the original wrote to make a call typecheck. Casts to a type whose
     // *direct* type argument is a wildcard (EntityType<? extends Mob>) are real and needed. An
     // invented one instead carries the wildcard one level deeper (App<Mu<? extends X>, T>), where
@@ -2219,7 +2225,12 @@ public class ExprProcessor implements CodeConstants {
       if (derivedVariable == null || derivedVariable.type != CodeType.GENVAR || !actual.containsKey(derivedVariable)) {
         continue;
       }
-      if (isWildcardArgument(actual.get(derivedVariable))) {
+      VarType derived = actual.get(derivedVariable);
+      // A wildcard, or a different type variable of the enclosing source, in an invariant
+      // position: neither is literally the target's variable, so the value does not assign and
+      // the source cast it (Constant<I> returned as CubicSpline<R>).
+      if (isWildcardArgument(derived)
+        || plainTypeVariable(derived) && named.containsKey(derived) && !derived.equals(targetArgument)) {
         return true;
       }
     }
