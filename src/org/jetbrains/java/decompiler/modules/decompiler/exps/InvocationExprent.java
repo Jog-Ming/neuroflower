@@ -465,6 +465,48 @@ public class InvocationExprent extends Exprent {
         if (instance != null && !isNew) {
           instance.setInvocationInstance();
 
+          // A builder's own type variables surface in the call's return type (CacheBuilder<K,V>
+          // .build returns LoadingCache<K,V>): the call's target instantiates them, and the
+          // receiver must be inferred with those same arguments, or the chain falls back to
+          // Object and every later member of it (a removal listener's notification) is raw.
+          if (upperBound != null && mthCls.getSignature() != null && desc.getSignature() != null) {
+            VarType declaredReturn = desc.getSignature().returnType;
+            if (declaredReturn != null && declaredReturn.type == CodeType.OBJECT
+              && declaredReturn.arrayDim == 0 && declaredReturn.isGeneric()
+              && upperBound.type == CodeType.OBJECT && upperBound.arrayDim == 0
+              && upperBound.isGeneric() && declaredReturn.value.equals(upperBound.value)) {
+              List<VarType> wanted = ((GenericType) declaredReturn).getArguments();
+              List<VarType> have = ((GenericType) upperBound).getArguments();
+              for (int i = 0; i < wanted.size() && i < have.size(); i++) {
+                VarType variable = wanted.get(i);
+                if (variable == null || variable.type != CodeType.GENVAR || have.get(i) == null) {
+                  continue;
+                }
+                VarType target = variable;
+                if (!mthCls.getSignature().fparameters.contains(variable.value)) {
+                  // A method-level variable (`<K1 extends K> build`): its bound names the class
+                  // variable the call's target actually instantiates.
+                  int index = desc.getSignature().typeParameters.indexOf(variable.value);
+                  if (index < 0 || index >= desc.getSignature().typeParameterBounds.size()) {
+                    continue;
+                  }
+                  java.util.List<VarType> varBounds = desc.getSignature().typeParameterBounds.get(index);
+                  VarType bound = varBounds.isEmpty() ? null : varBounds.get(0);
+                  if (bound == null || bound.type != CodeType.GENVAR
+                    || !mthCls.getSignature().fparameters.contains(bound.value)) {
+                    continue;
+                  }
+                  target = bound;
+                }
+                // The class's variables are pre-seeded with a dummy when nothing bound them; a
+                // value the call's target fixes replaces that placeholder.
+                VarType seeded = upperBoundsMap.get(target);
+                if (seeded == null || seeded == GenericType.DUMMY_VAR) {
+                  upperBoundsMap.put(target, have.get(i));
+                }
+              }
+            }
+          }
           VarType instUB = mthCls.getSignature() != null ? mthCls.getSignature().genericType.remap(upperBoundsMap) : upperBound;
           InvocationExprent priorOuter = OUTER_INVOCATION.get();
           Boolean priorSourceTarget = OUTER_SOURCE_TARGET.get();
