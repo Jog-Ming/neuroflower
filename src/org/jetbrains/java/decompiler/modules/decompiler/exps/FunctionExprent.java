@@ -736,7 +736,7 @@ public class FunctionExprent extends Exprent {
       case TERNARY:
         buf.pushNewlineGroup(indent, 1);
         buf.append(wrapOperandString(lstOperands.get(0), true, indent));
-        if (RoundTrip.newlineBetween(lstOperands.get(0), lstOperands.get(1))) {
+        if (RoundTrip.newlineBetweenOperands(lstOperands.get(0), lstOperands.get(1))) {
           buf.appendLineSeparator().appendIndent(indent + 1).append("? ");
         } else {
           buf.appendPossibleNewline(" ").append("? ");
@@ -745,7 +745,7 @@ public class FunctionExprent extends Exprent {
         try {
           markQualifierBreak(RoundTrip.sourceLine(this), lstOperands.get(1));
           buf.append(wrapOperandString(lstOperands.get(1), true, indent));
-          if (RoundTrip.newlineBetween(lstOperands.get(1), lstOperands.get(2))) {
+          if (RoundTrip.newlineBetweenOperands(lstOperands.get(1), lstOperands.get(2))) {
             buf.appendLineSeparator().appendIndent(indent + 1).append(": ");
           } else {
             buf.appendPossibleNewline(" ").append(": ");
