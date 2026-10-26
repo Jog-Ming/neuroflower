@@ -1303,6 +1303,19 @@ public final class RoundTrip {
       }
     }
     if (!(lastEnd >= 0 && lastEnd < bodyStart && returns.get(lastEnd))) {
+      // `if (!C) { return; }` where the exit is reached by falling out of a finally copy: the
+      // branch skips a block that runs the copy and then returns, and lands right after it. The
+      // return has to lie before the arm; when the arm holds it already, the printer's form is the
+      // guard itself and negating the condition would invert a correct one.
+      if (selector("finallyguard")) {
+        java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+        Integer target = targets == null ? null : targets.get(lastEnd);
+        int exit = target == null ? -1 : finallyCopyReturnBefore(method, target, bodyStart);
+        if (exit >= 0) {
+          markGuardExit(method, exit);
+          return negateCondition(condition);
+        }
+      }
       return null;
     }
     if (condition instanceof FunctionExprent function && function.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT) {
@@ -1322,6 +1335,29 @@ public final class RoundTrip {
     }
     markGuardExit(method, lastEnd);
     return negateCondition(condition);
+  }
+
+  /** The void return a finally copy falls out to, when the branch target is its end, else -1. */
+  private static int finallyCopyReturnBefore(StructMethod method, int target, int bodyStart) {
+    java.util.Set<Integer> copies = FINALLY_COPY_ENDS.get(method);
+    BitSet returns = VOID_RETURNS.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (copies == null || returns == null || ends == null) {
+      return -1;
+    }
+    for (Integer copyEnd : copies) {
+      int next = -1;
+      for (Integer start : ends.keySet()) {
+        if (start >= copyEnd && (next < 0 || start < next)) {
+          next = start;
+        }
+      }
+      Integer end = next < 0 ? null : ends.get(next);
+      if (end != null && returns.get(next) && end == target && next < bodyStart) {
+        return next;
+      }
+    }
+    return -1;
   }
 
   /**
