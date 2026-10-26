@@ -15,24 +15,38 @@ import java.util.List;
 
 public class StructTypeAnnotationAttribute extends StructGeneralAttribute {
   private List<TypeAnnotation> annotations = Collections.emptyList();
+  /**
+   * One row of a {@code localvar_target} table. A single annotation can cover several locals, so the
+   * path and annotation are shared and only the range and slot vary.
+   */
+  private List<LocalTypeAnnotation> localAnnotations = Collections.emptyList();
+
+  public record LocalTypeAnnotation(int startPc, int length, int index, TypeAnnotation.PathValue[] path, AnnotationExprent annotation) {
+  }
 
   @Override
   public void initContent(DataInputFullStream data, ConstantPool pool, BytecodeVersion version) throws IOException {
     int len = data.readUnsignedShort();
     if (len > 0) {
       annotations = new ArrayList<>(len);
+      localAnnotations = new ArrayList<>();
       for (int i = 0; i < len; i++) {
-        annotations.add(parse(data, pool));
+        parse(data, pool);
+      }
+      if (localAnnotations.isEmpty()) {
+        localAnnotations = Collections.emptyList();
       }
     }
     else {
       annotations = Collections.emptyList();
+      localAnnotations = Collections.emptyList();
     }
   }
 
-  private static TypeAnnotation parse(DataInputStream data, ConstantPool pool) throws IOException {
+  private void parse(DataInputStream data, ConstantPool pool) throws IOException {
     int targetType = data.readUnsignedByte();
     int target = targetType << 24;
+    int[] localRows = null;
 
     switch (targetType) {
       case TypeAnnotation.CLASS_TYPE_PARAMETER:
@@ -63,7 +77,13 @@ public class StructTypeAnnotationAttribute extends StructGeneralAttribute {
 
       case TypeAnnotation.LOCAL_VARIABLE:
       case TypeAnnotation.RESOURCE_VARIABLE:
-        data.skipBytes(data.readUnsignedShort() * 6);
+        int count = data.readUnsignedShort();
+        localRows = new int[count * 3];
+        for (int i = 0; i < count; i++) {
+          localRows[i * 3] = data.readUnsignedShort();
+          localRows[i * 3 + 1] = data.readUnsignedShort();
+          localRows[i * 3 + 2] = data.readUnsignedShort();
+        }
         break;
 
       case TypeAnnotation.FIELD:
@@ -83,11 +103,22 @@ public class StructTypeAnnotationAttribute extends StructGeneralAttribute {
 
     AnnotationExprent annotation = StructAnnotationAttribute.parseAnnotation(data, pool);
 
-    return new TypeAnnotation(target, path, annotation);
+    annotations.add(new TypeAnnotation(target, path, annotation));
+
+    if (localRows != null) {
+      for (int i = 0; i < localRows.length; i += 3) {
+        localAnnotations.add(new LocalTypeAnnotation(localRows[i], localRows[i + 1], localRows[i + 2], path, annotation));
+      }
+    }
   }
 
   public List<TypeAnnotation> getAnnotations() {
     return annotations;
+  }
+
+  /** The annotations written against local variables, one entry per (range, slot) row. */
+  public List<LocalTypeAnnotation> getLocalAnnotations() {
+    return localAnnotations;
   }
 
   public void setAnnotations(List<TypeAnnotation> annotations) {

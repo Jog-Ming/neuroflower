@@ -31,7 +31,9 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.struct.match.MatchEngine;
 import org.jetbrains.java.decompiler.struct.match.MatchNode;
 import org.jetbrains.java.decompiler.struct.match.MatchNode.RuleValue;
+import org.jetbrains.java.decompiler.struct.attr.StructTypeAnnotationAttribute;
 import org.jetbrains.java.decompiler.util.InterpreterUtil;
+import org.jetbrains.java.decompiler.util.Key;
 import org.jetbrains.java.decompiler.util.Pair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
@@ -118,6 +120,48 @@ public class VarExprent extends Exprent implements Pattern {
     return var;
   }
 
+  /**
+   * Type annotations javac wrote against this local's range, in the form the type printer wants.
+   * A {@code localvar_target} row names the range by start offset and slot, so the definition's own
+   * store offset and the target slot identify it.
+   */
+  private List<Pair<java.util.Queue<TypeAnnotation.PathValue>, AnnotationExprent>> localTypeAnnotations() {
+    MethodWrapper method = (MethodWrapper) DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    if (method == null || method.methodStruct == null || bytecode == null || bytecode.isEmpty()) {
+      return java.util.Collections.emptyList();
+    }
+    int offset = bytecode.nextSetBit(0);
+    int slot = index;
+    if (processor != null) {
+      Integer original = processor.getVarOriginalIndex(index);
+      if (original != null) {
+        slot = original;
+      }
+    }
+    List<Pair<java.util.Queue<TypeAnnotation.PathValue>, AnnotationExprent>> result = null;
+    for (Key<?> key : new Key<?>[]{
+      StructGeneralAttribute.ATTRIBUTE_RUNTIME_VISIBLE_TYPE_ANNOTATIONS,
+      StructGeneralAttribute.ATTRIBUTE_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS}) {
+      @SuppressWarnings("unchecked")
+      StructTypeAnnotationAttribute attribute =
+        method.methodStruct.getAttribute((Key<StructTypeAnnotationAttribute>) key);
+      if (attribute == null) {
+        continue;
+      }
+      for (StructTypeAnnotationAttribute.LocalTypeAnnotation local : attribute.getLocalAnnotations()) {
+        // The table starts the range after the store, so the store's own offset sits one byte earlier.
+        if (local.index() != slot || offset < local.startPc() - 1 || offset >= local.startPc() + local.length()) {
+          continue;
+        }
+        if (result == null) {
+          result = new java.util.ArrayList<>(1);
+        }
+        result.add(Pair.of(new java.util.ArrayDeque<>(Arrays.asList(local.path())), local.annotation()));
+      }
+    }
+    return result == null ? java.util.Collections.<Pair<java.util.Queue<TypeAnnotation.PathValue>, AnnotationExprent>>emptyList() : result;
+  }
+
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buffer = new TextBuffer();
@@ -148,7 +192,12 @@ public class VarExprent extends Exprent implements Pattern {
         if (name.equals(ExprProcessor.UNREPRESENTABLE_TYPE_STRING) || isIntersectionType) {
           buffer.append("var");
         } else {
-          buffer.appendCastTypeName(definitionType);
+          List<Pair<java.util.Queue<TypeAnnotation.PathValue>, AnnotationExprent>> localAnnotations = localTypeAnnotations();
+          if (localAnnotations.isEmpty()) {
+            buffer.appendCastTypeName(definitionType);
+          } else {
+            buffer.appendCastTypeName(definitionType, localAnnotations, java.util.Collections.emptySet());
+          }
         }
 
         buffer.append(" ");
