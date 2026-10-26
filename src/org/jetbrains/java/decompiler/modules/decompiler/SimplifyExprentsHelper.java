@@ -655,6 +655,12 @@ public class SimplifyExprentsHelper {
         return false;
       }
 
+      // The target ran the increment before the next statement loaded anything: the source wrote
+      // `++x;` on its own line, and inlining would move the iinc behind the receiver load.
+      if (RoundTrip.ppmmStandsAlone(func, next)) {
+        return false;
+      }
+
       // Try to find the next use of the variable
       Pair<Exprent, VarExprent> usage = findFirstValidUsage(var, next);
 

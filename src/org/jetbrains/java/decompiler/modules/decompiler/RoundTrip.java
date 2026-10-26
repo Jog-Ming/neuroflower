@@ -825,6 +825,20 @@ public final class RoundTrip {
     return end;
   }
 
+  /**
+   * True when the target ran this increment before anything the next statement loads, which is what
+   * `++x; use(x);` compiles to: javac evaluates the statement's own side effect first. The inlined
+   * form `use(++x)` loads the receiver (or the first argument) before the increment instead.
+   */
+  public static boolean ppmmStandsAlone(Exprent ppmm, Exprent next) {
+    if (!selector("ppmminline")) {
+      return false;
+    }
+    int inc = firstOffsetOf(ppmm);
+    int nxt = firstOffsetOf(next);
+    return inc >= 0 && nxt >= 0 && inc < nxt;
+  }
+
   /** The smallest instruction offset any part of the expression owns, or -1. */
   private static int firstOffsetOf(Exprent exprent) {
     int first = -1;
