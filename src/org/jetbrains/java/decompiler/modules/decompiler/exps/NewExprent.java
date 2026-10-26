@@ -387,6 +387,20 @@ public class NewExprent extends Exprent {
       || element instanceof FunctionExprent;
   }
 
+  /**
+   * The enclosing call's line when this creation's `new` has no line-table entry of its own.
+   * The allocation then inherits the preceding instruction's line, which says nothing about
+   * where the creation's text sits; written as an argument, it sits on the enclosing call's
+   * line, which is the only line the first argument may be compared with.
+   */
+  private int enclosingCreationLine() {
+    int newOffset = bytecode == null || bytecode.isEmpty() ? -1 : bytecode.nextSetBit(0);
+    if (newOffset > 0 && !RoundTrip.lineStartsAt(newOffset) && InvocationExprent.inArgument()) {
+      return InvocationExprent.enclosingCallLine();
+    }
+    return -1;
+  }
+
   /** An element whose first token is on its own line: not a chained call's later qualifier. */
   private static boolean startsOnItsLine(Exprent element) {
     if (element instanceof InvocationExprent invocation && invocation.getInstance() != null) {
@@ -480,6 +494,7 @@ public class NewExprent extends Exprent {
         }
         try {
           constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
+          constructor.setCallerEnclosingLine(enclosingCreationLine());
           buf.append(constructor.appendParamList(indent));
         } finally {
           if (anonymousCreation) {
@@ -572,6 +587,11 @@ public class NewExprent extends Exprent {
         }
 
         buf.append("new ");
+        // The allocation's own instruction sits where `new` is printed. Without this mapping the
+        // line aligner cannot see the line the allocation is on: the enclosing statement's store
+        // is mapped at the statement's start, so an allocation on a later line would be pulled
+        // back to the declaration's.
+        buf.addBytecodeMapping(bytecode);
 
         String typename = ExprProcessor.getTypeName(newType);
         if (enclosing == null) {
@@ -602,6 +622,7 @@ public class NewExprent extends Exprent {
             // would pin javac to a type the target rejects, so the source wrote the diamond.
             buf.append("<>");
             constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
+            constructor.setCallerEnclosingLine(enclosingCreationLine());
             buf.append('(').append(constructor.appendParamList(indent)).append(')');
             return buf;
           }
@@ -620,6 +641,7 @@ public class NewExprent extends Exprent {
             appendParameters(buf, args);
           }
           constructor.setCallerOpeningLine(RoundTrip.sourceLine(this));
+          constructor.setCallerEnclosingLine(enclosingCreationLine());
           buf.append('(').append(constructor.appendParamList(indent)).append(')');
         }
       }

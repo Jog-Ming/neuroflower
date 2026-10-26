@@ -88,6 +88,12 @@ public class InvocationExprent extends Exprent {
   private VarType remappedInstType = null;
   /** The line the call's own token sits on, when the printer of a constructor knows it. */
   private int callerOpeningLine = -1;
+  /**
+   * The line of the call whose argument list holds this creation, when the creation's `new` has
+   * no line-table entry of its own: its text then sits on that enclosing call's line, and only
+   * that line may be compared with the first argument's.
+   */
+  private int callerEnclosingLine = -1;
   public boolean forceGenericQualfication = false;
   private final NullableConcurrentHashMap<VarType, VarType> genericsMap = new NullableConcurrentHashMap<>();
   /** Type arguments recorded for a call whose variables the arguments leave unbound. */
@@ -1815,12 +1821,35 @@ public class InvocationExprent extends Exprent {
     for (Exprent inner : exprent.getAllExprents(true)) {
       if (inner instanceof NewExprent lambda && lambda.isLambda() && !lambda.isMethodReference()) {
         int bodyEnd = lambdaArgumentEndLine(lambda);
+        // An expression-bodied lambda returns its body's value, and javac attributes that
+        // return to the lambda expression's own first line; the dummy exit's line is therefore
+        // not where the body's text ends. The greatest line the body's own table records is.
+        int tableEnd = lambdaBodyLastLine(lambda);
+        if (tableEnd > bodyEnd) {
+          bodyEnd = tableEnd;
+        }
         if (bodyEnd > end) {
           end = bodyEnd;
         }
       }
     }
     return end;
+  }
+
+  /** The greatest line the lambda body's own table records, or -1. */
+  private static int lambdaBodyLastLine(NewExprent lambda) {
+    MethodWrapper body = lambdaBody(lambda);
+    org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute table =
+      body == null || body.methodStruct == null ? null : body.methodStruct.getAttribute(
+        org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    int[] raw = table == null ? null : table.getRawData();
+    int last = -1;
+    if (raw != null) {
+      for (int i = 1; i < raw.length; i += 2) {
+        last = Math.max(last, raw[i]);
+      }
+    }
+    return last;
   }
 
   /** The line a lambda argument's text ends on: its closing brace, or an expression body's end. */
@@ -1962,6 +1991,11 @@ public class InvocationExprent extends Exprent {
   /** Tells the argument printer the line the call's own token sits on, from its `new`. */
   public void setCallerOpeningLine(int line) {
     callerOpeningLine = line;
+  }
+
+  /** Tells the argument printer the enclosing call's line when the `new` has no entry of its own. */
+  public void setCallerEnclosingLine(int line) {
+    callerEnclosingLine = line;
   }
 
   public TextBuffer appendParamList(int indent) {
@@ -2254,8 +2288,13 @@ public class InvocationExprent extends Exprent {
       // line, so when the creation is itself an argument the enclosing call's line is the one
       // its text sits on, and a later first argument only says a chain inside it broke.
       boolean insideCall = OUTER_CALL_LINE.get()[0] >= 0 && OUTER_CALL_AT.get()[0] == RoundTrip.currentMethod();
+      // A creation's `new` carries a line of its own only when the target's table starts one
+      // there; an inherited line is not where the creation's text sits. A creation written as
+      // an argument sits on the enclosing call's line, and only that line may be compared with
+      // the first argument's -- otherwise an argument the target kept inline is moved away.
+      int creationLine = callerEnclosingLine > callerOpeningLine ? callerEnclosingLine : callerOpeningLine;
       boolean constructorStartLater = callerOpeningLine >= 0 && start < lstParameters.size()
-        && RoundTrip.sourceLine(lstParameters.get(start)) > callerOpeningLine;
+        && RoundTrip.sourceLine(lstParameters.get(start)) > creationLine;
       breakBeforeFirst = (!lambdaArgument || lambdaStartsLater)
         && (elementStartsLater || explicitStart || constructorStartLater || lambdaStartsLater);
       if (breakBeforeFirst) {
