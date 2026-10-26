@@ -2678,6 +2678,39 @@ public final class RoundTrip {
   }
 
   /**
+   * The slots the target's table declares inside this switch arm's own instruction range. A slot
+   * that two arms declare is proof the source braced them: unbraced arms share the switch's block,
+   * so javac would have to give the second one a fresh slot instead of reusing a dead one.
+   */
+  public static java.util.Map<Integer, int[]> targetSlotsDeclaredIn(Statement arm, java.util.Set<Integer> own) {
+    java.util.Map<Integer, int[]> slots = new java.util.HashMap<>();
+    if (!selector("armbraces") || arm == null) {
+      return slots;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return slots;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return slots;
+    }
+    int start = firstOffset(arm);
+    // The arm's own exprents bound the range; the block's last instruction can overshoot into
+    // the next arm and would attribute that arm's locals to this one.
+    int end = lastOffset(arm);
+    if (start < 0 || end < 0) {
+      return slots;
+    }
+    table.getRange(start, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= start && v.getStart() <= end)
+      .filter(v -> own.isEmpty() || own.contains(v.getIndex()))
+      .forEach(v -> slots.put(v.getIndex(), new int[]{v.getStart(), v.getEnd()}));
+    return slots;
+  }
+
+  /**
    * True when one of these arms yields: the switch is an expression printed in statement form, and
    * its arms have to cover every input, so a synthesized default cannot be left out.
    */

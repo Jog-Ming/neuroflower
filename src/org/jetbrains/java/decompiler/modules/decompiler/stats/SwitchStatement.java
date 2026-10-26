@@ -155,6 +155,30 @@ public class SwitchStatement extends Statement {
       }
     }
 
+    // A slot two arms declare in the target's table: the first arm's local died at its closing
+    // brace and javac handed the slot to the next arm, which only a braced arm can do.
+    Set<Statement> bracedEarly = new HashSet<>();
+    List<Map<Integer, int[]>> armSlots = new ArrayList<>();
+    for (Statement arm : caseStatements) {
+      armSlots.add(RoundTrip.targetSlotsDeclaredIn(arm, ownSlots(arm)));
+    }
+    for (int a = 0; a < armSlots.size(); a++) {
+      for (int b = a + 1; b < armSlots.size(); b++) {
+        int armEnd = RoundTrip.lastOffset(caseStatements.get(a));
+        for (Map.Entry<Integer, int[]> first : armSlots.get(a).entrySet()) {
+          int[] second = armSlots.get(b).get(first.getKey());
+          // The earlier local has to die at its arm's closing brace and the later one to start
+          // with its arm: a local declared in a nested block dies inside the arm instead.
+          if (second != null && first.getValue()[1] <= second[0]
+              && armEnd >= 0 && first.getValue()[1] >= armEnd - 1) {
+            bracedEarly.add(caseStatements.get(a));
+            bracedEarly.add(caseStatements.get(b));
+          }
+        }
+      }
+    }
+    braced.addAll(bracedEarly);
+
     VarType switch_type = headexprent.get(0).getExprType();
 
     // The instruction just after the whole switch: an arm whose block ends with a jump landing
@@ -249,6 +273,14 @@ public class SwitchStatement extends Statement {
       if (braced.contains(stat)) {
         buf.appendIndent(indent + 1);
         buf.append("}");
+        // The source wrote `} break;` for an arm braced to scope its locals; the same conditions
+        // that decide a dropped `break` apply, since the brace does not change reachability.
+        if (bracedEarly.contains(stat) && switchEnd >= 0 && i != lastPrinted
+            && guard == null && !patternArm
+            && RoundTrip.canCompleteNormally(stat) && !RoundTrip.printsExplicitJump(stat)
+            && RoundTrip.jumpsFromEnd(stat, switchEnd)) {
+          buf.append(" break;");
+        }
         buf.appendLineSeparator();
       }
     }
@@ -260,6 +292,22 @@ public class SwitchStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /** The slot indices this arm declares at its own level, not inside a nested statement. */
+  private static Set<Integer> ownSlots(Statement arm) {
+    Set<Integer> slots = new HashSet<>();
+    for (Exprent definition : arm.getVarDefinitions()) {
+      for (Exprent part : definition.getAllExprents(true, true)) {
+        if (part instanceof VarExprent var && var.isDefinition()) {
+          slots.add(var.getIndex());
+        }
+      }
+      if (definition instanceof VarExprent var && var.isDefinition()) {
+        slots.add(var.getIndex());
+      }
+    }
+    return slots;
   }
 
   /**
