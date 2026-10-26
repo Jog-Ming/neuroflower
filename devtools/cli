@@ -5,6 +5,7 @@
 #   ./devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class]
 #   ./devtools/cli tree <version> [--only Class]
 #   ./devtools/cli score <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+#   ./devtools/cli compile <version> <Class> [--no-cache] [--options "..."]
 #   ./devtools/cli corpus <version> --ground-truth <dir>
 #   ./devtools/cli dataset <version>
 #   ./devtools/cli reports [--version V] [--limit N]

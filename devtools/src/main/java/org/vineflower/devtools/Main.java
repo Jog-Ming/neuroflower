@@ -24,6 +24,7 @@ import java.util.concurrent.Future;
  *   decompile &lt;version&gt; [--no-cache] [--threads N] [--only Class] [--options "..."]
  *   tree      &lt;version&gt; [--only Class]
  *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+ *   compile   &lt;version&gt; &lt;Class&gt;
  *   corpus    &lt;version&gt; --ground-truth &lt;dir&gt;
  *   dataset   &lt;version&gt;
  *   clean     [--trees] [--compile] [--downloads] [--all]
@@ -90,6 +91,36 @@ public final class Main {
           boolean json = rest.contains("--json");
           Path tree = decompiler.tree(version, threads, noCache, only, optionsFlag(rest));
           new Verifier(workspace, minecraft).score(version, tree, only, threads, json);
+        }
+      }
+      case "compile" -> {
+        List<String> positional = positionals(rest);
+        if (positional.size() < 2) {
+          throw new IllegalArgumentException("usage: compile <version> <Class> [--no-cache] [--options \"...\"]");
+        }
+        String version = positional.get(0);
+        String className = positional.get(1);
+        boolean noCache = rest.contains("--no-cache");
+        Path tree = decompiler.tree(version, threadsDefault(), noCache, className, optionsFlag(rest));
+        List<Path> sources = Verifier.sources(tree, className);
+        if (sources.isEmpty()) {
+          throw new IllegalArgumentException("no source for " + className + " under " + tree);
+        }
+        List<Path> classpath = minecraft.classpath(version, false);
+        int release = Verifier.releaseOf(minecraft.clientJar(version, false));
+        boolean ok = true;
+        for (Path source : sources) {
+          List<Verifier.Problem> problems = Verifier.diagnose(source, classpath, release);
+          for (Verifier.Problem problem : problems) {
+            System.out.printf(Locale.ROOT, "%s:%d:%d: %s%n", tree.relativize(source),
+              problem.line(), problem.column(), problem.message());
+          }
+          System.out.printf(Locale.ROOT, "%s %s%n", problems.isEmpty() ? "compiled" : "failed",
+            tree.relativize(source));
+          ok &= problems.isEmpty();
+        }
+        if (!ok) {
+          System.exit(1);
         }
       }
       case "dataset" -> {
@@ -517,7 +548,7 @@ public final class Main {
 
   private static boolean needsTargetJdk(String command) {
     return switch (command) {
-      case "score", "dataset", "corpus" -> true;
+      case "score", "dataset", "corpus", "compile" -> true;
       default -> false;
     };
   }
@@ -736,6 +767,8 @@ public final class Main {
         tree      <version> [--only Class]    print the cached tree path
         score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes]
                                              several versions run concurrently, --jobs at a time
+        compile   <version> <Class>            compile that one class with the verifier's javac
+                                             settings and print its errors
         corpus    <version> --ground-truth D  write the class-to-ground-truth corpus
         dataset   <version>                   export per-instruction line alignment for the model
         clean     [--trees] [--compile] [--downloads] [--all]
