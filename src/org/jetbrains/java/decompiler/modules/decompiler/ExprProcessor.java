@@ -1220,7 +1220,11 @@ public class ExprProcessor implements CodeConstants {
 
         switch (edge.getType()) {
           case StatEdge.TYPE_BREAK:
-            buf.append("break");
+            // A break out of the loop body's last switch and a continue compile to different
+            // jumps; the target's jump at this offset says which one the source wrote.
+            boolean continues = !edge.labeled
+              && (RoundTrip.breakJumpsToContinue(jumpOffset) || RoundTrip.emptyArmContinues(stat));
+            buf.append(continues ? "continue" : "break");
             break;
           case StatEdge.TYPE_CONTINUE:
             buf.append("continue");

@@ -2254,6 +2254,101 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when a switch arm's {@code break} edge is really the loop's {@code continue}: the target's
+   * jump at the arm's last instruction lands on the loop's own continue point (hasNext, increment
+   * or condition), which a {@code break} cannot reach — that jumps past the switch instead.
+   */
+  public static boolean breakJumpsToContinue(int jumpOffset) {
+    if (!selector("breakcontinue") || jumpOffset < 0) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    Statement loop = OPEN_ALL_LOOPS.get().peek();
+    if (method == null
+        || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    Integer target = gotos == null ? null : gotos.get(jumpOffset);
+    return target != null && isLoopHeadTarget(doStatement, target);
+  }
+
+  /**
+   * True when this empty switch arm's `break;` is really the loop's `continue`. The block recorded
+   * nothing, so the arm's own jump offset is gone; the switch's bytecode range is the evidence: it
+   * must hold exactly one jump to the loop's continue point (that one is this arm's), and this must
+   * be the switch's only empty arm, so no other arm can own it.
+   */
+  public static boolean emptyArmContinues(Statement arm) {
+    if (!selector("breakcontinue")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    Statement loop = OPEN_ALL_LOOPS.get().peek();
+    if (method == null || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    if (!(arm.getParent() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement sw)) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    int start = firstOffset(sw);
+    int end = lastEnd(sw);
+    if (gotos == null || start < 0 || end < start) {
+      return false;
+    }
+    java.util.List<int[]> nested = new java.util.ArrayList<>();
+    collectNestedSwitchRanges(sw, nested);
+    int candidates = 0;
+    for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+      int from = edge.getKey();
+      if (from < start || from >= end) {
+        continue;
+      }
+      boolean inner = false;
+      for (int[] range : nested) {
+        if (from >= range[0] && from < range[1]) {
+          inner = true;
+          break;
+        }
+      }
+      // A jump inside a nested switch belongs to that switch's arms, not to this one.
+      if (!inner && isLoopHeadTarget(doStatement, edge.getValue())) {
+        candidates++;
+      }
+    }
+    if (candidates != 1) {
+      return false;
+    }
+    int empties = 0;
+    for (java.util.List<org.jetbrains.java.decompiler.modules.decompiler.StatEdge> armEdges : sw.getCaseEdges()) {
+      if (armEdges.isEmpty()) {
+        continue;
+      }
+      Statement destination = armEdges.get(0).getDestination();
+      if (destination.getExprents() != null && destination.getExprents().isEmpty()
+          && destination.getStats().isEmpty()) {
+        empties++;
+      }
+    }
+    return empties == 1;
+  }
+
+  /** Byte ranges of the switches nested inside this one, so their jumps are not counted twice. */
+  private static void collectNestedSwitchRanges(Statement stat, java.util.List<int[]> out) {
+    for (Statement child : stat.getStats()) {
+      if (child instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement nested) {
+        int start = firstOffset(nested);
+        int end = lastEnd(nested);
+        if (start >= 0 && end >= start) {
+          out.add(new int[]{start, end});
+        }
+      }
+      collectNestedSwitchRanges(child, out);
+    }
+  }
+
   /** Loops whose body is being printed, innermost first, whatever their type. */
   private static final ThreadLocal<java.util.ArrayDeque<Statement>> OPEN_ALL_LOOPS =
     ThreadLocal.withInitial(java.util.ArrayDeque::new);
