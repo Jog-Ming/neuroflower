@@ -128,7 +128,8 @@ public final class LocalDeclarationOrder {
 
     for (int i = 0; i < order.size(); i++) {
       Position position = order.get(i);
-      if (!(position.exprent instanceof VarExprent var) || !isRealDefinition(var)) {
+      VarExprent var = definedVar(position.exprent);
+      if (var == null || !isRealDefinition(var)) {
         continue;
       }
       int slot = position.slot;
@@ -166,7 +167,16 @@ public final class LocalDeclarationOrder {
       }
 
       debug(method, var, "hoisted from slot-" + slot + " past slot-" + earliest.slot);
-      hoisted.add(position);
+      if (position.exprent == var) {
+        hoisted.add(position);
+      } else {
+        // An initialized declaration: the table proves the variable was declared before an
+        // earlier one, so hoist the declaration bare and leave the store as an assignment. Only
+        // the declaration order moves; the value is still computed where it was printed.
+        VarExprent bare = (VarExprent) var.copy();
+        var.setDefinition(false);
+        hoisted.add(new Position(bare, position.list, slot));
+      }
     }
 
     if (hoisted.isEmpty()) {
@@ -615,8 +625,20 @@ public final class LocalDeclarationOrder {
       for (int i = 1; i < exprents.size(); i++) {
         Exprent exprent = exprents.get(i);
         int slot = bareDeclarationSlot(exprent);
+        boolean initialized = false;
         if (slot < 0) {
-          continue;
+          // An initialized declaration whose slot precedes an earlier declaration's was written
+          // before it in the source: print the declaration alone in slot order and keep the
+          // store where it was. Only the declaration moves, so no evaluation order changes.
+          VarExprent var = definedVar(exprent);
+          if (var == null || !isRealDefinition(var)) {
+            continue;
+          }
+          slot = slotOf(var, null);
+          if (slot < 0) {
+            continue;
+          }
+          initialized = true;
         }
         int j = i;
         while (j > 0) {
@@ -625,9 +647,19 @@ public final class LocalDeclarationOrder {
           if (previousSlot < 0 || previousSlot <= slot) {
             break;
           }
+          if (initialized) {
+            j--;
+            continue;
+          }
           exprents.set(j, previous);
           exprents.set(j - 1, exprent);
           j--;
+        }
+        if (j < i && initialized) {
+          VarExprent var = definedVar(exprent);
+          VarExprent bare = (VarExprent) var.copy();
+          var.setDefinition(false);
+          exprents.add(j, bare);
         }
       }
     }
@@ -674,6 +706,18 @@ public final class LocalDeclarationOrder {
 
   private static boolean isRealDefinition(VarExprent var) {
     return var.isDefinition() && !var.isStack();
+  }
+
+  /** The variable a declaration exprent defines: a bare declaration or an initialized one. */
+  private static VarExprent definedVar(Exprent exprent) {
+    if (exprent instanceof VarExprent var) {
+      return var;
+    }
+    if (exprent instanceof AssignmentExprent assignment
+      && assignment.getLeft() instanceof VarExprent var) {
+      return var;
+    }
+    return null;
   }
 
   private static int slotOf(VarExprent var, VarProcessor varproc) {
