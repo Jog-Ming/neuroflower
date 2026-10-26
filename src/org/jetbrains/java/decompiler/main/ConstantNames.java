@@ -92,7 +92,7 @@ public final class ConstantNames {
       if (isBootstrapOwner(owner)) {
         continue; // present for a lambda/indy bootstrap, never a source-named constant owner
       }
-      addOwnerCandidates(candidates, owner, nest, packageName, imports);
+      addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
     }
     if (candidates.isEmpty()) {
       return text;
@@ -600,7 +600,7 @@ public final class ConstantNames {
         continue;
       }
       if (candidateOwners.add(owner)) {
-        addOwnerCandidates(candidates, owner, nest, packageName, imports);
+        addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
       }
       activePairs.put(owner, entry.getValue());
     }
@@ -611,7 +611,7 @@ public final class ConstantNames {
         continue;
       }
       if (candidateOwners.add(owner)) {
-        addOwnerCandidates(candidates, owner, nest, packageName, imports);
+        addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
       }
       activeValues.put(owner, entry.getValue());
     }
@@ -621,7 +621,7 @@ public final class ConstantNames {
         continue;
       }
       if (candidateOwners.add(owner)) {
-        addOwnerCandidates(candidates, owner, nest, packageName, imports);
+        addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
       }
       inheritedNames.addAll(addInheritedCandidates(candidates, owner, packageName, imports));
       claimed.add(owner);
@@ -3194,9 +3194,44 @@ public final class ConstantNames {
     }
   }
 
+  /**
+   * Whether a class is the owner or a subclass of it.
+   *
+   * <p>A protected member is accessible inside the body of any subclass, and the body of a nested
+   * class is part of its enclosing class's body. The nest host is the class whose text is being
+   * scanned for a name, so its superclass chain decides whether a protected constant is writable.
+   */
+  private static boolean extendsClass(String className, String owner) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(className);
+    for (int depth = 0; depth < 32 && cls != null; depth++) {
+      if (cls.qualifiedName.equals(owner)) {
+        return true;
+      }
+      String superName = cls.superClass == null ? null : cls.superClass.getString();
+      if (superName == null) {
+        return false;
+      }
+      cls = DecompilerContext.getStructContext().getClass(superName);
+    }
+    return false;
+  }
+
   /** The accessible static final fields of one missing owner, as candidates for a literal value. */
   private static void addOwnerCandidates(Map<String, List<Constant>> candidates, String owner,
                                          String nest, String packageName, List<String> imports) {
+    addOwnerCandidates(candidates, owner, nest, packageName, imports, false);
+  }
+
+  /**
+   * The same, with whether the owner is one only a constant naming explains.
+   *
+   * <p>A protected constant is writable through a subclass's body, but that is the one widening
+   * only a pool-unexplained owner needs: an owner the text already names has its {@code Class}
+   * entry accounted for, and a second naming can only move the entry to a different point.
+   */
+  private static void addOwnerCandidates(Map<String, List<Constant>> candidates, String owner,
+                                         String nest, String packageName, List<String> imports,
+                                         boolean missingOwner) {
     StructClass cls = DecompilerContext.getStructContext().getClass(owner);
     if (cls == null) {
       return;
@@ -3214,6 +3249,7 @@ public final class ConstantNames {
       int access = field.getAccessFlags();
       boolean accessible = (access & CodeConstants.ACC_PUBLIC) != 0
         || ((access & CodeConstants.ACC_PRIVATE) == 0 && samePackage)
+        || ((access & CodeConstants.ACC_PROTECTED) != 0 && missingOwner && extendsClass(nest, owner))
         || ((access & CodeConstants.ACC_PRIVATE) != 0 && nestOf(owner).equals(nest));
       if (!accessible) {
         continue;
