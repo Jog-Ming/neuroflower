@@ -3913,6 +3913,10 @@ public final class ConstantNames {
   }
 
   /** The '-' of a unary minus directly before this literal, or -1 for a binary minus. */
+  /** Keywords that end a statement or precede an expression, so a minus after one is unary. */
+  private static final java.util.Set<String> KEYWORDS = java.util.Set.of(
+    "return", "case", "throw", "yield", "else", "assert", "default", "do", "in");
+
   private static int unaryMinusAt(String text, int start) {
     int i = start - 1;
     while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
@@ -3929,7 +3933,17 @@ public final class ConstantNames {
       return i;
     }
     char c = text.charAt(before);
-    return Character.isLetterOrDigit(c) || c == '_' || c == ')' || c == ']' || c == '"' || c == '\'' ? -1 : i;
+    if (Character.isLetter(c) || c == '_') {
+      // A keyword cannot end an expression, so a minus after one is unary: `return -1;`.
+      int wordStart = before;
+      while (wordStart > 0 && (Character.isLetterOrDigit(text.charAt(wordStart - 1))
+          || text.charAt(wordStart - 1) == '_')) {
+        wordStart--;
+      }
+      String word = text.substring(wordStart, before + 1);
+      return KEYWORDS.contains(word) ? i : -1;
+    }
+    return Character.isDigit(c) || c == 41 || c == 93 || c == 34 || c == 39 ? -1 : i;
   }
 
   /** The primitive type of a cast written immediately before an integer literal, or null. */
