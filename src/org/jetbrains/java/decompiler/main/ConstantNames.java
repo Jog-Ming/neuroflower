@@ -711,7 +711,15 @@ public final class ConstantNames {
         continue;
       }
       if (window == null) {
-        continue;
+        // The owner's Class entry sits below the first reference that names it, so javac entered
+        // it earlier -- by a folded constant naming. The naming must lie before that reference in
+        // the text, which is the only bound left when the neighbouring entries have no printed
+        // position.
+        int[] before = beforeReferenceWindow(text, own, index, firstUses, positions);
+        if (before == null) {
+          continue;
+        }
+        window = before;
       }
       if (candidateOwners.add(owner)) {
         addOwnerCandidates(candidates, owner, nest, packageName, imports);
@@ -1218,6 +1226,55 @@ public final class ConstantNames {
       return null; // the text order contradicts the pool order; no window is provable
     }
     return new int[]{from, to};
+  }
+
+  /**
+   * The text before the first reference that names an owner whose {@code Class} entry the pool
+   * entered earlier, or null when the entry is not provably earlier.
+   *
+   * <p>javac enters a reference's Class as that reference is generated, so a Class entry below its
+   * first reference was entered by something else before it -- in this file, a folded constant
+   * naming. That naming precedes the reference in text order; the window extends from the start of
+   * the class to the end of the reference's line.
+   */
+  private static int[] beforeReferenceWindow(String text, StructClass cls, int classIndex,
+                                             Map<Integer, FirstUse> firstUses,
+                                             Map<Pair<String, String>, Map<Integer, Integer>> positions) {
+    String owner = cls.getPool().getPool().get(classIndex) instanceof PrimitiveConstant primitive
+      ? primitive.getString() : null;
+    if (owner == null) {
+      return null;
+    }
+    List<PooledConstant> pool = cls.getPool().getPool();
+    int linkIndex = -1;
+    for (int i = 1; i < pool.size(); i++) {
+      if (pool.get(i) instanceof LinkConstant link && owner.equals(link.classname)) {
+        linkIndex = i;
+        break;
+      }
+    }
+    if (linkIndex < 0 || linkIndex <= classIndex) {
+      return null;
+    }
+    FirstUse use = firstUses.get(linkIndex);
+    Integer printed = position(cls, use, positions);
+    if (printed == null) {
+      return null;
+    }
+    // The naming that entered the Class just before this reference was evaluated in the same
+    // method, after the method began: the arguments of a call are generated there, not in the
+    // class body. A site in another method would move the entry to that method's own point.
+    int from = 0;
+    for (SiteSpace space : spaces(cls, positions)) {
+      if (space.key().equals(use.methodKey())) {
+        from = space.min();
+        break;
+      }
+    }
+    if (from > printed) {
+      return null;
+    }
+    return new int[]{from, lineEnd(text, printed)};
   }
 
   private static Integer position(StructClass cls, FirstUse use,
