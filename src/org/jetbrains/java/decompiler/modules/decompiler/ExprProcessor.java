@@ -1365,10 +1365,6 @@ public class ExprProcessor implements CodeConstants {
     // A switch expression is poly: with a type variable as the target, javac infers the switch's
     // own type from that target and casts each arm to the erasure, leaving no cast after the
     // merge. Our switch type came out as the bare erasure, so the outer cast is the printer's.
-    if (doCast && exprent instanceof SwitchExprent && RoundTrip.selector("switchbare")
-        && RoundTrip.isTypeVariableTarget(leftType)) {
-      doCast = false;
-    }
     boolean doCastNull = (castNull.cast && rightType.type == CodeType.NULL && !UNDEFINED_TYPE_STRING.equals(getTypeName(leftType)));
     boolean doCastNarrowing = (castNarrowing && isIntConstant(exprent) && isNarrowedIntType(leftType));
     boolean doCastGenerics = !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
