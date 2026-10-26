@@ -2324,6 +2324,117 @@ public final class RoundTrip {
     return min >= 0 && max >= min && target >= min && target <= max;
   }
 
+  /** The end offset of the statement's last instruction, or -1 when it has no recorded offsets. */
+  public static int lastInstructionEnd(Statement statement) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    int start = lastOffsetDeep(statement);
+    if (ends == null || start < 0) {
+      return -1;
+    }
+    Integer end = ends.get(start);
+    return end == null ? -1 : end;
+  }
+
+  /**
+   * The greatest instruction start covered by the statement or any statement nested in it, or -1.
+   * The recorded bit sets cover every byte of an instruction, so only offsets the scan knows as
+   * instruction starts count.
+   */
+  private static int lastOffsetDeep(Statement statement) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    int max = -1;
+    List<Exprent> exprents = statement.getExprents();
+    if (exprents != null && ends != null) {
+      for (Exprent exprent : exprents) {
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          BitSet bits = inner.bytecode;
+          if (bits == null || bits.isEmpty()) {
+            continue;
+          }
+          for (int offset = bits.nextSetBit(0); offset >= 0; offset = bits.nextSetBit(offset + 1)) {
+            if (ends.containsKey(offset) && offset > max) {
+              max = offset;
+            }
+          }
+        }
+      }
+    }
+    for (Statement child : statement.getStats()) {
+      int offset = lastOffsetDeep(child);
+      if (offset > max) {
+        max = offset;
+      }
+    }
+    return max;
+  }
+
+  /**
+   * True when a {@code goto} starts exactly where this statement's last instruction ends and lands
+   * on {@code target}: the statement's block ended with a jump the source wrote as {@code break;}.
+   */
+  public static boolean jumpsFromEnd(Statement statement, int target) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    int end = lastInstructionEnd(statement);
+    if (gotos == null || end < 0 || target < 0) {
+      return false;
+    }
+    Integer landed = gotos.get(end);
+    return landed != null && landed == target;
+  }
+
+  /**
+   * Whether the statement can finish without leaving the enclosing block — the Java rule that
+   * decides if a {@code break;} appended after it would be reachable code. Conservative where the
+   * language is: a loop or switch is assumed to be able to complete normally.
+   */
+  public static boolean canCompleteNormally(Statement statement) {
+    if (statement == null) {
+      return true;
+    }
+    List<Exprent> exprents = statement.getExprents();
+    if (exprents != null) {
+      if (exprents.isEmpty()) {
+        return true;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return !(last instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+        && (exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+            || exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.THROW));
+    }
+    if (statement instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement) {
+      if (ifStatement.getIfstat() != null && canCompleteNormally(ifStatement.getIfstat())) {
+        return true;
+      }
+      return ifStatement.getElsestat() == null || canCompleteNormally(ifStatement.getElsestat());
+    }
+    List<Statement> children = statement.getStats();
+    if (children.isEmpty()) {
+      return true;
+    }
+    return canCompleteNormally(children.get(children.size() - 1));
+  }
+
+  /** True when the statement's own tail already prints an explicit {@code break;} or {@code continue;}. */
+  public static boolean printsExplicitJump(Statement statement) {
+    Statement last = statement;
+    while (true) {
+      // The jump may hang off any statement on the tail path: an arm ending in `if (…) { … } else
+      // { … }` carries its `break` as the if's own edge, not the last block's.
+      for (StatEdge edge : last.getAllSuccessorEdges()) {
+        if (edge.explicit && (edge.getType() == StatEdge.TYPE_BREAK || edge.getType() == StatEdge.TYPE_CONTINUE)) {
+          return true;
+        }
+      }
+      if (last.getExprents() != null || last.getStats().isEmpty()) {
+        return false;
+      }
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
+  }
+
   /** Last target offset covered by a statement, or -1. */
   public static int lastOffset(Statement statement) {
     int max = -1;

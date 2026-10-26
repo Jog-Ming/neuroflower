@@ -157,7 +157,19 @@ public class SwitchStatement extends Statement {
 
     VarType switch_type = headexprent.get(0).getExprType();
 
-    for (int i : sourceOrder()) {
+    // The instruction just after the whole switch: an arm whose block ends with a jump landing
+    // there ended in a `break;` the source wrote and the tree dropped.
+    int switchEnd = -1;
+    if (getParent() instanceof SequenceStatement sequence) {
+      List<Statement> siblings = sequence.getStats();
+      for (int k = siblings.indexOf(this) + 1; k > 0 && k < siblings.size() && switchEnd < 0; k++) {
+        switchEnd = RoundTrip.firstOffset(siblings.get(k));
+      }
+    }
+    List<Integer> order = sourceOrder();
+    int lastPrinted = order.isEmpty() ? -1 : order.get(order.size() - 1);
+
+    for (int i : order) {
 
       Statement stat = caseStatements.get(i);
       List<StatEdge> edges = caseEdges.get(i);
@@ -210,6 +222,17 @@ public class SwitchStatement extends Statement {
       }
 
       buf.append(ExprProcessor.jmpWrapper(stat, indent + 2, false));
+
+      // A non-final arm whose block ends with a jump past the switch printed no `break;`: the
+      // target's jump proves the source wrote one, and `canCompleteNormally` keeps it reachable.
+      boolean patternArm = values.stream().anyMatch(value -> value instanceof FunctionExprent function
+        && function.getFuncType() == FunctionType.INSTANCEOF);
+      if (RoundTrip.selector("switchbreak") && switchEnd >= 0 && i != lastPrinted
+          && guard == null && !braced.contains(stat) && !patternArm
+          && RoundTrip.canCompleteNormally(stat) && !RoundTrip.printsExplicitJump(stat)
+          && RoundTrip.jumpsFromEnd(stat, switchEnd)) {
+        buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+      }
 
       if (braced.contains(stat)) {
         buf.appendIndent(indent + 1);
