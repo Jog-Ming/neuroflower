@@ -165,13 +165,18 @@ public class DoStatement extends Statement {
         buf.append(");").appendLineSeparator();
         break;
       case WHILE:
+        Exprent whileGuard = RoundTrip.foldedBreakGuard(conditionExprent.get(0), this, first);
         buf.appendIndent(indent).append("while (");
         buf.pushNewlineGroup(indent, 1);
         buf.appendPossibleNewline();
-        buf.append(conditionExprent.get(0).toJava(indent));
+        buf.append(whileGuard == null ? conditionExprent.get(0).toJava(indent)
+          : ((FunctionExprent) conditionExprent.get(0)).getLstOperands().get(0).toJava(indent));
         buf.appendPossibleNewline("", true);
         buf.popNewlineGroup();
         buf.append(") {").appendLineSeparator();
+        if (whileGuard != null) {
+          appendBreakGuard(buf, whileGuard, indent + 1);
+        }
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
         buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
@@ -202,17 +207,23 @@ public class DoStatement extends Statement {
           }
         }
         buf.appendIndent(indent);
+        Exprent forGuard = RoundTrip.foldedBreakGuard(conditionExprent.get(0), this, first);
         buf.pushNewlineGroup(indent, 1);
         buf.append("for (");
         if (initExprent.get(0) != null) {
           buf.append(initExprent.get(0).toJava(indent));
         }
         buf.append(";").appendPossibleNewline(" ")
-          .append(conditionExprent.get(0).toJava(indent)).append(";").appendPossibleNewline(" ")
+          .append(forGuard == null ? conditionExprent.get(0).toJava(indent)
+            : ((FunctionExprent) conditionExprent.get(0)).getLstOperands().get(0).toJava(indent))
+          .append(";").appendPossibleNewline(" ")
           .append(incExprent.get(0).toJava(indent))
           .appendPossibleNewline("", true);
         buf.popNewlineGroup();
         buf.append(") {").appendLineSeparator();
+        if (forGuard != null) {
+          appendBreakGuard(buf, forGuard, indent + 1);
+        }
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
         buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
@@ -229,6 +240,14 @@ public class DoStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /** Prints {@code if (!test) { break; }} at the head of a loop body. */
+  private static void appendBreakGuard(TextBuffer buf, Exprent test, int indent) {
+    buf.appendIndent(indent).append("if (")
+      .append(RoundTrip.negateCondition(test).toJava(indent)).append(") {").appendLineSeparator();
+    buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+    buf.appendIndent(indent).append("}").appendLineSeparator();
   }
 
   /** The last statement transfers control, so an update appended after it could not run. */

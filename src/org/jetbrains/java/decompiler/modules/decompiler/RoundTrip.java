@@ -1487,6 +1487,63 @@ public final class RoundTrip {
   }
 
   /**
+   * The last test of a loop condition the source wrote as {@code if (!B) break;}: that guard
+   * branches to the body and then jumps to the loop's exit, while the fused `A && B` condition
+   * would branch straight to the exit and leave no goto. The recorded branch-then-goto pair whose
+   * jump leaves the loop therefore proves the guard statement. Returns the tested operand, or null.
+   */
+  public static Exprent foldedBreakGuard(Exprent condition, Statement loop, Statement body) {
+    if (!selector("loopguard") || !(condition instanceof FunctionExprent function)
+        || function.getFuncType() != FunctionExprent.FunctionType.BOOLEAN_AND
+        || function.getLstOperands().size() != 2) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
+    java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (guards == null || sites == null || ends == null) {
+      return null;
+    }
+    int bodyStart = firstOffset(body);
+    int loopEnd = lastOffset(loop);
+    if (bodyStart < 0 || loopEnd < 0) {
+      return null;
+    }
+    int lastStart = -1;
+    if (condition.bytecode != null) {
+      for (int offset = condition.bytecode.nextSetBit(0); offset >= 0; offset = condition.bytecode.nextSetBit(offset + 1)) {
+        if (ends.containsKey(offset) && offset > lastStart) {
+          lastStart = offset;
+        }
+      }
+    }
+    if (lastStart >= 0) {
+      Integer key = ends.get(lastStart);
+      int[] site = key == null ? null : sites.get(key);
+      Integer gotoTarget = key == null ? null : guards.get(key);
+      // The branch skips to the body and the goto leaves the loop: the guard statement's signature.
+      if (site != null && gotoTarget != null && site[1] == bodyStart && gotoTarget > loopEnd) {
+        return function.getLstOperands().get(1);
+      }
+    }
+    // The decompiler built the merged condition, so it carries no offsets of its own; the pair is
+    // still recorded, keyed by the branch that skips to the body and jumps out of the loop.
+    for (java.util.Map.Entry<Integer, int[]> entry : sites.entrySet()) {
+      int key = entry.getKey();
+      int[] site = entry.getValue();
+      Integer gotoTarget = guards.get(key);
+      if (gotoTarget != null && site[1] == bodyStart && gotoTarget > loopEnd && key <= loopEnd) {
+        return function.getLstOperands().get(1);
+      }
+    }
+    return null;
+  }
+
+  /**
    * The remainder-loop layout: the condition's branch targets the body, the tail's statements fill
    * the exit block between the condition and the body, and the back edge jumps behind the tail.
    * The source wrote {@code while (true) { if (!cond) { tail } body }}.
