@@ -79,8 +79,11 @@ not edit code.
    truth and say what separates them in the class file — that is the proof it understood the shape
    rather than copied it.
 3. **Implement one family, with devtools.** A different agent applies the agreed rule to the whole
-   family, owns devtools for the regression run, and commits only when no attribute drops. Research
-   agents cost nothing to run in parallel; implementation agents must not share a checkout.
+   family, runs the whole-tree regression and commits only when no attribute drops. devtools takes
+   concurrent calls — trees and compile output are content-addressed, writes are atomic and pruning
+   holds a file lock and skips trees in use — so research agents may call it in parallel. What must
+   not overlap is a **build**: the jar is the measurement's input, and rebuilding it mid-run makes
+   classes vanish. One implementation agent owns the build at a time.
 4. **Repeat** until the metric has no family left. Report a family that has no deterministic
    discriminator as blocked, with the token pair.
 
