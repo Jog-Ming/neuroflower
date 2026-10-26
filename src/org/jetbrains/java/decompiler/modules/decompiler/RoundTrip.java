@@ -2711,6 +2711,184 @@ public final class RoundTrip {
   }
 
   /**
+   * The target scope end of a local this statement declares, or -1 when it declares none. A local
+   * whose range stops before the enclosing block ends was declared inside a nested block whose
+   * closing brace the source wrote there.
+   */
+  public static int declaredScopeEnd(Statement stat) {
+    if (!selector("bareblock") || stat == null) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return -1;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    int start = firstOffset(stat);
+    int end = lastOffset(stat);
+    if (start < 0 || end < 0) {
+      return -1;
+    }
+    return table.getRange(start, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= start && v.getStart() <= end)
+      .mapToInt(v -> v.getEnd())
+      .max()
+      .orElse(-1);
+  }
+
+  /** Last instruction end covered by a statement, or -1. */
+  public static int blockEnd(Statement stat) {
+    return stat == null ? -1 : lastEnd(stat);
+  }
+
+  /**
+   * The first local declared at or inside this statement whose target scope ends before the
+   * enclosing block does, as {@code {start, end}}, or null. Such a local was declared inside a
+   * nested block whose closing brace stood where its scope ends.
+   */
+  public static int[] nestedBlockScope(Statement stat, int windowEnd, int blockEnd) {
+    if (!selector("bareblock") || stat == null) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    int start = firstOffset(stat);
+    if (start < 0 || windowEnd < start || blockEnd <= 0) {
+      return null;
+    }
+    return table.getRange(start, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= start && v.getStart() <= windowEnd)
+      .filter(v -> v.getEnd() > v.getStart() && v.getEnd() < blockEnd)
+      .min(java.util.Comparator.comparingInt(v -> v.getStart()))
+      .map(v -> new int[]{v.getStart(), v.getEnd(), v.getIndex()})
+      .orElse(null);
+  }
+
+  /**
+   * True when any statement from {@code from} on still reads the local in this slot: closing a
+   * block in front of it would put the read outside the local's scope.
+   */
+  public static boolean slotUsedFrom(List<Statement> stats, int from, int slot) {
+    for (int j = Math.max(0, from); j < stats.size(); j++) {
+      Statement stat = stats.get(j);
+      java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+      queue.add(stat);
+      while (!queue.isEmpty()) {
+        Statement cur = queue.poll();
+        List<Exprent> exprents = cur.getExprents();
+        if (exprents != null) {
+          for (Exprent exprent : exprents) {
+            for (Exprent part : exprent.getAllExprents(true, true)) {
+              if (part instanceof VarExprent var && !var.isStack() && var.getIndex() == slot) {
+                return true;
+              }
+            }
+          }
+        }
+        queue.addAll(cur.getStats());
+      }
+    }
+    return false;
+  }
+
+  /** Index of the exprent in this statement whose offsets contain the offset, or -1. */
+  public static int exprentAtOffset(Statement stat, int offset) {
+    List<Exprent> exprents = stat == null ? null : stat.getExprents();
+    if (exprents == null) {
+      return -1;
+    }
+    for (int i = 0; i < exprents.size(); i++) {
+      for (Exprent part : exprents.get(i).getAllExprents(true, true)) {
+        if (part.bytecode != null && part.bytecode.get(offset)) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The target scope end of the local the statement's last exprent declares, or -1. The store's
+   * offset sits inside that exprent, so the table entry can be found even when the block's last
+   * instruction is not part of any exprent.
+   */
+  public static int lastExprentScopeEnd(Statement stat) {
+    if (!selector("bareblock") || stat == null) {
+      return -1;
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents == null || exprents.isEmpty()) {
+      return -1;
+    }
+    Exprent last = exprents.get(exprents.size() - 1);
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return -1;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    int start = firstOffsetOf(last);
+    if (start < 0) {
+      return -1;
+    }
+    int end = -1;
+    for (Exprent part : last.getAllExprents(true, true)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int lastByte = part.bytecode.previousSetBit(Integer.MAX_VALUE);
+      if (lastByte > end) {
+        end = lastByte;
+      }
+    }
+    if (end < start) {
+      return -1;
+    }
+    // The declaration's own store is the exprent's last instruction; an earlier local's load may
+    // sit in the same window, so take the entry that starts latest.
+    final int from = start;
+    final int to = end;
+    return table.getRange(from, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= from && v.getStart() <= to)
+      .max(java.util.Comparator.comparingInt(v -> v.getStart()))
+      .map(v -> v.getEnd())
+      .orElse(-1);
+  }
+
+  /** Debug helper: the target ranges of the locals a statement declares, as {@code slot[start,end)}. */
+  public static String declaredLocals(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return "-";
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    int start = firstOffset(stat);
+    int end = lastOffset(stat);
+    if (table == null || start < 0 || end < 0) {
+      return "-";
+    }
+    return table.getRange(start, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= start && v.getStart() <= end)
+      .map(v -> v.getIndex() + "[" + v.getStart() + "," + v.getEnd() + ")")
+      .toList().toString();
+  }
+
+  /**
    * True when one of these arms yields: the switch is an expression printed in statement form, and
    * its arms have to cover every input, so a synthesized default cannot be left out.
    */

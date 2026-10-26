@@ -119,6 +119,60 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // A local the source declared inside a nested block: its target scope ends before this block
+      // does, at the statement boundary the closing brace stood on. Print `{ … }` around the run
+      // that starts at that declaration, so the local's scope ends where the target's does.
+      if (RoundTrip.selector("bareblock")) {
+        int windowEnd = i + 1 < stats.size()
+          ? Math.max(RoundTrip.blockEnd(st), RoundTrip.firstOffset(stats.get(i + 1)) - 1)
+          : RoundTrip.blockEnd(st);
+        int[] scope = RoundTrip.nestedBlockScope(st, windowEnd, RoundTrip.blockEnd(this));
+        // The local has to be declared by this statement itself, and the block it lived in has to
+        // reach past it; otherwise the run is just this statement and the braces buy nothing.
+        if (scope != null && scope[0] <= RoundTrip.blockEnd(st)) {
+          int close = -1;
+          for (int j = i; j < stats.size(); j++) {
+            int end = RoundTrip.blockEnd(stats.get(j));
+            // The closing brace sits right after the run's last instruction; the back edge that
+            // ends the statement may add up to a few bytes past the last exprent offset.
+            if (Math.abs(end - scope[1]) <= 5) {
+              close = j;
+              break;
+            }
+            if (end > scope[1]) {
+              break;
+            }
+          }
+          if (close > i && close < stats.size() - 1
+              && !RoundTrip.slotUsedFrom(stats, close + 1, scope[2])) {
+            int split = RoundTrip.exprentAtOffset(st, scope[0]);
+            List<Exprent> exprents = st.getExprents();
+            if (split < 0 && exprents != null && !exprents.isEmpty()) {
+              // The declaration's store can sit past every exprent's recorded offsets; the block's
+              // last exprent is the one that declares it.
+              split = exprents.size() - 1;
+            }
+            if (exprents != null && split > 0) {
+              // The declaration is one exprent of this block: the exprents before it stay outside.
+              buf.append(ExprProcessor.listToJava(exprents.subList(0, split), indent));
+            }
+            buf.appendIndent(indent).append("{").appendLineSeparator();
+            if (exprents != null && split >= 0) {
+              buf.append(ExprProcessor.listToJava(exprents.subList(split, exprents.size()), indent + 1));
+            } else {
+              buf.append(ExprProcessor.jmpWrapper(st, indent + 1, true));
+            }
+            for (int j = i + 1; j <= close; j++) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent + 1, true));
+            }
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            notempty = true;
+            i = close;
+            continue;
+          }
+        }
+      }
+
 
       // `if (C) { rest } else { continue; }` printed by us as the guard `if (!C) { continue; }
       // rest`: the target's branch lands straight on the exit block, so the branch-then-goto pair
