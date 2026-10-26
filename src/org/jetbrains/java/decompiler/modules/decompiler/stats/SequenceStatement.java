@@ -299,12 +299,14 @@ public class SequenceStatement extends Statement {
         head.setCondition(RoundTrip.negateCondition(head.getCondition()));
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
-        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(
-          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, false));
-        buf.appendIndent(indent).append("}").appendLineSeparator();
+        Statement splitArm = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        if (!IfStatement.printSplitIf(buf, head, splitArm, ifStatement.getIfstat(), indent, false)) {
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(splitArm, indent + 1, true));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
         notempty = true;
         break;
       }
@@ -347,11 +349,13 @@ public class SequenceStatement extends Statement {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
-        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
-        buf.appendIndent(indent).append("}").appendLineSeparator();
+        if (!IfStatement.printSplitIf(buf, head, ifStatement.getIfstat(), stats.get(i + 1), indent, true)) {
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
         notempty = true;
         break;
       }
@@ -428,12 +432,14 @@ public class SequenceStatement extends Statement {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
-        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(
-          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, false));
-        buf.appendIndent(indent).append("}").appendLineSeparator();
+        Statement splitTail = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        if (!IfStatement.printSplitIf(buf, head, ifStatement.getIfstat(), splitTail, indent, false)) {
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(splitTail, indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
         notempty = true;
         break;
       }

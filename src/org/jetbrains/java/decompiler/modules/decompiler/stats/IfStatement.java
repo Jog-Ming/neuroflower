@@ -309,38 +309,9 @@ public class IfStatement extends Statement {
     // operand that only inherits the expression's line. When the target's table has an entry at
     // an operand's first instruction, on a line later than the one before it ends, the source
     // wrote the statements nested; print that run of ifs back.
-    if (ifstat != null && elsestat == null && !isLabeled() && condition instanceof IfExprent ifHead) {
-      List<Exprent> operands = booleanOperands(ifHead.getCondition());
-      if (operands.size() > 1) {
-        List<Integer> groups = new ArrayList<>();
-        groups.add(0);
-        for (int i = 1; i < operands.size(); i++) {
-          if (RoundTrip.newlineBetweenOperands(andOf(operands, 0, i), operands.get(i))) {
-            groups.add(i);
-          }
-        }
-        // A pattern variable declared by a later operand lives to the end of the same statement in
-        // the flat form; nesting puts its declaration inside a block, and javac then numbers local
-        // slots differently. The flat compile is the only one the table proves, so leave it.
-        boolean scoped = false;
-        for (int i = 1; i < operands.size(); i++) {
-          scoped |= declaresPattern(operands.get(i));
-        }
-        if (groups.size() > 1 && !scoped) {
-          for (int group = 0; group < groups.size(); group++) {
-            int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
-            IfExprent nested = (IfExprent) ifHead.copy();
-            nested.setCondition(andOf(operands, groups.get(group), to));
-            buf.appendIndent(indent + group).append(nested.toJava(indent + group))
-              .append(" {").appendLineSeparator();
-          }
-          buf.append(ExprProcessor.jmpWrapper(ifstat, indent + groups.size(), true));
-          for (int group = groups.size() - 1; group >= 0; group--) {
-            buf.appendIndent(indent + group).append("}").appendLineSeparator();
-          }
-          return buf;
-        }
-      }
+    if (ifstat != null && !isLabeled() && condition instanceof IfExprent ifHead
+        && printSplitIf(buf, ifHead, ifstat, elsestat, indent, false)) {
+      return buf;
     }
 
     buf.appendIndent(indent);
@@ -377,6 +348,13 @@ public class IfStatement extends Statement {
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
     }
 
+    appendElse(buf, indent);
+
+    return buf;
+  }
+
+  /** Prints the closing brace of the then arm and the else arm, if any, at this indent. */
+  private void appendElse(TextBuffer buf, int indent) {
     boolean elseif = false;
 
     if (elsestat != null) {
@@ -406,8 +384,6 @@ public class IfStatement extends Statement {
     if (!elseif) {
       buf.appendIndent(indent).append("}").appendLineSeparator();
     }
-
-    return buf;
   }
 
   /**
@@ -436,6 +412,74 @@ public class IfStatement extends Statement {
     return false;
   }
 
+  /**
+   * Where a `&&` condition splits back into nested ifs, as operand indices, or an empty list.
+   * A pattern variable declared by a later operand lives to the end of the same statement in the
+   * flat form; nesting puts its declaration inside a block, and javac then numbers local slots
+   * differently. The flat compile is the only one the table proves, so those stay flat.
+   */
+  static List<Integer> nestedIfGroups(IfExprent head) {
+    List<Exprent> operands = booleanOperands(head.getCondition());
+    if (operands.size() < 2) {
+      return java.util.Collections.emptyList();
+    }
+    for (int i = 1; i < operands.size(); i++) {
+      if (declaresPattern(operands.get(i))) {
+        return java.util.Collections.emptyList();
+      }
+    }
+    List<Integer> groups = new ArrayList<>();
+    groups.add(0);
+    for (int i = 1; i < operands.size(); i++) {
+      if (RoundTrip.operandStartsStatement(andOf(operands, 0, i), operands.get(i))) {
+        groups.add(i);
+      }
+    }
+    return groups.size() > 1 ? groups : java.util.Collections.emptyList();
+  }
+
+  /**
+   * Prints the condition split back into the nested ifs the target's table proves, the guarded
+   * arm inside them, and the flat form's else arm after the outermost brace. An else arm only
+   * moves out when the guarded arm always exits: the flat form jumps over the else, so an arm
+   * that can fall through would otherwise run it. An else that declares a local stays inside
+   * braces as well, since a statement outside them would keep the local alive longer. False,
+   * printing nothing, when nothing splits.
+   */
+  static boolean printSplitIf(TextBuffer buf, IfExprent head, Statement arm, Statement elseArm,
+                              int indent, boolean elseSemicolon) {
+    List<Integer> groups = nestedIfGroups(head);
+    if (groups.isEmpty()
+        || (elseArm != null && (!endsWithExit(arm) || RoundTrip.declaresLocal(elseArm)))) {
+      return false;
+    }
+    printNestedIfs(buf, head, arm, groups, indent);
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    if (elseArm != null) {
+      buf.append(ExprProcessor.jmpWrapper(elseArm, indent, elseSemicolon));
+    }
+    return true;
+  }
+
+  /**
+   * Prints one `if` header per group and the arm the innermost guards, leaving the outermost brace
+   * open: the caller closes it, and appends the else arm when there is one.
+   */
+  static void printNestedIfs(TextBuffer buf, IfExprent head, Statement arm, List<Integer> groups, int indent) {
+    List<Exprent> operands = booleanOperands(head.getCondition());
+    for (int group = 0; group < groups.size(); group++) {
+      int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
+      IfExprent nested = (IfExprent) head.copy();
+      nested.setCondition(andOf(operands, groups.get(group), to));
+      buf.appendIndent(indent + group).append(nested.toJava(indent + group))
+        .append(" {").appendLineSeparator();
+    }
+    buf.append(ExprProcessor.jmpWrapper(arm, indent + groups.size(), true));
+    for (int group = groups.size() - 1; group >= 1; group--) {
+      buf.appendIndent(indent + group).append("}").appendLineSeparator();
+    }
+  }
+
   /** The operands of a boolean-and condition in the order the source wrote them. */
   private static List<Exprent> booleanOperands(Exprent condition) {
     List<Exprent> operands = new ArrayList<>();
@@ -447,8 +491,10 @@ public class IfStatement extends Statement {
     if (condition instanceof FunctionExprent function
         && function.getFuncType() == FunctionType.BOOLEAN_AND
         && function.getLstOperands().size() == 2) {
+      // The fold nests to the right (the bytecode's three branches to one target), so both
+      // sides have to be flattened or a nested test stays hidden inside the right operand.
       collectOperands(function.getLstOperands().get(0), out);
-      out.add(function.getLstOperands().get(1));
+      collectOperands(function.getLstOperands().get(1), out);
     } else {
       out.add(condition);
     }

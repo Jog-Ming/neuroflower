@@ -694,14 +694,27 @@ public final class RoundTrip {
   /**
    * Whether a boolean operator's right operand starts on a line of its own. Both operands' own
    * bitsets can cover only a short-circuit branch, laid on the line the whole expression ends
-   * on, so the line the operand's text begins and ends on is read from its parts.
+   * on, so the line the operand's text begins and ends on is read from its parts, and the
+   * beginning is the first line-table entry the operand's left-hand evaluation chain reaches.
    */
   public static boolean newlineBetweenOperands(Exprent before, Exprent after) {
-    if (!enabled()) {
+    if (!enabled() || after == null) {
       return false;
     }
+    int end = lastLine(before);
+    if (end < 0) {
+      end = sourceLineEnd(before);
+    }
+    // Only a line the operand's own text begins at proves the source broke before it: a later
+    // entry inside the operand may belong to a sub-expression that starts its own line.
+    int start = operandStartLine(after);
+    return start >= 0 && end >= 0 && start > end;
+  }
+
+  /** The last source line the expression's text covers, or -1. */
+  private static int lastLine(Exprent exprent) {
     int end = -1;
-    for (Exprent part : before.getAllExprents(true, false)) {
+    for (Exprent part : exprent.getAllExprents(true, false)) {
       if (part.bytecode == null || part.bytecode.isEmpty()) {
         continue;
       }
@@ -710,14 +723,13 @@ public final class RoundTrip {
         end = line;
       }
     }
-    if (end < 0) {
-      end = sourceLineEnd(before);
-    }
-    // Only an operand whose own first instruction starts a line proves the source broke
-    // before it: a later entry inside the operand may belong to a line the operand's text
-    // began earlier (a chain broken before its first call, an argument on its own line).
+    return end;
+  }
+
+  /** The smallest instruction offset any part of the expression owns, or -1. */
+  private static int firstOffsetOf(Exprent exprent) {
     int first = -1;
-    for (Exprent part : after.getAllExprents(true, true)) {
+    for (Exprent part : exprent.getAllExprents(true, true)) {
       if (part.bytecode == null || part.bytecode.isEmpty()) {
         continue;
       }
@@ -726,18 +738,49 @@ public final class RoundTrip {
         first = offset;
       }
     }
-    if (first < 0) {
+    return first;
+  }
+
+  /**
+   * The target's line at which the operand's text begins, or -1 when its table has no entry of
+   * its own. Only an entry at the operand's own first instruction proves the source broke before
+   * it; an entry found anywhere else belongs to a sub-expression that changed line inside it.
+   */
+  public static int operandStartLine(Exprent exprent) {
+    int first = firstOffsetOf(exprent);
+    if (first < 0 || !lineStartsAt(first)) {
+      return -1;
+    }
+    return lineAtOffset(first);
+  }
+
+  /**
+   * Whether the target's table starts a line exactly at this operand's first instruction, after
+   * the line the text before it ends on. javac anchors a statement at its condition's first
+   * instruction and an operand of a boolean expression only at an invocation inside it, so an
+   * entry at the very first instruction proves the source wrote the test as nested statements
+   * rather than as the right operand of {@code &&}.
+   */
+  public static boolean operandStartsStatement(Exprent before, Exprent after) {
+    if (!selector("ifnest") || after == null) {
       return false;
     }
     StructMethod method = currentMethod();
-    StructLineNumberTableAttribute table = method == null ? null
-      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (method == null) {
+      return false;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
     if (table == null) {
       return false;
     }
+    int first = firstOffsetOf(after);
+    if (first < 0 || !lineStartsAt(first)) {
+      return false;
+    }
+    int end = lastLine(before);
     int start = lineAtOffset(first);
-    boolean startsLine = table.findLineNumber(first) != (first <= 0 ? -1 : table.findLineNumber(first - 1));
-    return startsLine && end >= 0 && start >= 0 && start > end;
+    return end >= 0 && start > end;
   }
 
   /**
