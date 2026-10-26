@@ -161,7 +161,7 @@ public class SwitchExprent extends Exprent {
         Exprent exprent = stat.getExprents().get(0);
 
         if (exprent instanceof YieldExprent) {
-          Exprent content = ((YieldExprent) exprent).getContent();
+          Exprent content = bareArmValue(((YieldExprent) exprent).getContent(), target);
 
           if (content instanceof ConstExprent && !Objects.equals(content.getExprType(), VarType.VARTYPE_NULL)) {
             ((ConstExprent)content).setConstType(this.type);
@@ -258,6 +258,24 @@ public class SwitchExprent extends Exprent {
   /** The type the enclosing context expects from this value; consumed by the next {@link #toJava}. */
   public void setPrintTarget(VarType target) {
     this.printTarget = target;
+  }
+
+  /**
+   * A bare switch with a type-variable target gets one cast per arm to the switch's own erasure
+   * from javac itself, so the cast the tree carries around each arm's value is that compiled
+   * coercion, not something the source wrote. Printing the value lets javac put it back.
+   */
+  private Exprent bareArmValue(Exprent content, VarType target) {
+    if (target == null || !RoundTrip.selector("switchbare") || !RoundTrip.isTypeVariableTarget(target)
+        || !(content instanceof FunctionExprent cast)
+        || cast.getFuncType() != FunctionExprent.FunctionType.CAST
+        || cast.getLstOperands().isEmpty()
+        || !Objects.equals(cast.getExprType(), this.type)) {
+      return content;
+    }
+    // The cast to the switch's own erasure is javac's own coercion for a bare switch, which it
+    // re-creates from the case list; printing it pins the arm to the erasure instead.
+    return cast.getLstOperands().get(0);
   }
 
   /**

@@ -1162,6 +1162,19 @@ public final class RoundTrip {
     return disabled == null || !disabled.contains(name);
   }
 
+  /** True when the target names a type variable: a generic variable or an unknown object type. */
+  public static boolean isTypeVariableTarget(VarType target) {
+    if (target == null || target.arrayDim != 0) {
+      return false;
+    }
+    if (target.type == org.jetbrains.java.decompiler.struct.gen.CodeType.GENVAR) {
+      return true;
+    }
+    return target.type == org.jetbrains.java.decompiler.struct.gen.CodeType.OBJECT
+      && !target.isGeneric() && target.value != null
+      && DecompilerContext.getStructContext().getClass(target.value) == null;
+  }
+
   /**
    * True when the two return expressions come from distinct return instructions in the target.
    * A return-position ternary shares one return after a join; an if/else has one per arm.
