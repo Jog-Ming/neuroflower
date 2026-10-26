@@ -170,15 +170,23 @@ public class CatchStatement extends Statement {
 
     // A return the decompiler folded into the try body: javac ends the protected range with a
     // skip-goto, so a return instruction past that destination was written after the try/catch.
+    // A sequence-bodied try is accepted only when its last child is a lone return: the hoist
+    // then moves exactly that statement out, never a return other statements still depend on.
     Exprent hoistedReturn = null;
+    Statement hoistOwner = first;
     int firstHandler = firstHandlerOffset();
-    if (firstHandler >= 0 && first.getExprents() != null && !first.getExprents().isEmpty()) {
-      List<Exprent> bodyExprents = first.getExprents();
-      Exprent lastBody = bodyExprents.get(bodyExprents.size() - 1);
-      if (lastBody instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
-          && exit.getValue() != null && RoundTrip.returnPastTry(exit, firstHandler)) {
-        hoistedReturn = lastBody;
-        bodyExprents.remove(bodyExprents.size() - 1);
+    if (firstHandler >= 0) {
+      Statement owner = first.getExprents() != null && !first.getExprents().isEmpty()
+        ? first : trailingReturnOwner(first);
+      List<Exprent> bodyExprents = owner == null ? null : owner.getExprents();
+      if (bodyExprents != null && !bodyExprents.isEmpty()) {
+        Exprent lastBody = bodyExprents.get(bodyExprents.size() - 1);
+        if (lastBody instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+            && exit.getValue() != null && RoundTrip.returnPastTry(exit, firstHandler)) {
+          hoistedReturn = lastBody;
+          hoistOwner = owner;
+          bodyExprents.remove(bodyExprents.size() - 1);
+        }
       }
     }
 
@@ -290,7 +298,7 @@ public class CatchStatement extends Statement {
     buf.appendLineSeparator();
 
     if (hoistedReturn != null) {
-      first.getExprents().add(hoistedReturn);
+      hoistOwner.getExprents().add(hoistedReturn);
       buf.appendIndent(indent).append(hoistedReturn.toJava(indent)).append(";").appendLineSeparator();
     }
 
@@ -298,6 +306,32 @@ public class CatchStatement extends Statement {
   }
 
   /** The bytecode offset of the first catch handler's exception store, or -1. */
+  /**
+   * The sequence statement whose own exprents end with the try body's trailing return, or null.
+   * Only the body's last printing child is consulted: a return inside a nested arm is not the
+   * body's own exit and must not be hoisted.
+   */
+  private static Statement trailingReturnOwner(Statement body) {
+    List<Statement> children = body.getStats();
+    if (children == null || children.isEmpty()) {
+      return null;
+    }
+    for (int i = children.size() - 1; i >= 0; i--) {
+      Statement child = children.get(i);
+      if (RoundTrip.printsNothing(child)) {
+        continue;
+      }
+      List<Exprent> exprents = child.getExprents();
+      if (exprents == null || exprents.isEmpty()) {
+        return null;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+        && exit.getValue() != null ? child : null;
+    }
+    return null;
+  }
+
   private int firstHandlerOffset() {
     if (stats.size() < 2) {
       return -1;
