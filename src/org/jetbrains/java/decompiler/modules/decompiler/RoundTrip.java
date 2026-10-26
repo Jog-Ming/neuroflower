@@ -1747,6 +1747,66 @@ public final class RoundTrip {
    * back to the loop head per statement, so an {@code ||} of n tests came from n separate
    * {@code if (C) continue;} statements rather than one shared condition.
    */
+  /**
+   * The operand groups the target's recorded continue guards split this condition into, or null
+   * when it holds fewer than two. Each guard key K ends one written statement: the next statement
+   * starts at K+3, so the group boundary is the first operand that begins at or after it. Unlike
+   * {@link #splitsIntoGuards} this does not need one guard per operand — a written guard may itself
+   * be a chain of several tests.
+   */
+  public static java.util.List<java.util.List<Exprent>> guardGroups(Exprent head, java.util.List<Exprent> operands,
+                                                                   Statement around) {
+    if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()
+        || operands.size() < 2) {
+      return null;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(currentMethod());
+    if (guards == null || guards.isEmpty()) {
+      return null;
+    }
+    java.util.List<Integer> keys = new java.util.ArrayList<>();
+    for (Integer end : guards.keySet()) {
+      if (end > head.bytecode.length() || end <= 0 || !head.bytecode.get(end - 1)) {
+        continue;
+      }
+      if (continuesAt(end, around)) {
+        keys.add(end);
+      }
+    }
+    if (keys.isEmpty()) {
+      return null;
+    }
+    java.util.Collections.sort(keys);
+    int[] starts = new int[operands.size()];
+    for (int i = 0; i < starts.length; i++) {
+      starts[i] = firstOffsetOf(operands.get(i));
+      if (starts[i] < 0) {
+        return null;
+      }
+    }
+    java.util.List<java.util.List<Exprent>> groups = new java.util.ArrayList<>();
+    int from = 0;
+    for (Integer key : keys) {
+      int boundary = key + 3;
+      int next = from;
+      while (next < starts.length && starts[next] < boundary) {
+        next++;
+      }
+      if (next == from) {
+        return null;
+      }
+      groups.add(new java.util.ArrayList<>(operands.subList(from, next)));
+      from = next;
+      if (from >= operands.size()) {
+        break;
+      }
+    }
+    if (from < operands.size()) {
+      groups.add(new java.util.ArrayList<>(operands.subList(from, operands.size())));
+    }
+    return groups.size() > 1 ? groups : null;
+  }
+
   public static boolean splitsIntoGuards(Exprent head, int operands, Statement around) {
     if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()
         || operands < 2) {

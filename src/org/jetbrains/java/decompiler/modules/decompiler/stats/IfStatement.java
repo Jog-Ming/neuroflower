@@ -254,10 +254,13 @@ public class IfStatement extends Statement {
       // Two guards merged into one `||`: the target records a goto back to the loop head for each
       // operand, so the source wrote one `if (C) continue;` per test.
       List<Exprent> ors = orOperands(source);
-      boolean split = RoundTrip.splitsIntoGuards(ifHead, ors.size(), this);
-      for (Exprent operand : split ? ors : java.util.Collections.singletonList(source)) {
+      List<List<Exprent>> groups = RoundTrip.guardGroups(ifHead, ors, this);
+      if (groups == null) {
+        groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
+      }
+      for (List<Exprent> group : groups) {
         IfExprent guard = (IfExprent) ifHead.copy();
-        guard.setCondition(operand);
+        guard.setCondition(orOf(group));
         buf.appendIndent(indent);
         buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
         buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
@@ -547,6 +550,18 @@ public class IfStatement extends Statement {
       }
     }
     return -1;
+  }
+
+  /** One operand, or the operands joined by `||` again, as a guard condition prints it. */
+  private static Exprent orOf(List<Exprent> operands) {
+    if (operands.size() == 1) {
+      return operands.get(0);
+    }
+    Exprent left = orOf(operands.subList(0, operands.size() - 1));
+    List<Exprent> pair = new ArrayList<>(2);
+    pair.add(left);
+    pair.add(operands.get(operands.size() - 1));
+    return new FunctionExprent(FunctionType.BOOLEAN_OR, pair, null);
   }
 
   /** The operands of a boolean-or condition, flattened; a single expression comes back alone. */
