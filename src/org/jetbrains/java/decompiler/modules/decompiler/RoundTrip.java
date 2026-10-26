@@ -7,6 +7,7 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FieldExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
@@ -756,7 +757,21 @@ public final class RoundTrip {
       return false;
     }
     int skip = handlerExitOffset(handlerOffset);
-    return skip >= 0 && exit.bytecode.nextSetBit(0) >= skip;
+    if (skip < 0 || exit.bytecode.nextSetBit(0) < skip) {
+      return false;
+    }
+    // The return instruction can sit past the range while the value it returns was computed
+    // inside it: `return valueOf(response);` keeps the call protected and only the return
+    // outside, which is `T result; try { result = …; } catch …; return result;`. Hoisting such a
+    // return would move the call out of the range and let the exception escape.
+    if (exit instanceof ExitExprent exitExprent) {
+      Exprent value = exitExprent.getValue();
+      int valueStart = value == null ? -1 : firstOffsetOf(value);
+      if (valueStart >= 0 && valueStart < skip) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** The target's source line for a bytecode offset, or -1. */
