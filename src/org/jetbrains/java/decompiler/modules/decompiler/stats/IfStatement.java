@@ -235,11 +235,15 @@ public class IfStatement extends Statement {
     if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
         && (getParent() instanceof DoStatement
             // The same mirror one level in: `if (!C) { rest }` printed as the loop body's tail.
-            // The printed condition has to be the whole of what the head covers: a pattern if's
-            // head also spans the nested condition, and its guard belongs to that inner test.
+            // A pattern if's head also spans the nested condition, and its guard belongs to that
+            // inner test, so a condition that declares a pattern variable is refused outright.
+            // Otherwise the head's length is a fallback: a condition the decompiler built itself
+            // carries no offsets, and refusing those would lose every compound guard.
             || RoundTrip.endsLoopBody(this)
-               && ifHead.bytecode != null && ifHead.getCondition().bytecode != null
-               && ifHead.getCondition().bytecode.length() == ifHead.bytecode.length())
+               && ifHead.bytecode != null
+               && !declaresPattern(ifHead.getCondition())
+               && (ifHead.getCondition().bytecode == null
+                   || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()))
         && RoundTrip.printContinueGuard(ifHead, this)) {
       Exprent printed = ifHead.getCondition();
       Exprent source = printed instanceof FunctionExprent not
