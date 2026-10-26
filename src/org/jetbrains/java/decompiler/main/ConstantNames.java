@@ -574,7 +574,19 @@ public final class ConstantNames {
       Integer ownIndex = classIndices.get(own.qualifiedName);
       // No instruction uses the class's own Class entry, so nothing in the code can have entered
       // it: whatever position it holds was created by a folded constant naming before the code.
+      // A field or method reference to the class that sits below the entry did enter it, as that
+      // reference's operand, and then the entry says nothing about a naming.
       ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex);
+      if (ownEarly) {
+        List<PooledConstant> pool = own.getPool().getPool();
+        for (int i = 1; i < ownIndex && i < pool.size(); i++) {
+          if (pool.get(i) instanceof LinkConstant link
+              && own.qualifiedName.equals(link.classname)) {
+            ownEarly = false;
+            break;
+          }
+        }
+      }
     }
     Map<String, Double> folded = new HashMap<>();
     for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
