@@ -2254,7 +2254,7 @@ public class InvocationExprent extends Exprent {
       // line, so when the creation is itself an argument the enclosing call's line is the one
       // its text sits on, and a later first argument only says a chain inside it broke.
       boolean insideCall = OUTER_CALL_LINE.get()[0] >= 0 && OUTER_CALL_AT.get()[0] == RoundTrip.currentMethod();
-      boolean constructorStartLater = callerOpeningLine >= 0 && !insideCall && start < lstParameters.size()
+      boolean constructorStartLater = callerOpeningLine >= 0 && start < lstParameters.size()
         && RoundTrip.sourceLine(lstParameters.get(start)) > callerOpeningLine;
       breakBeforeFirst = (!lambdaArgument || lambdaStartsLater)
         && (elementStartsLater || explicitStart || constructorStartLater || lambdaStartsLater);
