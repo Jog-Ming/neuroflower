@@ -2275,6 +2275,40 @@ public final class RoundTrip {
   }
 
   /**
+   * True when this bare void return is the method's exit that the block merely falls out of: the
+   * target's jump from inside the block lands on the return, so the source let the block complete.
+   * Printing a `return;` inside the braces compiles to `monitorexit; return` instead.
+   */
+  public static boolean fallsOutToExit(Statement block, Exprent exit) {
+    if (!selector("synexit")) {
+      return false;
+    }
+    if (!(exit instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent e)
+        || e.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+        || e.getValue() != null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    int start = firstOffset(block);
+    int end = lastEnd(block);
+    int exitStart = exit.bytecode.nextSetBit(0);
+    if (gotos == null || start < 0 || end < start || exitStart <= start) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> jump : gotos.entrySet()) {
+      int from = jump.getKey();
+      if (from >= start && from < exitStart && jump.getValue() == exitStart) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * True when this empty switch arm's `break;` is really the loop's `continue`. The block recorded
    * nothing, so the arm's own jump offset is gone; the switch's bytecode range is the evidence: it
    * must hold exactly one jump to the loop's continue point (that one is this arm's), and this must

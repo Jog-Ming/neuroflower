@@ -4,6 +4,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
@@ -75,7 +76,29 @@ public class SynchronizedStatement extends Statement {
     }
     buf.append(" {").appendLineSeparator();
 
-    buf.append(ExprProcessor.jmpWrapper(body, indent + 1, true));
+    // The block's own completion jumps to the method's return: the source wrote no `return;`
+    // inside the braces, so drop the copy the tree carries while it prints.
+    java.util.List<Exprent> exitOwner = null;
+    Exprent droppedExit = null;
+    if (body.getExprents() == null && !body.getStats().isEmpty()) {
+      Statement lastStat = body.getStats().get(body.getStats().size() - 1);
+      java.util.List<Exprent> exprents = lastStat.getExprents();
+      if (exprents != null && !exprents.isEmpty()) {
+        Exprent last = exprents.get(exprents.size() - 1);
+        if (RoundTrip.fallsOutToExit(this, last)) {
+          exitOwner = exprents;
+          droppedExit = last;
+          exprents.remove(exprents.size() - 1);
+        }
+      }
+    }
+    try {
+      buf.append(ExprProcessor.jmpWrapper(body, indent + 1, true));
+    } finally {
+      if (exitOwner != null) {
+        exitOwner.add(droppedExit);
+      }
+    }
 
     buf.appendIndent(indent).append("}");
     mapMonitorExitInstr(buf);
