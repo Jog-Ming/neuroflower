@@ -701,6 +701,34 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `int i = 0; for (int size = …; i < size; i++)` where the target gives `i` a scope that
+      // opens at the loop's head and closes with the loop: the source declared both in the for
+      // init, and the hoisted form makes the next loop's variable take another slot.
+      if (i + 1 < stats.size() && st.type == Statement.StatementType.BASIC_BLOCK
+          && st.getExprents() != null && !st.getExprents().isEmpty()
+          && stats.get(i + 1) instanceof DoStatement loop
+          && loop.getLooptype() == DoStatement.Type.FOR
+          && loop.getInitExprent() instanceof AssignmentExprent init
+          && init.getLeft() instanceof VarExprent initVar
+          && loop.getConditionExprent() != null && loop.getIncExprent() != null
+          && RoundTrip.forInitContinues(st.getExprents().get(st.getExprents().size() - 1), loop, init,
+               i + 2 < stats.size() ? RoundTrip.firstOffset(stats.get(i + 2)) : -1)) {
+        Exprent declaration = st.getExprents().get(st.getExprents().size() - 1);
+        buf.append(ExprProcessor.listToJava(st.varDefinitions, indent));
+        for (int k = 0; k < st.getExprents().size() - 1; k++) {
+          buf.appendIndent(indent).append(st.getExprents().get(k).toJava(indent)).append(";").appendLineSeparator();
+        }
+        buf.appendIndent(indent).append("for (").append(declaration.toJava(indent))
+          .append(", ").append(initVar.getName()).append(" = ").append(init.getRight().toJava(indent))
+          .append("; ").append(loop.getConditionExprent().toJava(indent))
+          .append("; ").append(loop.getIncExprent().toJava(indent)).append(") {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(loop.getFirst(), indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        i++;
+        continue;
+      }
+
       TextBuffer str = ExprProcessor.jmpWrapper(st, indent, false);
 
       if (i > 0 && !str.containsOnlyWhitespaces() && notempty) {

@@ -1990,6 +1990,32 @@ public final class RoundTrip {
       && !head.bytecode.isEmpty() && continuesAt(head.bytecode.length(), sequence);
   }
 
+  /**
+   * True when this declaration belongs to the for loop after it: the target's table gives the
+   * variable a scope that opens at the loop's head and closes with the loop, and the loop's own
+   * init declares another variable of the same type. The source wrote `for (T a = …, b = …; …)`,
+   * which javac compiles exactly like the hoisted form but gives one declaration in the table.
+   */
+  public static boolean forInitContinues(Exprent declaration, Statement loop, Exprent init, int boundary) {
+    if (!selector("forinit")) {
+      return false;
+    }
+    if (!(declaration instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent first)
+        || !(first.getLeft() instanceof VarExprent a) || !a.isDefinition()
+        || !(init instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent second)
+        || !(second.getLeft() instanceof VarExprent b) || !b.isDefinition()) {
+      return false;
+    }
+    if (a.getLVT() == null || b.getLVT() == null || a.getExprType() == null
+        || !a.getExprType().equals(b.getExprType())) {
+      return false;
+    }
+    int start = firstOffset(loop);
+    int end = boundary >= 0 ? boundary : lastEnd(loop);
+    return start >= 0 && end > start && a.getLVT().getEnd() <= end && a.getLVT().getEnd() > start
+      && b.getLVT().getEnd() <= end;
+  }
+
   /** True when the jump into the guard sits immediately before this next test (3 bytes of goto). */
   public static boolean continuesBefore(Exprent next, Statement around) {
     if (!selector("continueguard")) {
