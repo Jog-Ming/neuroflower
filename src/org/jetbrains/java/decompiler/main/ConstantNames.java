@@ -220,7 +220,8 @@ public final class ConstantNames {
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
-                           Map<String, PairSite> pairs, Map<String, ValueSite> values) {
+                           Map<String, PairSite> pairs, Map<String, ValueSite> values,
+                           Set<String> earlyOwners) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -255,6 +256,9 @@ public final class ConstantNames {
      * be preceded by a naming.
      */
     boolean existsAt(String owner, int start) {
+      if (earlyOwners.contains(owner)) {
+        return true; // entered while the class's names were resolved, before any generated code
+      }
       return withinInterned(owner, start) && afterNaming(owner, start);
     }
 
@@ -300,6 +304,9 @@ public final class ConstantNames {
      * printer mapped no instruction in) is not contradicted: the pool says nothing about it.
      */
     boolean contradicts(String owner, int start) {
+      if (earlyOwners.contains(owner)) {
+        return false;
+      }
       long[] bounds = coordinates == null ? null : coordinates.get(owner);
       if (bounds == null) {
         return false;
@@ -343,7 +350,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of());
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -561,6 +568,7 @@ public final class ConstantNames {
     Map<String, Integer> classIndices = classIndices(own);
     Set<Integer> early = earlyClassEntries(own, classIndices);
     Set<Integer> setup = setupClassEntries(own, classIndices);
+    Set<String> earlyOwners = earlyOwners(own, classIndices, setup, firstUses);
     Map<String, Double> folded = new HashMap<>();
     for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
       Double value = foldedValue(own, entry.getValue());
@@ -579,7 +587,7 @@ public final class ConstantNames {
     // enclosing name directly instead.
     for (String ancestor : enclosings(own.qualifiedName)) {
       Integer index = classIndices.get(ancestor);
-      if (index != null && opensPool(own, index, setup, firstUses)) {
+      if (index != null && earlyOwners.contains(ancestor)) {
         lexical.add(ancestor);
         claimed.add(ancestor);
         if (candidateOwners.add(ancestor)) {
@@ -733,7 +741,7 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues),
+        activeValues, earlyOwners),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -1113,6 +1121,56 @@ public final class ConstantNames {
       }
     }
     return true;
+  }
+
+  /**
+   * The owners whose {@code Class} entry the pool holds before any generated code.
+   *
+   * <p>A protected constant of a superclass in another package, and an unqualified constant of the
+   * enclosing class, are resolved while the class's names are resolved: javac enters the owner's
+   * {@code Class} then, ahead of every entry the code generation later creates. The entry cannot be
+   * a reference's operand (that would be entered with the reference) and cannot be the class's own
+   * or its superclass's setup entry.
+   */
+  private static Set<String> earlyOwners(StructClass own, Map<String, Integer> classIndices,
+                                         Set<Integer> setup, Map<Integer, FirstUse> firstUses) {
+    Set<String> owners = new HashSet<>();
+    int firstReferenced = Integer.MAX_VALUE;
+    for (int key : firstUses.keySet()) {
+      firstReferenced = Math.min(firstReferenced, key);
+    }
+    if (firstReferenced == Integer.MAX_VALUE) {
+      return owners; // no generated code, so nothing proves an early entry
+    }
+    String nest = nestOf(own.qualifiedName);
+    String packageName = packageOf(own.qualifiedName);
+    List<PooledConstant> pool = own.getPool().getPool();
+    for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
+      int index = entry.getValue();
+      String owner = entry.getKey();
+      if (index >= firstReferenced || setup.contains(index) || owner.equals(own.qualifiedName)) {
+        continue;
+      }
+      // Only two kinds of name are resolved before any generated code: the enclosing class's,
+      // written unqualified, and a protected constant of a superclass in another package. Any
+      // other early entry is entered for a reason the pool does not record here.
+      boolean enclosing = own.qualifiedName.startsWith(owner + "$");
+      boolean remoteSuper = !packageName.equals(packageOf(owner)) && extendsClass(nest, owner);
+      if (!enclosing && !remoteSuper) {
+        continue;
+      }
+      boolean operand = false;
+      for (int i = index + 1; i < Math.min(pool.size(), index + 5); i++) {
+        if (pool.get(i) instanceof LinkConstant link && owner.equals(link.classname)) {
+          operand = true;
+          break;
+        }
+      }
+      if (!operand) {
+        owners.add(owner);
+      }
+    }
+    return owners;
   }
 
   private static int[] window(String text, StructClass cls, int index,
@@ -1680,7 +1738,8 @@ public final class ConstantNames {
       if (!inWindow.contains(entry.getKey())) {
         // A referenced owner's window is the only evidence of where the original named it; without
         // a site inside the window there is nothing to place the name against.
-        if (!rules.strict().contains(entry.getKey())) {
+        if (!rules.strict().contains(entry.getKey())
+            && !rules.placement().earlyOwners().contains(entry.getKey())) {
           for (Site site : entry.getValue()) {
             if (rules.placement().existsAt(entry.getKey(), site.start())
                 && !rules.placement().contradicts(entry.getKey(), site.start())) {
@@ -1701,7 +1760,61 @@ public final class ConstantNames {
         }
       }
     }
+    earlySites(text, rules, deferred, sites);
     compositeSites(text, spans, rules, sites);
+  }
+
+  /**
+   * Places one naming for an owner whose {@code Class} entry precedes all generated code.
+   *
+   * <p>The site is not placed by the pool order, because the entry was not created at a generated
+   * point; one naming anywhere reproduces it. Only an immediate value is accepted: naming a pooled
+   * value would enter that value at the site, and the target pool did not put it there.
+   */
+  private static void earlySites(String text, Rules rules, Map<String, List<Site>> deferred,
+                                 List<Site> sites) {
+    if (rules.placement().earlyOwners() == null || rules.placement().earlyOwners().isEmpty()) {
+      return;
+    }
+    for (String owner : rules.placement().earlyOwners()) {
+      if (hasSiteFor(sites, owner) || rules.placement().lexical().contains(owner)) {
+        continue;
+      }
+      List<Site> candidates = deferred.get(owner);
+      if (candidates == null) {
+        continue;
+      }
+      Site best = null;
+      for (Site site : candidates) {
+        if ((best == null || site.start() < best.start()) && immediateSite(text, site)) {
+          best = site;
+        }
+      }
+      if (best != null) {
+        addSiteOnce(sites, best);
+      }
+    }
+  }
+
+  /** Whether the site replaces a bare literal javac folds to an immediate. */
+  private static boolean immediateSite(String text, Site site) {
+    if (site.start() < 0 || site.start() >= site.end() || site.end() > text.length()) {
+      return false;
+    }
+    String literal = text.substring(site.start(), site.end()).trim();
+    if (literal.equals("true") || literal.equals("false")) {
+      return true;
+    }
+    if (literal.startsWith("'") && literal.endsWith("'")) {
+      return true;
+    }
+    try {
+      long value = Long.parseLong(literal);
+      return value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
+    }
+    catch (NumberFormatException e) {
+      return false;
+    }
   }
 
   /** One constant field of a pool-unexplained owner, for a bitwise combination. */
