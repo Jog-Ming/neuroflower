@@ -2254,6 +2254,158 @@ public final class RoundTrip {
     return false;
   }
 
+  /** Loops whose body is being printed, innermost first, whatever their type. */
+  private static final ThreadLocal<java.util.ArrayDeque<Statement>> OPEN_ALL_LOOPS =
+    ThreadLocal.withInitial(java.util.ArrayDeque::new);
+
+  /** Registers a loop of any type whose body is being printed. */
+  public static void enterAnyLoop(Statement loop) {
+    OPEN_ALL_LOOPS.get().push(loop);
+  }
+
+  public static void exitAnyLoop() {
+    java.util.ArrayDeque<Statement> loops = OPEN_ALL_LOOPS.get();
+    if (!loops.isEmpty()) {
+      loops.poll();
+    }
+  }
+
+  /**
+   * True when code nested in a loop inside this one jumps to a return the decompiler copied here:
+   * no unlabelled `break` can reach that far, so the source named this loop with a label.
+   */
+  public static boolean carriesOutwardBreak(Statement loop) {
+    if (!selector("breaklabel") || loop == null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return false;
+    }
+    java.util.Set<Integer> returns = copiedExitOffsets(loop);
+    if (returns.isEmpty()) {
+      return false;
+    }
+    int start = firstOffset(loop);
+    int end = loopOwnEnd(loop);
+    for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+      if (edge.getKey() >= start && returns.contains(edge.getValue()) && end == edge.getValue()
+          && insideNestedLoop(loop, edge.getKey())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The label a bare void return prints with when it is the target's jump out of an enclosing loop
+   * that the jump cannot reach without a name, or null when it prints as `return;`/plain `break;`.
+   */
+  public static String labelledBreakLabel(Exprent exit) {
+    if (!selector("breaklabel") || exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    int exitStart = exit.bytecode.nextSetBit(0);
+    if (gotos == null || exitStart < 0) {
+      return null;
+    }
+    java.util.Iterator<Statement> loops = OPEN_ALL_LOOPS.get().iterator();
+    if (loops.hasNext()) {
+      loops.next();
+    }
+    while (loops.hasNext()) {
+      Statement loop = loops.next();
+      int start = firstOffset(loop);
+      if (start < 0 || loopOwnEnd(loop) != exitStart) {
+        continue;
+      }
+      for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+        if (edge.getValue() == exitStart && edge.getKey() >= start && edge.getKey() < exitStart) {
+          return "label" + loop.id;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Where this loop's own body ends: the instruction after its back edge to the head. */
+  private static int loopOwnEnd(Statement loop) {
+    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    Exprent head = doStatement.getConditionExprent();
+    if (ends == null || gotos == null || head == null) {
+      return -1;
+    }
+    // A condition the decompiler composed carries no offsets of its own.
+    int headStart = head.bytecode != null && !head.bytecode.isEmpty()
+      ? head.bytecode.nextSetBit(0) : firstOffsetOf(head);
+    if (headStart < 0) {
+      return -1;
+    }
+    int end = -1;
+    for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+      if (edge.getValue() == headStart) {
+        Integer instructionEnd = ends.get(edge.getKey());
+        if (instructionEnd != null && instructionEnd > end) {
+          end = instructionEnd;
+        }
+      }
+    }
+    return end;
+  }
+
+  /** Offsets where a bare void return sits anywhere inside this statement. */
+  private static java.util.Set<Integer> copiedExitOffsets(Statement stat) {
+    java.util.Set<Integer> offsets = new java.util.HashSet<>();
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(stat);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          for (Exprent part : exprent.getAllExprents(true, true)) {
+            if (part instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+                && exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+                && exit.getValue() == null
+                && exit.bytecode != null && !exit.bytecode.isEmpty()) {
+              offsets.add(exit.bytecode.nextSetBit(0));
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return offsets;
+  }
+
+  /** Whether this offset lies inside a loop nested in {@code outer}. */
+  private static boolean insideNestedLoop(Statement outer, int offset) {
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    for (Statement child : outer.getStats()) {
+      queue.add(child);
+    }
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement) {
+        int start = firstOffset(cur);
+        int end = lastEndExcept(cur, new BitSet());
+        if (start >= 0 && end >= start && offset >= start && offset < end) {
+          return true;
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return false;
+  }
+
   /** The last instruction end inside this statement, ignoring the offsets of one exprent. */
   private static int lastEndExcept(Statement stat, BitSet skip) {
     StructMethod method = currentMethod();

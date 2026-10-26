@@ -103,6 +103,14 @@ public class ExitExprent extends Exprent {
         buf.append("break");
         return buf;
       }
+      if (value == null && retType.type == CodeType.VOID) {
+        // The jump leaves an outer loop, out of reach of an unlabelled break: the source named it.
+        String label = RoundTrip.labelledBreakLabel(this);
+        if (label != null) {
+          buf.append("break ").append(label);
+          return buf;
+        }
+      }
       buf.append("return");
 
       if (retType.type != CodeType.VOID) {

@@ -105,11 +105,13 @@ public class DoStatement extends Statement {
     int varDefsStart = buf.length();
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
-    if (isLabeled()) {
+    if (isLabeled() || RoundTrip.carriesOutwardBreak(this)) {
       buf.appendIndent(indent).append("label").append(this.id).append(":").appendLineSeparator();
     }
 
-    switch (looptype) {
+    RoundTrip.enterAnyLoop(this);
+    try {
+      switch (looptype) {
       case INFINITE:
         // An exit copied out of this loop prints as the break the target jumped with.
         RoundTrip.enterLoop(this);
@@ -221,6 +223,9 @@ public class DoStatement extends Statement {
         buf.append(" : ").append(incExprent.get(0).toJava(indent)).append(") {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
         buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
+    } finally {
+      RoundTrip.exitAnyLoop();
     }
 
     return buf;
