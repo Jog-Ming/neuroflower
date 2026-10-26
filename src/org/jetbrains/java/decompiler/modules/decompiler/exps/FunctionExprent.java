@@ -649,7 +649,7 @@ public class FunctionExprent extends Exprent {
         buf.pushNewlineGroup(indent, 1);
       }
       buf.append(leftOperand);
-      if (RoundTrip.newlineBetween(left, right)) {
+      if (RoundTrip.newlineBetweenOperands(left, right)) {
         buf.appendLineSeparator().appendIndent(indent + 1).append(funcType.operator).append(" ");
       } else {
         buf.appendPossibleNewline(" ").append(funcType.operator).append(" ");
