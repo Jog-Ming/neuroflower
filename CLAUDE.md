@@ -48,7 +48,8 @@ work stands — belong in project memory.
     `devtools/poll 90 grep -q '^fully' .dev/tmp/score.out && tail -5 .dev/tmp/score.out`. The elapsed
     time it prints calibrates the next timeout; any request over 300 s is capped at 300 s with a notice.
 - **Read the ground truth before deriving a repair.** When a reference source tree is available, copy
-  the form from it instead of re-deriving it from bytecode.
+  the form from it instead of re-deriving it from bytecode — and understand why that form is right,
+  not just what it says.
 - **Verify before inventing.** A repair to one declaration is often illegal in terms of another
   (overrides, erasure, raw types). Diff the set of error messages between rounds.
 - **Commits are unsigned; pushing is signed and only on request.** Commit with `git commit --no-gpg-sign`;
@@ -59,10 +60,27 @@ work stands — belong in project memory.
   without a prompt — reading, grepping, the project's own scripts under `.dev/tmp` — and must state
   that a step which would need approval is skipped and written into the report instead of attempted.
   Message a running agent this rule the moment it is added.
-- **When the deterministic routes look exhausted, dispatch research subagents.** A fresh agent with
-  one narrow, evidence-driven question sees what the working context has stopped noticing; give it
-  the files, the measurement, and what is already ruled out, and ask for concrete proposals with
-  the evidence behind them.
+## The family loop
+
+Every unaligned metric is worked the same way. The main process classifies and dispatches; it does
+not edit code.
+
+1. **Classify.** Split the metric's residue into families by root cause, not by first opcode: a
+   shared first-divergence instruction is a starting guess that the research step has to confirm or
+   dissolve.
+2. **Research one family, read-only.** Give a fresh agent one family, the report, our tree and the
+   ground-truth tree. It picks one or more representative classes — as short as possible, and free of
+   other families' or metrics' problems — and works out the repair by hand, editing a scratch copy of
+   the *tree* to prove the form. If no such class exists it says what sample would be needed; it may
+   not run the decompiler to make one while a measurement owns devtools. It must explain why the
+   ground truth is right, and offer at least one candidate repair that differs from the ground truth
+   and say what separates them in the class file — that is the proof it understood the shape rather
+   than copied it.
+3. **Implement one family, with devtools.** A different agent applies the agreed rule to the whole
+   family, owns devtools for the regression run, and commits only when no attribute drops. Research
+   agents cost nothing to run in parallel; implementation agents must not share a checkout.
+4. **Repeat** until the metric has no family left. Report a family that has no deterministic
+   discriminator as blocked, with the token pair.
 
 ## devtools/cli
 
