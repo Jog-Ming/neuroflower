@@ -67,7 +67,14 @@ not edit code.
 
 1. **Classify.** Split the metric's residue into families by root cause, not by first opcode: a
    shared first-divergence instruction is a starting guess that the research step has to confirm or
-   dissolve.
+   dissolve. Count per method, not per file — a file-level tally picks up a sibling class's
+   difference and inflates a family several-fold.
+   **The classification is a hypothesis, and a wrong one is the normal case.** The research agent
+   must be free to answer "this is not one family" or "this family has no members left": the first
+   survey's buckets were wrong about half the time (a supposed 72-class continue-guard family was 6;
+   a 41-class constant family could not exist, because javac inlines those constants). A research
+   report that dissolves a family is a success, and the next round re-cuts the residue with what it
+   learned.
 2. **Research one family.** Give a fresh agent one family, the report, our tree and the
    ground-truth tree. It picks one or more representative classes — as short as possible, and free of
    other families' or metrics' problems — and works out the repair by hand, editing a scratch copy of
