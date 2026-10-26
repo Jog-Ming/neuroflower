@@ -2655,6 +2655,28 @@ public final class RoundTrip {
     return guards == null || !guards.containsKey(lastEnd);
   }
 
+  /**
+   * True when this switch arm is the one javac synthesizes for an exhaustive switch: it throws a
+   * freshly built {@code MatchException} and its first instruction owns no line-table entry, so no
+   * source statement wrote it. javac rebuilds it from the case list, so not printing it is exact.
+   */
+  public static boolean synthesizedMatchThrow(Statement stat) {
+    if (!selector("matchexception") || stat == null) {
+      return false;
+    }
+    if (!IfPatternMatchProcessor.isStatementMatchThrow(stat)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLineNumberTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = firstOffset(stat);
+    return start >= 0 && !startsLine(table, start);
+  }
+
   /** Whether the table starts an entry at this exact offset: a statement on a new line began there. */
   private static boolean startsLine(StructLineNumberTableAttribute table, int offset) {
     int[] raw = table.getRawData();

@@ -57,6 +57,10 @@ public class SwitchExprent extends Exprent {
     List<Integer> order = armOrder();
     for (int i : order) {
       Statement stat = this.backing.getCaseStatements().get(i);
+      // javac rebuilds an exhaustive switch's MatchException arm from the case list.
+      if (RoundTrip.synthesizedMatchThrow(stat)) {
+        continue;
+      }
       List<StatEdge> edges = this.backing.getCaseEdges().get(i);
       List<Exprent> values = this.backing.getCaseValues().get(i);
       Exprent guard = this.backing.getCaseGuards().size() > i ? this.backing.getCaseGuards().get(i) : null;

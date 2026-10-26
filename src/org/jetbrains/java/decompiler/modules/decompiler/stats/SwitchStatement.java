@@ -167,7 +167,12 @@ public class SwitchStatement extends Statement {
       }
     }
     List<Integer> order = sourceOrder();
-    int lastPrinted = order.isEmpty() ? -1 : order.get(order.size() - 1);
+    int lastPrinted = -1;
+    for (int i : order) {
+      if (!RoundTrip.synthesizedMatchThrow(caseStatements.get(i))) {
+        lastPrinted = i;
+      }
+    }
 
     for (int i : order) {
 
