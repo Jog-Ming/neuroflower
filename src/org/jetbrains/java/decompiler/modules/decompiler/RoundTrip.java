@@ -38,6 +38,10 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Continue guards by branch end: {goto offset (the continue), body start (the branch target)}. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> CONTINUE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The same, for an if/else whose then arm ends with the continue: branch end maps to loop head. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> CONTINUE_ELSE_GUARDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Continue-else guards by branch end: {goto offset (the continue), else start (the branch target)}. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> CONTINUE_ELSE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Branch opcode by the end offset of each conditional branch, for polarity checks. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCHES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Jump target of each conditional branch, by the end offset of the branch instruction. */
@@ -59,6 +63,9 @@ public final class RoundTrip {
     BitSet sinks = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
     java.util.Map<Integer, int[]> sites = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> elseGuards = new java.util.HashMap<>();
+    java.util.Map<Integer, int[]> elseSites = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> prevByEnd = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branchTargets = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
@@ -110,11 +117,24 @@ public final class RoundTrip {
           }
         }
       }
+      prevByEnd.put(instr.startOffset + instr.length, instr.startOffset);
+    }
+    // `if (C) { ...; continue; } rest`: the branch jumps over the then arm to `rest`, and the
+    // then arm's terminal goto is the continue. Instructions are contiguous, so that goto is the
+    // one ending exactly where a forward branch lands; record it under the branch's end.
+    for (java.util.Map.Entry<Integer, Integer> branch : branchTargets.entrySet()) {
+      Integer prev = prevByEnd.get(branch.getValue());
+      if (branch.getValue() > branch.getKey() && prev != null && gotos.containsKey(prev)) {
+        elseGuards.put(branch.getKey(), gotos.get(prev));
+        elseSites.put(branch.getKey(), new int[]{prev, branch.getValue()});
+      }
     }
     VOID_RETURNS.put(method, returns);
     VALUE_SINKS.put(method, sinks);
     CONTINUE_GUARDS.put(method, guards);
     CONTINUE_SITES.put(method, sites);
+    CONTINUE_ELSE_GUARDS.put(method, elseGuards);
+    CONTINUE_ELSE_SITES.put(method, elseSites);
     BRANCHES.put(method, branches);
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
@@ -1523,6 +1543,126 @@ public final class RoundTrip {
       }
     }
     return true;
+  }
+
+  /**
+   * Whether a local declared in this statement runs to its end. Such a statement's scope closes at
+   * the jump that follows it; a {@code continue} printed after the local's last use would close the
+   * scope after that jump instead of before it, and the local's table range would grow. A local
+   * declared in a nested block ends earlier and is unaffected.
+   */
+  public static boolean declaresLocalToEnd(Statement statement) {
+    StructMethod method = currentMethod();
+    if (method == null || statement == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = firstOffset(statement);
+    int end = lastEnd(statement);
+    if (start < 0 || end < 0) {
+      return false;
+    }
+    // The table's own range filter wants both ends, but the scope ends at the jump past the last
+    // instruction, so bound the start here and compare the end directly.
+    return table.getRange(start, Integer.MAX_VALUE)
+      .anyMatch(v -> v.getStart() <= end && v.getEnd() >= end);
+  }
+
+  /**
+   * The mirror of {@link #printContinueGuard} for an else arm: {@code if (C) { ...; continue; } rest}
+   * where the decompiler kept {@code rest} as the else arm. The branch jumps over the then arm and
+   * the goto ending that arm is the continue. The caller proves the arm is the rest of the loop
+   * body, so hoisting it keeps every scope's end where it was and no local can change slot.
+   */
+  public static boolean printContinueElse(Exprent head, Statement sequence) {
+    if (!selector("continueguard")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_ELSE_GUARDS.get(method);
+    BitSet offsets = head.bytecode;
+    if (guards == null || guards.isEmpty() || offsets == null || offsets.isEmpty()) {
+      return false;
+    }
+    Integer target = guards.get(offsets.length());
+    if (target == null) {
+      return false;
+    }
+    Statement loop = sequence.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    // Only a jump to the loop head counts. An ordinary if/else joins after its else arm, which
+    // is still inside the loop, so the loop's extent alone cannot tell the two apart.
+    if (!isLoopHeadTarget(doStatement, target)) {
+      return false;
+    }
+    // The source wrote `continue;` on a line of its own, so the table starts an entry at its goto
+    // and puts it before the else arm's first line. An if/else's closing jump inherits the line of
+    // the arm before it and starts nothing; when the table has no entry at the goto, the extra
+    // `continue` line would change the table and the arm is an ordinary else.
+    java.util.Map<Integer, int[]> sites = CONTINUE_ELSE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(offsets.length());
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (site == null || table == null || !startsLine(table, site[0])) {
+      return false;
+    }
+    int continueLine = table.findLineNumber(site[0]);
+    int bodyLine = table.findLineNumber(site[1]);
+    if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
+      return false;
+    }
+    return true;
+  }
+
+  /** Whether the table starts an entry at this exact offset: a statement on a new line began there. */
+  private static boolean startsLine(StructLineNumberTableAttribute table, int offset) {
+    int[] raw = table.getRawData();
+    for (int i = 0; i + 1 < raw.length; i += 2) {
+      if (raw[i] == offset) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Whether {@code target} is where a {@code continue} of this loop lands, without the loop's extent. */
+  private static boolean isLoopHeadTarget(org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    // A continue jumps to the loop's head, which is built before the body's first statement.
+    int bodyStart = firstOffset(loop.getFirst());
+    if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
+      return true;
+    }
+    Exprent head = switch (loop.getLooptype()) {
+      case WHILE, DO_WHILE -> loop.getConditionExprent();
+      case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
+      default -> null;
+    };
+    if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
+      // The loop top may load a local the condition exprent does not own, so the target can sit
+      // a short load before the exprent's first byte.
+      int start = head.bytecode.nextSetBit(0);
+      if (target <= start && target >= start - 3) {
+        return true;
+      }
+      // An array for-each keeps its increment after the body; the exprent owns that bytecode.
+      Exprent inc = loop.getIncExprent();
+      if (inc != null && inc.bytecode != null && inc.bytecode.get(target)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** The instruction a {@code continue} in this loop jumps to. */

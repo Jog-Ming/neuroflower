@@ -147,6 +147,30 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (C) { ...; continue; } rest` in the source; the decompiler kept `rest` as the else
+      // arm, so the continue becomes the loop's back edge. The arm's terminal goto to the loop
+      // head proves the source closed the branch. Hoisting the arm is exact only when the if
+      // ends the loop body: the arm's scope then ends where the else block's did, so a local it
+      // declares cannot move, and nothing after the if could depend on the branch.
+      if (st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IFELSE && ifStatement.getElsestat() != null
+          && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !st.isLabeled()
+          && ifStatement.getIfstat() != null
+          && !RoundTrip.printsNothing(ifStatement.getElsestat())
+          && !RoundTrip.declaresLocalToEnd(ifStatement.getIfstat())
+          && i == stats.size() - 1 && endsLoopBody()
+          && RoundTrip.printContinueElse(ifStatement.getHeadexprent(), this)) {
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getElsestat(), indent, false));
+        notempty = true;
+        continue;
+      }
+
       // `while (a && b) { body } return X;` where the exit block sits before the body and the
       // condition's branches target both the exit and the body: the source wrote the guard
       // inside `while (true)`.

@@ -250,6 +250,25 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // The same source shape with the rest of the body as the else arm: `if (C) { ...; continue; }
+    // rest`. The arm's terminal goto to the loop head proves the continue; the arm always exits,
+    // so the rest runs exactly where the else arm did. Hoisting is exact only when the if ends the
+    // loop body: the arm's scope then ends where the else block's did, so a local it declares
+    // cannot move, and nothing after the if could depend on the branch.
+    if (ifstat != null && elsestat != null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && !RoundTrip.printsNothing(elsestat)
+        && !RoundTrip.declaresLocalToEnd(ifstat)
+        && endsLoopBody(this)
+        && RoundTrip.printContinueElse(ifHead, this)) {
+      buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
+      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
+      return buf;
+    }
+
     // `if (C) A else B` and `if (!C) B else A` are the same program in different bytes; the target's
     // branch opcode or the arm lines' order says which one was written.
     if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
@@ -389,6 +408,32 @@ public class IfStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /**
+   * Whether this statement is the last thing every enclosing statement up to the loop runs, so a
+   * guard printed at its end skips nothing the loop still needs and hoisting an arm into it keeps
+   * every scope's end where it was.
+   */
+  private static boolean endsLoopBody(Statement stat) {
+    for (Statement parent = stat.getParent(); parent != null; parent = stat.getParent()) {
+      if (parent instanceof DoStatement) {
+        return true;
+      }
+      if (parent instanceof SequenceStatement sequence) {
+        if (sequence.getStats().getLast() != stat) {
+          return false;
+        }
+      } else if (parent instanceof IfStatement ifStatement) {
+        if (ifStatement.getIfstat() != stat) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+      stat = parent;
+    }
+    return false;
   }
 
   /** The operands of a boolean-and condition in the order the source wrote them. */
