@@ -1554,6 +1554,101 @@ public final class RoundTrip {
     return target != null && target > tailEnd;
   }
 
+  /**
+   * The index of the arm statement the target's then-arm ends on, when the arm was folded together
+   * with the statements that follow the if: the arm statement ending at {@code g} is followed, in
+   * the target, by a goto at {@code g} that jumps to {@code t}, the tail occupies {@code [g+len, t)}
+   * and the arm's next statement starts at {@code t}. The source wrote
+   * {@code if (C) { A } else { tail } rest}; -1 when the shape is different.
+   */
+  public static int thenArmSplit(Statement arm, Statement tail) {
+    StructMethod method = currentMethod();
+    if (method == null || arm == null || tail == null) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || gotos == null || !(arm instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence)) {
+      return -1;
+    }
+    int tailStart = firstOffset(tail);
+    int tailEnd = lastEnd(tail);
+    if (tailStart < 0 || tailEnd < 0) {
+      return -1;
+    }
+    int gotoStart = -1;
+    int target = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      Integer end = ends.get(entry.getKey());
+      if (end != null && end == tailStart && entry.getValue() == tailEnd) {
+        gotoStart = entry.getKey();
+        target = entry.getValue();
+        break;
+      }
+    }
+    if (gotoStart < 0) {
+      return -1;
+    }
+    java.util.List<Statement> stats = sequence.getStats();
+    for (int k = 0; k < stats.size() - 1; k++) {
+      if (lastEnd(stats.get(k)) == gotoStart && firstOffset(stats.get(k + 1)) == target) {
+        return k;
+      }
+    }
+    return -1;
+  }
+
+  /** The goto that sits immediately before this tail and jumps past it, or -1. */
+  public static int gotoBeforeTail(Statement tail) {
+    StructMethod method = currentMethod();
+    if (method == null || tail == null) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || gotos == null) {
+      return -1;
+    }
+    int tailStart = firstOffset(tail);
+    int tailEnd = lastEnd(tail);
+    if (tailStart < 0 || tailEnd < 0) {
+      return -1;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      Integer end = ends.get(entry.getKey());
+      if (end != null && end == tailStart && entry.getValue() == tailEnd) {
+        return entry.getKey();
+      }
+    }
+    return -1;
+  }
+
+  /** The end offset of a statement's own head exprents (an if's prelude), or -1. */
+  public static int headExprentsEnd(Statement stat) {
+    if (!(stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement)) {
+      return -1;
+    }
+    java.util.List<Exprent> exprents = ifStatement.getFirst().getExprents();
+    if (exprents == null || exprents.isEmpty()) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    int max = -1;
+    for (Exprent exprent : exprents) {
+      if (exprent.bytecode == null) {
+        continue;
+      }
+      for (int offset = exprent.bytecode.nextSetBit(0); offset >= 0; offset = exprent.bytecode.nextSetBit(offset + 1)) {
+        Integer end = ends == null ? null : ends.get(offset);
+        if (end != null && end > max) {
+          max = end;
+        }
+      }
+    }
+    return max;
+  }
+
   private static int lastStart(Statement stat) {
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);

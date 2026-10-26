@@ -423,6 +423,67 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { A; rest; return Y; } return X;` where the target's then-arm ends on A with a goto
+      // over the returning else block: the source wrote `if (C) { A } else { return X; } rest`.
+      if (i + 1 == stats.size() - 1 && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && !ifStatement.isPatternMatched()
+          && ifStatement.getIfstat() instanceof SequenceStatement thenSeq
+          && singleExit(stats.get(i + 1)) != null
+          && !RoundTrip.declaresLocal(stats.get(i + 1))) {
+        int split = RoundTrip.thenArmSplit(thenSeq, stats.get(i + 1));
+        List<Statement> rest = split >= 0
+          ? thenSeq.getStats().subList(split + 1, thenSeq.getStats().size())
+          : List.of();
+        if (split >= 0 && rest.stream().noneMatch(RoundTrip::declaresLocalIn)) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          for (int k = 0; k <= split; k++) {
+            buf.append(ExprProcessor.jmpWrapper(thenSeq.getStats().get(k), indent + 1, k == 0));
+          }
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          for (int k = 0; k < rest.size(); k++) {
+            buf.append(ExprProcessor.jmpWrapper(rest.get(k), indent, k == 0));
+          }
+          notempty = true;
+          break;
+        }
+        // The split falls inside the arm's first statement: the target's then-arm ends on the
+        // prelude the decompiler attached to the following if's head (`x = …;` before `if (…)`).
+        if (split < 0 && !thenSeq.getStats().isEmpty()
+            && thenSeq.getStats().get(0) instanceof IfStatement firstIf) {
+          int gotoStart = RoundTrip.gotoBeforeTail(stats.get(i + 1));
+          List<Exprent> headExprents = firstIf.getFirst().getExprents();
+          if (gotoStart >= 0 && headExprents != null && !headExprents.isEmpty()
+              && RoundTrip.headExprentsEnd(firstIf) == gotoStart) {
+            IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+            buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+            buf.append(ifStatement.getFirst().toJava(indent));
+            buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+            buf.append(ExprProcessor.listToJava(headExprents, indent + 1));
+            buf.appendIndent(indent).append("} else {").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            List<Exprent> saved = firstIf.getFirst().getExprents();
+            firstIf.getFirst().setExprents(new java.util.ArrayList<>());
+            try {
+              for (int k = 0; k < thenSeq.getStats().size(); k++) {
+                buf.append(ExprProcessor.jmpWrapper(thenSeq.getStats().get(k), indent, k == 0));
+              }
+            } finally {
+              firstIf.getFirst().setExprents(saved);
+            }
+            notempty = true;
+            break;
+          }
+        }
+      }
+
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
