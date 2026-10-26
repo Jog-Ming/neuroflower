@@ -1653,6 +1653,15 @@ public final class RoundTrip {
       && !head.bytecode.isEmpty() && continuesAt(head.bytecode.length(), sequence);
   }
 
+  /** True when the jump into the guard sits immediately before this next test (3 bytes of goto). */
+  public static boolean continuesBefore(Exprent next, Statement around) {
+    if (!selector("continueguard")) {
+      return false;
+    }
+    int start = firstOffsetOf(next);
+    return start >= 3 && continuesAt(start - 3, around);
+  }
+
   /**
    * True when this condition merges that many {@code continue} guards: the target records one jump
    * back to the loop head per statement, so an {@code ||} of n tests came from n separate
@@ -1807,7 +1816,14 @@ public final class RoundTrip {
         return true;
       }
       if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence) {
-        if (sequence.getStats().isEmpty() || sequence.getStats().getLast() != cur) {
+        // The sequence may end with an empty block that prints nothing; the last statement that
+        // reaches the page is the one a continue has to follow.
+        java.util.List<Statement> stats = sequence.getStats();
+        int last = stats.size() - 1;
+        while (last >= 0 && printsNothing(stats.get(last))) {
+          last--;
+        }
+        if (last < 0 || stats.get(last) != cur) {
           return false;
         }
       } else if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement) {
