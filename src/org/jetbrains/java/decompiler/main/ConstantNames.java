@@ -576,7 +576,7 @@ public final class ConstantNames {
       // it: whatever position it holds was created by a folded constant naming before the code.
       // A field or method reference to the class that sits below the entry did enter it, as that
       // reference's operand, and then the entry says nothing about a naming.
-      ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex);
+      ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex) && !nested(own);
       if (ownEarly) {
         List<PooledConstant> pool = own.getPool().getPool();
         for (int i = 1; i < ownIndex && i < pool.size(); i++) {
@@ -1148,6 +1148,20 @@ public final class ConstantNames {
       }
     }
     return true;
+  }
+
+  /** Whether the class file names itself in its own {@code InnerClasses} attribute. */
+  private static boolean nested(StructClass own) {
+    StructInnerClassesAttribute inner = own.getAttribute(StructGeneralAttribute.ATTRIBUTE_INNER_CLASSES);
+    if (inner == null) {
+      return false;
+    }
+    for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
+      if (own.qualifiedName.equals(entry.innerName)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
