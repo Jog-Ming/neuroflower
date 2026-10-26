@@ -1125,6 +1125,16 @@ public final class RoundTrip {
         lastEnd = end;
       }
     }
+    if (lastEnd >= 0 && lastEnd < bodyStart && !returns.get(lastEnd)) {
+      // `if (!C) { return; } body`: the condition's branch jumps to the return, which sits before
+      // the body, and the fall-through reaches the body instead. The guard prints negated.
+      java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+      Integer target = targets == null ? null : targets.get(lastEnd);
+      if (target != null && target >= 0 && target < bodyStart && returns.get(target)) {
+        markGuardExit(method, target);
+        return negateCondition(condition);
+      }
+    }
     if (!(lastEnd >= 0 && lastEnd < bodyStart && returns.get(lastEnd))) {
       return null;
     }
