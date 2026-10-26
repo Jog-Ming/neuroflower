@@ -1788,7 +1788,7 @@ public final class ConstantNames {
       }
       Site best = null;
       for (Site site : candidates) {
-        if ((best == null || site.start() < best.start()) && immediateSite(text, site)) {
+        if ((best == null || site.start() < best.start()) && bareName(text, site)) {
           best = site;
         }
       }
@@ -1808,26 +1808,14 @@ public final class ConstantNames {
     return false;
   }
 
-  /** Whether the site replaces a bare literal javac folds to an immediate. */
-  private static boolean immediateSite(String text, Site site) {
+  /** Whether the site replaces a literal with a plain constant name. */
+  private static boolean bareName(String text, Site site) {
     if (site.start() < 0 || site.start() >= site.end() || site.end() > text.length()) {
       return false;
     }
-    String literal = text.substring(site.start(), site.end()).trim();
-    if (literal.equals("true") || literal.equals("false")) {
-      return true;
-    }
-    if (literal.startsWith("'") && literal.endsWith("'")) {
-      return true;
-    }
-    try {
-      long value = Long.parseLong(literal);
-      return value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
-    }
-    catch (NumberFormatException e) {
-      return false;
-    }
+    return site.replacement().matches("[A-Za-z_$][A-Za-z0-9_$.]*");
   }
+
 
   /** One constant field of a pool-unexplained owner, for a bitwise combination. */
   private record CompositeField(String name, long value) {
