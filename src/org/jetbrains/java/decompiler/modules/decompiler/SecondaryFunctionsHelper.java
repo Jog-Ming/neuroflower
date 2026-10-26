@@ -476,10 +476,45 @@ public final class SecondaryFunctionsHelper {
               break;
             }
           }
+          FunctionExprent operator = compound;
+          if (operand == null && isCastLike(compound.getFuncType())
+              && compound.getLstOperands().size() == 1
+              && compound.getLstOperands().get(0) instanceof FunctionExprent inner) {
+            // `x = (T)(x <op> e)`: the cast narrows the assignment's result, and `x <op>= e`
+            // narrows implicitly, so the target's duplicate of the target proves the compound
+            // form and the cast must not be printed.
+            operator = inner;
+            operand = compoundOperand(left, inner);
+            for (Exprent candidate : inner.getLstOperands()) {
+              if (candidate.equals(left)) {
+                matching = candidate;
+                break;
+              }
+            }
+          }
+          if (operand == null && isAssociative(operator.getFuncType())) {
+            // `x = (T)((x | a) | b)`: the chain is left-associative, so the source's operand is
+            // the rest of the chain after the target is removed.
+            List<Exprent> flat = new ArrayList<>();
+            flattenAssociative(operator, operator.getFuncType(), flat);
+            List<Exprent> rest = new ArrayList<>();
+            Exprent found = null;
+            for (Exprent candidate : flat) {
+              if (found == null && candidate.equals(left)) {
+                found = candidate;
+              } else {
+                rest.add(candidate);
+              }
+            }
+            if (found != null && !rest.isEmpty()) {
+              operand = rebuildAssociative(operator.getFuncType(), rest);
+              matching = found;
+            }
+          }
           if (operand != null && matching != null) {
             if (RoundTrip.isCompoundTarget(left, matching)) {
               asexpr.setRight(operand);
-              asexpr.setCondType(compound.getFuncType());
+              asexpr.setCondType(operator.getFuncType());
               ret = exprent;
               break;
             }
@@ -567,6 +602,43 @@ public final class SecondaryFunctionsHelper {
     }
 
     return ret;
+  }
+
+  /** A conversion the compound form performs implicitly: a cast or a narrowing conversion. */
+  private static boolean isCastLike(FunctionType type) {
+    return switch (type) {
+      case CAST, I2B, I2C, I2S, I2L, I2F, I2D, L2I, L2F, L2D, F2I, F2L, F2D, D2I, D2L, D2F -> true;
+      default -> false;
+    };
+  }
+
+  private static boolean isAssociative(FunctionType type) {
+    return type == FunctionType.ADD || type == FunctionType.MUL || type == FunctionType.AND
+      || type == FunctionType.OR || type == FunctionType.XOR;
+  }
+
+  /** The operands of a chain of one associative operator, left to right. */
+  private static void flattenAssociative(FunctionExprent function, FunctionType type, List<Exprent> out) {
+    List<Exprent> operands = function.getLstOperands();
+    if (function.getFuncType() != type || operands.size() < 2) {
+      out.add(function);
+      return;
+    }
+    for (Exprent operand : operands) {
+      if (operand instanceof FunctionExprent nested) {
+        flattenAssociative(nested, type, out);
+      } else {
+        out.add(operand);
+      }
+    }
+  }
+
+  private static Exprent rebuildAssociative(FunctionType type, List<Exprent> operands) {
+    Exprent built = operands.get(0);
+    for (int i = 1; i < operands.size(); i++) {
+      built = new FunctionExprent(type, new ArrayList<>(java.util.List.of(built, operands.get(i))), null);
+    }
+    return built;
   }
 
   private static Exprent compoundOperand(Exprent left, FunctionExprent function) {
