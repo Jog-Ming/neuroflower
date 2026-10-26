@@ -1190,6 +1190,49 @@ public final class RoundTrip {
 
   /** True when a local variable's scope starts inside the statement's instruction range. */
   public static boolean declaresLocal(Statement stat) {
+    return declaresLocalBetween(stat, false);
+  }
+
+  /** As {@link #declaresLocal} but over the statement's own exprent offsets, not its block's end. */
+  public static boolean declaresLocalIn(Statement stat) {
+    return declaresLocalBetween(stat, true);
+  }
+
+  /**
+   * True when the condition's branch jumps to the statement that follows the if, with the if arm
+   * starting past a void return: {@code if (!C) { rest; return; } arm}. javac branches to the rest,
+   * ends it with the return, and reaches the arm from the condition's own fall-through.
+   */
+  public static boolean guardBeforeTail(Exprent head, Statement rest, Statement arm) {
+    if (!selector("guardtail") || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    BitSet returns = method == null ? null : VOID_RETURNS.get(method);
+    if (ends == null || targets == null || returns == null) {
+      return false;
+    }
+    int restStart = firstOffset(rest);
+    int armStart = firstOffset(arm);
+    if (restStart < 0 || armStart <= restStart) {
+      return false;
+    }
+    int lastStart = -1;
+    int lastTarget = -1;
+    for (int offset = head.bytecode.nextSetBit(0); offset >= 0; offset = head.bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end) && offset > lastStart) {
+        lastStart = offset;
+        lastTarget = targets.get(end);
+      }
+    }
+    // The branch lands on the rest, and the one-byte return ends the guard right before the arm.
+    return lastStart >= 0 && lastTarget == restStart && armStart - 1 >= 0 && returns.get(armStart - 1);
+  }
+
+  private static boolean declaresLocalBetween(Statement stat, boolean ownOffsets) {
     StructMethod method = currentMethod();
     if (method == null || stat == null) {
       return false;
@@ -1200,7 +1243,7 @@ public final class RoundTrip {
       return false;
     }
     int start = firstOffset(stat);
-    int end = lastEnd(stat);
+    int end = ownOffsets ? lastOffset(stat) : lastEnd(stat);
     if (start < 0 || end < 0) {
       return false;
     }

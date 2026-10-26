@@ -311,6 +311,36 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { arm; return; } rest` at the tail: the target jumps to the rest, ends it with a
+      // void return and reaches the arm from the condition's own fall-through, so the source wrote
+      // `if (!C) { rest; return; } arm`. Both blocks keep their braces, so no local moves.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() instanceof SequenceStatement thenSeq
+          && !thenSeq.getStats().isEmpty()
+          && bareReturn(thenSeq.getStats().get(thenSeq.getStats().size() - 1)) != null
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && stats.subList(i + 1, stats.size()).stream().noneMatch(RoundTrip::declaresLocalIn)
+          && RoundTrip.guardBeforeTail(ifStatement.getHeadexprent(), stats.get(i + 1), thenSeq)) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        for (int k = i + 1; k < stats.size(); k++) {
+          buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+        }
+        buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        List<Statement> hoisted = thenSeq.getStats();
+        for (int k = 0; k < hoisted.size() - 1; k++) {
+          buf.append(ExprProcessor.jmpWrapper(hoisted.get(k), indent, false));
+        }
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body; return; }` at the method tail under the strict guard layout: the source
       // wrote `if (!C) { return; } body` (goto body / return / body:).
       if (!hasContent(stats.subList(i + 1, stats.size())) && st instanceof IfStatement ifStatement
