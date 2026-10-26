@@ -221,7 +221,7 @@ public final class ConstantNames {
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
-                           Set<String> earlyOwners, boolean ownEarly) {
+                           Set<String> earlyOwners, boolean ownEarly, boolean ownProven) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -350,7 +350,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false);
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false, false);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -488,6 +488,54 @@ public final class ConstantNames {
     return a.order != b.order ? Integer.compare(a.order, b.order) : Integer.compare(a.offset, b.offset);
   }
 
+  /**
+   * The generation-order bounds of the point that interned the class's own {@code Class} entry.
+   *
+   * <p>Every lower entry was interned before that point and every higher one after it, so a site
+   * outside the bounds would enter the {@code Class} at another position. A lower entry may be
+   * first used long after it was entered: a {@code Class} operand of a reference is numbered after
+   * the reference and entered with it, so the reference's first use is the operand's entry point,
+   * even when the class's own literals use it in a later-generated method. Capping each operand's
+   * point this way keeps the lower bound from running past the naming the pool records.
+   */
+  private static long[] ownBounds(StructClass cls, int ownIndex, Map<Integer, FirstUse> firstUses,
+                                  Map<String, Integer> classIndices, Set<Integer> early) {
+    Map<Integer, Long> upper = new HashMap<>();
+    long succ = Long.MAX_VALUE;
+    for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
+      int key = entry.getKey();
+      if (key == ownIndex || early.contains(key)) {
+        continue;
+      }
+      long point = coordinate(entry.getValue().order(), entry.getValue().offset());
+      if (key < ownIndex) {
+        upper.put(key, point);
+      }
+      else {
+        succ = Math.min(succ, point);
+      }
+    }
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i < pool.size(); i++) {
+      if (!(pool.get(i) instanceof LinkConstant link) || link.classname == null) {
+        continue;
+      }
+      Integer operand = classIndices.get(link.classname);
+      FirstUse use = firstUses.get(i);
+      if (operand == null || use == null || operand >= ownIndex || i >= operand
+          || early.contains(operand)) {
+        continue;
+      }
+      long point = coordinate(use.order(), use.offset());
+      upper.merge(operand, point, Math::min);
+    }
+    long pred = Long.MIN_VALUE;
+    for (long point : upper.values()) {
+      pred = Math.max(pred, point);
+    }
+    return new long[]{pred, succ};
+  }
+
   private static final class Interval {
     final String className;
     final int start;
@@ -570,22 +618,44 @@ public final class ConstantNames {
     Set<Integer> setup = setupClassEntries(own, classIndices);
     Set<String> earlyOwners = earlyOwners(own, classIndices, setup, firstUses);
     boolean ownEarly = false;
+    boolean ownProven = false;
     {
       Integer ownIndex = classIndices.get(own.qualifiedName);
       // No instruction uses the class's own Class entry, so nothing in the code can have entered
       // it: whatever position it holds was created by a folded constant naming before the code.
       // A field or method reference to the class that sits below the entry did enter it, as that
       // reference's operand, and then the entry says nothing about a naming.
-      ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex) && !nested(own);
-      if (ownEarly) {
+      boolean selfReferenceBelow = false;
+      if (ownIndex != null) {
         List<PooledConstant> pool = own.getPool().getPool();
         for (int i = 1; i < ownIndex && i < pool.size(); i++) {
           if (pool.get(i) instanceof LinkConstant link
               && own.qualifiedName.equals(link.classname)) {
-            ownEarly = false;
+            selfReferenceBelow = true;
             break;
           }
         }
+      }
+      ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex) && !nested(own)
+        && !selfReferenceBelow;
+      // An entry no reference of the class itself can explain, with an instruction-referenced
+      // entry above it, was interned before that instruction was generated: not as a reference
+      // operand and not at write time. A folded own-constant naming is the only mechanism that
+      // enters the class's own Class at a code point (a name resolved before any code enters it
+      // earlier still), so the pool order brackets every site the naming can occupy exactly as
+      // it does for a foreign owner.
+      boolean referencedAbove = false;
+      for (int key : firstUses.keySet()) {
+        if (ownIndex != null && key > ownIndex) {
+          referencedAbove = true;
+          break;
+        }
+      }
+      ownProven = ownIndex != null && !firstUses.containsKey(ownIndex) && !selfReferenceBelow
+        && referencedAbove;
+      if (ownProven) {
+        coordinates.put(own.qualifiedName,
+          ownBounds(own, ownIndex, firstUses, classIndices, early));
       }
     }
     Map<String, Double> folded = new HashMap<>();
@@ -768,7 +838,7 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, earlyOwners, ownEarly),
+        activeValues, earlyOwners, ownEarly, ownProven),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -4171,15 +4241,37 @@ public final class ConstantNames {
     // literal another owner's constant could explain: the pair says which owner was named here.
     // The class's own constant keeps its long-standing precedence: its Class entry is in the pool
     // regardless, so no pair can say more about it than the own-constant rule already does.
-    Constant ownConstant = null;
+    Constant firstOwn = null;
+    boolean ownShared = false;
+    List<Constant> ownValue = new ArrayList<>();
     if (constants != null) {
       for (Constant constant : constants) {
         if (constant.owner().equals(own)) {
-          if (ownConstant != null) {
-            ownConstant = null; // two own constants share the value; only a proof may choose
-            break;
+          ownValue.add(constant);
+          if (firstOwn != null) {
+            ownShared = true; // two own constants share the value; only a proof may choose
           }
-          ownConstant = constant;
+          else {
+            firstOwn = constant;
+          }
+        }
+      }
+    }
+    Constant ownConstant = ownShared ? null : firstOwn;
+    if (ownValue.isEmpty() && key.startsWith(VariableType.INT.name() + "|")) {
+      // A byte, short or char constant selected where the source prints an int literal folds to
+      // that int, so it is the class's own constant for this value too. The int constants stay
+      // first: a narrower one could change an overload choice the int literal did not make.
+      int bar = key.indexOf('|');
+      for (VariableType kind : List.of(VariableType.BYTE, VariableType.SHORT, VariableType.CHAR)) {
+        List<Constant> narrower = candidates.get(kind.name() + key.substring(bar));
+        if (narrower == null) {
+          continue;
+        }
+        for (Constant constant : narrower) {
+          if (constant.owner().equals(own)) {
+            ownValue.add(constant);
+          }
         }
       }
     }
@@ -4208,7 +4300,10 @@ public final class ConstantNames {
       return;
     }
     if (constants == null || constants.isEmpty()) {
-      return;
+      if (ownValue.isEmpty()) {
+        return; // no candidate at all; a narrower own constant alone needs the proof below
+      }
+      constants = List.of();
     }
     // A quoted literal is printed by enclosing a buffer whose mapping sits at its content start,
     // so the recorded position of the instruction is one past the opening quote.
@@ -4219,13 +4314,20 @@ public final class ConstantNames {
       usable = new ArrayList<>(constants);
       usable.remove(excluded);
     }
+    Constant provenOwn = ownProvenConstant(ownValue, key, own, anchor, placement);
     Constant paired = usable.size() > 1 ? pairOwner(usable, anchor, placement) : null;
     Constant constant = ownCandidate ? ownConstant
       : paired != null ? paired
       : usable.size() == 1 ? usable.get(0) : selectProvable(usable, anchor, placement, own);
     if (constant == null) {
+      // Nothing the existing rules place explains this literal; the own Class entry still says
+      // the original named one of its constants at this point, and the pool admitted the site.
+      constant = provenOwn;
+    }
+    if (constant == null) {
       return;
     }
+    boolean provenSite = constant == provenOwn;
     boolean foreign = !constant.owner().equals(own);
     boolean lexical = foreign && placement != null && placement.lexical() != null
       && placement.lexical().contains(constant.owner());
@@ -4277,12 +4379,13 @@ public final class ConstantNames {
     boolean recorded = placement != null
       && ((placement.pairs() != null && placement.pairs().containsKey(constant.owner()))
           || (placement.values() != null && placement.values().containsKey(constant.owner())));
-    if (window == null && !placed && !recorded && !ownCandidate && tooCommon(key)) {
+    if (window == null && !placed && !recorded && !provenSite && !ownCandidate
+        && tooCommon(key)) {
       // The class's own constant is unambiguous here: the value is common, but the name can only
       // be this class's own field, and naming it is the only way its Class entry moves forward.
       return;
     }
-    if (window == null && !placed && !recorded && ownCandidate && tooCommon(key)
+    if (window == null && !placed && !recorded && !provenSite && ownCandidate && tooCommon(key)
         && !placement.ownEarly()) {
       // The own name is only worth printing where the pool shows the class's own Class entry was
       // entered early; otherwise the literal is what the original wrote.
@@ -4344,6 +4447,12 @@ public final class ConstantNames {
       if (key.startsWith("FLOATCAST|")) {
         printed = "(float) " + printed;
       }
+    }
+    if (provenSite && !key.startsWith(constant.kind().name() + "|")) {
+      // The literal is an int and the name is a byte, short or char constant. The cast keeps the
+      // expression's type int, so an overload choice the literal made cannot change; a cast of a
+      // constant variable is still a constant expression and folds to the same value.
+      printed = "(int) " + printed;
     }
     // A pair owner's site is the argument generation of the reference the pair precedes. The
     // literal must not carry a pool value of its own unless one already sits below the pair, and
@@ -4544,6 +4653,38 @@ public final class ConstantNames {
     } catch (NumberFormatException e) {
       return null;
     }
+  }
+
+  /**
+   * The class's own constant whose folded value this literal is, when the pool places the naming.
+   *
+   * <p>Naming any own constant of the value interns the same {@code Class} entry and folds to the
+   * same literal, so several constants of one value are interchangeable and the first declaration
+   * is the deterministic pick; one whose declared kind is the literal's is preferred, since a
+   * narrower name could change an overload choice. The site itself is not interchangeable: an own
+   * constant named anywhere else enters the Class entry at that other point, so only the pool's
+   * generation-order bracket admits it.
+   */
+  private static Constant ownProvenConstant(List<Constant> ownValue, String key, String own,
+                                            int anchor, Placement placement) {
+    if (ownValue.isEmpty() || placement == null || !placement.ownProven()) {
+      return null;
+    }
+    if (!placement.provesExactly(own, anchor)) {
+      return null;
+    }
+    // A local class's binary suffix carries its number ("Outer$1Name"), so the simple name the
+    // printed form would qualify with is not an identifier; an anonymous class prints unqualified.
+    String simple = simpleName(own);
+    if (!anonymous(own) && (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0)))) {
+      return null;
+    }
+    for (Constant constant : ownValue) {
+      if (key.startsWith(constant.kind().name() + "|")) {
+        return constant;
+      }
+    }
+    return ownValue.get(0);
   }
 
   /**
