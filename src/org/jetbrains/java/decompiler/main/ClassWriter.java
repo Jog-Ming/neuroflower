@@ -488,7 +488,13 @@ public class ClassWriter implements StatementWriter {
       }
     }
     if (!differs) {
-      return false;
+      // A lambda that captures `this` is lowered to an instance body. A static bridge whose first
+      // parameter is that captured instance and whose remaining parameters are forwarded
+      // unchanged is javac's lowering of a bound method reference `this::name`, whose declared
+      // parameters coincide with the functional method's.
+      if (prefix != 1 || !(methodObject instanceof VarExprent receiver) || !"this".equals(receiver.getName())) {
+        return false;
+      }
     }
     FullInstructionSequence seq;
     try {

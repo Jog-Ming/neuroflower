@@ -54,6 +54,11 @@ work stands — belong in project memory.
 - **Commits are unsigned; pushing is signed and only on request.** Commit with `git commit --no-gpg-sign`;
   do not change the git configuration. Push only when the user asks, re-signing the branch before
   the push.
+- **A subagent's tool calls never prompt the user for approval.** A wave of agents that each stop on a
+  permission dialog buries the user. The brief must name only paths and commands the agent can run
+  without a prompt — reading, grepping, the project's own scripts under `.dev/tmp` — and must state
+  that a step which would need approval is skipped and written into the report instead of attempted.
+  Message a running agent this rule the moment it is added.
 - **When the deterministic routes look exhausted, dispatch research subagents.** A fresh agent with
   one narrow, evidence-driven question sees what the working context has stopped noticing; give it
   the files, the measurement, and what is already ruled out, and ask for concrete proposals with
