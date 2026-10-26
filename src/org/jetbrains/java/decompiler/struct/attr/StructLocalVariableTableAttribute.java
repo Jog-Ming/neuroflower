@@ -142,6 +142,18 @@ public class StructLocalVariableTableAttribute extends StructGeneralAttribute {
       return this.length - o.length;
     }
     
+    public int getStartPC() {
+      return start_pc;
+    }
+
+    public int getLength() {
+      return length;
+    }
+
+    public int getIndex() {
+      return index;
+    }
+
     public String getName() {
       return name;
     }

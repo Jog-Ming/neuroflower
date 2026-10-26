@@ -195,6 +195,40 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (A) { … exit } if (B) { … exit }` with pattern variables in different slots, the first
+      // no longer live where B tests, and B's variable not read afterwards: the source wrote an
+      // else-if chain. Sequential ifs let javac reuse the first variable's slot.
+      if (i + 1 < stats.size() && st instanceof IfStatement first
+          && first.iftype == IfStatement.IFTYPE_IF && first.getElsestat() == null
+          && !first.isLabeled() && !stats.get(i + 1).isLabeled()
+          && stats.get(i + 1) instanceof IfStatement second
+          && second.iftype == IfStatement.IFTYPE_IF && second.getElsestat() == null
+          && first.getIfstat() != null && second.getIfstat() != null
+          && second.varDefinitions.isEmpty()
+          && (second.getFirst() == null || second.getFirst().getExprents() == null
+              || second.getFirst().getExprents().isEmpty())
+          && exits(first.getIfstat()) && exits(second.getIfstat())
+          && patternVar(first) != null && patternVar(second) != null
+          && !patternVar(first).getName().equals(patternVar(second).getName())
+          && patternSlot(first) >= 0 && patternSlot(second) >= 0
+          && patternSlot(first) != patternSlot(second)
+          && !aliveAt(first, second)
+          && i + 2 < stats.size() && stats.size() == i + 3 && exits(stats.get(i + 2))
+          && !usedLater(stats, i + 2, patternVar(second))) {
+        buf.append(ExprProcessor.listToJava(first.varDefinitions, indent));
+        buf.append(first.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(first.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(first.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent).append("} else ");
+        buf.append(second.getFirst().toJava(indent));
+        buf.append(second.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(second.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        i++;
+        continue;
+      }
+
       // `if (C) { body } rest` where the target's table puts a void return between the condition
       // and the body, before the body's line: the source wrote `if (!C) { rest; return; } body`.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
@@ -540,6 +574,93 @@ public class SequenceStatement extends Statement {
       return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
     }
     return endsWithExit(last.getStats());
+  }
+
+  /** Whether the first if's pattern variable is still in scope where the second if tests. */
+  private static boolean aliveAt(IfStatement first, IfStatement second) {
+    var method = RoundTrip.currentMethod();
+    VarExprent variable = patternVar(first);
+    int at = RoundTrip.firstOffset(second);
+    if (method == null || variable == null || at < 0) {
+      return false;
+    }
+    org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute table =
+      method.getAttribute(org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    return table.getVariables().anyMatch(entry -> entry.getIndex() == variable.getIndex()
+      && entry.getStartPC() <= at && at < entry.getStartPC() + entry.getLength());
+  }
+
+  /** The instanceof pattern variable this if declares, or null. */
+  private static VarExprent patternVar(IfStatement stat) {
+    if (stat.getHeadexprent() == null || stat.getHeadexprent().getCondition() == null) {
+      return null;
+    }
+    for (Exprent part : stat.getHeadexprent().getCondition().getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2
+          && function.getLstOperands().get(2) instanceof VarExprent variable) {
+        return variable;
+      }
+    }
+    return null;
+  }
+
+  /** The slot of the instanceof pattern variable this if declares, or -1. */
+  private static int patternSlot(IfStatement stat) {
+    VarExprent variable = patternVar(stat);
+    return variable == null ? -1 : variable.getIndex();
+  }
+
+  /** Whether this statement's own body ends with a return or a throw. */
+  private static boolean exits(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      if (exprents.isEmpty()) {
+        return false;
+      }
+      Exprent last = exprents.get(exprents.size() - 1);
+      return last instanceof ExitExprent exit
+        && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW);
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && exits(children.get(children.size() - 1));
+  }
+
+  /** Whether a later statement of this sequence still reads that variable. */
+  private static boolean usedLater(List<Statement> stats, int from, VarExprent variable) {
+    if (variable == null) {
+      return false;
+    }
+    for (int k = from; k < stats.size(); k++) {
+      if (readsVariable(stats.get(k), variable.getIndex(), variable.getVersion())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean readsVariable(Statement stat, int index, int version) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        for (Exprent part : exprent.getAllExprents(true, true)) {
+          if (part instanceof VarExprent variable && variable.getIndex() == index
+              && variable.getVersion() == version) {
+            return true;
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (readsVariable(child, index, version)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean endsWithReturn(Statement stat) {
