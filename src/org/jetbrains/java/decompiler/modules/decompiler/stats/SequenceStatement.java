@@ -290,7 +290,8 @@ public class SequenceStatement extends Statement {
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
           && !ifStatement.isPatternMatched()
-          && ifStatement.getIfstat() != null && endsWithReturn(ifStatement.getIfstat())
+          && ifStatement.getIfstat() != null
+          && (endsWithReturn(ifStatement.getIfstat()) || endsWithBreak(ifStatement.getIfstat()))
           && hasContent(stats.subList(i + 1, stats.size()))
           && !RoundTrip.declaresLocal(ifStatement.getIfstat())
           && stats.subList(i + 1, stats.size()).stream().noneMatch(RoundTrip::declaresLocal)
@@ -724,16 +725,35 @@ public class SequenceStatement extends Statement {
   }
 
   private static boolean endsWithReturn(Statement stat) {
+    Exprent last = lastExprent(stat);
+    return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+  }
+
+  /**
+   * True when the arm ends in a plain {@code break} out of the enclosing loop: the arm leaves the
+   * statement, so the source could equally have written it as the else arm of the negated test.
+   */
+  private static boolean endsWithBreak(Statement stat) {
+    Statement last = stat;
+    while (true) {
+      List<Statement> children = last.getStats();
+      if (children == null || children.isEmpty()) {
+        break;
+      }
+      last = children.get(children.size() - 1);
+    }
+    List<StatEdge> edges = last.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    return edges.size() == 1 && edges.get(0).getType() == StatEdge.TYPE_BREAK
+      && edges.get(0).explicit && !edges.get(0).labeled;
+  }
+
+  private static Exprent lastExprent(Statement stat) {
     List<Exprent> exprents = stat.getExprents();
     if (exprents != null) {
-      if (exprents.isEmpty()) {
-        return false;
-      }
-      Exprent last = exprents.get(exprents.size() - 1);
-      return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+      return exprents.isEmpty() ? null : exprents.get(exprents.size() - 1);
     }
     List<Statement> children = stat.getStats();
-    return !children.isEmpty() && endsWithReturn(children.get(children.size() - 1));
+    return children.isEmpty() ? null : lastExprent(children.get(children.size() - 1));
   }
 
   @Override

@@ -285,7 +285,9 @@ public class IfStatement extends Statement {
     // branch opcode or the arm lines' order says which one was written.
     if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
         && condition instanceof IfExprent ifHead
-        && (RoundTrip.swapIfArms(ifHead) || RoundTrip.swapIfArmsByLine(ifstat, elsestat))) {
+        && (RoundTrip.swapIfArms(ifHead)
+            || (RoundTrip.swapIfArmsByLine(ifstat, elsestat)
+                && !RoundTrip.polaritySelfConsistent(ifHead, ifstat, elsestat)))) {
       IfExprent head = (IfExprent) ifHead.copy();
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       // The arm the swap prints second was declared in the method body, so the source closed

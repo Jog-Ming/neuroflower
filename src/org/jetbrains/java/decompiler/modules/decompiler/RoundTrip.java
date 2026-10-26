@@ -383,6 +383,29 @@ public final class RoundTrip {
     return or ? target == elseStart : target == thenStart;
   }
 
+  /**
+   * True when the target's last condition branch lands on the arm the printed condition says it
+   * should: an {@code &&} chain's last test reaches the else arm, an {@code ||} chain's the then
+   * arm. When this holds the tree's polarity is the source's, and line evidence about the arms
+   * must not flip it.
+   */
+  public static boolean polaritySelfConsistent(Exprent head, Statement thenArm, Statement elseArm) {
+    if (!selector("polaritytarget") || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    if (currentMethod() == null) {
+      return false;
+    }
+    int thenStart = firstOffset(thenArm);
+    int elseStart = firstOffset(elseArm);
+    int target = lastBranchTarget(ifHead.bytecode);
+    if (thenStart < 0 || elseStart < 0 || target < 0 || thenStart == elseStart) {
+      return false;
+    }
+    boolean or = lastAtomUnderOr(ifHead.getCondition(), false);
+    return or ? target == thenStart : target == elseStart;
+  }
+
   /** The destination of the last conditional branch inside these offsets, or -1. */
   private static int lastBranchTarget(BitSet bytecode) {
     StructMethod method = currentMethod();
