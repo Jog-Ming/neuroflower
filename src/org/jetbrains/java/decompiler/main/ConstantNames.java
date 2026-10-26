@@ -1760,7 +1760,7 @@ public final class ConstantNames {
         }
       }
     }
-    earlySites(text, rules, deferred, sites);
+    earlySites(text, spans, rules, deferred, sites);
     compositeSites(text, spans, rules, sites);
   }
 
@@ -1771,13 +1771,13 @@ public final class ConstantNames {
    * point; one naming anywhere reproduces it. Only an immediate value is accepted: naming a pooled
    * value would enter that value at the site, and the target pool did not put it there.
    */
-  private static void earlySites(String text, Rules rules, Map<String, List<Site>> deferred,
-                                 List<Site> sites) {
+  private static void earlySites(String text, List<int[]> spans, Rules rules,
+                                 Map<String, List<Site>> deferred, List<Site> sites) {
     if (rules.placement().earlyOwners() == null || rules.placement().earlyOwners().isEmpty()) {
       return;
     }
     for (String owner : rules.placement().earlyOwners()) {
-      if (hasSiteFor(sites, owner) || rules.placement().lexical().contains(owner)) {
+      if (siteIn(sites, owner, spans) || rules.placement().lexical().contains(owner)) {
         continue;
       }
       List<Site> candidates = deferred.get(owner);
@@ -1794,6 +1794,16 @@ public final class ConstantNames {
         addSiteOnce(sites, best);
       }
     }
+  }
+
+  /** Whether a site for this owner already lies inside one of this class's own text ranges. */
+  private static boolean siteIn(List<Site> sites, String owner, List<int[]> spans) {
+    for (Site site : sites) {
+      if (site.owner().equals(owner) && inside(spans, site.start())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Whether the site replaces a bare literal javac folds to an immediate. */
