@@ -6,6 +6,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
@@ -110,6 +111,9 @@ public class DoStatement extends Statement {
 
     switch (looptype) {
       case INFINITE:
+        if (printBreakGuard(buf, indent)) {
+          break;
+        }
         buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
         buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -442,6 +446,65 @@ public class DoStatement extends Statement {
   public Type getLooptype() {
     return looptype;
   }
+
+  /**
+   * Prints a `while (true)` whose body was folded as `if (!E) { arm } exit;` back to the guard the
+   * source wrote, `if (E) break; arm`, with the loop's exit left outside the body. False, printing
+   * nothing, when the body is not that shape.
+   */
+  /**
+   * Prints a `while (true)` whose exit was folded into the body as `if (E) { return; } rest` back to
+   * the guard the source wrote, `if (E) break; rest`. The return sits past the loop's back edge in
+   * the target, so it is the loop's exit and not part of the body; leaving it inside makes the loop
+   * run once.
+   */
+  private boolean printBreakGuard(TextBuffer buf, int indent) {
+    if (!(first instanceof SequenceStatement sequence) || sequence.getStats().size() != 2
+        || !varDefinitions.isEmpty()) {
+      return false;
+    }
+    List<Statement> stats = sequence.getStats();
+    if (!(stats.get(0) instanceof IfStatement guard) || guard.getElsestat() != null
+        || guard.getIfstat() == null || !guard.varDefinitions.isEmpty()
+        || guard.getHeadexprent() == null) {
+      return false;
+    }
+    org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent head = guard.getHeadexprent();
+    ExitExprent exit = bareReturn(guard.getIfstat());
+    if (exit == null) {
+      return false;
+    }
+    int exitOffset = RoundTrip.firstOffset(guard.getIfstat());
+    int bodyEnd = -1;
+    for (int i = 1; i < stats.size(); i++) {
+      bodyEnd = Math.max(bodyEnd, RoundTrip.lastOffset(stats.get(i)));
+    }
+    // The return lies past the body's last instruction: it is the loop's exit, not an arm.
+    if (exitOffset < 0 || bodyEnd < 0 || exitOffset <= bodyEnd) {
+      return false;
+    }
+    buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(guard.getFirst(), indent + 1, false));
+    buf.appendIndent(indent + 1).append("if (")
+      .append(head.getCondition().toJava(indent + 1)).append(") {").appendLineSeparator();
+    buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+    buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+    for (int i = 1; i < stats.size(); i++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(i), indent + 1, true));
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    return true;
+  }
+
+  /** The bare `return;` a block prints, or null. */
+  private static ExitExprent bareReturn(Statement stat) {
+    List<Exprent> exprents = stat == null ? null : stat.getExprents();
+    if (exprents == null || exprents.size() != 1 || !(exprents.get(0) instanceof ExitExprent exit)) {
+      return null;
+    }
+    return exit.getExitType() == ExitExprent.Type.RETURN && exit.getValue() == null ? exit : null;
+  }
+
 
   public void setLooptype(Type looptype) {
     this.looptype = looptype;
