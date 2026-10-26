@@ -128,7 +128,12 @@ public final class RecordHelper {
       boolean objectMethod = (name.equals("equals") && descriptor.equals("(Ljava/lang/Object;)Z"))
         || (name.equals("hashCode") && descriptor.equals("()I"))
         || (name.equals("toString") && descriptor.equals("()Ljava/lang/String;"));
-      if (objectMethod || isComponentAccessor(cl, name, descriptor)) {
+      if (objectMethod) {
+        // javac emits the generated accessors after toString/hashCode/equals, so an accessor that
+        // precedes one of them was declared in the record body and keeps its place.
+        return false;
+      }
+      if (isComponentAccessor(cl, name, descriptor)) {
         continue;
       }
       return false;
