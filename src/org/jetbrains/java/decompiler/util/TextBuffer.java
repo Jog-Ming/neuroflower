@@ -342,7 +342,7 @@ public class TextBuffer {
     if (myDebugTrace != null) {
       myDebugTrace.myPreventDeletion = true;
     }
-    myBytecodeOffsetMapping.putIfAbsent(new BytecodeMappingKey(bytecodeOffset, null, null), myStringBuilder.length());
+    myBytecodeOffsetMapping.put(new BytecodeMappingKey(bytecodeOffset, null, null), myStringBuilder.length());
   }
 
   public void addStartBytecodeMapping(int bytecodeOffset) {
