@@ -221,7 +221,7 @@ public final class ConstantNames {
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
-                           Set<String> earlyOwners) {
+                           Set<String> earlyOwners, boolean ownEarly) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -350,7 +350,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of());
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -569,6 +569,17 @@ public final class ConstantNames {
     Set<Integer> early = earlyClassEntries(own, classIndices);
     Set<Integer> setup = setupClassEntries(own, classIndices);
     Set<String> earlyOwners = earlyOwners(own, classIndices, setup, firstUses);
+    boolean ownEarly = false;
+    {
+      Integer ownIndex = classIndices.get(own.qualifiedName);
+      if (ownIndex != null) {
+        int firstReferenced = Integer.MAX_VALUE;
+        for (int key : firstUses.keySet()) {
+          firstReferenced = Math.min(firstReferenced, key);
+        }
+        ownEarly = ownIndex < firstReferenced;
+      }
+    }
     Map<String, Double> folded = new HashMap<>();
     for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
       Double value = foldedValue(own, entry.getValue());
@@ -749,7 +760,7 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, earlyOwners),
+        activeValues, earlyOwners, ownEarly),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -4230,7 +4241,15 @@ public final class ConstantNames {
     boolean recorded = placement != null
       && ((placement.pairs() != null && placement.pairs().containsKey(constant.owner()))
           || (placement.values() != null && placement.values().containsKey(constant.owner())));
-    if (window == null && !placed && !recorded && tooCommon(key)) {
+    if (window == null && !placed && !recorded && !ownCandidate && tooCommon(key)) {
+      // The class's own constant is unambiguous here: the value is common, but the name can only
+      // be this class's own field, and naming it is the only way its Class entry moves forward.
+      return;
+    }
+    if (window == null && !placed && !recorded && ownCandidate && tooCommon(key)
+        && !placement.ownEarly()) {
+      // The own name is only worth printing where the pool shows the class's own Class entry was
+      // entered early; otherwise the literal is what the original wrote.
       return;
     }
     if (constant.owner().equals(own)) {
