@@ -59,6 +59,102 @@ public final class LocalDeclarationOrder {
     reorderWithinList(root);
   }
 
+  /**
+   * A local whose table entry starts before the block that assigns it was declared bare at the
+   * enclosing level: the source wrote `T v;` above the loop and assigned inside it. Only the
+   * declaration moves; the value is still computed where it was printed.
+   */
+  private static void hoistNestedOut(Statement seq, VarProcessor varproc, NameTable names, String method) {
+    if (!RoundTrip.selector("decllvt")) {
+      return;
+    }
+    int maxSlot = -1;
+    for (Exprent definition : seq.getVarDefinitions()) {
+      maxSlot = Math.max(maxSlot, targetSlot(definition));
+    }
+    List<Statement> children = new ArrayList<>(seq.getStats());
+    for (Statement child : children) {
+      Statement body = nestedBody(child);
+      if (body != null) {
+        List<Exprent> candidates = new ArrayList<>(body.getVarDefinitions());
+        List<Exprent> firstExprents = body.getStats().isEmpty() ? null : body.getStats().get(0).getExprents();
+        if (firstExprents != null) {
+          candidates.addAll(firstExprents);
+        }
+        for (Exprent exprent : candidates) {
+          VarExprent var = definedVar(exprent);
+          if (var == null || !isRealDefinition(var) || var.getLVT() == null) {
+            continue;
+          }
+          // The target gave this local a slot below one that prints before the block: the source
+          // declared it further up the sequence, bare, and assigned it here.
+          if (var.getLVT().getIndex() < 0 || var.getLVT().getIndex() >= maxSlot) {
+            continue;
+          }
+          if (!names.uniqueName(var) || mentionsField(seq, var.getName())) {
+            debug(method, var, "rejected: nested declaration would capture a name");
+            continue;
+          }
+          debug(method, var, "hoisted out of a nested block: slot " + var.getLVT().getIndex()
+            + " below " + maxSlot);
+          Exprent declaration;
+          if (exprent == var) {
+            removeIdentity(body.getVarDefinitions(), exprent);
+            if (firstExprents != null) {
+              removeIdentity(firstExprents, exprent);
+            }
+            declaration = exprent;
+          } else {
+            declaration = var.copy();
+            var.setDefinition(false);
+          }
+          insertByTargetSlot(seq.getVarDefinitions(), declaration);
+        }
+      }
+      for (Exprent definition : child.getVarDefinitions()) {
+        maxSlot = Math.max(maxSlot, targetSlot(definition));
+      }
+      if (child.type == Statement.StatementType.BASIC_BLOCK && child.getExprents() != null) {
+        for (Exprent exprent : child.getExprents()) {
+          maxSlot = Math.max(maxSlot, targetSlot(exprent));
+        }
+      }
+    }
+  }
+
+  /** The block directly under a statement that prints as a nested block, or null. */
+  private static Statement nestedBody(Statement child) {
+    if (child instanceof DoStatement loop) {
+      Statement body = loop.getFirst();
+      return body != null && body.type == Statement.StatementType.SEQUENCE ? body : null;
+    }
+    if (child instanceof IfStatement ifStatement) {
+      Statement body = ifStatement.getIfstat();
+      return body != null && body.type == Statement.StatementType.SEQUENCE ? body : null;
+    }
+    return null;
+  }
+
+  /** Inserts the declaration before the first definition the target gives a higher slot. */
+  private static void insertByTargetSlot(List<Exprent> definitions, Exprent declaration) {
+    int slot = targetSlot(declaration);
+    int at = definitions.size();
+    for (int i = 0; i < definitions.size(); i++) {
+      int other = targetSlot(definitions.get(i));
+      if (other >= 0 && slot >= 0 && other > slot) {
+        at = i;
+        break;
+      }
+    }
+    definitions.add(at, declaration);
+  }
+
+  /** The slot the target's local table gives this definition, or -1. */
+  private static int targetSlot(Exprent exprent) {
+    VarExprent var = definedVar(exprent);
+    return var == null || var.getLVT() == null ? -1 : var.getLVT().getIndex();
+  }
+
   // *****************************************************************************
   // cross-statement hoist
   // *****************************************************************************
@@ -116,6 +212,7 @@ public final class LocalDeclarationOrder {
   }
 
   private static void hoistInSequence(Statement seq, VarProcessor varproc, NameTable names, String method) {
+    hoistNestedOut(seq, varproc, names, method);
     if (seq.isLabeled()) {
       // A labeled sequence prints its varDefinitions before `label: {`, so a declaration moved
       // into them escapes the block and could capture a name used after it.
