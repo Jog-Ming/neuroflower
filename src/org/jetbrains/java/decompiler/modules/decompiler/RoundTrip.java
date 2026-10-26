@@ -2677,6 +2677,45 @@ public final class RoundTrip {
     return start >= 0 && !startsLine(table, start);
   }
 
+  /**
+   * True when one of these arms yields: the switch is an expression printed in statement form, and
+   * its arms have to cover every input, so a synthesized default cannot be left out.
+   */
+  public static boolean switchYields(List<Statement> arms) {
+    for (Statement arm : arms) {
+      if (statementYields(arm)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean statementYields(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        // A nested switch owns its own yields.
+        if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.SwitchExprent) {
+          continue;
+        }
+        for (Exprent part : exprent.getAllExprents(true, true)) {
+          if (part instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.YieldExprent) {
+            return true;
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (child instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement) {
+        continue;
+      }
+      if (statementYields(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Whether the table starts an entry at this exact offset: a statement on a new line began there. */
   private static boolean startsLine(StructLineNumberTableAttribute table, int offset) {
     int[] raw = table.getRawData();

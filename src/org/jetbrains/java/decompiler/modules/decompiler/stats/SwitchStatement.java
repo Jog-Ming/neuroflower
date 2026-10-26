@@ -167,9 +167,13 @@ public class SwitchStatement extends Statement {
       }
     }
     List<Integer> order = sourceOrder();
+    // An arm that only throws a synthesized MatchException prints only when the switch is an
+    // expression in statement form: its arms have to cover every input, and javac rejects a
+    // switch expression that misses one.
+    boolean skipMatch = !RoundTrip.switchYields(caseStatements);
     int lastPrinted = -1;
     for (int i : order) {
-      if (!RoundTrip.synthesizedMatchThrow(caseStatements.get(i))) {
+      if (!(skipMatch && RoundTrip.synthesizedMatchThrow(caseStatements.get(i)))) {
         lastPrinted = i;
       }
     }
@@ -177,6 +181,9 @@ public class SwitchStatement extends Statement {
     for (int i : order) {
 
       Statement stat = caseStatements.get(i);
+      if (skipMatch && RoundTrip.synthesizedMatchThrow(stat)) {
+        continue;
+      }
       List<StatEdge> edges = caseEdges.get(i);
       List<Exprent> values = caseValues.get(i);
       Exprent guard = caseGuards.size() > i ? caseGuards.get(i) : null;
