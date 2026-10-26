@@ -1457,10 +1457,12 @@ public final class ConstantNames {
    *
    * <p>{@code open}/{@code close} are the argument list of the call the pair precedes; a field
    * reference has no argument list and stores -1 in both, leaving the generation-order gap between
-   * {@code lower} and {@code successor} to place the site.
+   * {@code lower} and {@code successor} to place the site. {@code successorAt} is the character
+   * position the successor's first use was printed at, or -1; a value successor printed inside a
+   * field initializer places its naming at the literal in that same initializer.
    */
   private record PairSite(int classIndex, long successor, long lower, long after, int open, int close,
-                          String member, String successorKey, Set<String> pooled) {
+                          String member, String successorKey, Set<String> pooled, int successorAt) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.equals(successorKey)) {
@@ -1503,6 +1505,7 @@ public final class ConstantNames {
                                                  Map<Pair<String, String>, Map<Integer, Integer>> positions) {
     Map<String, PairSite> pairs = new HashMap<>();
     List<PooledConstant> pool = cls.getPool().getPool();
+    Map<String, Integer> indices = classIndices(cls);
     for (int i = 1; i + 2 < pool.size(); i++) {
       if (!(pool.get(i) instanceof PrimitiveConstant entry)
           || entry.type != CodeConstants.CONSTANT_Class
@@ -1550,7 +1553,7 @@ public final class ConstantNames {
       if (direct != null && coordinate(direct.order(), direct.offset()) <= point) {
         continue;
       }
-      long[] bounds = coordinates(firstUses, i, early, -1);
+      long[] bounds = pairBounds(cls, firstUses, i, early, indices);
       if (bounds[1] != point) {
         continue; // a higher entry was created before this reference; the pair is not its naming
       }
@@ -1578,10 +1581,120 @@ public final class ConstantNames {
         continue;
       }
       String successorKey = pool.get(i + 2) instanceof PrimitiveConstant pv ? valueKey(pv) : null;
+      if (successorKey != null && successorKey.startsWith(VariableType.STRING.name() + "|")
+          && !ownerDeclares(owner, successorKey)) {
+        // A numeric value after the pair may be the fold of an expression over the owner's
+        // constants, so it can never be refuted. A string cannot be built from an int constant,
+        // and a string value no constant of the owner holds is not the value the naming folded to:
+        // the naming entered nothing and the next entry belongs to whatever was entered next. The
+        // naming was still the last pool-entering event before it, so the pair's generation gap
+        // places the site exactly as a reference successor's does.
+        successorKey = null;
+      }
+      Integer at = position(cls, use, positions);
       pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], lastPoolUse(firstUses, use),
-        open, close, member, successorKey, pooledKeys(cls, i)));
+        open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at));
     }
     return pairs;
+  }
+
+  /**
+   * The generation-order bounds of a pair's naming site, read from the pool.
+   *
+   * <p>The same bracket as {@link #coordinates}, except that a {@code Class} entry entered as a
+   * reference's operand is bounded by that reference's first use: the operand is numbered after
+   * the reference and enters the pool with it, so the reference's instruction is the operand's
+   * entry point even when the class's own first instruction use lies in a later method. Without
+   * the cap a lower entry first used after the pair would put the bound past a site the pool
+   * still admits.
+   */
+  private static long[] pairBounds(StructClass cls, Map<Integer, FirstUse> firstUses, int index,
+                                   Set<Integer> early, Map<String, Integer> classIndices) {
+    Map<Integer, Long> upper = new HashMap<>();
+    long succ = Long.MAX_VALUE;
+    for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
+      int key = entry.getKey();
+      if (key == index || early.contains(key)) {
+        continue;
+      }
+      long point = coordinate(entry.getValue().order(), entry.getValue().offset());
+      if (key < index) {
+        upper.put(key, point);
+      }
+      else {
+        succ = Math.min(succ, point);
+      }
+    }
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i < pool.size(); i++) {
+      if (!(pool.get(i) instanceof LinkConstant link) || link.classname == null) {
+        continue;
+      }
+      Integer operand = classIndices.get(link.classname);
+      FirstUse use = firstUses.get(i);
+      if (operand == null || use == null || operand >= index || i >= operand
+          || early.contains(operand)) {
+        continue;
+      }
+      upper.merge(operand, coordinate(use.order(), use.offset()), Math::min);
+    }
+    long pred = Long.MIN_VALUE;
+    for (long point : upper.values()) {
+      pred = Math.max(pred, point);
+    }
+    return new long[]{pred, succ};
+  }
+
+  /**
+   * Whether the owner declares (or inherits) a constant whose folded value is this pool value key.
+   *
+   * <p>A string value no constant of the owner holds cannot be the value the naming entered, so the
+   * pair must be read as a bare Class+name pair. An owner whose class file is not on this run's
+   * classpath keeps the value reading; nothing can refute it.
+   */
+  private static boolean ownerDeclares(String owner, String successorKey) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    if (cls == null) {
+      return true;
+    }
+    if (declares(cls, successorKey)) {
+      return true;
+    }
+    for (InheritedConstant inherited : inheritedConstants(cls)) {
+      if (inheritedKey(inherited).equals(successorKey)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean declares(StructClass cls, String key) {
+    for (StructField field : cls.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      StructConstantValueAttribute attribute =
+        field.getAttribute(StructGeneralAttribute.ATTRIBUTE_CONSTANT_VALUE);
+      if (attribute == null) {
+        continue;
+      }
+      PrimitiveConstant value = cls.getPool().getPrimitiveConstant(attribute.getIndex());
+      VariableType kind = kind(field.getDescriptor());
+      if (value == null || value.value == null || kind == null) {
+        continue;
+      }
+      String printed = kind == VariableType.BOOLEAN && value.value instanceof Integer flag
+        ? Boolean.toString(flag != 0) : String.valueOf(value.value);
+      if ((kind + "|" + printed).equals(key)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String inheritedKey(InheritedConstant inherited) {
+    return inherited.kind() + "|" + inherited.printed();
   }
 
   /**
@@ -1853,13 +1966,21 @@ public final class ConstantNames {
               fieldBest = site;
               fieldMatches++;
             }
+            else if (pair.successorKey() != null && pairedInitializer(text,
+                rules.placement().spaces(), rules.placement().spans(), site.start(),
+                pair.successorAt())) {
+              // The successor is the folded value the naming entered, and its printed point is
+              // this very initializer: the literal here is the naming that entered it.
+              fieldBest = site;
+              fieldMatches++;
+            }
             continue;
           }
-          if (pair.successorKey() == null && pair.after() != NO_COORDINATE
+          boolean sameRank = (coordinate >>> 32) == (pair.successor() >>> 32);
+          if (pair.successorKey() == null && sameRank && pair.after() != NO_COORDINATE
               && coordinate <= pair.after()) {
             continue; // an entry the pair precedes was used between this site and the reference
           }
-          boolean sameRank = (coordinate >>> 32) == (pair.successor() >>> 32);
           long offset = coordinate & 0xffffffffL;
           long successorOffset = pair.successor() & 0xffffffffL;
           // A value successor is the entry the naming itself entered, so the literal's own point
@@ -1867,14 +1988,24 @@ public final class ConstantNames {
           // strictly earlier site.
           boolean atValue = pair.member() == null && offset == successorOffset;
           boolean atOrBefore = offset < successorOffset || atValue;
-          if (!sameRank || !atOrBefore) {
-            continue; // another method, or after the reference was generated
+          if (sameRank) {
+            if (!atOrBefore) {
+              continue; // after the reference was generated
+            }
+            if (pair.open() >= 0 && inArgs) {
+              // the naming sits in the call's own argument list, between the pair and the invoke
+            }
+            else if (!atValue
+                && coordinate <= (pair.successorKey() == null ? pair.after() : pair.lower())) {
+              continue; // before the previous entry's first use; the naming would move it
+            }
           }
-          if (pair.open() >= 0 && inArgs) {
-            // the naming sits in the call's own argument list, between the pair and the invoke
-          }
-          else if (!atValue && coordinate <= pair.lower()) {
-            continue; // before the previous entry's first use; the naming would move it
+          else if (pair.successorKey() != null
+              || !(coordinate < pair.successor() && coordinate > pair.lower())) {
+            // A value successor lies at the literal's own point, in its own method. A naming in an
+            // earlier method can only precede a reference, and only where the interval bound
+            // (capped at each operand's reference) stays below it.
+            continue;
           }
           if (best == null || coordinate > bestCoordinate) {
             best = site;
@@ -2268,11 +2399,14 @@ public final class ConstantNames {
     // successor's point; a reference is created after its arguments and needs an earlier site.
     boolean atValue = pair.member() == null && offset == successorOffset;
     boolean atOrBefore = offset < successorOffset || atValue;
-    // At the value's own point the naming creates the pair right before it, so every lower entry
-    // already exists; the first-use lower bound is a proxy only and can lie above this point when
-    // an early entry is first used in a later method.
+    // Within a reference successor's method the offsets follow the generation order, so the last
+    // entry first used before the successor is the exact lower bound: an entry created after that
+    // use and before the successor would be used there, and the pair would not precede it. The
+    // interval-wide first-use bound is a proxy only and can lie above this point when an early
+    // entry is first used in a later method.
+    long lower = pair.successorKey() == null ? pair.after() : pair.lower();
     return (coordinate >>> 32) == (pair.successor() >>> 32) && atOrBefore
-      && (atValue || coordinate > pair.lower());
+      && (atValue || coordinate > lower);
   }
 
   /**
@@ -2433,11 +2567,14 @@ public final class ConstantNames {
     // methods by generation, so any site below the successor is still generated before it. Only
     // the argument window is bound to the successor's own method.
     boolean before = coordinate < pair.successor();
+    // In a reference successor's own method the last use before it is the exact lower bound; in an
+    // earlier method the interval-wide first-use bound is the only one the pool order offers.
+    long lower = sameRank && pair.successorKey() == null ? pair.after() : pair.lower();
     if (pair.open() >= 0 && sameRank) {
       boolean inArgs = position > pair.open() && position < pair.close();
-      return inArgs || before && coordinate > pair.lower();
+      return inArgs || before && coordinate > lower;
     }
-    return before && coordinate > pair.lower();
+    return before && coordinate > lower;
   }
 
   /** Whether some site already names this owner in the class text. */
@@ -3887,26 +4024,71 @@ public final class ConstantNames {
       if (constantValue(own, field) == null) {
         continue;
       }
-      java.util.regex.Matcher matcher = java.util.regex.Pattern
-        .compile("\\b" + java.util.regex.Pattern.quote(field.getName()) + "\\s*=")
-        .matcher(text);
-      for (int[] span : spans) {
-        matcher.region(span[0], span[1]);
-        while (matcher.find()) {
-          int depth = 0;
-          int i = matcher.end();
-          while (i < span[1]) {
-            char c = text.charAt(i);
-            if (c == '(' || c == '[' || c == '{') depth++;
-            else if (c == ')' || c == ']' || c == '}') { if (depth == 0) break; depth--; }
-            else if (c == ';' && depth == 0) break;
-            i++;
-          }
-          ranges.computeIfAbsent(field.getName(), k -> new ArrayList<>()).add(new int[]{matcher.start(), i});
-        }
+      List<int[]> found = initializerRanges(text, spans, field.getName());
+      if (!found.isEmpty()) {
+        ranges.computeIfAbsent(field.getName(), k -> new ArrayList<>()).addAll(found);
       }
     }
     return ranges;
+  }
+
+  /**
+   * Where the source assigns this field, from its name through the closing semicolon.
+   *
+   * <p>The printer records a field initializer's offsets under a {@code <field-init NAME>} key, so
+   * the text its recorded position falls in is that field's initializer. The range is read from
+   * the printed declaration, not from the pool: an initializer of any field, constant or not, is
+   * found the same way.
+   */
+  private static List<int[]> initializerRanges(String text, List<int[]> spans, String name) {
+    List<int[]> ranges = new ArrayList<>();
+    java.util.regex.Matcher matcher = java.util.regex.Pattern
+      .compile("\\b" + java.util.regex.Pattern.quote(name) + "\\s*=")
+      .matcher(text);
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      while (matcher.find()) {
+        int depth = 0;
+        int i = matcher.end();
+        while (i < span[1]) {
+          char c = text.charAt(i);
+          if (c == '(' || c == '[' || c == '{') depth++;
+          else if (c == ')' || c == ']' || c == '}') { if (depth == 0) break; depth--; }
+          else if (c == ';' && depth == 0) break;
+          i++;
+        }
+        ranges.add(new int[]{matcher.start(), i});
+      }
+    }
+    return ranges;
+  }
+
+  /**
+   * Whether a value successor's printed point and a site lie in one field's initializer.
+   *
+   * <p>A value successor is the folded value the naming itself entered, so the instruction that
+   * uses it is the naming site. When the printer prints that use at a field declaration, its
+   * position lies in the {@code <field-init NAME>} buffer, and a literal inside the same printed
+   * initializer is the site the value was created at.
+   */
+  private static boolean pairedInitializer(String text, List<SiteSpace> spaces, List<int[]> spans,
+                                           int site, int successorAt) {
+    if (spaces == null || successorAt < 0) {
+      return false;
+    }
+    for (SiteSpace space : spaces) {
+      if (!space.key().startsWith("<field-init ") || successorAt < space.min()
+          || successorAt > space.max()) {
+        continue;
+      }
+      String name = space.key().substring("<field-init ".length(), space.key().length() - 1);
+      for (int[] range : initializerRanges(text, spans, name)) {
+        if (site >= range[0] && site < range[1]) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private static void scan(String text, Map<String, List<Constant>> candidates, List<String> imports,
