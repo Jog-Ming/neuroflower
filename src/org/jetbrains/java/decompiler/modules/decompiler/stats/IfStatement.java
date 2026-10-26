@@ -235,10 +235,11 @@ public class IfStatement extends Statement {
     if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
         && (getParent() instanceof DoStatement
             // The same mirror one level in: `if (!C) { rest }` printed as the loop body's tail.
-            || condition instanceof FunctionExprent not
-               && not.getFuncType() == FunctionType.BOOL_NOT
-               && not.getLstOperands().size() == 1
-               && RoundTrip.endsLoopBody(this))
+            // The printed condition has to be the whole of what the head covers: a pattern if's
+            // head also spans the nested condition, and its guard belongs to that inner test.
+            || RoundTrip.endsLoopBody(this)
+               && ifHead.bytecode != null && ifHead.getCondition().bytecode != null
+               && ifHead.getCondition().bytecode.length() == ifHead.bytecode.length())
         && RoundTrip.printContinueGuard(ifHead, this)) {
       Exprent printed = ifHead.getCondition();
       Exprent source = printed instanceof FunctionExprent not
