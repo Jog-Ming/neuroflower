@@ -500,12 +500,40 @@ public class SequenceStatement extends Statement {
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(tail, indent + 1, true));
-          buf.appendIndent(indent).append("}").appendLineSeparator();
-          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          if (RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), tail)) {
+            buf.appendIndent(indent).append("} else {").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+          } else {
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          }
           notempty = true;
           i++;
           continue;
         }
+      }
+
+      // `if (C) { A } return X;` where the target's then-arm ends with a jump over the returning
+      // block: the source wrote `if (C) { A } else { return X; }`, and only the false path returns.
+      // Without that jump the arm falls into the return and the trailing print is the faithful one.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && singleExit(stats.get(i + 1)) instanceof ExitExprent elseExit
+          && elseExit.getExitType() == ExitExprent.Type.RETURN
+          && RoundTrip.gotoPastsExit(ifStatement.getIfstat(), stats.get(i + 1))) {
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        i++;
+        continue;
       }
 
       // The mirror: the bytecode put `return X` before the rest, but the target's table puts its
@@ -534,11 +562,18 @@ public class SequenceStatement extends Statement {
           head.setCondition(RoundTrip.negateCondition(head.getCondition()));
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
+          Statement movedRest = new SequenceStatement(stats.subList(i + 1, stats.size()));
+          boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest);
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-          buf.append(ExprProcessor.jmpWrapper(
-            new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
-          buf.appendIndent(indent).append("}").appendLineSeparator();
-          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          buf.append(ExprProcessor.jmpWrapper(movedRest, indent + 1, true));
+          if (asElse) {
+            buf.appendIndent(indent).append("} else {").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+          } else {
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          }
           notempty = true;
           break;
         }

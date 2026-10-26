@@ -1808,6 +1808,68 @@ public final class RoundTrip {
    * source wrote {@code body; exit;} rather than the guard the bytecode's block order suggests.
    */
   public static boolean exitAfterBody(Statement exitStatement, Statement body) {
+    return exitAfterBodyImpl(exitStatement, body);
+  }
+
+  /**
+   * True when the target's then-arm ends with a jump over the returning block our sequence prints
+   * as the statement after the if: the source wrote {@code if (C) { A } else { return X; }} and the
+   * arm's fall-through reaches the rest instead. The jump has to sit immediately after the arm's
+   * own last instruction, so a merge jump generated for some other construct cannot trigger it.
+   */
+  public static boolean gotoPastsExit(Statement arm, Statement exit) {
+    if (!selector("elseblock")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || arm == null || exit == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return false;
+    }
+    int exitStart = firstOffset(exit);
+    int armEnd = lastEnd(arm);
+    // A goto is three bytes; it must start where the arm's last instruction ends and end on the
+    // returning block's first instruction.
+    if (exitStart < 0 || armEnd < 0 || armEnd + 3 != exitStart) {
+      return false;
+    }
+    Integer target = gotos.get(exitStart);
+    return target != null && target > exitStart;
+  }
+
+  /**
+   * True when a jump skips exactly this arm: the target records a goto that ends on the arm's first
+   * instruction and lands on the instruction after the arm, and the statement before the arm ends
+   * where that goto begins. The source wrote `if (C) { rest } else { arm }`; printing the arm after
+   * the rest instead would run it on both paths.
+   */
+  public static boolean gotoJumpsOverArm(Statement arm, Statement rest) {
+    if (!selector("elseblock")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || arm == null || rest == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return false;
+    }
+    int start = firstOffset(arm);
+    int end = lastEnd(arm);
+    int restEnd = lastEnd(rest);
+    if (start < 0 || end <= start || restEnd < 0 || restEnd + 3 != start) {
+      return false;
+    }
+    // GOTO_TARGETS is keyed by the jump's own offset, which is where the rest ends.
+    Integer target = gotos.get(restEnd);
+    return target != null && target == end;
+  }
+
+  private static boolean exitAfterBodyImpl(Statement exitStatement, Statement body) {
     if (!selector("exitlast")) {
       return false;
     }
