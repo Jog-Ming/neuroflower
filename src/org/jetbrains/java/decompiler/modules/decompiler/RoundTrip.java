@@ -1761,6 +1761,33 @@ public final class RoundTrip {
     return true;
   }
 
+  /**
+   * True when this statement is the last thing printed on the way out of its loop body, so a
+   * {@code continue} at its end jumps to the loop head having skipped nothing.
+   */
+  public static boolean endsLoopBody(Statement stat) {
+    Statement cur = stat;
+    for (Statement parent = cur.getParent(); parent != null; parent = cur.getParent()) {
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement) {
+        return true;
+      }
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence) {
+        if (sequence.getStats().isEmpty() || sequence.getStats().getLast() != cur) {
+          return false;
+        }
+      } else if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement) {
+        if (ifStatement.getIfstat() != cur
+            || (ifStatement.getElsestat() != null && !printsNothing(ifStatement.getElsestat()))) {
+          return false;
+        }
+      } else {
+        return false;
+      }
+      cur = parent;
+    }
+    return false;
+  }
+
   /** Whether the table starts an entry at this exact offset: a statement on a new line began there. */
   private static boolean startsLine(StructLineNumberTableAttribute table, int offset) {
     int[] raw = table.getRawData();

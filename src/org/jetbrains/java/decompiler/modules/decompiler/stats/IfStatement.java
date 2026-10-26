@@ -453,7 +453,7 @@ public class IfStatement extends Statement {
         || (elseArm != null && (!endsWithExit(arm) || RoundTrip.declaresLocal(elseArm)))) {
       return false;
     }
-    printNestedIfs(buf, head, arm, groups, indent);
+    printNestedIfs(buf, head, arm, groups, indent, elseArm == null);
     buf.appendIndent(indent).append("}").appendLineSeparator();
     if (elseArm != null) {
       buf.append(ExprProcessor.jmpWrapper(elseArm, indent, elseSemicolon));
@@ -465,12 +465,34 @@ public class IfStatement extends Statement {
    * Prints one `if` header per group and the arm the innermost guards, leaving the outermost brace
    * open: the caller closes it, and appends the else arm when there is one.
    */
-  static void printNestedIfs(TextBuffer buf, IfExprent head, Statement arm, List<Integer> groups, int indent) {
+  static void printNestedIfs(TextBuffer buf, IfExprent head, Statement arm, List<Integer> groups, int indent,
+                             boolean allowContinueGuard) {
     List<Exprent> operands = booleanOperands(head.getCondition());
+    // The innermost group is the target's guard when its last branch falls through to a jump back
+    // to the loop head: the source wrote `if (C) continue;` there, not `if (!C) { arm }`.
+    boolean guard = allowContinueGuard && !groups.isEmpty()
+      && RoundTrip.endsLoopBody(arm) && RoundTrip.printContinueGuard(head, arm);
     for (int group = 0; group < groups.size(); group++) {
       int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
       IfExprent nested = (IfExprent) head.copy();
       nested.setCondition(andOf(operands, groups.get(group), to));
+      if (guard && group == groups.size() - 1) {
+        Exprent printed = nested.getCondition();
+        nested.setCondition(printed instanceof FunctionExprent not
+            && not.getFuncType() == FunctionType.BOOL_NOT
+            && not.getLstOperands().size() == 1
+          ? not.getLstOperands().get(0)
+          : RoundTrip.negateCondition(printed));
+        buf.appendIndent(indent + group).append(nested.toJava(indent + group))
+          .append(" {").appendLineSeparator();
+        buf.appendIndent(indent + group + 1).append("continue;").appendLineSeparator();
+        buf.appendIndent(indent + group).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(arm, indent + group, true));
+        for (int close = group - 1; close >= 1; close--) {
+          buf.appendIndent(indent + close).append("}").appendLineSeparator();
+        }
+        return;
+      }
       buf.appendIndent(indent + group).append(nested.toJava(indent + group))
         .append(" {").appendLineSeparator();
     }
