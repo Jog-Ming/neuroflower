@@ -589,6 +589,22 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's line table puts a candidate for-update on a line distinct from the
+   * condition's, proving the source wrote it as the loop body's last statement rather than in a
+   * for header. A for header's update carries the header's line, which the condition shares
+   * unless the header itself was written across several lines; the caller only uses this to keep
+   * the while form, which compiles to the same instructions either way.
+   */
+  public static boolean updateIsBodyStatement(Exprent condition, Exprent update) {
+    if (!selector("whileupdate")) {
+      return false;
+    }
+    int updateLine = sourceLine(update);
+    int conditionLine = sourceLine(condition);
+    return updateLine >= 0 && conditionLine >= 0 && updateLine != conditionLine;
+  }
+
+  /**
    * Whether the target's line table has an entry exactly at the expression's first instruction.
    * javac only marks lines where an AST node's position sits, so an argument that merely inherits
    * the enclosing statement's line has no entry of its own; a break there is layout the original

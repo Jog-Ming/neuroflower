@@ -529,6 +529,14 @@ public class MergeHelper {
 
       Exprent lastExp = lastData.getExprents().get(lastData.getExprents().size() - 1);
 
+      // A for header's update takes the header's line while a while body's last statement takes
+      // its own: a distinct line proves the source kept this exprent in the body, so the loop stays
+      // a while and the exprent prints where the source wrote it (inside a guard's arm, for one).
+      // Both forms compile to the same instructions, so only the target's table separates them.
+      if (RoundTrip.updateIsBodyStatement(stat.getConditionExprent(), lastExp)) {
+        return;
+      }
+
       // Cannot integrate if the last exprent is a throw or return
       if (lastExp instanceof ExitExprent) {
         return;
