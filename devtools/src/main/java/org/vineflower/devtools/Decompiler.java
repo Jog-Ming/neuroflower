@@ -54,8 +54,11 @@ public final class Decompiler {
     Path client = minecraft.clientJar(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
     String optionKey = options.isEmpty() ? "baked-defaults" : String.join(" ", options);
+    // An inner class pulls its outer class into the subset, so the subset is not the same tree a
+    // bare class name produced before this rule existed.
+    String onlyKey = only != null && only.indexOf('$') >= 0 ? only + "|nestall" : only;
     String key = Workspace.sha256(Workspace.sha256(client) + Workspace.sha256(devJar) + optionKey
-      + classpathFingerprint(classpath) + (only == null ? "" : "|only=" + only));
+      + classpathFingerprint(classpath) + (onlyKey == null ? "" : "|only=" + onlyKey));
     Path dir = workspace.trees.resolve(key);
     Path src = dir.resolve("src");
     JsonObject meta = Files.exists(dir.resolve("meta.json"))
@@ -255,19 +258,30 @@ public final class Decompiler {
     return failed;
   }
 
-  /** A jar with the class and everything named Class$..., so nested and anonymous classes come too. */
+  /**
+   * A jar with the class and everything named Class$..., so nested and anonymous classes come too.
+   * An inner class also brings its outermost class along: the decompiler names the source file
+   * after the outer class, so a subset holding only X$Y would produce no X.java at all.
+   */
   private Path subsetJar(String version, String binaryName) throws Exception {
     Path client = minecraft.clientJar(version, false);
     String entryName = binaryName.replace('.', '/') + ".class";
-    Path jar = workspace.tmp.resolve("subset-" + Workspace.sha256(version + "|" + binaryName) + ".jar");
+    String prefix = entryName.substring(0, entryName.length() - ".class".length());
+    int dollar = prefix.indexOf('$');
+    String outerPrefix = dollar > 0 ? prefix.substring(0, dollar) : null;
+    String outerName = outerPrefix == null ? null : outerPrefix + ".class";
+    boolean inner = outerName != null;
+    Path jar = workspace.tmp.resolve("subset-" + Workspace.sha256(version + "|" + binaryName + (inner ? "|nestall" : "")) + ".jar");
     Files.createDirectories(jar.getParent());
     try (ZipFile zip = new ZipFile(client.toFile());
          ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(jar))) {
-      String prefix = entryName.substring(0, entryName.length() - ".class".length());
       boolean found = false;
       for (ZipEntry entry : java.util.Collections.list(zip.entries())) {
         String name = entry.getName();
-        if (name.equals(entryName) || name.startsWith(prefix + "$")) {
+        // An inner request takes the whole nest: the outer's source names its siblings, and a
+        // subset holding only one of them does not compile.
+        if (name.equals(entryName) || name.startsWith(prefix + "$")
+            || (outerPrefix != null && (name.equals(outerName) || name.startsWith(outerPrefix + "$")))) {
           found = true;
           out.putNextEntry(new ZipEntry(name));
           try (var in = zip.getInputStream(entry)) {

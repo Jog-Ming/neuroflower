@@ -622,7 +622,14 @@ public final class Verifier {
       List<Path> list = new ArrayList<>(walk.filter(p -> p.toString().endsWith(".java")).toList());
       if (relative != null) {
         String wanted = relative.replace('\\', '/');
-        list.removeIf(p -> !root.relativize(p).toString().replace('\\', '/').endsWith(wanted));
+        // An inner class has no file of its own: the decompiler names the file after the outermost
+        // class, so X$Y is scored through X.java.
+        int dollar = only.indexOf('$');
+        String outer = dollar > 0 ? only.substring(0, dollar).replace('.', '/') + ".java" : null;
+        list.removeIf(p -> {
+          String path = root.relativize(p).toString().replace('\\', '/');
+          return !path.endsWith(wanted) && (outer == null || !path.endsWith(outer));
+        });
       }
       Collections.sort(list);
       return list;
