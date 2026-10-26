@@ -506,6 +506,13 @@ public class ClassWriter implements StatementWriter {
     if (seq == null || seq.isEmpty()) {
       return false;
     }
+    // A varargs method reference: javac's bridge packs the single parameter into an array and
+    // calls the varargs method with it. A lambda's body has the functional method's own parameter
+    // types, so only a reference (whose bridge widens them) shows up with `differs` set.
+    if (RoundTrip.selector("methodrefvarargs") && differs && staticNoCapture(prefix)
+        && writeVarargsMethodReference(cl, mt, target0(seq, cl, md_content), buffer)) {
+      return true;
+    }
     int index = 0;
     int paramIndex = 0;
     int slot = 0;
@@ -610,6 +617,64 @@ public class ClassWriter implements StatementWriter {
     } else {
       buffer.append(instance);
     }
+    buffer.append("::").appendMethod(target.elementname, false, target.classname,
+      target.elementname, target.descriptor);
+    return true;
+  }
+
+  /** The value of a small integer constant instruction, or Integer.MIN_VALUE. */
+  private static int intConstant(Instruction ins) {
+    int op = ins.opcode;
+    if (op >= CodeConstants.opc_iconst_m1 && op <= CodeConstants.opc_iconst_5) {
+      return op - CodeConstants.opc_iconst_0;
+    }
+    if (op == CodeConstants.opc_bipush || op == CodeConstants.opc_sipush) {
+      return ins.operand(0);
+    }
+    return Integer.MIN_VALUE;
+  }
+
+  private static boolean staticNoCapture(int prefix) {
+    return prefix == 0;
+  }
+
+  /** The static call a single-parameter varargs bridge forwards to, or null when the body differs. */
+  private static LinkConstant target0(FullInstructionSequence seq, StructClass cl, MethodDescriptor md_content) {
+    if (seq == null || md_content.params.length != 1 || seq.length() != 8) {
+      return null;
+    }
+    if (intConstant(seq.getInstr(0)) != 1
+        || seq.getInstr(1).opcode != CodeConstants.opc_anewarray
+        || seq.getInstr(2).opcode != CodeConstants.opc_dup
+        || intConstant(seq.getInstr(3)) != 0
+        || loadSlot(seq.getInstr(4)) == null || loadSlot(seq.getInstr(4)) != 0
+        || seq.getInstr(5).opcode != CodeConstants.opc_aastore
+        || seq.getInstr(6).opcode != CodeConstants.opc_invokestatic) {
+      return null;
+    }
+    Instruction ret = seq.getInstr(7);
+    if (!isReturn(ret.opcode)) {
+      return null;
+    }
+    LinkConstant target = cl.getPool().getLinkConstant(seq.getInstr(6).operand(0));
+    if (target == null || target.elementname == null || target.descriptor == null) {
+      return null;
+    }
+    String arrayType = cl.getPool().getPrimitiveConstant(seq.getInstr(1).operand(0)).getString();
+    MethodDescriptor md_target = MethodDescriptor.parseDescriptor(target.descriptor);
+    if (md_target.params.length != 1 || md_target.params[0].arrayDim != 1
+        || !md_target.params[0].value.equals(arrayType)) {
+      return null;
+    }
+    return target;
+  }
+
+  private boolean writeVarargsMethodReference(StructClass cl, StructMethod mt, LinkConstant target,
+                                              TextBuffer buffer) {
+    if (target == null) {
+      return false;
+    }
+    buffer.appendCastTypeName(new VarType(target.classname, true));
     buffer.append("::").appendMethod(target.elementname, false, target.classname,
       target.elementname, target.descriptor);
     return true;
