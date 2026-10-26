@@ -236,16 +236,23 @@ public class IfStatement extends Statement {
         && getParent() instanceof DoStatement
         && RoundTrip.printContinueGuard(ifHead, this)) {
       Exprent printed = ifHead.getCondition();
-      IfExprent guard = (IfExprent) ifHead.copy();
-      guard.setCondition(printed instanceof FunctionExprent not
+      Exprent source = printed instanceof FunctionExprent not
           && not.getFuncType() == FunctionType.BOOL_NOT
           && not.getLstOperands().size() == 1
         ? not.getLstOperands().get(0)
-        : RoundTrip.negateCondition(printed));
-      buf.appendIndent(indent);
-      buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
-      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
-      buf.appendIndent(indent).append("}").appendLineSeparator();
+        : RoundTrip.negateCondition(printed);
+      // Two guards merged into one `||`: the target records a goto back to the loop head for each
+      // operand, so the source wrote one `if (C) continue;` per test.
+      List<Exprent> ors = orOperands(source);
+      boolean split = RoundTrip.splitsIntoGuards(ifHead, ors.size(), this);
+      for (Exprent operand : split ? ors : java.util.Collections.singletonList(source)) {
+        IfExprent guard = (IfExprent) ifHead.copy();
+        guard.setCondition(operand);
+        buf.appendIndent(indent);
+        buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
       return buf;
     }
@@ -499,6 +506,24 @@ public class IfStatement extends Statement {
     buf.append(ExprProcessor.jmpWrapper(arm, indent + groups.size(), true));
     for (int group = groups.size() - 1; group >= 1; group--) {
       buf.appendIndent(indent + group).append("}").appendLineSeparator();
+    }
+  }
+
+  /** The operands of a boolean-or condition, flattened; a single expression comes back alone. */
+  private static List<Exprent> orOperands(Exprent condition) {
+    List<Exprent> operands = new ArrayList<>();
+    collectOrOperands(condition, operands);
+    return operands;
+  }
+
+  private static void collectOrOperands(Exprent condition, List<Exprent> out) {
+    if (condition instanceof FunctionExprent function
+        && function.getFuncType() == FunctionType.BOOLEAN_OR
+        && function.getLstOperands().size() == 2) {
+      collectOrOperands(function.getLstOperands().get(0), out);
+      collectOrOperands(function.getLstOperands().get(1), out);
+    } else {
+      out.add(condition);
     }
   }
 

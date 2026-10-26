@@ -1639,23 +1639,48 @@ public final class RoundTrip {
    * {@code if (!C) { body }}, which compiles to the opposite branch with no goto.
    */
   public static boolean printContinueGuard(Exprent head, Statement sequence) {
-    if (!selector("continueguard")) {
+    return selector("continueguard") && head != null && head.bytecode != null
+      && !head.bytecode.isEmpty() && continuesAt(head.bytecode.length(), sequence);
+  }
+
+  /**
+   * True when this condition merges that many {@code continue} guards: the target records one jump
+   * back to the loop head per statement, so an {@code ||} of n tests came from n separate
+   * {@code if (C) continue;} statements rather than one shared condition.
+   */
+  public static boolean splitsIntoGuards(Exprent head, int operands, Statement around) {
+    if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()
+        || operands < 2) {
       return false;
     }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(currentMethod());
+    if (guards == null || guards.isEmpty()) {
+      return false;
+    }
+    int count = 0;
+    for (Integer end : guards.keySet()) {
+      // The branch that falls into the guard has to sit inside this condition's own bytes.
+      if (end > head.bytecode.length() || end <= 0 || !head.bytecode.get(end - 1)) {
+        continue;
+      }
+      if (continuesAt(end, around)) {
+        count++;
+      }
+    }
+    return count == operands;
+  }
+
+  private static boolean continuesAt(int end, Statement around) {
     StructMethod method = currentMethod();
     if (method == null) {
       return false;
     }
     java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
-    BitSet offsets = head.bytecode;
-    if (guards == null || guards.isEmpty() || offsets == null || offsets.isEmpty()) {
-      return false;
-    }
-    Integer target = guards.get(offsets.length());
+    Integer target = guards == null ? null : guards.get(end);
     if (target == null) {
       return false;
     }
-    Statement loop = sequence.getParent();
+    Statement loop = around == null ? null : around.getParent();
     while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
       loop = loop.getParent();
     }
@@ -1667,7 +1692,7 @@ public final class RoundTrip {
     }
     // The target's table must put the continue's line before the body's first line.
     java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
-    int[] site = sites == null ? null : sites.get(offsets.length());
+    int[] site = sites == null ? null : sites.get(end);
     StructLineNumberTableAttribute table =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
     if (site != null && table != null) {
