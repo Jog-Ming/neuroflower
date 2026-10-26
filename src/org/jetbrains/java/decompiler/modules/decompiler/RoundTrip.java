@@ -359,6 +359,82 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's last condition branch jumps to the arm the printed condition says it
+   * should not: an {@code &&} chain's last test branches to the else arm, an {@code ||} chain's to
+   * the then arm, so a branch to the other arm proves the source wrote the negated condition with
+   * the arms the other way round. Unlike the opcode test this reads the branch's destination, which
+   * does not depend on how the decompiler typed the operands.
+   */
+  public static boolean swapIfArmsByTarget(Exprent head, Statement thenArm, Statement elseArm) {
+    if (!selector("polaritytarget") || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    int thenStart = firstOffset(thenArm);
+    int elseStart = firstOffset(elseArm);
+    int target = lastBranchTarget(ifHead.bytecode);
+    if (thenStart < 0 || elseStart < 0 || target < 0 || thenStart == elseStart) {
+      return false;
+    }
+    boolean or = lastAtomUnderOr(ifHead.getCondition(), false);
+    return or ? target == elseStart : target == thenStart;
+  }
+
+  /** The destination of the last conditional branch inside these offsets, or -1. */
+  private static int lastBranchTarget(BitSet bytecode) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    if (ends == null || targets == null || bytecode == null || bytecode.isEmpty()) {
+      return -1;
+    }
+    int lastStart = -1;
+    int lastTarget = -1;
+    for (int offset = bytecode.nextSetBit(0); offset >= 0; offset = bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end) && offset > lastStart) {
+        lastStart = offset;
+        lastTarget = targets.get(end);
+      }
+    }
+    return lastTarget;
+  }
+
+  /**
+   * Whether the condition's last test jumps on success rather than on failure: the last atom of an
+   * {@code ||} chain does, the last atom of an {@code &&} chain does not, and a negation flips it.
+   */
+  private static boolean lastAtomUnderOr(Exprent condition, boolean inverted) {
+    while (condition instanceof FunctionExprent function) {
+      FunctionExprent.FunctionType type = function.getFuncType();
+      if (type == FunctionExprent.FunctionType.BOOL_NOT) {
+        Exprent inner = function.getLstOperands().get(0);
+        // A negation of an atom is the atom's own polarity and leaves the side alone; a negation of
+        // a chain swaps the connective, so the chain is read with the flag flipped.
+        if (inner instanceof FunctionExprent nested
+            && (nested.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND
+                || nested.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_OR)) {
+          inverted = !inverted;
+          condition = inner;
+          continue;
+        }
+        return inverted;
+      }
+      if (type == FunctionExprent.FunctionType.BOOLEAN_AND || type == FunctionExprent.FunctionType.BOOLEAN_OR) {
+        inverted ^= type == FunctionExprent.FunctionType.BOOLEAN_OR;
+        java.util.List<Exprent> operands = function.getLstOperands();
+        condition = operands.get(operands.size() - 1);
+      } else {
+        return inverted;
+      }
+    }
+    return inverted;
+  }
+
+  /**
    * True when the target branched the other way: the original wrote the negated condition with the
    * arms swapped. Only plain boolean tests are handled; comparisons and short-circuit conditions
    * compile to different opcode families and are left alone.

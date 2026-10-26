@@ -1118,7 +1118,9 @@ public class SimplifyExprentsHelper {
   private static List<Exprent> ternaryOperands(IfStatement statement, Statement ifArm, Statement elseArm,
                                                Exprent thenValue, Exprent elseValue) {
     Exprent condition = statement.getHeadexprent().getCondition();
-    if (RoundTrip.swapIfArms(statement.getHeadexprent()) || RoundTrip.swapIfArmsByLine(ifArm, elseArm)) {
+    boolean swap = RoundTrip.swapIfArms(statement.getHeadexprent()) || RoundTrip.swapIfArmsByLine(ifArm, elseArm)
+      || RoundTrip.swapIfArmsByTarget(statement.getHeadexprent(), ifArm, elseArm);
+    if (swap) {
       return Arrays.asList(RoundTrip.negateCondition(condition), elseValue, thenValue);
     }
     return Arrays.asList(condition, thenValue, elseValue);
