@@ -68,14 +68,16 @@ not edit code.
 1. **Classify.** Split the metric's residue into families by root cause, not by first opcode: a
    shared first-divergence instruction is a starting guess that the research step has to confirm or
    dissolve.
-2. **Research one family, read-only.** Give a fresh agent one family, the report, our tree and the
+2. **Research one family.** Give a fresh agent one family, the report, our tree and the
    ground-truth tree. It picks one or more representative classes — as short as possible, and free of
    other families' or metrics' problems — and works out the repair by hand, editing a scratch copy of
-   the *tree* to prove the form. If no such class exists it says what sample would be needed; it may
-   not run the decompiler to make one while a measurement owns devtools. It must explain why the
-   ground truth is right, and offer at least one candidate repair that differs from the ground truth
-   and say what separates them in the class file — that is the proof it understood the shape rather
-   than copied it.
+   the *tree* to prove the form; when no such class exists it decompiles one it writes itself. It may
+   use devtools **one class at a time** (`decompile <version> --only <Class>`, `score <version>
+   --only <Class>`, `tree <version> --only <Class>`), never a whole-tree score and never a build: a
+   rebuilt jar in the middle of a full measurement makes classes vanish from it. It must explain why
+   the ground truth is right, and offer at least one candidate repair that differs from the ground
+   truth and say what separates them in the class file — that is the proof it understood the shape
+   rather than copied it.
 3. **Implement one family, with devtools.** A different agent applies the agreed rule to the whole
    family, owns devtools for the regression run, and commits only when no attribute drops. Research
    agents cost nothing to run in parallel; implementation agents must not share a checkout.
