@@ -98,6 +98,10 @@ public class ExitExprent extends Exprent {
     buf.addBytecodeMapping(bytecode);
 
     if (exitType == Type.RETURN) {
+      if (value == null && retType.type == CodeType.VOID && RoundTrip.fallsOutOfFinally(this)) {
+        // The region just falls out of its try: the shared exit is the method's, not the source's.
+        return buf;
+      }
       if (value == null && retType.type == CodeType.VOID && RoundTrip.printsAsBreak(this)) {
         // The target jumped here from inside the loop: the source wrote `break;`, not `return;`.
         buf.append("break");

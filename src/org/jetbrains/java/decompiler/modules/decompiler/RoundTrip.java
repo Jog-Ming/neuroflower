@@ -51,6 +51,10 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_STARTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Target of each goto, by its start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> GOTO_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Offsets just past an inlined copy of a finally body, per method. */
+  private static final java.util.Map<StructMethod, java.util.Set<Integer>> FINALLY_COPY_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The method's last instruction start offset. */
+  private static final java.util.Map<StructMethod, Integer> LAST_INSTRUCTION = new java.util.concurrent.ConcurrentHashMap<>();
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instructions that store or discard the stack's value: a call's result ends its statement here. */
@@ -73,6 +77,7 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
+    java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
@@ -152,13 +157,80 @@ public final class RoundTrip {
         // enclosing try statement's closing-brace line. Where the body returns or throws, the
         // range ends at the handler itself, whose line is the catch clause's, not the brace's.
         Instruction exit = seq.getInstr(toIndex);
-        if (exit.opcode != CodeConstants.opc_goto && exit.opcode != CodeConstants.opc_goto_w) {
-          continue;
+        if (exit.opcode == CodeConstants.opc_goto || exit.opcode == CodeConstants.opc_goto_w) {
+          handlerEnds.put(seq.getInstr(handlerIndex).startOffset, exit.startOffset);
         }
-        handlerEnds.put(seq.getInstr(handlerIndex).startOffset, exit.startOffset);
+        // A finally handler's body ends with athrow; javac copies that body to every path that
+        // leaves the protected range, so the same instruction run appears several times.
+        int start = seq.getInstr(handlerIndex).startOffset;
+        int athrow = -1;
+        for (int i = handlerIndex; i < seq.length(); i++) {
+          int opcode = seq.getInstr(i).opcode;
+          if (opcode == CodeConstants.opc_athrow) {
+            athrow = seq.getInstr(i).startOffset;
+            break;
+          }
+          if (opcode == CodeConstants.opc_goto || opcode == CodeConstants.opc_return) {
+            break;
+          }
+        }
+        if (athrow >= 0) {
+          finallyCopies.add(new int[]{start, athrow});
+        }
       }
     }
     HANDLER_ENDS.put(method, handlerEnds);
+    // Inlined copies of a finally body: every instruction of the handler up to its athrow, found
+    // again elsewhere in the stream. Record the offset just past each copy and the method's last
+    // instruction offset, so a `return` that only a copy jumps to can be recognised.
+    java.util.Set<Integer> copyEnds = new java.util.HashSet<>();
+    for (int[] body : finallyCopies) {
+      java.util.List<long[]> signature = new java.util.ArrayList<>();
+      for (int i = 0; i < seq.length(); i++) {
+        Instruction instr = seq.getInstr(i);
+        if (instr.startOffset < body[0]) {
+          continue;
+        }
+        if (instr.startOffset >= body[1]) {
+          break;
+        }
+        signature.add(new long[]{instr.opcode, 0});
+      }
+      // javac prefixes the handler itself with the exception store; the inlined copies do not have
+      // it, so it is not part of the body being copied.
+      if (!signature.isEmpty()
+          && signature.get(0)[0] >= CodeConstants.opc_istore && signature.get(0)[0] <= CodeConstants.opc_astore) {
+        signature.remove(0);
+      }
+      // ...and the rethrow's own value load sits right before the athrow, also not copied.
+      if (!signature.isEmpty()
+          && signature.get(signature.size() - 1)[0] >= CodeConstants.opc_iload
+          && signature.get(signature.size() - 1)[0] <= CodeConstants.opc_aload) {
+        signature.remove(signature.size() - 1);
+      }
+      if (signature.isEmpty()) {
+        continue;
+      }
+      for (int start = 0; start + signature.size() <= seq.length(); start++) {
+        if (seq.getInstr(start).startOffset >= body[0] && seq.getInstr(start).startOffset < body[1]) {
+          continue;
+        }
+        boolean same = true;
+        for (int k = 0; k < signature.size(); k++) {
+          Instruction instr = seq.getInstr(start + k);
+          long[] want = signature.get(k);
+          if (instr.opcode != want[0]) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          copyEnds.add(seq.getInstr(start + signature.size() - 1).startOffset + seq.getInstr(start + signature.size() - 1).length);
+        }
+      }
+    }
+    FINALLY_COPY_ENDS.put(method, copyEnds);
+    LAST_INSTRUCTION.put(method, seq.length() == 0 ? -1 : seq.getInstr(seq.length() - 1).startOffset);
     GOTO_TARGETS.put(method, gotos);
     BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
@@ -737,6 +809,36 @@ public final class RoundTrip {
     }
     int offset = exprent.bytecode.previousSetBit(Integer.MAX_VALUE);
     return lnt.findLineNumber(offset) != (offset <= 0 ? -1 : lnt.findLineNumber(offset - 1));
+  }
+
+  /**
+   * True when this void return is only reached by falling out of a protected region: the method's
+   * last instruction is a shared exit, and some jump into it sits right after an inlined copy of a
+   * finally body. A return the source wrote inside try/finally gets its own return instruction.
+   */
+  public static boolean fallsOutOfFinally(Exprent exit) {
+    if (!selector("finallycopy") || exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Set<Integer> copyEnds = FINALLY_COPY_ENDS.get(method);
+    Integer last = LAST_INSTRUCTION.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    int offset = exit.bytecode.nextSetBit(0);
+    if (copyEnds == null || last == null || gotos == null || offset < 0 || offset != last) {
+      return false;
+    }
+    boolean hit = false;
+    for (java.util.Map.Entry<Integer, Integer> goto_ : gotos.entrySet()) {
+      if (goto_.getValue() == offset && copyEnds.contains(goto_.getKey())) {
+        hit = true;
+        break;
+      }
+    }
+    return hit;
   }
 
   /** The first offset after the protected range of the handler at this offset, or -1. */
