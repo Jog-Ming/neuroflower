@@ -120,6 +120,38 @@ public class SequenceStatement extends Statement {
       }
 
 
+      // `if (C) { rest } else { continue; }` printed by us as the guard `if (!C) { continue; }
+      // rest`: the target's branch lands straight on the exit block, so the branch-then-goto pair
+      // the guard form needs is absent. Keep the rest inside the then arm and the exit in an else.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && ifStatement.getIfstat() == null && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && !ifStatement.isPatternMatched()
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && RoundTrip.selector("elseexit")
+          && RoundTrip.exitBranchLandsOn(ifStatement.getHeadexprent(), ifStatement.getIfEdge())) {
+        Exprent condition = ifStatement.getHeadexprent().getCondition();
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(condition instanceof FunctionExprent not
+            && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT
+            && not.getLstOperands().size() == 1
+          ? not.getLstOperands().get(0)
+          : RoundTrip.negateCondition(condition));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        for (int k = i + 1; k < stats.size(); k++) {
+          buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+        }
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.appendIndent(indent + 1)
+          .append(ifStatement.getIfEdge().getType() == StatEdge.TYPE_BREAK ? "break;" : "continue;")
+          .appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) continue; body` in the source; the decompiler printed its mirror `if (!C) { body }`.
       // The target's branch-then-goto shape and line table prove the continue. The mirror is the
       // loop's whole remaining body, so the guard is exact only when this sequence is the loop

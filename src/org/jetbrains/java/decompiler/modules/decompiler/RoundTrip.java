@@ -1919,6 +1919,53 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when the head's last branch lands directly on the block this edge exits to, with no jump
+   * following the branch: the source wrote `if (C) { … } else { continue; }`, and the branch to the
+   * exit is the condition's own. A guard form would instead branch past a jump to the loop head and
+   * record that jump as a continue guard.
+   */
+  public static boolean exitBranchLandsOn(Exprent head, org.jetbrains.java.decompiler.modules.decompiler.StatEdge edge) {
+    if (!selector("elseexit") || head == null || head.bytecode == null || edge == null) {
+      return false;
+    }
+    if (edge.getType() != org.jetbrains.java.decompiler.modules.decompiler.StatEdge.TYPE_CONTINUE
+        && edge.getType() != org.jetbrains.java.decompiler.modules.decompiler.StatEdge.TYPE_BREAK) {
+      return false;
+    }
+    if (edge.labeled) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> guards = method == null ? null : CONTINUE_GUARDS.get(method);
+    int exitStart = firstOffset(edge.getDestination());
+    if (ends == null || targets == null || exitStart < 0 || head.bytecode.isEmpty()) {
+      return false;
+    }
+    int lastStart = -1;
+    int lastEnd = -1;
+    for (int offset = head.bytecode.nextSetBit(0); offset >= 0; offset = head.bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end) && offset > lastStart) {
+        lastStart = offset;
+        lastEnd = end;
+      }
+    }
+    // The branch has to land straight on where a continue of this loop goes (its increment or
+    // condition), and no jump may sit between the branch and it.
+    if (lastStart < 0
+        || !(edge.getDestination() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop)) {
+      return false;
+    }
+    Integer landing = targets.get(lastEnd);
+    if (landing == null || !isContinueTarget(loop, landing)) {
+      return false;
+    }
+    return guards == null || !guards.containsKey(lastEnd);
+  }
+
   /** Whether the table starts an entry at this exact offset: a statement on a new line began there. */
   private static boolean startsLine(StructLineNumberTableAttribute table, int offset) {
     int[] raw = table.getRawData();
