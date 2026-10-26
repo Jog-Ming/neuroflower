@@ -746,6 +746,19 @@ public final class RoundTrip {
     return end == null ? -1 : end;
   }
 
+  /**
+   * True when the target's return sits past the try's protected range. javac ends the range at a
+   * skip-goto, so a return written after the try/catch starts at or after that goto's destination,
+   * while one folded into the body starts before it.
+   */
+  public static boolean returnPastTry(Exprent exit, int handlerOffset) {
+    if (exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return false;
+    }
+    int skip = handlerExitOffset(handlerOffset);
+    return skip >= 0 && exit.bytecode.nextSetBit(0) >= skip;
+  }
+
   /** The target's source line for a bytecode offset, or -1. */
   public static int lineAtOffset(int offset) {
     StructMethod method = currentMethod();

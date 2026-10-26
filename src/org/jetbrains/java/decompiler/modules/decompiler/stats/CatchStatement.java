@@ -12,6 +12,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.struct.StructMethod;
@@ -167,6 +168,20 @@ public class CatchStatement extends Statement {
       buf.append(") {").appendLineSeparator();
     }
 
+    // A return the decompiler folded into the try body: javac ends the protected range with a
+    // skip-goto, so a return instruction past that destination was written after the try/catch.
+    Exprent hoistedReturn = null;
+    int firstHandler = firstHandlerOffset();
+    if (firstHandler >= 0 && first.getExprents() != null && !first.getExprents().isEmpty()) {
+      List<Exprent> bodyExprents = first.getExprents();
+      Exprent lastBody = bodyExprents.get(bodyExprents.size() - 1);
+      if (lastBody instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+          && exit.getValue() != null && RoundTrip.returnPastTry(exit, firstHandler)) {
+        hoistedReturn = lastBody;
+        bodyExprents.remove(bodyExprents.size() - 1);
+      }
+    }
+
     buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
     buf.appendIndent(indent).append("}");
 
@@ -274,7 +289,24 @@ public class CatchStatement extends Statement {
     }
     buf.appendLineSeparator();
 
+    if (hoistedReturn != null) {
+      first.getExprents().add(hoistedReturn);
+      buf.appendIndent(indent).append(hoistedReturn.toJava(indent)).append(";").appendLineSeparator();
+    }
+
     return buf;
+  }
+
+  /** The bytecode offset of the first catch handler's exception store, or -1. */
+  private int firstHandlerOffset() {
+    if (stats.size() < 2) {
+      return -1;
+    }
+    BasicBlock block = stats.get(1).getBasichead() == null ? null : stats.get(1).getBasichead().getBlock();
+    if (block == null || block.getSeq().isEmpty() || block.getInstruction(0).opcode != CodeConstants.opc_astore) {
+      return -1;
+    }
+    return block.getOldOffset(0);
   }
 
   /**
