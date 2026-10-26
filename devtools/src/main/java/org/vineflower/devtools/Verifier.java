@@ -433,9 +433,13 @@ public final class Verifier {
     System.out.printf(Locale.ROOT, "%-12s %8s %8s%n", "attribute", "match", "rate");
     for (String attribute : ClassDiff.ATTRIBUTES) {
       int count = matches.get(attribute);
-      System.out.printf(Locale.ROOT, "%-12s %8d %7.1f%%%n", attribute, count,
+      // `code` compares instruction streams with the pool resolved by symbol, so it is the
+      // non-reflective execution-logic metric: identical instructions, pool order ignored.
+      String label = attribute.equals("code") ? "code/logic" : attribute;
+      System.out.printf(Locale.ROOT, "%-12s %8d %7.1f%%%n", label, count,
         classes == 0 ? 0.0 : 100.0 * count / classes);
     }
+
     System.out.printf(Locale.ROOT, "metrics raw %d  cast %d  double %d  unchecked %d%n",
       totals.raw(), totals.redundantCasts(), totals.doubleCasts(), totals.unchecked());
     if (failingFiles > 0) {
