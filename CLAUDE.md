@@ -63,7 +63,9 @@ work stands — belong in project memory.
 ## The family loop
 
 Every unaligned metric is worked the same way. The main process classifies and dispatches; it does
-not edit code.
+not edit decompiler code. The one exception is devtools itself: when the user asks for a change to
+the pipeline — a new subcommand, a flag — the main process makes it directly. That is a tool the
+loop runs on, not a repair, and the family rules do not apply to it.
 
 1. **Classify.** Split the metric's residue into families by root cause, not by first opcode: a
    shared first-divergence instruction is a starting guess that the research step has to confirm or
@@ -104,6 +106,7 @@ devtools/cli versions [--no-cache]                    list Mojang's versions
 devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class] [--options "..."] [--timeout minutes]
 devtools/cli tree      <version> [--only Class]       print the cached tree path
 devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--options "..."] [--timeout minutes]
+devtools/cli compile   <version> <Class>             compile that one class like the verifier does
 devtools/cli corpus    <version> --ground-truth <dir> write the class-to-ground-truth corpus
 devtools/cli dataset   <version>                      export per-instruction line alignment for the model
 devtools/cli reports   [--version V] [--limit N]      list past scores
