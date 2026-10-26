@@ -248,6 +248,32 @@ public class CatchStatement extends Statement {
       }
 
       buf.append(") {").appendLineSeparator();
+      // A handler whose block was emptied in processing keeps only the statements the decompiler
+      // folded in from the join. When the parameter's table entry ends before such a trailing
+      // return and the join prints that same return instruction, the return belongs outside the
+      // block and must not be printed twice.
+      List<Exprent> foldedJoin = null;
+      if (block.getSeq().length() == 0 && stat.getExprents() != null && !stat.getExprents().isEmpty()) {
+        List<Exprent> exprents = stat.getExprents();
+        int scopeEnd = RoundTrip.scopeEndAt(RoundTrip.firstExprentOffset(exprents.get(0)));
+        if (scopeEnd > 0) {
+          int split = exprents.size();
+          while (split > 0) {
+            Exprent last = exprents.get(split - 1);
+            if (!(last instanceof ExitExprent exit) || exit.getExitType() != ExitExprent.Type.RETURN
+                || last.bytecode == null || last.bytecode.isEmpty()
+                || last.bytecode.nextSetBit(0) < scopeEnd
+                || !RoundTrip.exitPrintedElsewhere(getTopParent(), last)) {
+              break;
+            }
+            split--;
+          }
+          if (split < exprents.size()) {
+            foldedJoin = new ArrayList<>(exprents.subList(split, exprents.size()));
+            exprents.subList(split, exprents.size()).clear();
+          }
+        }
+      }
       // javac ends a catch parameter's scope at the closing brace, so a statement whose first
       // instruction lies at or after that end was written outside the catch block. The decompiler
       // folds such a tail into the handler, which lengthens the scope by the tail's first
@@ -293,6 +319,9 @@ public class CatchStatement extends Statement {
         buf.appendLineSeparator();
         buf.append(ExprProcessor.listToJava(tail, indent));
         stat.getExprents().addAll(tail);
+      }
+      if (foldedJoin != null) {
+        stat.getExprents().addAll(foldedJoin);
       }
     }
     buf.appendLineSeparator();

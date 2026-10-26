@@ -2143,6 +2143,66 @@ public final class RoundTrip {
     return max;
   }
 
+  /** First target offset covered by this expression, or -1. */
+  public static int firstExprentOffset(Exprent exprent) {
+    return firstOffsetOf(exprent);
+  }
+
+  /**
+   * The end of the innermost local variable scope alive at this offset, or -1. javac ends a catch
+   * parameter's scope at the closing brace, so a statement at or past this offset was written
+   * outside the block.
+   */
+  public static int scopeEndAt(int offset) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table =
+      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null || offset < 0) {
+      return -1;
+    }
+    int bestStart = -1;
+    int bestEnd = -1;
+    for (StructLocalVariableTableAttribute.LocalVariable var : table.getVariables().toList()) {
+      if (var.getStart() <= offset && offset < var.getEnd() && var.getStart() > bestStart) {
+        bestStart = var.getStart();
+        bestEnd = var.getEnd();
+      }
+    }
+    return bestEnd;
+  }
+
+  /**
+   * True when another expression in this method prints an exit at the same offset: the decompiler
+   * copied a join's return into a block while the join still prints it.
+   */
+  public static boolean exitPrintedElsewhere(Statement root, Exprent exit) {
+    if (root == null || exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return false;
+    }
+    int offset = exit.bytecode.nextSetBit(0);
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(root);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent candidate : exprents) {
+          if (candidate == exit) {
+            continue;
+          }
+          for (Exprent inner : candidate.getAllExprents(true, true)) {
+            if (inner instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent
+                && inner.bytecode != null && inner.bytecode.get(offset)) {
+              return true;
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return false;
+  }
+
   /** First target offset covered by a statement, or -1. */
   public static int firstOffset(Statement statement) {
     int min = -1;
