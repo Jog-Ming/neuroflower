@@ -572,13 +572,9 @@ public final class ConstantNames {
     boolean ownEarly = false;
     {
       Integer ownIndex = classIndices.get(own.qualifiedName);
-      if (ownIndex != null) {
-        int firstReferenced = Integer.MAX_VALUE;
-        for (int key : firstUses.keySet()) {
-          firstReferenced = Math.min(firstReferenced, key);
-        }
-        ownEarly = ownIndex < firstReferenced;
-      }
+      // No instruction uses the class's own Class entry, so nothing in the code can have entered
+      // it: whatever position it holds was created by a folded constant naming before the code.
+      ownEarly = ownIndex != null && !firstUses.containsKey(ownIndex);
     }
     Map<String, Double> folded = new HashMap<>();
     for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
