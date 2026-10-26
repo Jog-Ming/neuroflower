@@ -429,10 +429,12 @@ public class SequenceStatement extends Statement {
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
           && !ifStatement.isPatternMatched()
-          && ifStatement.getIfstat() instanceof SequenceStatement thenSeq
-          && singleExit(stats.get(i + 1)) != null
+          && ifStatement.getIfstat() != null
+          // The else block only has to end in an exit; it may carry statements of its own before it.
+          && endsWithExit(java.util.Collections.singletonList(stats.get(i + 1)))
           && !RoundTrip.declaresLocal(stats.get(i + 1))) {
-        int split = RoundTrip.thenArmSplit(thenSeq, stats.get(i + 1));
+        SequenceStatement thenSeq = ifStatement.getIfstat() instanceof SequenceStatement seq ? seq : null;
+        int split = thenSeq != null ? RoundTrip.thenArmSplit(thenSeq, stats.get(i + 1)) : -1;
         List<Statement> rest = split >= 0
           ? thenSeq.getStats().subList(split + 1, thenSeq.getStats().size())
           : List.of();
@@ -453,9 +455,27 @@ public class SequenceStatement extends Statement {
           notempty = true;
           break;
         }
+        // The same shape with the arm's statements held as exprents of one basic block.
+        List<Exprent> armExprents = ifStatement.getIfstat().getExprents();
+        int exprentSplit = armExprents == null ? -1 : RoundTrip.thenExprentSplit(armExprents, stats.get(i + 1));
+        if (exprentSplit >= 0
+            && armExprents.subList(exprentSplit + 1, armExprents.size()).stream()
+               .noneMatch(e -> e instanceof VarExprent v && v.isDefinition())) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.listToJava(armExprents.subList(0, exprentSplit + 1), indent + 1));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.listToJava(armExprents.subList(exprentSplit + 1, armExprents.size()), indent));
+          notempty = true;
+          break;
+        }
         // The split falls inside the arm's first statement: the target's then-arm ends on the
         // prelude the decompiler attached to the following if's head (`x = …;` before `if (…)`).
-        if (split < 0 && !thenSeq.getStats().isEmpty()
+        if (split < 0 && thenSeq != null && !thenSeq.getStats().isEmpty()
             && thenSeq.getStats().get(0) instanceof IfStatement firstIf) {
           int gotoStart = RoundTrip.gotoBeforeTail(stats.get(i + 1));
           List<Exprent> headExprents = firstIf.getFirst().getExprents();

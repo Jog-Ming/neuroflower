@@ -1598,6 +1598,57 @@ public final class RoundTrip {
     return -1;
   }
 
+  /**
+   * The index of the arm exprent the target's then-arm ends on when the arm is a single basic block
+   * whose statements are exprents: the exprent ending just before the goto, with the next exprent
+   * starting at the goto's target. Same evidence as {@link #thenArmSplit}, one level down.
+   */
+  public static int thenExprentSplit(java.util.List<Exprent> exprents, Statement tail) {
+    StructMethod method = currentMethod();
+    if (method == null || exprents == null || exprents.size() < 2 || tail == null) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || gotos == null) {
+      return -1;
+    }
+    int tailStart = firstOffset(tail);
+    int tailEnd = lastEnd(tail);
+    if (tailStart < 0 || tailEnd < 0) {
+      return -1;
+    }
+    int gotoStart = -1;
+    int target = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      Integer end = ends.get(entry.getKey());
+      if (end != null && end == tailStart && entry.getValue() == tailEnd) {
+        gotoStart = entry.getKey();
+        target = entry.getValue();
+        break;
+      }
+    }
+    if (gotoStart < 0) {
+      return -1;
+    }
+    for (int k = 0; k + 1 < exprents.size(); k++) {
+      Exprent before = exprents.get(k);
+      Exprent after = exprents.get(k + 1);
+      if (before.bytecode == null || before.bytecode.isEmpty()
+          || after.bytecode == null || after.bytecode.isEmpty()) {
+        continue;
+      }
+      int beforeEnd = before.bytecode.previousSetBit(Integer.MAX_VALUE) + 1;
+      int afterStart = after.bytecode.nextSetBit(0);
+      // The next exprent's own offsets may start after the goto target when its operands are
+      // loaded first; what pins the boundary is the exprent ending exactly on the goto.
+      if (beforeEnd == gotoStart && afterStart >= target) {
+        return k;
+      }
+    }
+    return -1;
+  }
+
   /** The goto that sits immediately before this tail and jumps past it, or -1. */
   public static int gotoBeforeTail(Statement tail) {
     StructMethod method = currentMethod();
