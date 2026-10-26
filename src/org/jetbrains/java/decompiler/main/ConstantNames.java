@@ -1364,8 +1364,10 @@ public final class ConstantNames {
         if (!call && !field) {
           continue; // the entry after the pair is neither a call nor a field reference
         }
-        if (owner.equals(link.classname)) {
-          continue; // the pair is that reference's operand
+        if (owner.equals(link.classname) && firstUses.get(i) != null
+            && firstUses.get(i + 2) != null
+            && compare(firstUses.get(i), firstUses.get(i + 2)) <= 0) {
+          continue; // the class is used directly before this reference, so a naming proves nothing
         }
         member = field ? link.elementname : null;
         methodName = call ? link.elementname : null;
