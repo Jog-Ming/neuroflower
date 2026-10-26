@@ -221,6 +221,19 @@ public final class RecordHelper {
     return buffers;
   }
 
+  /** The simple name when this type is a member type declared by the class being printed, else null. */
+  private static String directMemberType(StructClass cl, VarType type) {
+    if (type == null || cl == null || type.value == null || cl.qualifiedName == null) {
+      return null;
+    }
+    String prefix = cl.qualifiedName + "$";
+    if (!type.value.startsWith(prefix)) {
+      return null;
+    }
+    String simple = type.value.substring(prefix.length());
+    return simple.indexOf('$') < 0 ? simple : null;
+  }
+
   private static void recordComponentToJava(TextBuffer buffer, StructClass cl, StructRecordComponent cd, int param, boolean varArgComponent) {
     Set<TextBuffer> annotations = getRecordComponentAnnotations(cl, cd, param);
     Set<String> writtenAnnotations = new HashSet<>();
@@ -240,7 +253,13 @@ public final class RecordHelper {
     var annos = ClassWriter.getTypeAnnotations(cd, TypeAnnotation.FIELD, -1);
 
     if (!annos.isEmpty()) {
-      buffer.appendCastTypeName(varArgComponent ? fieldType.decreaseArrayDim() : fieldType, annos, writtenAnnotations);
+      // A top-level annotation on a type this class declares itself has to sit on the simple name:
+      // written against the qualified name javac records it while the canonical constructor's
+      // annotations are laid down, which reorders RuntimeVisibleTypeAnnotations.
+      String memberName = RoundTrip.selector("recsimplename") ? directMemberType(cl, fieldType) : null;
+      VarType annotatedType = memberName == null ? fieldType
+        : new VarType(fieldType.type, fieldType.arrayDim, memberName);
+      buffer.appendCastTypeName(varArgComponent ? annotatedType.decreaseArrayDim() : annotatedType, annos, writtenAnnotations);
     } else {
       buffer.appendCastTypeName(varArgComponent ? fieldType.decreaseArrayDim() : fieldType);
     }
