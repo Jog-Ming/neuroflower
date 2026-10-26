@@ -1404,6 +1404,34 @@ public final class RoundTrip {
     return lastStart >= 0 && lastTarget == bodyStart;
   }
 
+  /** True when only one branch in the method enters this statement's first instruction. */
+  public static boolean soleEntry(Statement stat) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    int start = stat == null ? -1 : firstOffset(stat);
+    if (targets == null || start < 0) {
+      return false;
+    }
+    int into = 0;
+    for (Integer target : targets.values()) {
+      if (target != null && target == start) {
+        into++;
+      }
+    }
+    return into == 1;
+  }
+
+  /**
+   * True when the rest of the sequence sits physically before this arm. A source {@code if (C) { A }
+   * else { B }} falls through A and jumps over it to B, so the block we print as the arm is B while
+   * the statements after it are A; a guard always keeps its arm first.
+   */
+  public static boolean restPrecedesArm(Statement firstRest, Statement arm) {
+    int restStart = firstRest == null ? -1 : firstOffset(firstRest);
+    int armStart = arm == null ? -1 : firstOffset(arm);
+    return restStart >= 0 && armStart >= 0 && restStart < armStart;
+  }
+
   /** True when a local variable's scope starts inside the statement's instruction range. */
   public static boolean declaresLocal(Statement stat) {
     return declaresLocalBetween(stat, false);

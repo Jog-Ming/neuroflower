@@ -634,6 +634,32 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (C) { A } else { B }` where A falls through: our arm is B and the statements after it
+      // are A, which the bytecode places *before* it — a guard always keeps its arm first. Print
+      // the source's two arms back in that order.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && armLeaves(ifStatement.getIfstat())
+          && stats.subList(i + 1, stats.size()).stream().noneMatch(RoundTrip::declaresLocalIn)
+          && RoundTrip.restPrecedesArm(stats.get(i + 1), ifStatement.getIfstat())
+          && RoundTrip.soleEntry(ifStatement.getIfstat())
+          && RoundTrip.swapIfArmsByTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat(), stats.get(i + 1))) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        Statement rest = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(rest, indent + 1, true));
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // The mirror: the bytecode put `return X` before the rest, but the target's table puts its
       // line last, so the source wrote `if (!C) { rest } return X;`.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
@@ -999,6 +1025,31 @@ public class SequenceStatement extends Statement {
     List<StatEdge> edges = last.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
     return edges.size() == 1 && edges.get(0).getType() == StatEdge.TYPE_BREAK
       && edges.get(0).explicit && !edges.get(0).labeled;
+  }
+
+  /**
+   * True when this arm leaves the site at its end: a return or throw, or a break or continue edge
+   * on its last statement. The decompiler marks the break it synthesized itself as implicit, so the
+   * edge's flags are not part of the test.
+   */
+  private static boolean armLeaves(Statement stat) {
+    if (exits(stat)) {
+      return true;
+    }
+    Statement last = stat;
+    while (true) {
+      List<Statement> children = last.getStats();
+      if (children == null || children.isEmpty()) {
+        break;
+      }
+      last = children.get(children.size() - 1);
+    }
+    for (StatEdge edge : last.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.getType() == StatEdge.TYPE_BREAK || edge.getType() == StatEdge.TYPE_CONTINUE) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static Exprent lastExprent(Statement stat) {
