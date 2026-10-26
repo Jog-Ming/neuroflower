@@ -1863,6 +1863,42 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's last condition branch lands straight on the exit this break edge leaves
+   * for, with no branch-then-goto pair recorded at that branch end: the source wrote
+   * {@code if (!C) { rest } else { break; }}. The guard form {@code if (C) { break; } rest}
+   * compiles to a branch over a jump to the exit, which the scan records as a pair.
+   */
+  public static boolean breakBranchLandsOnExit(Exprent head, Statement stat) {
+    if (!selector("elsebreak")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null || head.bytecode.isEmpty() || stat == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
+    if (targets == null) {
+      return false;
+    }
+    Statement loop = stat.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    if (loop == null) {
+      return false;
+    }
+    int end = head.bytecode.length();
+    Integer target = targets.get(end);
+    // The branch has to leave the loop entirely: the exit is past everything the loop covers.
+    int loopEnd = lastOffset(loop);
+    if (target == null || loopEnd < 0 || target <= loopEnd) {
+      return false;
+    }
+    return guards == null || !guards.containsKey(end);
+  }
+
+  /**
    * True when the target's then-arm ends with a jump over the returning block our sequence prints
    * as the statement after the if: the source wrote {@code if (C) { A } else { return X; }} and the
    * arm's fall-through reaches the rest instead. The jump has to sit immediately after the arm's

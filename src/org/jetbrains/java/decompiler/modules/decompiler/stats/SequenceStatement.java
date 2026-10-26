@@ -504,6 +504,30 @@ public class SequenceStatement extends Statement {
         }
       }
 
+      // `if (C) { break; } rest` where the target's branch lands straight on the loop exit: the
+      // source wrote `if (!C) { rest } else { break; }`. The guard form would have compiled a
+      // branch over a jump to the exit, and the scan would have recorded that pair.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && ifStatement.getIfstat() == null && !ifStatement.isLabeled() && !st.isLabeled()
+          && !ifStatement.isPatternMatched()
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && stats.subList(i + 1, stats.size()).stream().noneMatch(RoundTrip::declaresLocal)
+          && RoundTrip.breakBranchLandsOnExit(ifStatement.getHeadexprent(), ifStatement)) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(
+          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
