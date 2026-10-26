@@ -2200,6 +2200,97 @@ public final class RoundTrip {
     return false;
   }
 
+  private static final ThreadLocal<java.util.ArrayDeque<Statement>> OPEN_LOOPS =
+    ThreadLocal.withInitial(java.util.ArrayDeque::new);
+
+  /** Registers a loop whose body is being printed, so a copied exit can print as its break. */
+  public static void enterLoop(Statement loop) {
+    OPEN_LOOPS.get().push(loop);
+  }
+
+  public static void exitLoop() {
+    java.util.ArrayDeque<Statement> loops = OPEN_LOOPS.get();
+    if (!loops.isEmpty()) {
+      loops.poll();
+    }
+  }
+
+  /**
+   * True when this bare void return is a break the decompiler copied out of the loop it prints in:
+   * the target records a goto inside the loop whose destination is this very return, and the return
+   * sits after everything else the loop covers. The source's `break;` is that goto; printing
+   * `return;` instead drops it, one instruction shorter.
+   */
+  public static boolean printsAsBreak(Exprent exit) {
+    if (!selector("copiedbreak")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    Statement loop = OPEN_LOOPS.get().peek();
+    if (method == null || loop == null || exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return false;
+    }
+    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)
+        || doStatement.getLooptype() != org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.INFINITE) {
+      return false;
+    }
+    int loopStart = firstOffset(loop);
+    int exitStart = exit.bytecode.nextSetBit(0);
+    int loopEnd = lastEndExcept(loop, exit.bytecode);
+    if (loopStart < 0 || loopEnd < 0 || exitStart < 0 || exitStart < loopEnd) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+      int from = edge.getKey();
+      // The jump may start exactly where the loop's printed body ends: it is the exit edge itself.
+      if (edge.getValue() == exitStart && from >= loopStart && from < exitStart) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The last instruction end inside this statement, ignoring the offsets of one exprent. */
+  private static int lastEndExcept(Statement stat, BitSet skip) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null) {
+      return -1;
+    }
+    int max = -1;
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(stat);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          for (Exprent inner : exprent.getAllExprents(true, true)) {
+            BitSet bits = inner.bytecode;
+            if (bits == null || (bits.isEmpty() && inner == null)) {
+              continue;
+            }
+            for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+              if (skip != null && skip.get(off)) {
+                continue;
+              }
+              Integer end = ends.get(off);
+              if (end != null && end > max) {
+                max = end;
+              }
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return max;
+  }
+
   /**
    * True when the head's last branch lands directly on the block this edge exits to, with no jump
    * following the branch: the source wrote `if (C) { … } else { continue; }`, and the branch to the

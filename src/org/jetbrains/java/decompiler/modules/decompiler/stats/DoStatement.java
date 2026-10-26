@@ -111,12 +111,18 @@ public class DoStatement extends Statement {
 
     switch (looptype) {
       case INFINITE:
-        if (printBreakGuard(buf, indent)) {
-          break;
+        // An exit copied out of this loop prints as the break the target jumped with.
+        RoundTrip.enterLoop(this);
+        try {
+          if (printBreakGuard(buf, indent)) {
+            break;
+          }
+          buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        } finally {
+          RoundTrip.exitLoop();
         }
-        buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
-        buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
       case DO_WHILE:
         if (conditionExprent.get(0) != null && RoundTrip.loopGuardInsideBody(conditionExprent.get(0), first)) {

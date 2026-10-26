@@ -98,6 +98,11 @@ public class ExitExprent extends Exprent {
     buf.addBytecodeMapping(bytecode);
 
     if (exitType == Type.RETURN) {
+      if (value == null && retType.type == CodeType.VOID && RoundTrip.printsAsBreak(this)) {
+        // The target jumped here from inside the loop: the source wrote `break;`, not `return;`.
+        buf.append("break");
+        return buf;
+      }
       buf.append("return");
 
       if (retType.type != CodeType.VOID) {
