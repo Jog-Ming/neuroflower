@@ -1910,12 +1910,29 @@ public final class ConstantNames {
    * where the generation order contradicts them: a site whose printed position lies outside the
    * pool-order bounds is not where the owner's Class entry can have been entered.
    */
+  /** Whether a placed site lies earlier in the generation order than another placeable one. */
+  private static boolean before(Site site, Site other, Placement placement) {
+    long a = siteCoordinate(placement.spaces(), site.start());
+    long b = siteCoordinate(placement.spaces(), other.start());
+    return a != NO_COORDINATE && b != NO_COORDINATE && a < b;
+  }
+
+  /** Whether a literal site opens with a quote, whose content the printer's mapping covers. */
+  private static boolean quoted(String text, int position) {
+    return position >= 0 && position < text.length()
+      && (text.charAt(position) == '"' || text.charAt(position) == '\'');
+  }
+
   private static void scanClass(String text, List<int[]> spans, Rules rules, List<Site> sites) {
     Map<String, List<Site>> deferred = new HashMap<>();
+    // Sites the expression solver invented: it admits any literal of a reference successor's
+    // generation gap, so a direct naming found later in the same gap withdraws the guess.
+    Map<String, List<Site>> invented = new HashMap<>();
     Set<String> inWindow = new HashSet<>();
     for (int[] span : spans) {
       scan(text, span[0], span[1], rules.candidates(), rules.imports(), rules.packageName(),
-        sites, rules.own(), rules.ownInitializers(), rules.placement(), deferred, inWindow);
+        sites, rules.own(), rules.ownInitializers(), rules.placement(), deferred, inWindow,
+        invented);
     }
     // The pool's own records place a site exactly, so they are tried before the printed-line
     // windows. A record that finds no site leaves the owner to the window rules below.
@@ -1955,7 +1972,11 @@ public final class ConstantNames {
         for (Site site : candidates) {
           boolean inArgs = pair.open() >= 0 && site.start() > pair.open()
             && site.start() < pair.close();
-          long coordinate = siteCoordinate(rules.placement().spaces(), site.start());
+          // A quoted literal's recorded position sits one past its opening quote (the printer
+          // maps the buffer's content, not the quote it adds): the point a string or char naming
+          // occupies is that recorded position, exactly as the scan's own anchor rule reads it.
+          int anchor = quoted(text, site.start()) ? site.start() + 1 : site.start();
+          long coordinate = siteCoordinate(rules.placement().spaces(), anchor);
           if (coordinate == NO_COORDINATE) {
             // A field initializer's folded literal is printed in the class body, where the
             // printer maps no instruction point for it. The field reference right after the pair
@@ -2518,6 +2539,9 @@ public final class ConstantNames {
       // is the original's form whenever the pool offers one; only without it does an expression
       // stand in, and only where the pair leaves the neighbour free-standing.
       String found = direct != null ? direct : referenceSuccessor ? expression : first;
+      if (found != null && exactProof != null) {
+        exactProof[1] = direct != null; // the literal's own value is the constant's own value
+      }
       return found == null ? null : new Site(start, end, "(" + found + ")", entry.getKey());
     }
     return null;
@@ -3648,8 +3672,13 @@ public final class ConstantNames {
     }
     boolean samePackage = packageName.equals(packageOf(owner));
     boolean imported = imports.contains(simpleName(owner));
-    if (!samePackage && !imported && owner.contains("$")) {
-      return; // a nested class's binary name cannot be written in source
+    if (!samePackage && !imported && owner.contains("$")
+        && !(missingOwner && publiclyNameable(owner, packageName))) {
+      // A nested class's binary name cannot be written in source, but its dotted source name can
+      // whenever every class of the chain is public: the site printer falls back to that form.
+      // Only an owner the pool alone explains may use it; an owner the text already names has its
+      // Class entry accounted for, and a second naming would only move it.
+      return;
     }
     for (StructField field : cls.getFields()) {
       if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
@@ -4095,13 +4124,14 @@ public final class ConstantNames {
                            String packageName, List<Site> sites, String own,
                            Map<String, List<int[]>> ownInitializers) {
     scan(text, 0, text.length(), candidates, imports, packageName, sites, own, ownInitializers,
-      NO_PLACEMENT, null, null);
+      NO_PLACEMENT, null, null, null);
   }
 
   private static void scan(String text, int from, int to, Map<String, List<Constant>> candidates,
                            List<String> imports, String packageName, List<Site> sites, String own,
                            Map<String, List<int[]>> ownInitializers, Placement placement,
-                           Map<String, List<Site>> deferred, Set<String> inWindow) {
+                           Map<String, List<Site>> deferred, Set<String> inWindow,
+                           Map<String, List<Site>> invented) {
     int i = from;
     while (i < to) {
       char c = text.charAt(i);
@@ -4124,7 +4154,7 @@ public final class ConstantNames {
           String value = unescape(text.substring(i + 1, end - 1));
           if (value != null && !value.isEmpty()) {
             addSite(sites, i, end, VariableType.STRING + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-              placement, deferred, inWindow);
+              placement, deferred, inWindow, invented);
           }
         }
         i = end;
@@ -4136,7 +4166,7 @@ public final class ConstantNames {
           Integer value = charValue(text.substring(i + 1, end - 1));
           if (value != null) {
             addSite(sites, i, end, VariableType.CHAR + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-              placement, deferred, inWindow);
+              placement, deferred, inWindow, invented);
           }
         }
         i = end;
@@ -4150,14 +4180,14 @@ public final class ConstantNames {
         String word = text.substring(i, end);
         if (word.equals("true") || word.equals("false")) {
           addSite(sites, i, end, VariableType.BOOLEAN + "|" + word, "", candidates, imports, packageName, own, ownInitializers,
-            placement, deferred, inWindow);
+            placement, deferred, inWindow, invented);
         }
         i = end;
         continue;
       }
       if (Character.isDigit(c) && (i == 0 || !isIdentifierPart(text.charAt(i - 1)))) {
         i = scanNumber(text, i, sites, candidates, imports, packageName, own, ownInitializers,
-          placement, deferred, inWindow);
+          placement, deferred, inWindow, invented);
         continue;
       }
       i++;
@@ -4255,7 +4285,7 @@ public final class ConstantNames {
                                 Map<String, List<Constant>> candidates, List<String> imports,
                                 String packageName, String own, Map<String, List<int[]>> ownInitializers,
                                 Placement placement, Map<String, List<Site>> deferred,
-                                Set<String> inWindow) {
+                                Set<String> inWindow, Map<String, List<Site>> invented) {
     int i = start;
     char c = text.charAt(i);
     boolean hex = c == '0' && i + 1 < text.length()
@@ -4324,7 +4354,7 @@ public final class ConstantNames {
         if ((asLong == null || asLong.size() != 1)
             && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
           addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number, "",
-            candidates, imports, packageName, own, ownInitializers, placement, deferred, inWindow, false);
+            candidates, imports, packageName, own, ownInitializers, placement, deferred, inWindow, invented, false);
         }
       } else if (digits.indexOf('.') >= 0 || digits.indexOf('e') >= 0 || digits.indexOf('E') >= 0) {
         kind = VariableType.DOUBLE.name();
@@ -4350,34 +4380,34 @@ public final class ConstantNames {
     if (castKind != null) {
       int before = sites.size();
       addSite(sites, primitiveCastStart(text, start), i, castKind.name() + "|" + value, "", candidates, imports,
-        packageName, own, ownInitializers, placement, deferred, inWindow);
+        packageName, own, ownInitializers, placement, deferred, inWindow, invented);
       if (sites.size() > before) {
         return i;
       }
     }
     addSite(sites, siteStart, i, kind + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
-      placement, deferred, inWindow);
+      placement, deferred, inWindow, invented);
     if (kind.equals(VariableType.FLOAT.name())) {
       addSite(sites, siteStart, i, "FLOATCAST|" + value, "", candidates, imports, packageName, own, ownInitializers,
-        placement, deferred, inWindow);
+        placement, deferred, inWindow, invented);
     }
     if (!negative && (kind.equals(VariableType.FLOAT.name()) || kind.equals(VariableType.DOUBLE.name()))) {
       addIntegralSite(start, i, value, kind.equals(VariableType.FLOAT.name()), sites, candidates, imports,
-        packageName, own, ownInitializers, placement, deferred, inWindow);
+        packageName, own, ownInitializers, placement, deferred, inWindow, invented);
     }
     if (kind.equals(VariableType.DOUBLE.name())) {
       addWidenedFloatSite(siteStart, i, value, negative, sites, candidates, imports, packageName, own,
-        ownInitializers, placement, deferred, inWindow);
+        ownInitializers, placement, deferred, inWindow, invented);
     }
     if (negative && value.startsWith("-")) {
       // The source can write a positive constant behind a unary minus; the literal is then the
       // negation of the constant, not a negative constant of its own.
       String magnitude = value.substring(1);
       addSite(sites, siteStart, i, kind + "|" + magnitude, "-", candidates, imports, packageName, own,
-        ownInitializers, placement, deferred, inWindow);
+        ownInitializers, placement, deferred, inWindow, invented);
       if (kind.equals(VariableType.FLOAT.name())) {
         addSite(sites, siteStart, i, "FLOATCAST|" + magnitude, "-", candidates, imports, packageName, own,
-          ownInitializers, placement, deferred, inWindow);
+          ownInitializers, placement, deferred, inWindow, invented);
       }
       if (kind.equals(VariableType.LONG.name())) {
         try {
@@ -4385,7 +4415,7 @@ public final class ConstantNames {
           List<Constant> asLong = candidates.get(kind + "|" + magnitude);
           if ((asLong == null || asLong.size() != 1) && mag <= Integer.MAX_VALUE) {
             addSite(sites, siteStart, i, VariableType.INT.name() + "|" + mag, "-", candidates, imports,
-              packageName, own, ownInitializers, placement, deferred, inWindow);
+              packageName, own, ownInitializers, placement, deferred, inWindow, invented);
           }
         } catch (NumberFormatException ignored) {
           // a magnitude too large for a positive long has no constant to name
@@ -4399,9 +4429,9 @@ public final class ConstantNames {
                               Map<String, List<Constant>> candidates, List<String> imports,
                               String packageName, String own, Map<String, List<int[]>> ownInitializers,
                               Placement placement, Map<String, List<Site>> deferred,
-                              Set<String> inWindow) {
+                              Set<String> inWindow, Map<String, List<Site>> invented) {
     addSite(sites, start, end, key, prefix, candidates, imports, packageName, own, ownInitializers,
-      placement, deferred, inWindow, true);
+      placement, deferred, inWindow, invented, true);
   }
 
   /**
@@ -4416,7 +4446,8 @@ public final class ConstantNames {
                               Map<String, List<Constant>> candidates, List<String> imports,
                               String packageName, String own, Map<String, List<int[]>> ownInitializers,
                               Placement placement, Map<String, List<Site>> deferred,
-                              Set<String> inWindow, boolean allowSolved) {
+                              Set<String> inWindow, Map<String, List<Site>> invented,
+                              boolean allowSolved) {
     List<Constant> constants = candidates.get(key);
     // A pool pair records an owner named immediately before a reference the generation placed at
     // one instruction. That is the strongest evidence a site can have, and it also settles a
@@ -4470,14 +4501,40 @@ public final class ConstantNames {
       }
     }
     boolean ownCandidate = ownConstant != null;
-    boolean[] exactProof = new boolean[1];
+    // [0] a value successor is the exact folded value, [1] the solution is the constant's own
+    // name (not an expression the solver built from one of its constants).
+    boolean[] exactProof = new boolean[2];
     Site solved = allowSolved && placement != null && placement.pairs() != null
       && !placement.pairs().isEmpty() && prefix.isEmpty()
       ? solvedSite(key, start, end, own, imports, packageName, placement, exactProof) : null;
     // The class's own constant keeps precedence over a naming placed by the generation gap: its
     // Class entry is in the pool regardless, so the gap proves less about it. A value successor
-    // is the exact folded value, though, and settles which owner the source named.
-    if (solved != null && (exactProof[0] || !ownCandidate)) {
+    // is the exact folded value, though, and settles which owner the source named. The same holds
+    // where the own name is unusable at this site anyway (a frequent value with no pool evidence
+    // for the own entry's position): the foreign pair is the only evidence left, so it decides.
+    boolean ownUnusable = ownCandidate && tooCommon(key) && placement != null
+      && !placement.ownEarly() && !placement.ownProven();
+    if (solved != null && (exactProof[0] || !ownCandidate
+        || exactProof[1] && ownUnusable)) {
+      // A reference successor's pair records only that some naming entered the owner before the
+      // reference: an invented expression is admitted at any literal of the pair's generation gap,
+      // so that literal alone does not prove it is where the pool's one naming stood. A direct
+      // naming found at a later generation point does: it is the constant's own value written as
+      // the literal, and the pair's naming is the last pool-entering event before the reference,
+      // so the earlier guess is withdrawn.
+      if (exactProof[0] || exactProof[1]) {
+        List<Site> guessed = invented == null ? null : invented.remove(solved.owner());
+        if (guessed != null) {
+          for (Site site : guessed) {
+            if (before(site, solved, placement)) {
+              sites.remove(site);
+            }
+          }
+        }
+      }
+      else if (invented != null) {
+        invented.computeIfAbsent(solved.owner(), k -> new ArrayList<>()).add(solved);
+      }
       addSiteOnce(sites, solved);
       return;
     }
@@ -4694,7 +4751,8 @@ public final class ConstantNames {
                                       List<Site> sites, Map<String, List<Constant>> candidates,
                                       List<String> imports, String packageName, String own,
                                       Map<String, List<int[]>> ownInitializers, Placement placement,
-                                      Map<String, List<Site>> deferred, Set<String> inWindow) {
+                                      Map<String, List<Site>> deferred, Set<String> inWindow,
+                                      Map<String, List<Site>> invented) {
     if (placement == null || placement.windows() == null) {
       return;
     }
@@ -4751,7 +4809,7 @@ public final class ConstantNames {
     // `intExpr / NAME` into an integer division. The cast keeps the literal's type, and a cast of a
     // constant variable is itself a constant expression, so the compiled value is unchanged.
     addSite(sites, start, end, key, single ? "(float) " : "(double) ", candidates, imports,
-      packageName, own, ownInitializers, placement, deferred, inWindow);
+      packageName, own, ownInitializers, placement, deferred, inWindow, invented);
   }
 
   /**
@@ -4768,7 +4826,8 @@ public final class ConstantNames {
                                           List<Site> sites, Map<String, List<Constant>> candidates,
                                           List<String> imports, String packageName, String own,
                                           Map<String, List<int[]>> ownInitializers, Placement placement,
-                                          Map<String, List<Site>> deferred, Set<String> inWindow) {
+                                          Map<String, List<Site>> deferred, Set<String> inWindow,
+                                          Map<String, List<Site>> invented) {
     if (placement == null || placement.windows() == null) {
       return;
     }
@@ -4803,7 +4862,7 @@ public final class ConstantNames {
       return;
     }
     addSite(sites, start, end, key, negative ? "-(double) " : "(double) ", candidates, imports,
-      packageName, own, ownInitializers, placement, deferred, inWindow);
+      packageName, own, ownInitializers, placement, deferred, inWindow, invented);
   }
 
   /**
