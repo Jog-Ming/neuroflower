@@ -339,7 +339,14 @@ public class SimplifyExprentsHelper {
 
       double fraction = ((double) mapInit.size()) / size;
 
-      if ((arrVar.isStack() && fraction > 0) || (size <= 7 && fraction >= 0.3) || (size > 7 && fraction >= 0.7)) {
+      // A `new T[]{...}` initialiser keeps the array reference on the operand stack through every
+      // element store (a dup chain) and only stores it at the end, so the decompiler holds it in a
+      // stack variable.  When the class file stores the new array to a local first and reads it
+      // back with aload for each element store, the source was the split form
+      // `T[] x = new T[n]; x[i] = ...;` and the writes cannot be folded into an initialiser
+      // expression: doing so would print `new T[]{...}`, whose dup chain does not match the store
+      // the class file kept.  Merge stack variables only.
+      if (arrVar.isStack() && fraction > 0) {
         List<Exprent> lstRet = new ArrayList<>();
 
         VarType arrayType = newExpr.getNewType().decreaseArrayDim();
