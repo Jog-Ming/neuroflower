@@ -76,10 +76,18 @@ public final class LocalDeclarationOrder {
     for (Statement child : children) {
       Statement body = nestedBody(child);
       if (body != null) {
+        // Everything printed before this block counts as already declared: a sibling's plain
+        // statements print above the switch just as the sequence's own definitions do.
+        for (Statement sibling : siblingsBefore(children, child)) {
+          maxSlot = Math.max(maxSlot, printedDeclarationsUpTo(sibling));
+        }
         List<Exprent> candidates = new ArrayList<>(body.getVarDefinitions());
         List<Exprent> firstExprents = body.getStats().isEmpty() ? null : body.getStats().get(0).getExprents();
         if (firstExprents != null) {
           candidates.addAll(firstExprents);
+        }
+        if (body.getExprents() != null) {
+          candidates.addAll(body.getExprents());
         }
         for (Exprent exprent : candidates) {
           VarExprent var = definedVar(exprent);
@@ -103,12 +111,20 @@ public final class LocalDeclarationOrder {
             if (firstExprents != null) {
               removeIdentity(firstExprents, exprent);
             }
+            if (body.getExprents() != null) {
+              removeIdentity(body.getExprents(), exprent);
+            }
             declaration = exprent;
           } else {
             declaration = var.copy();
             var.setDefinition(false);
           }
-          insertByTargetSlot(seq.getVarDefinitions(), declaration);
+          // A switch head prints right after its siblings' statements, so the declaration belongs
+          // beside them; for a loop or if body the sequence's own definitions stay the target.
+          List<Exprent> target = child instanceof SwitchStatement
+            ? insertionList(seq, child)
+            : seq.getVarDefinitions();
+          insertByTargetSlot(target, declaration);
         }
       }
       for (Exprent definition : child.getVarDefinitions()) {
@@ -122,6 +138,89 @@ public final class LocalDeclarationOrder {
     }
   }
 
+  /**
+   * The list the declarations printed just before this child live in: the exprents of the last
+   * sibling that prints declarations of its own, else the sequence's own definitions.
+   */
+  private static List<Exprent> insertionList(Statement seq, Statement child) {
+    List<Exprent> best = seq.getVarDefinitions();
+    int bestSlot = -1;
+    for (Exprent definition : best) {
+      bestSlot = Math.max(bestSlot, targetSlot(definition));
+    }
+    for (Statement sibling : siblingsBefore(seq.getStats(), child)) {
+      List<Exprent> candidate = declarationsList(sibling);
+      if (candidate == null) {
+        continue;
+      }
+      int slot = -1;
+      for (Exprent definition : candidate) {
+        slot = Math.max(slot, targetSlot(definition));
+      }
+      if (slot >= bestSlot && slot >= 0) {
+        bestSlot = slot;
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  /** The exprent list a statement's own declarations print from, or null. */
+  private static List<Exprent> declarationsList(Statement stat) {
+    Statement body = nestedBody(stat);
+    if (body == null) {
+      return stat.getExprents();
+    }
+    List<Exprent> inner = declarationsList(body);
+    return inner != null && !inner.isEmpty() ? inner : body.getExprents();
+  }
+
+  /**
+   * The highest target slot among the declarations this statement prints at its own level or in
+   * the head of a switch, loop or if body, which print before the statement's block.
+   */
+  private static int printedDeclarationsUpTo(Statement stat) {
+    int max = -1;
+    for (Exprent definition : stat.getVarDefinitions()) {
+      max = Math.max(max, targetSlot(definition));
+    }
+    if (stat.getExprents() != null) {
+      for (Exprent definition : stat.getExprents()) {
+        max = Math.max(max, targetSlot(definition));
+      }
+    }
+    Statement body = nestedBody(stat);
+    if (body != null) {
+      max = Math.max(max, printedDeclarationsUpTo(body));
+    }
+    return max;
+  }
+
+  /** The siblings printed before this child, in print order. */
+  private static List<Statement> siblingsBefore(List<Statement> children, Statement child) {
+    List<Statement> before = new ArrayList<>();
+    for (Statement sibling : children) {
+      if (sibling == child) {
+        break;
+      }
+      before.add(sibling);
+    }
+    return before;
+  }
+
+  /** True when every child prints as a plain run of statements, so the root reads like a sequence. */
+  private static boolean onlyBasicBlocks(Statement stat) {
+    if (stat.getStats().isEmpty()) {
+      return false;
+    }
+    for (Statement child : stat.getStats()) {
+      if (child.type != Statement.StatementType.BASIC_BLOCK) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** The block directly under a statement that prints as a nested block, or null. */
   private static Statement nestedBody(Statement child) {
     if (child instanceof DoStatement loop) {
@@ -131,6 +230,11 @@ public final class LocalDeclarationOrder {
     if (child instanceof IfStatement ifStatement) {
       Statement body = ifStatement.getIfstat();
       return body != null && body.type == Statement.StatementType.SEQUENCE ? body : null;
+    }
+    if (child instanceof SwitchStatement switchStatement) {
+      // The head block prints just before `switch (…)`, so its declarations can move out to the
+      // sequence and keep their place relative to the switch.
+      return switchStatement.getFirst();
     }
     return null;
   }
@@ -160,7 +264,8 @@ public final class LocalDeclarationOrder {
   // *****************************************************************************
 
   private static void hoistAcrossStatements(Statement stat, VarProcessor varproc, NameTable names, String method) {
-    if (stat.type == Statement.StatementType.SEQUENCE) {
+    if (stat.type == Statement.StatementType.SEQUENCE
+        || (stat.type == Statement.StatementType.ROOT && onlyBasicBlocks(stat))) {
       hoistInSequence(stat, varproc, names, method);
     }
     for (Statement child : stat.getStats()) {
