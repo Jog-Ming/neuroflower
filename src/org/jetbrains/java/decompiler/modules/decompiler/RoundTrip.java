@@ -1593,6 +1593,34 @@ public final class RoundTrip {
     return toExit && toBody;
   }
 
+  /**
+   * The targets of the condition's own conditional branches, one entry per branch, in instruction
+   * order. A {@code ||} compiles as one branch per operand and the operands land on different
+   * targets; a simple test or a conjunction has every branch landing on one skip target.
+   */
+  public static int[] branchTargets(Exprent head) {
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null) {
+      return new int[0];
+    }
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    if (branchStarts == null) {
+      return new int[0];
+    }
+    java.util.List<Integer> targets = new java.util.ArrayList<>();
+    for (int at = head.bytecode.nextSetBit(0); at >= 0; at = head.bytecode.nextSetBit(at + 1)) {
+      Integer target = branchStarts.get(at);
+      if (target != null) {
+        targets.add(target);
+      }
+    }
+    int[] result = new int[targets.size()];
+    for (int i = 0; i < result.length; i++) {
+      result[i] = targets.get(i);
+    }
+    return result;
+  }
+
   private static Integer ownBranchTarget(Exprent operand, java.util.Map<Integer, Integer> branchStarts) {
     BitSet bits = operand.bytecode;
     if (bits == null) {

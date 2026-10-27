@@ -119,6 +119,12 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // A `||` arm with its body left after it: print the test positively and the body as its arm.
+      if (printDisjunctiveArm(buf, indent, i)) {
+        notempty = true;
+        break;
+      }
+
       // A local the source declared inside a nested block: its target scope ends before this block
       // does, at the statement boundary the closing brace stood on. Print `{ … }` around the run
       // that starts at that declaration, so the local's scope ends where the target's does.
@@ -772,6 +778,187 @@ public class SequenceStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /**
+   * Prints a {@code ||} arm of an else-if chain back as the source's positive test. A disjunction
+   * compiles as two branch blocks that both lead into the same arm, so the arm's body is one of the
+   * condition's branch targets; a simple test or a conjunction only branches to its skip target,
+   * which is where the next arm begins. The compiler saw the arm's second incoming edge as a join,
+   * so this block holds the chain inverted with the arm's body after it; the class file's branch
+   * target is what proves the source wrote the test positively. Prints
+   * {@code if (C) { body; break label; }} and then the rest of the chain, the source's else-if
+   * shape. False, printing nothing, when the block is not this shape.
+   */
+  private boolean printDisjunctiveArm(TextBuffer buf, int indent, int i) {
+    if (i + 1 >= stats.size() || !(stats.get(i) instanceof IfStatement arm)
+        || arm.iftype != IfStatement.IFTYPE_IF || arm.getElsestat() != null || arm.getIfstat() == null
+        || arm.isLabeled() || arm.isPatternMatched()
+        || arm.getHeadexprent() == null || arm.getHeadexprent().getCondition() == null) {
+      return false;
+    }
+    List<Statement> after = stats.subList(i + 1, stats.size());
+    Statement lastBody = stats.get(stats.size() - 1);
+    List<StatEdge> bodyExit = lastBody.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    StatEdge exit = terminalBreak(arm.getIfstat());
+    // The body's own printed break is the flip's break when the printer kept it explicit; when it
+    // did not, the flip prints one, and it has to print a labeled jump. A body that ends in a
+    // return or throw never reaches the chain, so no break is needed and none may be printed.
+    boolean needsBreak = !bodyExit.isEmpty() && !bodyExit.get(0).explicit && !cannotComplete(lastBody);
+    // The body moves into the then arm and the chain out of it: a local declared in either would
+    // end its scope somewhere else, and a slot the target hands out again would move.
+    if (!hasContent(after) || exit == null || exit.closure == null
+        || after.stream().anyMatch(RoundTrip::declaresLocal)
+        || RoundTrip.declaresLocal(arm.getIfstat())
+        // The chain has to leave the block on its own break. A regular edge into the statements
+        // that follow would mean they run after the chain too, which the flip would lose.
+        || flowsInto(arm.getIfstat(), after)
+        // The body has to leave the same way; anything else is a different flow.
+        || !bodyLeaves(bodyExit, lastBody, exit)
+        || (needsBreak && !exit.labeled)
+        // The statement's own condition carries the offsets of the instructions that built it, and
+        // its range start includes them; a first-offset walk misses them once they are in the head.
+        || !disjunctiveTest(arm.getHeadexprent(), after.get(0).getStartEndRange().start)) {
+      return false;
+    }
+    IfExprent head = (IfExprent) arm.getHeadexprent().copy();
+    head.setCondition(RoundTrip.negateCondition(arm.getHeadexprent().getCondition()));
+    // The declarations that ran before the test live on the head block; the flip prints the if
+    // itself, so they have to be printed here or they are lost.
+    buf.append(ExprProcessor.listToJava(arm.varDefinitions, indent));
+    buf.append(arm.getFirst().toJava(indent));
+    buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+    for (int k = i + 1; k < stats.size(); k++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+    }
+    if (needsBreak) {
+      buf.appendIndent(indent + 1).append("break label").append(exit.closure.id).append(";").appendLineSeparator();
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(arm.getIfstat(), indent, false));
+    return true;
+  }
+
+  /**
+   * Whether the class file proves the if's test is a disjunction with the following statement as
+   * its arm: every operand contributes exactly one branch, and the branches land on two different
+   * targets, one of them the arm. A simple test has a single branch (an early-return guard's one
+   * branch lands on the rest without a second target), and a conjunction's branches all land on the
+   * same skip target. An operand that is itself a short-circuit keeps its own branches, so the
+   * printed form has to be a plain conjunction as well.
+   */
+  private static boolean disjunctiveTest(IfExprent head, int bodyStart) {
+    Exprent condition = head.getCondition();
+    if (!(condition instanceof FunctionExprent and)
+        || and.getFuncType() != FunctionExprent.FunctionType.BOOLEAN_AND) {
+      return false;
+    }
+    List<Exprent> operands = new ArrayList<>();
+    if (!plainOperands(and, operands)) {
+      return false;
+    }
+    int[] targets = RoundTrip.branchTargets(head);
+    if (targets.length < 2 || targets.length != operands.size()) {
+      return false;
+    }
+    int other = -1;
+    boolean toBody = false;
+    for (int target : targets) {
+      if (target == bodyStart) {
+        toBody = true;
+      } else if (other < 0) {
+        other = target;
+      } else if (other != target) {
+        return false;
+      }
+    }
+    return toBody && other >= 0;
+  }
+
+  /** The operands of a conjunction, flattened; false when one of them is itself a disjunction. */
+  private static boolean plainOperands(Exprent condition, List<Exprent> out) {
+    if (condition instanceof FunctionExprent function
+        && function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND
+        && function.getLstOperands().size() == 2) {
+      return plainOperands(function.getLstOperands().get(0), out)
+        && plainOperands(function.getLstOperands().get(1), out);
+    }
+    for (Exprent part : condition.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_OR) {
+        return false;
+      }
+    }
+    out.add(condition);
+    return true;
+  }
+
+  /**
+   * The break edge the arm's last printed statement ends with, or null. The flip has to leave the
+   * block by the same break the inverted arm used, so the label comes from that edge.
+   */
+  private static StatEdge terminalBreak(Statement stat) {
+    while (true) {
+      List<StatEdge> edges = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+      if (edges.size() == 1 && edges.get(0).getType() != StatEdge.TYPE_REGULAR && edges.get(0).explicit) {
+        return edges.get(0);
+      }
+      List<Statement> children = stat.getStats();
+      if (children == null || children.isEmpty()) {
+        return null;
+      }
+      stat = children.get(children.size() - 1);
+    }
+  }
+
+  /**
+   * Whether the body leaves the block the way the flipped arm does: through the same break, or
+   * with an exit of its own when it has no edge. Anything else — a regular edge, a break to a
+   * different label — is a different flow, and the print it already has is kept.
+   */
+  private static boolean bodyLeaves(List<StatEdge> bodyExit, Statement lastBody, StatEdge exit) {
+    if (bodyExit.isEmpty()) {
+      return exits(lastBody);
+    }
+    return bodyExit.size() == 1 && bodyExit.get(0).getType() == StatEdge.TYPE_BREAK
+      && bodyExit.get(0).closure == exit.closure;
+  }
+
+  /**
+   * Whether the statement cannot complete normally, so a statement printed after it would be
+   * unreachable: a block ending in a return or throw, an if with both arms like that, or a
+   * sequence whose last statement is. A statement printed last before a jump can also not fall
+   * into it after an explicit break; that case prints its own jump and adds nothing.
+   */
+  private static boolean cannotComplete(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
+    }
+    if (stat instanceof IfStatement ifStatement) {
+      return ifStatement.getElsestat() != null && ifStatement.getIfstat() != null
+        && cannotComplete(ifStatement.getIfstat()) && cannotComplete(ifStatement.getElsestat());
+    }
+    if (stat instanceof SequenceStatement || stat instanceof RootStatement) {
+      List<Statement> children = stat.getStats();
+      return !children.isEmpty() && cannotComplete(children.get(children.size() - 1));
+    }
+    return false;
+  }
+
+  /** Whether any statement under the root has a direct edge into one of these statements. */
+  private static boolean flowsInto(Statement root, List<Statement> targets) {
+    for (StatEdge edge : root.getAllDirectSuccessorEdges()) {
+      if (targets.contains(edge.getDestination())) {
+        return true;
+      }
+    }
+    for (Statement child : root.getStats()) {
+      if (flowsInto(child, targets)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** The single return or throw of a statement, or null; a throw moves into a guard unharmed. */
