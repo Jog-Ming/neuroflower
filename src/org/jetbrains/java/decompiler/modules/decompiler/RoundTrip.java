@@ -65,6 +65,10 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> DUP_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Start offsets of every store to a slot, keyed by the slot. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, BitSet>> STORE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Start offsets of every load of a slot, keyed by the slot. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, BitSet>> LOAD_SITES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The slot a store at this start offset writes. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -86,12 +90,18 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> dupStores = new java.util.HashMap<>();
     java.util.Map<Integer, BitSet> storeSites = new java.util.HashMap<>();
+    java.util.Map<Integer, BitSet> loadSites = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> storeSlots = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode >= CodeConstants.opc_iload && instr.opcode <= CodeConstants.opc_aload) {
+        loadSites.computeIfAbsent(instr.operand(0), k -> new BitSet()).set(instr.startOffset);
+      }
       if (instr.opcode >= CodeConstants.opc_istore && instr.opcode <= CodeConstants.opc_astore) {
         storeSites.computeIfAbsent(instr.operand(0), k -> new BitSet()).set(instr.startOffset);
+        storeSlots.put(instr.startOffset, instr.operand(0));
         // `dup; store N`: the duplicate on the stack and the local N are the same value version,
         // so the store's own value is also the value the source assigned to N.
         if (i > 0) {
@@ -281,6 +291,8 @@ public final class RoundTrip {
     RETURN_STORES.put(method, returnStores);
     DUP_STORES.put(method, dupStores);
     STORE_SITES.put(method, storeSites);
+    LOAD_SITES.put(method, loadSites);
+    STORE_SLOTS.put(method, storeSlots);
   }
 
   /**
@@ -1244,6 +1256,20 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
     Integer end = ends == null ? null : ends.get(offset);
     return end == null ? -1 : end;
+  }
+
+  /** The slot a store instruction at this start offset writes, or -1. */
+  public static int storeSlotAt(StructMethod method, int offset) {
+    java.util.Map<Integer, Integer> map = method == null ? null : STORE_SLOTS.get(method);
+    Integer slot = map == null ? null : map.get(offset);
+    return slot == null ? -1 : slot;
+  }
+
+  /** Whether the method loads this slot anywhere. */
+  public static boolean loadsSlot(StructMethod method, int slot) {
+    java.util.Map<Integer, BitSet> map = method == null ? null : LOAD_SITES.get(method);
+    BitSet sites = map == null ? null : map.get(slot);
+    return sites != null && !sites.isEmpty();
   }
 
   /** Whether some store to {@code slot} starts after {@code from} and no later than {@code to}. */

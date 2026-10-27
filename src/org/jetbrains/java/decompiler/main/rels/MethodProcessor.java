@@ -444,6 +444,11 @@ public class MethodProcessor implements Runnable {
     if (DupStoreFolding.fold(root, mt)) {
       decompileRecord.add("DupStoreFolding", root);
     }
+    // A value the printer dropped may still be a store the target made into a source-named local
+    // it never reads; dropping the store would recompile as `pop`.
+    if (NamedDeadStore.restore(root, mt, varProc)) {
+      decompileRecord.add("NamedDeadStore", root);
+    }
 
     varProc.setVarDefinitions(root);
     decompileRecord.add("SetVarDefinitions", root);
