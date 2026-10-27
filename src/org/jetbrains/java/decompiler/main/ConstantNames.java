@@ -3561,7 +3561,12 @@ public final class ConstantNames {
     if (inner != null) {
       Map<String, Integer> classIndices = classIndices(cls);
       for (StructInnerClassesAttribute.Entry entry : inner.getEntries()) {
-        if (entry.innerName != null) {
+        // An entry for a nested type of another class exists because this class's source named
+        // that type. When our text does not name it as a type, the naming can only have gone
+        // through one of its constants, so the attribute must not dismiss the candidate here.
+        boolean ownMember = entry.innerName != null && cls.qualifiedName != null
+          && cls.qualifiedName.equals(entry.enclosingName);
+        if (entry.innerName != null && ownMember) {
           explained.add(entry.innerName);
         }
         // The attribute is written after every field and method, so it interns the inner class
