@@ -240,6 +240,18 @@ public class ClassWriter implements StatementWriter {
 
         if (!lambdaToAnonymous) {
           RootStatement root = wrapper.getMethodWrapper(mt.getName(), mt.getDescriptor()).root;
+          // A lambda body is a method of its own in the class file, and a `store N; load N; ret`
+          // tail inside it is the same evidence as in any method. The restore has to run with the
+          // lambda's method in scope: outside it, the enclosing method's instruction table answers
+          // for offsets that belong to the body.
+          StructMethod outerStructMethod = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+          DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, mt);
+          try {
+            ReturnedVariable.restore(root);
+          }
+          finally {
+            DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, outerStructMethod);
+          }
           if (DecompilerContext.getOption(IFernflowerPreferences.MARK_CORRESPONDING_SYNTHETICS)) {
             buffer.append("/* ")
               .appendMethod(node.lambdaInformation.content_method_name,
