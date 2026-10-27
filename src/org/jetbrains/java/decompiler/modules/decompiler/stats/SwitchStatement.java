@@ -191,6 +191,10 @@ public class SwitchStatement extends Statement {
       switchEnd = jumpEnd;
     }
     List<Integer> order = sourceOrder();
+    // When the printed order leaves the arms' bytecode blocks in another sequence, the source was
+    // written in an order the class file did not record and the jumps say nothing about a break
+    // this printer could put back: the group a jump belongs to is not the group it prints in.
+    boolean orderUnknown = layoutReordered(order);
     // An arm that only throws a synthesized MatchException prints only when the switch is an
     // expression in statement form: its arms have to cover every input, and javac rejects a
     // switch expression that misses one.
@@ -283,7 +287,7 @@ public class SwitchStatement extends Statement {
         lastJoins = joins;
       }
       boolean breakInside = false;
-      if (RoundTrip.selector("switchbreak") && joins && !yields
+      if (RoundTrip.selector("switchbreak") && joins && !yields && !orderUnknown
           && guard == null && !patternArm
           && RoundTrip.canCompleteNormally(stat) && !armLeaves) {
         // A braced arm holds the break inside the brace when the target's table still has a local
@@ -315,7 +319,7 @@ public class SwitchStatement extends Statement {
     // so it has to be printed back even though it compiles to no instruction of its own.
     if (RoundTrip.selector("switchbreak") && RoundTrip.selector("switchdefault")
         && switchEnd >= 0 && !defaultPrinted && lastPrinted >= 0 && lastJoins
-        && !yields && !isPattern() && caseGuards.stream().noneMatch(Objects::nonNull)
+        && !yields && !orderUnknown && !isPattern() && caseGuards.stream().noneMatch(Objects::nonNull)
         && defaultTargetOffset() == switchEnd) {
       buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
       buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
@@ -355,6 +359,29 @@ public class SwitchStatement extends Statement {
       line.addStartBytecodeMapping(jumpOffset);
     }
     return line;
+  }
+
+  /**
+   * True when the order the arms print in is provably neither the bytecode's block order nor an
+   * unknown. Javac lays the blocks out in source order, so a switch printed in its table's key
+   * order while the blocks sit in another sequence was written in an order the class file only
+   * records through the line table — and there the jump evidence belongs to a layout that is not
+   * being printed. An arm with no instruction of its own makes the block order unprovable.
+   */
+  private boolean layoutReordered(List<Integer> order) {
+    int size = caseStatements.size();
+    if (size < 2) {
+      return false;
+    }
+    List<Integer> layout = new ArrayList<>(size);
+    for (int i = 0; i < size; i++) {
+      if (RoundTrip.firstOffset(caseStatements.get(i)) < 0) {
+        return false;
+      }
+      layout.add(i);
+    }
+    layout.sort(Comparator.comparingInt(i -> RoundTrip.firstOffset(caseStatements.get(i))));
+    return !layout.equals(order);
   }
 
   /** The offset just past the switch, read from the statement that follows it, or -1. */
