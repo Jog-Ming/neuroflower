@@ -6,6 +6,7 @@ package org.jetbrains.java.decompiler.modules.decompiler;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FieldExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
@@ -15,6 +16,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
@@ -613,15 +615,23 @@ public final class LocalDeclarationOrder {
           if (init != null) {
             entry = exprent(init, entry);
           }
-          // Header expressions run before the first body statement only for a while loop; the
-          // others run after it, but checking their uses against the entry state is conservative.
+          boolean bodyEntry = entry;
+          boolean conditionAfterBody = false;
           switch (loop.getLooptype()) {
             case WHILE:
+              // A while loop evaluates its condition before every iteration, so what the
+              // condition assigns on the way to true is definitely assigned inside the body.
+              // Later iterations enter the condition with at least this state, and the analysis
+              // is monotone.
+              bodyEntry = trueState(loop.getConditionExprent(), entry);
+              break;
             case DO_WHILE:
-              exprent(loop.getConditionExprent(), entry);
+              // The condition runs after the body; it is checked against the body's exit below.
+              conditionAfterBody = true;
               break;
             case FOR:
-              exprent(loop.getConditionExprent(), entry);
+              // The init and the condition both run before the first body statement.
+              bodyEntry = trueState(loop.getConditionExprent(), entry);
               exprent(loop.getIncExprent(), entry);
               break;
             case FOR_EACH:
@@ -631,8 +641,14 @@ public final class LocalDeclarationOrder {
               break;
           }
           Statement body = loop.getFirst();
-          if (body != null) {
-            stat(body, entry);
+          boolean afterBody = body == null ? bodyEntry : stat(body, bodyEntry);
+          if (conditionAfterBody) {
+            // A `continue` skips the rest of the body, so the linear walk may credit it with an
+            // assignment the jumping path never makes; the body's entry state is the safe floor.
+            exprent(loop.getConditionExprent(), hasContinue(body) ? bodyEntry : afterBody);
+            // A do-while runs its body at least once, and with no jump out of the middle every
+            // exit passes the body's end; the code after the loop sees that state.
+            return hasBreakOrContinue(body) ? bodyEntry : afterBody;
           }
           // The loop may run zero times, and a break may leave it from any iteration.
           return entry;
@@ -683,14 +699,20 @@ public final class LocalDeclarationOrder {
             }
           }
           Statement body = catchStatement.getFirst();
-          if (body != null) {
-            stat(body, assigned);
-          }
+          boolean afterBody = body == null ? assigned : stat(body, assigned);
+          // Control reaches the code after the statement either by leaving the body normally or
+          // by leaving a handler normally; a handler that always returns or throws never gets
+          // there, so it must not undo what the body established.
+          boolean result = afterBody;
           for (int i = 1; i < catchStatement.getStats().size(); i++) {
-            stat(catchStatement.getStats().get(i), assigned);
+            Statement handler = catchStatement.getStats().get(i);
+            // A handler may run after any prefix of the try body.
+            boolean handlerState = stat(handler, assigned);
+            if (!neverCompletesNormally(handler)) {
+              result = result && handlerState;
+            }
           }
-          // A handler may run after any prefix of the try body.
-          return assigned;
+          return result;
         }
         case CATCH_ALL: {
           CatchAllStatement catchAll = (CatchAllStatement)stat;
@@ -778,6 +800,43 @@ public final class LocalDeclarationOrder {
       return assigned;
     }
 
+    /**
+     * The state guaranteed when this expression evaluates to true: the operands a short-circuit
+     * guard forced to run are evaluated here, so what they assign holds on the branch that takes
+     * the condition. Uses are still checked against the state on entry.
+     */
+    private boolean trueState(Exprent expression, boolean assigned) {
+      if (expression instanceof FunctionExprent function) {
+        List<Exprent> operands = function.getLstOperands();
+        if (function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_AND) {
+          boolean eval = assigned;
+          boolean truth = assigned;
+          for (Exprent operand : operands) {
+            truth = trueState(operand, eval);
+            eval = exprent(operand, eval);
+          }
+          return truth;
+        }
+        if (function.getFuncType() == FunctionExprent.FunctionType.BOOLEAN_OR) {
+          if (operands.isEmpty()) {
+            return assigned;
+          }
+          // If the first operand is true the rest never runs, so only its own assignments hold.
+          boolean truth = trueState(operands.get(0), assigned);
+          boolean eval = exprent(operands.get(0), assigned);
+          for (int i = 1; i < operands.size(); i++) {
+            exprent(operands.get(i), eval);
+          }
+          return truth;
+        }
+        if (function.getFuncType() == FunctionExprent.FunctionType.TERNARY) {
+          // Only the condition is evaluated before the picked arm, whichever it is.
+          return exprent(expression, assigned);
+        }
+      }
+      return exprent(expression, assigned);
+    }
+
     /** The parts of a store target, in evaluation order; a plain variable reads nothing. */
     private boolean location(Exprent exprent, boolean assigned) {
       if (exprent instanceof VarExprent) {
@@ -788,6 +847,92 @@ public final class LocalDeclarationOrder {
 
     private boolean isTarget(Exprent exprent) {
       return exprent instanceof VarExprent var && !var.isStack() && var.getVarVersionPair().equals(target);
+    }
+
+    /** True when an explicit {@code continue} leaves any statement of this subtree. */
+    private static boolean hasContinue(Statement stat) {
+      if (stat == null) {
+        return false;
+      }
+      if (hasExplicit(stat, StatEdge.TYPE_CONTINUE)) {
+        return true;
+      }
+      for (Statement child : stat.getStats()) {
+        if (hasContinue(child)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * True when control never falls out of the bottom of this statement: every path ends in a
+     * {@code return} or a {@code throw}. A break or continue leaves through an edge this walk
+     * does not follow, so it counts as completing normally rather than as an exit.
+     */
+    private static boolean neverCompletesNormally(Statement stat) {
+      if (stat == null || hasBreakOrContinue(stat)) {
+        return false;
+      }
+      List<Exprent> exprents = stat.getExprents();
+      if (exprents != null) {
+        for (int i = exprents.size() - 1; i >= 0; i--) {
+          Exprent exprent = exprents.get(i);
+          if (exprent != null) {
+            return exprent instanceof ExitExprent exit
+              && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW);
+          }
+        }
+        return false;
+      }
+      switch (stat.type) {
+        case SEQUENCE: {
+          for (Statement child : stat.getStats()) {
+            if (neverCompletesNormally(child)) {
+              return true;
+            }
+          }
+          return false;
+        }
+        case IF: {
+          IfStatement ifStatement = (IfStatement)stat;
+          return ifStatement.getIfstat() != null && ifStatement.getElsestat() != null
+            && neverCompletesNormally(ifStatement.getIfstat())
+            && neverCompletesNormally(ifStatement.getElsestat());
+        }
+        case SYNCHRONIZED: {
+          Statement body = ((SynchronizedStatement)stat).getBody();
+          return body != null && neverCompletesNormally(body);
+        }
+        default:
+          return false;
+      }
+    }
+
+    private static boolean hasBreakOrContinue(Statement stat) {
+      if (hasExplicit(stat, StatEdge.TYPE_BREAK) || hasExplicit(stat, StatEdge.TYPE_CONTINUE)) {
+        return true;
+      }
+      for (Statement child : stat.getStats()) {
+        if (hasBreakOrContinue(child)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * True when the source wrote a break or continue here. A loop's implicit back edge is not a
+     * jump the source made, and a jump to the dummy exit block is a return, not a fall-through
+     * into the code after this statement.
+     */
+    private static boolean hasExplicit(Statement stat, int type) {
+      for (StatEdge edge : stat.getSuccessorEdges(type)) {
+        if (edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)) {
+          return true;
+        }
+      }
+      return false;
     }
   }
 
