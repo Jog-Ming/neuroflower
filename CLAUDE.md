@@ -28,8 +28,6 @@ allowed to change as the work does.
   console parser reads a single-dash argument as a three-letter short name, so `-line-align=0`
   silently becomes `--lin=-align=0` and the run measures the unchanged default. A single-dash A/B is
   an empty measurement.
-- **A blocked class is reported with its token pair.** Never write it off as a decompiler limitation;
-  record the exact tokens that diverge.
 - **Never print an erased type.** A repair may print a type only when every type argument is recorded
   and nameable: no wildcard captures, no erased stand-ins, no unresolved type variables. If the only
   available type is an erasure, a capture, or an unknown, print nothing. A raw or erased type changes
@@ -50,8 +48,6 @@ allowed to change as the work does.
 - **Read the ground truth before deriving a repair.** When a reference source tree is available, copy
   the form from it instead of re-deriving it from bytecode — and understand why that form is right,
   not just what it says.
-- **Verify before inventing.** A repair to one declaration is often illegal in terms of another
-  (overrides, erasure, raw types). Diff the set of error messages between rounds.
 - **Commits are unsigned; pushing is signed and only on request.** Commit with `git commit --no-gpg-sign`;
   do not change the git configuration. Push only when the user asks, re-signing the branch before
   the push.
@@ -93,8 +89,11 @@ loop runs on, not a repair, and the family rules do not apply to it.
    holds a file lock and skips trees in use — so research agents may call it in parallel. What must
    not overlap is a **build**: the jar is the measurement's input, and rebuilding it mid-run makes
    classes vanish. One implementation agent owns the build at a time.
-4. **Repeat** until the metric has no family left. Report a family that has no deterministic
-   discriminator as blocked, with the token pair.
+4. **Repeat** until the metric has no family left. A family with no deterministic discriminator is
+   reported as blocked, and the report **records the exact diverging token pair** and which piece of
+   evidence is missing, so the next round starts from that record instead of re-deriving it. The
+   token pair is what makes a blocked family actionable later; "the decompiler cannot do this" is
+   not a report.
 
 ## devtools/cli
 
