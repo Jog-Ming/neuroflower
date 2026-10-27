@@ -321,17 +321,18 @@ public final class TryWithResourcesProcessor {
         }
       }
     } else {
-      if (stat instanceof BasicBlockStatement) {
-        if (stat.getExprents() != null && !stat.getExprents().isEmpty()) {
-          Exprent exprent = stat.getExprents().get(0);
+      // javac's try-with-resources leaves the close at the head of the shared exit block, which
+      // is often a compound statement rather than a bare block.
+      Statement block = stat instanceof BasicBlockStatement ? stat : stat.getFirst();
+      if (block != null && block.getExprents() != null && !block.getExprents().isEmpty()) {
+        Exprent exprent = block.getExprents().get(0);
 
-          if (exprent instanceof InvocationExprent) {
-            Exprent inst = ((InvocationExprent) exprent).getInstance();
+        if (exprent instanceof InvocationExprent) {
+          Exprent inst = ((InvocationExprent) exprent).getInstance();
 
-            // Ensure the var exprent we want to remove is the right one
-            if (inst instanceof VarExprent && inst.equals(closeable) && isCloseable(exprent)) {
-              return true;
-            }
+          // Ensure the var exprent we want to remove is the right one
+          if (inst instanceof VarExprent && inst.equals(closeable) && isCloseable(exprent)) {
+            return true;
           }
         }
       }
@@ -369,7 +370,10 @@ public final class TryWithResourcesProcessor {
         statement.replaceWithEmpty();
       }
     } else {
-      statement.getExprents().remove(0);
+      Statement block = statement instanceof BasicBlockStatement ? statement : statement.getFirst();
+      if (block != null && block.getExprents() != null && !block.getExprents().isEmpty()) {
+        block.getExprents().remove(0);
+      }
     }
   }
 
