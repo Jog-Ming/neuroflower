@@ -990,6 +990,54 @@ public class ClassWriter implements StatementWriter {
             }
           }
         }
+        // A member with no line of its own — a method without code, a field without an initializer
+        // line — has no evidence of where the source put it, and the carry above hands it a
+        // neighbour's line. When that line would sort it after a member the class file lists
+        // later, the source cannot have had that order: take the later neighbour's line instead,
+        // and the sequence tie-break keeps the file order. This corrects the carry; it never
+        // replaces a line the target actually recorded.
+        if (RoundTrip.selector("memberfileorder")) {
+          for (int i = 0; i < planSize; i++) {
+            int[] member = plan.get(i);
+            if (original[i] >= 0 || member[2] < 0 || member[0] != 1) {
+              continue;
+            }
+            MethodWrapper wrapperOf = wrapper.getMethodWrapper(member[1]);
+            if (wrapperOf != null && wrapperOf.root != null) {
+              continue; // a method with code has a table of its own
+            }
+            // Only a leading run of code-less methods: once a method with a line has been seen,
+            // the carry's placement is the one the target's own table implies.
+            boolean leading = true;
+            for (int j = 0; j < i; j++) {
+              if (plan.get(j)[0] == 1 && original[j] >= 0) {
+                leading = false;
+                break;
+              }
+            }
+            if (!leading) {
+              continue;
+            }
+            for (int j = i + 1; j < planSize; j++) {
+              // Only another method bounds a method: the class file lists fields first whatever
+              // the source order, so a field's position says nothing about where a method sat.
+              if (original[j] < 0 || plan.get(j)[0] != 1 || plan.get(j)[2] < 0) {
+                continue;
+              }
+              // A constructor's or static block's line is the class header or an initializer
+              // anchor, not a declaration position: neither can bound a method's place.
+              StructMethod boundMethod = methods.get(plan.get(j)[1]);
+              if (CodeConstants.INIT_NAME.equals(boundMethod.getName())
+                  || CodeConstants.CLINIT_NAME.equals(boundMethod.getName())) {
+                continue;
+              }
+              if (plan.get(j)[2] < member[2]) {
+                member[2] = plan.get(j)[2];
+              }
+              break;
+            }
+          }
+        }
         // Fields keep their declaration order: a forward reference from an initializer to a later
         // field is illegal, and their own lines are only as trustworthy as their initializers.
         int previousField = -1;
