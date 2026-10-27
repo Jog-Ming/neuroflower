@@ -190,6 +190,22 @@ public class SwitchStatement extends Statement {
         switchEnd = RoundTrip.firstOffset(siblings.get(k));
       }
     }
+    if (switchEnd < 0) {
+      // With no sibling after the switch, the join is the end of the last instruction any arm
+      // covers — but only trust it when an arm's own tail jump lands exactly there.
+      int candidate = -1;
+      for (Statement arm : caseStatements) {
+        candidate = Math.max(candidate, RoundTrip.blockEnd(arm));
+      }
+      if (candidate > 0) {
+        for (Statement arm : caseStatements) {
+          if (RoundTrip.jumpsFromEnd(arm, candidate)) {
+            switchEnd = candidate;
+            break;
+          }
+        }
+      }
+    }
     List<Integer> order = sourceOrder();
     // An arm that only throws a synthesized MatchException prints only when the switch is an
     // expression in statement form: its arms have to cover every input, and javac rejects a
@@ -257,15 +273,22 @@ public class SwitchStatement extends Statement {
         }
       }
 
-      buf.append(ExprProcessor.jmpWrapper(stat, indent + 2, false));
+      TextBuffer armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
+      buf.append(armBuf);
+      // What the arm actually printed decides whether it still needs a `break;`. The tree's own
+      // edge is not enough evidence: an explicit break edge can hang off a statement the printer
+      // renders without one, which is exactly the arm that falls through on the page.
+      String armText = armBuf.convertToStringAndAllowDataDiscard().stripTrailing();
 
       // A non-final arm whose block ends with a jump past the switch printed no `break;`: the
       // target's jump proves the source wrote one, and `canCompleteNormally` keeps it reachable.
       boolean patternArm = values.stream().anyMatch(value -> value instanceof FunctionExprent function
         && function.getFuncType() == FunctionType.INSTANCEOF);
+      boolean armLeaves = armText.endsWith("break;") || armText.endsWith("continue;")
+        || armText.endsWith("return;") || armText.endsWith("throw;");
       if (RoundTrip.selector("switchbreak") && switchEnd >= 0 && i != lastPrinted
           && guard == null && !braced.contains(stat) && !patternArm
-          && RoundTrip.canCompleteNormally(stat) && !RoundTrip.printsExplicitJump(stat)
+          && RoundTrip.canCompleteNormally(stat) && !armLeaves
           && RoundTrip.jumpsFromEnd(stat, switchEnd)) {
         buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
       }
