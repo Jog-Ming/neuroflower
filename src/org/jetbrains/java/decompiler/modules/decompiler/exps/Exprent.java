@@ -13,6 +13,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
+import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
@@ -215,7 +216,7 @@ public abstract class Exprent implements IMatchable {
 
       Comparator<VarExprent> comp = new Comparator<VarExprent>() {
         public int compare(VarExprent o1, VarExprent o2) {
-          return o1.getIndex() - o2.getIndex();
+          return declarationSlot(o1) - declarationSlot(o2);
         }
       };
 
@@ -240,6 +241,22 @@ public abstract class Exprent implements IMatchable {
       }
       return ret;
     }
+
+  /**
+   * The slot javac gave this local, which is its declaration order. The internal index is a
+   * renumbering and can disagree with it; sorting by the renumbering would print two declarations
+   * in an order the source never had, undoing a swap another pass made.
+   */
+  private static int declarationSlot(VarExprent var) {
+    VarProcessor processor = var.getProcessor();
+    if (processor != null) {
+      Integer original = processor.getVarOriginalIndex(var.getIndex());
+      if (original != null) {
+        return original;
+      }
+    }
+    return var.getIndex();
+  }
 
   protected void gatherGenerics(VarType upperBound, VarType ret, Map<VarType, VarType> genericsMap) {
     // List<T> -> List<String>
