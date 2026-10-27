@@ -56,7 +56,7 @@ public final class LocalDeclarationOrder {
 
     NameTable names = NameTable.build(root);
     hoistAcrossStatements(root, varproc, names, method);
-    reorderWithinList(root);
+    reorderWithinList(root, varproc);
   }
 
   /**
@@ -821,12 +821,12 @@ public final class LocalDeclarationOrder {
   // within-list pass
   // *****************************************************************************
 
-  private static void reorderWithinList(Statement stat) {
+  private static void reorderWithinList(Statement stat, VarProcessor varproc) {
     List<Exprent> exprents = stat.getExprents();
     if (exprents != null) {
       for (int i = 1; i < exprents.size(); i++) {
         Exprent exprent = exprents.get(i);
-        int slot = bareDeclarationSlot(exprent);
+        int slot = bareDeclarationSlot(exprent, varproc);
         boolean initialized = false;
         if (slot < 0) {
           // An initialized declaration whose slot precedes an earlier declaration's was written
@@ -836,7 +836,7 @@ public final class LocalDeclarationOrder {
           if (var == null || !isRealDefinition(var)) {
             continue;
           }
-          slot = slotOf(var, null);
+          slot = slotOf(var, varproc);
           if (slot < 0) {
             continue;
           }
@@ -845,7 +845,7 @@ public final class LocalDeclarationOrder {
         int j = i;
         while (j > 0) {
           Exprent previous = exprents.get(j - 1);
-          int previousSlot = declarationSlot(previous, null);
+          int previousSlot = declarationSlot(previous, varproc);
           if (previousSlot < 0 || previousSlot <= slot) {
             break;
           }
@@ -865,8 +865,77 @@ public final class LocalDeclarationOrder {
         }
       }
     }
+    if (!stat.getVarDefinitions().isEmpty()) {
+      reconcileDefinitions(stat, exprents, varproc);
+    }
     for (Statement child : stat.getStats()) {
-      reorderWithinList(child);
+      reorderWithinList(child, varproc);
+    }
+  }
+
+  /**
+   * A bare declaration hoisted to the sequence's definitions prints before every exprent, but the
+   * source order is the target's slot order: one whose slot follows an initialized declaration's
+   * prints after it. The declaration itself is unchanged, so nothing it declares changes value.
+   */
+  private static void reconcileDefinitionsInto(List<Exprent> definitions, List<Exprent> exprents,
+                                               VarProcessor varproc) {
+    for (int d = definitions.size() - 1; d >= 0; d--) {
+      Exprent declaration = definitions.get(d);
+      int slot = declarationSlot(declaration, varproc);
+      if (slot < 0 || readsLocalBefore(declaration, exprents)) {
+        continue;
+      }
+      int target = -1;
+      for (int i = 0; i < exprents.size(); i++) {
+        int earlier = declarationSlot(exprents.get(i), varproc);
+        if (earlier >= 0 && earlier < slot) {
+          target = i;
+        }
+      }
+      if (target >= 0) {
+        definitions.remove(d);
+        exprents.add(target + 1, declaration);
+      }
+    }
+  }
+
+  /** The exprents of the sequence's first child statement, when that child is a plain block. */
+  private static List<Exprent> firstChildExprents(Statement stat) {
+    if (stat.getExprents() != null || stat.getStats().isEmpty()) {
+      return null;
+    }
+    Statement first = stat.getStats().get(0);
+    return first instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement
+      ? first.getExprents() : null;
+  }
+
+  /** True when any exprent of the list reads the local this declaration defines. */
+  private static boolean readsLocalBefore(Exprent declaration, List<Exprent> exprents) {
+    VarExprent declared = definedVar(declaration);
+    if (declared == null) {
+      return true;
+    }
+    for (Exprent exprent : exprents) {
+      for (Exprent part : exprent.getAllExprents(true, true)) {
+        if (part instanceof VarExprent var && !var.isDefinition()
+          && var.getIndex() == declared.getIndex()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static void reconcileDefinitions(Statement stat, List<Exprent> exprents, VarProcessor varproc) {
+    // A sequence whose definitions print before its child statements can hide a declaration in
+    // the first child block; the source order is still the target's slot order.
+    List<Exprent> childExprents = firstChildExprents(stat);
+    if (childExprents != null && childExprents != exprents) {
+      reconcileDefinitionsInto(stat.getVarDefinitions(), childExprents, varproc);
+    }
+    if (exprents != null) {
+      reconcileDefinitionsInto(stat.getVarDefinitions(), exprents, varproc);
     }
   }
 
@@ -887,9 +956,9 @@ public final class LocalDeclarationOrder {
   }
 
   /** The slot of a declaration statement that only names a variable, or -1. */
-  private static int bareDeclarationSlot(Exprent exprent) {
+  private static int bareDeclarationSlot(Exprent exprent, VarProcessor varproc) {
     if (exprent instanceof VarExprent var && isRealDefinition(var)) {
-      return slotOf(var, null);
+      return slotOf(var, varproc);
     }
     return -1;
   }
