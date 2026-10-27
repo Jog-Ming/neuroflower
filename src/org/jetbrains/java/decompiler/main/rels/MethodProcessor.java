@@ -444,6 +444,11 @@ public class MethodProcessor implements Runnable {
     if (DupStoreFolding.fold(root, mt)) {
       decompileRecord.add("DupStoreFolding", root);
     }
+    // A compound assignment whose receiver javac cached in a temporary reads through it; print
+    // the source form, which re-lowers to the same temporary and the same value-producing store.
+    if (TempReceiverCompound.fold(root, mt)) {
+      decompileRecord.add("TempReceiverCompound", root);
+    }
     // A value the printer dropped may still be a store the target made into a source-named local
     // it never reads; dropping the store would recompile as `pop`.
     if (NamedDeadStore.restore(root, mt, varProc)) {

@@ -518,10 +518,11 @@ public final class SecondaryFunctionsHelper {
               ret = exprent;
               break;
             }
-            // A field's compound form always duplicates the receiver; the target's sequence has
-            // no duplicate here, so the source wrote the expanded assignment and the stock
-            // simplification below would still fold it into the compound form.
-            if (left instanceof FieldExprent) {
+            // A field's compound form always duplicates the receiver, and an array element's
+            // duplicates its address pair; the target's sequence has no duplicate here, so the
+            // source wrote the expanded assignment and the stock simplification below would
+            // still fold it into the compound form.
+            if (left instanceof FieldExprent || left instanceof ArrayExprent) {
               return ret;
             }
           }

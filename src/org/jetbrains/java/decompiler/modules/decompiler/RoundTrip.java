@@ -6,6 +6,7 @@ import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ArrayExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
@@ -1396,7 +1397,9 @@ public final class RoundTrip {
   /**
    * True when the target kept a duplicate of the left-hand side next to the matching operand:
    * {@code this.f += e} compiles as {@code aload_0; dup; getfield f; ...; putfield f}, while
-   * {@code this.f = this.f + e} loads the field twice.
+   * {@code this.f = this.f + e} loads the field twice.  An array element's compound form
+   * ({@code a[i] |= e}) duplicates the address pair instead: {@code aload a; iload i; dup2;
+   * laload; ...; lastore}, where the expanded form loads {@code a} and {@code i} again.
    */
   public static boolean isCompoundTarget(Exprent left, Exprent matching) {
     if (!selector("compound")) {
@@ -1422,6 +1425,14 @@ public final class RoundTrip {
       }
       return index > 0 && isDup(seq.getInstr(index - 1).opcode);
     }
+    if (left instanceof ArrayExprent) {
+      // The address pair (array, index) is one word each, so its duplicate is always dup2 and
+      // it sits immediately before the element load the compound form reads through.
+      if (opcode < CodeConstants.opc_iaload || opcode > CodeConstants.opc_saload) {
+        return false;
+      }
+      return index > 0 && seq.getInstr(index - 1).opcode == CodeConstants.opc_dup2;
+    }
     if (left instanceof VarExprent) {
       if (!isLoad(opcode)) {
         return false;
@@ -1433,6 +1444,53 @@ public final class RoundTrip {
 
   private static boolean isDup(int opcode) {
     return opcode >= CodeConstants.opc_dup && opcode <= CodeConstants.opc_dup2_x2;
+  }
+
+  /**
+   * True when the target stored through a receiver javac had to cache in a temporary:
+   * {@code this.part.f += e} compiles as {@code aload_0; getfield part; astore N; aload N;
+   * aload N; getfield f; ...; dup_x1; putfield f; pop} — the value survives the store and is
+   * discarded right after, which only an assignment expression produces, and the read has no
+   * duplicate of its own because the temporary already holds the receiver.
+   */
+  public static boolean isCachedReceiverTarget(Exprent store, Exprent matching) {
+    if (!selector("compound-temp")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    FullInstructionSequence seq = method.getInstructionSequence();
+    BitSet storeOffsets = store.bytecode;
+    BitSet readOffsets = matching.bytecode;
+    if (seq == null || storeOffsets == null || storeOffsets.isEmpty()
+      || readOffsets == null || readOffsets.isEmpty()) {
+      return false;
+    }
+    Integer storeIndex = seq.offsetToIndex().get(storeOffsets.nextSetBit(0));
+    Integer readIndex = seq.offsetToIndex().get(readOffsets.nextSetBit(0));
+    if (storeIndex == null || readIndex == null) {
+      return false;
+    }
+    if (seq.getInstr(storeIndex).opcode != CodeConstants.opc_putfield
+      || seq.getInstr(readIndex).opcode != CodeConstants.opc_getfield) {
+      return false;
+    }
+    if (storeIndex == 0 || storeIndex + 1 >= seq.length()) {
+      return false;
+    }
+    int before = seq.getInstr(storeIndex - 1).opcode;
+    int after = seq.getInstr(storeIndex + 1).opcode;
+    if (before != CodeConstants.opc_dup_x1 && before != CodeConstants.opc_dup2_x1) {
+      return false;
+    }
+    if (after != CodeConstants.opc_pop && after != CodeConstants.opc_pop2) {
+      return false;
+    }
+    // A duplicate before the read is the ordinary field compound (`this.f += e`), which the
+    // matching-operand rule already covers; this shape reads through the cached temporary.
+    return readIndex == 0 || !isDup(seq.getInstr(readIndex - 1).opcode);
   }
 
   /** True when the target emitted a checkcast inside this expression's bytecode range. */
