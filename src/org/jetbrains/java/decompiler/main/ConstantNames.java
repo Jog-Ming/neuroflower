@@ -1462,7 +1462,8 @@ public final class ConstantNames {
    * field initializer places its naming at the literal in that same initializer.
    */
   private record PairSite(int classIndex, long successor, long lower, long after, int open, int close,
-                          String member, String successorKey, Set<String> pooled, int successorAt) {
+                          String member, String successorKey, Set<String> pooled, int successorAt,
+                          int lowerAt) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.equals(successorKey)) {
@@ -1592,8 +1593,10 @@ public final class ConstantNames {
         successorKey = null;
       }
       Integer at = position(cls, use, positions);
+      Integer lowerAt = position(cls, lastPoolUseEntry(firstUses, use), positions);
       pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], lastPoolUse(firstUses, use),
-        open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at));
+        open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at,
+        lowerAt == null ? -1 : lowerAt));
     }
     return pairs;
   }
@@ -1707,14 +1710,19 @@ public final class ConstantNames {
    * entry's first use would create its own entry after the pair instead and reorder the pool.
    */
   private static long lastPoolUse(Map<Integer, FirstUse> firstUses, FirstUse successor) {
-    long last = NO_COORDINATE;
+    FirstUse entry = lastPoolUseEntry(firstUses, successor);
+    return entry == null ? NO_COORDINATE : coordinate(entry.order(), entry.offset());
+  }
+
+  /** The last pool entry first used before the reference in its method, or null when none is. */
+  private static FirstUse lastPoolUseEntry(Map<Integer, FirstUse> firstUses, FirstUse successor) {
+    FirstUse last = null;
     for (FirstUse use : firstUses.values()) {
       if (use.order() != successor.order() || use.offset() >= successor.offset()) {
         continue;
       }
-      long point = coordinate(use.order(), use.offset());
-      if (last == NO_COORDINATE || point > last) {
-        last = point;
+      if (last == null || compare(use, last) > 0) {
+        last = use;
       }
     }
     return last;
@@ -1728,7 +1736,11 @@ public final class ConstantNames {
       if (c == '(') {
         return i;
       }
-      if (c == ';' || c == '{' || c == '}' || c == '=' || c == '\n') {
+      // A static field initializer prints its invoke at the assignment: the position the tracer
+      // recorded points at the '=', and the call being named is the initializer's own right-hand
+      // side. Crossing the '=' stays inside one statement; the statement's other boundaries
+      // still end the search.
+      if (c == ';' || c == '{' || c == '}' || c == '\n') {
         return -1;
       }
       if (c == '"' || c == '\'') {
@@ -2474,28 +2486,48 @@ public final class ConstantNames {
     if (site == null) {
       return null;
     }
+    // A value successor is the pool's own record of the folded value the naming produced, so its
+    // match is exact and takes precedence. A reference successor only says that some naming of the
+    // owner was the last pool-entering event before the reference; several owners' pairs can admit
+    // the same argument list, and one candidate's expression must not hide another's exact record.
+    Site exact = null;
+    boolean exactDirect = false;
+    Site directSite = null;
+    Site invented = null;
     for (Map.Entry<String, PairSite> entry : placement.pairs().entrySet()) {
       PairSite pair = entry.getValue();
       if (!pairProvesSite(pair, key, start, placement)) {
         continue;
       }
       boolean referenceSuccessor = pair.successorKey() == null;
-      if (exactProof != null) {
-        exactProof[0] = !referenceSuccessor;
-      }
       if (referenceSuccessor) {
-        long sitePoint = siteCoordinate(placement.spaces(), start);
-        if (sitePoint == NO_COORDINATE || sitePoint <= pair.after()) {
-          // An instruction between this site and the reference used an entry the pair precedes, so
-          // the original named the constant after that instruction; naming it here would reorder
-          // the pool.
-          continue;
+        boolean inArgs = pair.open() >= 0 && start > pair.open() && start < pair.close();
+        if (inArgs) {
+          // Inside the call's own argument list the naming must come after the last entry the
+          // generation placed below the pair; naming before it would create the pair ahead of that
+          // entry. A folded literal usually has no printed position of its own, so the coordinate
+          // of the preceding operand cannot tell the two apart, while the character offsets can:
+          // the arguments are printed in the order they are generated. When that last use has no
+          // printed position nothing can place it, and the pool-free expression rule below is the
+          // only evidence left.
+          if (pair.lowerAt() >= 0 && start <= pair.lowerAt()) {
+            continue;
+          }
+        }
+        else {
+          long sitePoint = siteCoordinate(placement.spaces(), start);
+          if (sitePoint == NO_COORDINATE || sitePoint <= pair.after()) {
+            // An instruction between this site and the reference used an entry the pair precedes,
+            // so the original named the constant after that instruction; naming it here would
+            // reorder the pool.
+            continue;
+          }
         }
       }
       String owner = entry.getKey();
       String qualifier = solverQualifier(owner, packageName);
       if (qualifier == null) {
-        return null; // the owner cannot be named unambiguously from this class
+        continue; // the owner cannot be named unambiguously from this class
       }
       List<SourceConstant> sources = sourceConstants(owner, site, imports, packageName);
       Set<String> pooledBefore = referenceSuccessor ? pooledKeys(site, pair.classIndex()) : Set.of();
@@ -2528,10 +2560,13 @@ public final class ConstantNames {
           direct = solved;
         }
         if (expression == null
-            && (immediateConstant(source) || pooledBefore.contains(constantKey(source)))) {
+            && (immediateConstant(source) || pooledBefore.contains(constantKey(source)))
+            && poolFree(solved, pooledBefore)) {
           // Named before a reference successor, a constant enters its own value after the class
           // and its name. An immediate enters nothing, and a value the pool already holds below
-          // the pair is reused, so either reproduces the pair the pool leaves free-standing.
+          // the pair is reused, so either reproduces the pair the pool leaves free-standing. The
+          // solved expression's own literals must obey the same rule: a pooled value it introduces
+          // would land after the pair, where the original had none.
           expression = solved;
         }
       }
@@ -2539,12 +2574,36 @@ public final class ConstantNames {
       // is the original's form whenever the pool offers one; only without it does an expression
       // stand in, and only where the pair leaves the neighbour free-standing.
       String found = direct != null ? direct : referenceSuccessor ? expression : first;
-      if (found != null && exactProof != null) {
-        exactProof[1] = direct != null; // the literal's own value is the constant's own value
+      if (found == null) {
+        continue;
       }
-      return found == null ? null : new Site(start, end, "(" + found + ")", entry.getKey());
+      Site solved = new Site(start, end, "(" + found + ")", owner);
+      if (!referenceSuccessor) {
+        if (exact != null) {
+          return null; // two value successors of one value cannot both name this literal
+        }
+        exact = solved;
+        exactDirect = direct != null;
+      }
+      else if (direct != null) {
+        if (directSite != null) {
+          return null; // two owners declare the literal's own value; the pool cannot choose
+        }
+        directSite = solved;
+      }
+      else {
+        if (invented != null) {
+          return null; // two owners' expressions fold here; the pool does not record which
+        }
+        invented = solved;
+      }
     }
-    return null;
+    Site chosen = exact != null ? exact : directSite != null ? directSite : invented;
+    if (chosen != null && exactProof != null) {
+      exactProof[0] = exact != null;
+      exactProof[1] = exact != null ? exactDirect : chosen == directSite;
+    }
+    return chosen;
   }
 
   /** The fully qualified form of the owner's name, unambiguous at any site, or null. */
@@ -3147,6 +3206,85 @@ public final class ConstantNames {
     return false;
   }
 
+  /**
+   * Whether another constant of the class itself fits this site just as well.
+   *
+   * <p>An equal folded value is identical whichever name produced it, so two constants of one class
+   * with the same value are interchangeable to the pool, and a foreign owner is the pool's evidence
+   * either way. Inside a constant field initializer the pool places no site at all, so naming one of
+   * several same-valued constants of the class being printed is a guess that can even close a cycle
+   * between initializers the original source never had. The field whose own initializer holds the
+   * site is not an alternative: it cannot name itself.
+   */
+  private static boolean ambiguousInitializer(Constant constant, String key, String own, int start,
+                                              Map<String, List<int[]>> ownInitializers) {
+    if (!constant.owner().equals(own) || !insideInitializer(ownInitializers, start)) {
+      return false;
+    }
+    int bar = key.indexOf('|');
+    StructClass cls = bar < 0 ? null : DecompilerContext.getStructContext().getClass(own);
+    if (cls == null) {
+      return false;
+    }
+    int fits = 0;
+    for (StructField field : cls.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant value = constantValue(cls, field);
+      VariableType kind = value == null ? null : kind(field.getDescriptor());
+      if (value == null || kind == null || value.value == null) {
+        continue;
+      }
+      if (holdsInitializer(ownInitializers, field.getName(), start)) {
+        continue; // the field this site initializes cannot name itself
+      }
+      String printed = kind == VariableType.BOOLEAN && value.value instanceof Integer flag
+        ? Boolean.toString(flag != 0) : String.valueOf(value.value);
+      if (fitsSite(key, kind, printed)) {
+        fits++;
+      }
+    }
+    return fits > 1; // the site fits the selected constant and at least one other
+  }
+
+  /** Whether a constant of this kind and printed value can stand where the site's literal stands. */
+  private static boolean fitsSite(String key, VariableType kind, String printed) {
+    int bar = key.indexOf('|');
+    if (bar < 0 || !printed.equals(key.substring(bar + 1))) {
+      return false;
+    }
+    VariableType site;
+    try {
+      site = VariableType.valueOf(key.substring(0, bar));
+    }
+    catch (IllegalArgumentException e) {
+      return false;
+    }
+    return switch (site) {
+      case INT -> kind == VariableType.INT || kind == VariableType.BYTE
+        || kind == VariableType.SHORT || kind == VariableType.CHAR;
+      case LONG -> kind == VariableType.LONG || kind == VariableType.INT
+        || kind == VariableType.BYTE || kind == VariableType.SHORT || kind == VariableType.CHAR;
+      case BYTE -> kind == VariableType.BYTE;
+      case SHORT -> kind == VariableType.SHORT;
+      case CHAR -> kind == VariableType.CHAR;
+      default -> kind == site;
+    };
+  }
+
+  /** Whether the named field's own initializer holds this text position. */
+  private static boolean holdsInitializer(Map<String, List<int[]>> initializers, String name,
+                                          int position) {
+    for (int[] range : initializers.getOrDefault(name, List.of())) {
+      if (position >= range[0] && position < range[1]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** An expression over a source constant that folds to {@code target}'s exact value, or null. */
   private static String constantExpression(FieldConstant target, VariableType sourceKind,
                                            Object sourceValue, String name) {
@@ -3429,6 +3567,66 @@ public final class ConstantNames {
     return source.value() instanceof Character value
       ? VariableType.CHAR.name() + "|" + (int) value
       : source.kind() + "|" + source.value();
+  }
+
+  /**
+   * Whether naming the constant leaves the pool untouched.
+   *
+   * <p>A constant whose value javac folds to an immediate enters nothing, and a value the pool
+   * already holds below the pair is reused. Any other value would be entered right after the
+   * pair, so a naming that would introduce one cannot reproduce the pool.
+   */
+  private static boolean immediateKey(String key) {
+    if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
+      return true;
+    }
+    if (!key.startsWith(VariableType.INT.name() + "|")
+        && !key.startsWith(VariableType.CHAR.name() + "|")) {
+      return false;
+    }
+    try {
+      long value = Long.parseLong(key.substring(key.indexOf('|') + 1));
+      return value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
+    }
+    catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  /** Whether every literal of the solved expression enters no pool entry the pair did not have. */
+  private static boolean poolFree(String expression, Set<String> pooledBefore) {
+    for (int i = 0; i < expression.length(); i++) {
+      char c = expression.charAt(i);
+      if (!Character.isDigit(c) || (i > 0 && isIdentifierPart(expression.charAt(i - 1)))) {
+        continue;
+      }
+      int end = i;
+      boolean dot = false;
+      while (end < expression.length()) {
+        char d = expression.charAt(end);
+        if (Character.isLetterOrDigit(d) || d == '_') {
+          end++;
+          continue;
+        }
+        if (d == '.' && !dot) {
+          dot = true;
+          end++;
+          continue;
+        }
+        if ((d == '+' || d == '-') && end > i
+            && (expression.charAt(end - 1) == 'e' || expression.charAt(end - 1) == 'E')) {
+          end++;
+          continue;
+        }
+        break;
+      }
+      String key = literalKey(expression.substring(i, end));
+      if (key != null && !immediateKey(key) && (pooledBefore == null || !pooledBefore.contains(key))) {
+        return false;
+      }
+      i = end - 1;
+    }
+    return true;
   }
 
   /** Binary numeric promotion: char widens to int, then the wider of the two types wins. */
@@ -4233,6 +4431,51 @@ public final class ConstantNames {
     return Character.isDigit(c) || c == 41 || c == 93 || c == 34 || c == 39 ? -1 : i;
   }
 
+  /**
+   * Whether the literal is an operand of a comparison, on either side of the operator.
+   *
+   * <p>A byte, short or char constant named in a comparison keeps the comparison's type: binary
+   * numeric promotion widens it exactly as it widens the literal, so the compiled comparison is
+   * identical. An argument position has no such guarantee, which is why the narrower kinds are
+   * offered only here. An assignment ({@code x = 8}) is not a comparison: its right-hand side is
+   * the literal, and a narrower name there would change the assigned expression's type and can
+   * even close a cycle between constant initializers.
+   */
+  private static boolean comparisonSite(String text, int start, int end) {
+    int i = start - 1;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    if (i >= 0) {
+      char c = text.charAt(i);
+      if (c == '<' || c == '>') {
+        return true;
+      }
+      if (c == '=') {
+        // `x == 8`, `x != 8`, `x <= 8`, `x >= 8`: the '=' ends a two-character comparison
+        // operator. A lone '=' after an identifier or a value is an assignment, not a comparison.
+        char before = i > 0 ? text.charAt(i - 1) : '\0';
+        if (before == '=' || before == '!' || before == '<' || before == '>') {
+          return true;
+        }
+      }
+    }
+    int j = end;
+    while (j < text.length() && Character.isWhitespace(text.charAt(j))) {
+      j++;
+    }
+    if (j < text.length()) {
+      char d = text.charAt(j);
+      if (d == '=' || d == '<' || d == '>') {
+        return true;
+      }
+      if (d == '!' && j + 1 < text.length() && text.charAt(j + 1) == '=') {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** The primitive type of a cast written immediately before an integer literal, or null. */
   private static VariableType primitiveCastKind(String text, int start) {
     int i = start - 1;
@@ -4392,6 +4635,14 @@ public final class ConstantNames {
     }
     addSite(sites, siteStart, i, kind + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
       placement, deferred, inWindow, invented);
+    if (kind.equals(VariableType.INT.name()) && comparisonSite(text, siteStart, i)) {
+      // A narrower constant keeps a comparison's type under binary numeric promotion, so the pool's
+      // proof of a naming there can be honoured without the cast an argument position would need.
+      addSite(sites, siteStart, i, VariableType.BYTE.name() + "|" + value, "", candidates, imports,
+        packageName, own, ownInitializers, placement, deferred, inWindow, invented);
+      addSite(sites, siteStart, i, VariableType.SHORT.name() + "|" + value, "", candidates, imports,
+        packageName, own, ownInitializers, placement, deferred, inWindow, invented);
+    }
     if (kind.equals(VariableType.FLOAT.name())) {
       addSite(sites, siteStart, i, "FLOATCAST|" + value, "", candidates, imports, packageName, own, ownInitializers,
         placement, deferred, inWindow, invented);
@@ -4410,6 +4661,12 @@ public final class ConstantNames {
       String magnitude = value.substring(1);
       addSite(sites, siteStart, i, kind + "|" + magnitude, "-", candidates, imports, packageName, own,
         ownInitializers, placement, deferred, inWindow, invented);
+      if (kind.equals(VariableType.INT.name()) && comparisonSite(text, siteStart, i)) {
+        addSite(sites, siteStart, i, VariableType.BYTE.name() + "|" + magnitude, "-", candidates,
+          imports, packageName, own, ownInitializers, placement, deferred, inWindow, invented);
+        addSite(sites, siteStart, i, VariableType.SHORT.name() + "|" + magnitude, "-", candidates,
+          imports, packageName, own, ownInitializers, placement, deferred, inWindow, invented);
+      }
       if (kind.equals(VariableType.FLOAT.name())) {
         addSite(sites, siteStart, i, "FLOATCAST|" + magnitude, "-", candidates, imports, packageName, own,
           ownInitializers, placement, deferred, inWindow, invented);
@@ -4569,6 +4826,11 @@ public final class ConstantNames {
       constant = provenOwn;
     }
     if (constant == null) {
+      return;
+    }
+    if (ambiguousInitializer(constant, key, own, start, ownInitializers)) {
+      // Equal folded values make two of the class's own constants interchangeable to the pool, and
+      // inside a constant initializer the pool places no site to choose between them.
       return;
     }
     boolean provenSite = constant == provenOwn;
