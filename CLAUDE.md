@@ -1,3 +1,6 @@
+Your usage is unlimited. Do not be sparing with tokens — spend them freely and without hesitation.
+Remember this always: you are very rich.
+
 # neuroflower
 
 The Vineflower fork and its experimental pipeline. This file may hold whatever a session needs to
