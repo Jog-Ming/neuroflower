@@ -25,6 +25,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAUConstructorSp
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SimpleSSAReassign;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -83,6 +84,16 @@ public class FinallyProcessor {
 
           Integer var = this.finallyBlocks.get(handler);
           fin.setMonitor(var == null ? null : new VarExprent(var, VarType.VARTYPE_INT, this.varProcessor));
+
+          // The body may hold one try/catch whose catch the source wrote on this same try. The
+          // class file decides: a nested try inside the outer try puts the whole inner statement —
+          // handler included — under the catch-all range, so a range spans the handler's offset.
+          // In a single try/catch/finally no catch-all range strictly contains it; the range ends
+          // before the handler or begins at it.
+          Statement sole = CatchAllStatement.soleCatch(fin.getFirst());
+          if (sole instanceof CatchStatement catchStat) {
+            fin.setMergeCatch(CatchAllStatement.finallySpansNoCatchHandler(catchStat, mt));
+          }
         } else {
           // Check if this is a finally statement.
           Record inf = this.getFinallyInformation(cl, mt, root, fin);
