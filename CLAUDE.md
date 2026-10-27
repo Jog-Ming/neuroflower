@@ -122,7 +122,3 @@ iteration loop; score the whole goal set only after a batch of large gains.
 **Changing this interface means changing this block.** Any new, removed or renamed command, flag or
 default must be reflected here in the same change; an out-of-date usage block is a broken interface.
 
-## Naming
-
-Modules carry both a neural and a botanical meaning where such a word exists (`amygdala`, `cortex`,
-`hippocampus`; `dendron`, `auxin`, `meristem`).
