@@ -51,6 +51,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> BRANCH_STARTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Target of each goto, by its start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> GOTO_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** For each switch instruction (by start offset): its default target, then its keyed targets. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> SWITCH_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Offsets just past an inlined copy of a finally body, per method. */
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> FINALLY_COPY_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The method's last instruction start offset. */
@@ -76,6 +78,7 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
+    java.util.Map<Integer, int[]> switches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     for (int i = 0; i < seq.length(); i++) {
@@ -91,6 +94,27 @@ public final class RoundTrip {
       }
       if (instr.opcode == CodeConstants.opc_return) {
         returns.set(instr.startOffset);
+      }
+      // A switch's case targets are the arm entry points the CFG no longer keeps: an arm that
+      // prints nothing still entered its block here, and which block that was decides if the
+      // source wrote a bare `break;` there.
+      if (instr instanceof org.jetbrains.java.decompiler.code.SwitchInstruction sw) {
+        int[] dests = sw.getDestinations();
+        int fallback = sw.getDefaultDestination();
+        if (dests != null && fallback >= 0 && fallback < seq.length()) {
+          int[] targets = new int[dests.length + 1];
+          targets[0] = seq.getInstr(fallback).startOffset;
+          for (int d = 0; d < dests.length; d++) {
+            if (dests[d] < 0 || dests[d] >= seq.length()) {
+              targets = null;
+              break;
+            }
+            targets[d + 1] = seq.getInstr(dests[d]).startOffset;
+          }
+          if (targets != null) {
+            switches.put(instr.startOffset, targets);
+          }
+        }
       }
       // `store N; load N; return`: javac's copy of a value the source kept in a variable. The
       // printer folded the copy away; the slot's LVT entry proves the variable existed.
@@ -232,6 +256,7 @@ public final class RoundTrip {
     FINALLY_COPY_ENDS.put(method, copyEnds);
     LAST_INSTRUCTION.put(method, seq.length() == 0 ? -1 : seq.getInstr(seq.length() - 1).startOffset);
     GOTO_TARGETS.put(method, gotos);
+    SWITCH_TARGETS.put(method, switches);
     BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
   }
@@ -3023,6 +3048,30 @@ public final class RoundTrip {
     return slots;
   }
 
+  /**
+   * True when a local this arm declares is still in the target's table at {@code offset}: its
+   * entry closes after the jump, so the arm's block was still open there — the source wrote the
+   * {@code break;} inside the brace rather than after it.
+   */
+  public static boolean declaredScopePast(Statement arm, int offset) {
+    if (arm == null || offset < 0) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table =
+      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = firstOffset(arm);
+    int end = lastOffset(arm);
+    if (start < 0 || end < 0) {
+      return false;
+    }
+    return table.getRange(start, Integer.MAX_VALUE)
+      .anyMatch(v -> v.getStart() >= start && v.getStart() <= end && v.getEnd() > offset);
+  }
+
   /** Last instruction end covered by a statement, or -1. */
   public static int blockEnd(Statement stat) {
     return stat == null ? -1 : lastEnd(stat);
@@ -3270,12 +3319,85 @@ public final class RoundTrip {
   public static boolean jumpsFromEnd(Statement statement, int target) {
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
-    int end = lastInstructionEnd(statement);
-    if (gotos == null || end < 0 || target < 0) {
+    if (gotos == null || target < 0) {
       return false;
     }
-    Integer landed = gotos.get(end);
-    return landed != null && landed == target;
+    for (int end : new int[]{lastInstructionEnd(statement), sinkEnd(statement)}) {
+      Integer landed = end < 0 ? null : gotos.get(end);
+      if (landed != null && landed == target) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The end offset of a value sink the printer folded into this statement's last call: a call
+   * whose result nothing reads keeps a `pop` of its own, so a jump the source wrote after the
+   * statement starts one instruction further than the exprent's own bytes end.
+   */
+  private static int sinkEnd(Statement statement) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    BitSet sinks = method == null ? null : VALUE_SINKS.get(method);
+    int start = statement == null ? -1 : lastOffsetDeep(statement);
+    if (ends == null || sinks == null || start < 0) {
+      return -1;
+    }
+    Integer end = ends.get(start);
+    if (end == null || !sinks.get(end)) {
+      return -1;
+    }
+    Integer after = ends.get(end);
+    return after == null ? -1 : after;
+  }
+
+  /** The offset of the goto that starts where this statement's last instruction ends, or -1. */
+  public static int tailJumpOffset(Statement statement) {
+    int end = lastInstructionEnd(statement);
+    if (jumpTargetAt(end) >= 0) {
+      return end;
+    }
+    int sunk = sinkEnd(statement);
+    return jumpTargetAt(sunk) >= 0 ? sunk : -1;
+  }
+
+  /** The target of the goto that starts where this statement's last instruction ends, or -1. */
+  public static int tailJumpTarget(Statement statement) {
+    return jumpTargetAt(tailJumpOffset(statement));
+  }
+
+  /** The target of the goto starting exactly at this offset, or -1 when none starts there. */
+  public static int jumpTargetAt(int offset) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (gotos == null || offset < 0) {
+      return -1;
+    }
+    Integer landed = gotos.get(offset);
+    return landed == null ? -1 : landed;
+  }
+
+  /**
+   * The targets of the switch instruction starting at this offset: the default target first, then
+   * the keyed targets in table order (the same order the head's successor edges are stored in), or
+   * null when the method recorded no such instruction.
+   */
+  public static int[] switchTargetsAt(int offset) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, int[]> switches = method == null ? null : SWITCH_TARGETS.get(method);
+    return switches == null || offset < 0 ? null : switches.get(offset);
+  }
+
+  /** True when {@code target} is where a {@code continue} of an enclosing loop would land. */
+  public static boolean enclosingContinueTarget(Statement statement, int target) {
+    for (Statement cur = statement == null ? null : statement.getParent(); cur != null; cur = cur.getParent()) {
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
+          && isContinueTarget(loop, target)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
