@@ -209,6 +209,16 @@ public class SwitchStatement extends Statement {
       }
     }
 
+    // The class file's default target is the join: a value matching no label lands past the
+    // switch, so the source wrote no `default:` group whose block this switch owns. The tree
+    // nonetheless hangs the default edge off an arm when that arm's block holds none of its
+    // instructions — a case whose jump to the join was elided, or the join block itself — and
+    // printing the label there is what a recompiled table would take as the default's target.
+    // Whether the source wrote a trailing `default: break;` is the rule below's decision.
+    boolean defaultIsJoin = switchEnd >= 0 && defaultTargetOffset() == switchEnd
+      && RoundTrip.selector("switchbreak") && RoundTrip.selector("switchdefault")
+      && !yields && !isPattern() && caseGuards.stream().noneMatch(Objects::nonNull);
+
     boolean defaultPrinted = false;
     boolean lastJoins = false;
     for (int i : order) {
@@ -221,8 +231,13 @@ public class SwitchStatement extends Statement {
       List<Exprent> values = caseValues.get(i);
       Exprent guard = caseGuards.size() > i ? caseGuards.get(i) : null;
 
+      boolean anyLabel = false;
       for (int j = 0; j < edges.size(); j++) {
         if (edges.get(j) == defaultEdge) {
+          if (defaultIsJoin) {
+            continue;
+          }
+          anyLabel = true;
           defaultPrinted = true;
           buf.appendIndent(indent + 1).append("default:");
           if (braced.contains(stat) && j == edges.size() - 1) {
@@ -231,6 +246,7 @@ public class SwitchStatement extends Statement {
 
           buf.appendLineSeparator();
         } else {
+          anyLabel = true;
           Exprent value = values.get(j);
 
           buf.appendIndent(indent + 1).append("case ");
@@ -265,6 +281,12 @@ public class SwitchStatement extends Statement {
           }
           buf.appendLineSeparator();
         }
+      }
+
+      // Every label this arm carried was the joined default, which the source did not write
+      // here: the arm is no group at all, and its body would attach to the arm before it.
+      if (!anyLabel) {
+        continue;
       }
 
       TextBuffer armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
