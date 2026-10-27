@@ -21,6 +21,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SynchronizedStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 
 import java.util.ArrayList;
@@ -281,25 +283,25 @@ public final class LocalDeclarationOrder {
    */
   private static List<Position> declarationOrder(Statement seq, VarProcessor varproc) {
     List<Position> order = new ArrayList<>();
-    addPositions(order, seq.getVarDefinitions(), varproc);
+    addPositions(order, seq, seq.getVarDefinitions(), varproc);
     for (Statement child : seq.getStats()) {
       if (child.type == Statement.StatementType.GENERAL || child.type == Statement.StatementType.DUMMY_EXIT) {
         continue;
       }
-      addPositions(order, child.getVarDefinitions(), varproc);
+      addPositions(order, child, child.getVarDefinitions(), varproc);
       if (child.type == Statement.StatementType.BASIC_BLOCK) {
         List<Exprent> exprents = child.getExprents();
         if (exprents != null) {
-          addPositions(order, exprents, varproc);
+          addPositions(order, child, exprents, varproc);
         }
       }
       else if (child instanceof IfStatement ifStatement) {
         Statement head = ifStatement.getFirst();
         if (head != null && head.type == Statement.StatementType.BASIC_BLOCK) {
-          addPositions(order, head.getVarDefinitions(), varproc);
+          addPositions(order, ifStatement, head.getVarDefinitions(), varproc);
           List<Exprent> exprents = head.getExprents();
           if (exprents != null) {
-            addPositions(order, exprents, varproc);
+            addPositions(order, ifStatement, exprents, varproc);
           }
         }
       }
@@ -307,11 +309,11 @@ public final class LocalDeclarationOrder {
     return order;
   }
 
-  private static void addPositions(List<Position> order, List<Exprent> exprents, VarProcessor varproc) {
+  private static void addPositions(List<Position> order, Statement owner, List<Exprent> exprents, VarProcessor varproc) {
     for (int i = 0; i < exprents.size(); i++) {
       Exprent exprent = exprents.get(i);
       if (exprent != null) {
-        order.add(new Position(exprent, exprents, declarationSlot(exprent, varproc)));
+        order.add(new Position(exprent, exprents, declarationSlot(exprent, varproc), owner, -1));
       }
     }
   }
@@ -338,10 +340,15 @@ public final class LocalDeclarationOrder {
       if (slot < 0) {
         continue;
       }
+      // javac reserves a local's slot at its declaration, so a slot freed by an earlier local
+      // (a differently named one: javac writes a row per scope range, and the same name is one
+      // variable) proves this declaration came after that local's scope closed. The landing
+      // point must lie past it; a declaration printed inside the dead scope cannot be ours.
+      int deadEnd = slotReuseEnd(var);
 
       Position earliest = null;
       for (int j = 0; j < i; j++) {
-        if (order.get(j).slot > slot) {
+        if (order.get(j).slot > slot && afterDeadScope(order.get(j), deadEnd)) {
           earliest = order.get(j);
           break;
         }
@@ -368,16 +375,17 @@ public final class LocalDeclarationOrder {
         continue;
       }
 
-      debug(method, var, "hoisted from slot-" + slot + " past slot-" + earliest.slot);
+      debug(method, var, "hoisted from slot-" + slot + " past slot-" + earliest.slot
+        + (deadEnd >= 0 ? " after dead scope " + deadEnd : ""));
       if (position.exprent == var) {
-        hoisted.add(position);
+        hoisted.add(new Position(position.exprent, position.list, slot, position.owner, deadEnd));
       } else {
         // An initialized declaration: the table proves the variable was declared before an
         // earlier one, so hoist the declaration bare and leave the store as an assignment. Only
         // the declaration order moves; the value is still computed where it was printed.
         VarExprent bare = (VarExprent) var.copy();
         var.setDefinition(false);
-        hoisted.add(new Position(bare, position.list, slot));
+        hoisted.add(new Position(bare, position.list, slot, position.owner, deadEnd));
       }
     }
 
@@ -388,33 +396,44 @@ public final class LocalDeclarationOrder {
     for (Position position : hoisted) {
       removeIdentity(position.list, position.exprent);
     }
-    hoisted.sort((a, b) -> Integer.compare(a.slot, b.slot));
+    // Higher slots first, so a declaration that is itself being hoisted is already back in the
+    // printed order when a lower one looks for the declaration it must precede.
+    hoisted.sort((a, b) -> Integer.compare(b.slot, a.slot));
 
     if (delegation != null) {
       // `this(...)`/`super(...)` must stay the constructor's first statement; the source
-      // declared the hoisted locals right after it.
+      // declared the hoisted locals right after it. Each one is inserted at the same index,
+      // which turns the descending walk back into slot order.
       List<Exprent> body = delegation.list;
       int at = indexOfIdentity(body, delegation.exprent) + 1;
       if (at <= 0) {
         at = body.size(); // unreachable: never place a declaration before the delegation
       }
       for (Position position : hoisted) {
-        body.add(at++, position.exprent);
+        body.add(at, position.exprent);
       }
       return;
     }
 
+    // The source declared each variable just above the first declaration whose slot is higher:
+    // the table's slot order is the source order. Placing a declaration at the sequence's top
+    // would print it above every earlier declaration and diverge from the target.
     for (Position position : hoisted) {
-      List<Exprent> definitions = seq.getVarDefinitions();
-      int at = definitions.size();
-      for (int i = 0; i < definitions.size(); i++) {
-        int slot = declarationSlot(definitions.get(i), varproc);
-        if (slot > position.slot) {
-          at = i;
+      Position anchor = null;
+      for (Position candidate : declarationOrder(seq, varproc)) {
+        if (candidate.slot > position.slot && afterDeadScope(candidate, position.deadEnd)) {
+          anchor = candidate;
           break;
         }
       }
-      definitions.add(at, position.exprent);
+      if (anchor == null) {
+        // Nothing higher prints after the dead scope any more; the declaration is put back
+        // where it printed before. The slot table offers no landing point that keeps its slot.
+        position.list.add(position.exprent);
+        continue;
+      }
+      int at = indexOfIdentity(anchor.list, anchor.exprent);
+      anchor.list.add(at < 0 ? anchor.list.size() : at, position.exprent);
     }
   }
 
@@ -947,11 +966,17 @@ public final class LocalDeclarationOrder {
     final Exprent exprent;
     final List<Exprent> list;
     final int slot;
+    /** The statement holding the list, for the offset the declaration prints at. */
+    final Statement owner;
+    /** The end offset of the scope this variable's slot came from, or -1. */
+    final int deadEnd;
 
-    Position(Exprent exprent, List<Exprent> list, int slot) {
+    Position(Exprent exprent, List<Exprent> list, int slot, Statement owner, int deadEnd) {
       this.exprent = exprent;
       this.list = list;
       this.slot = slot;
+      this.owner = owner;
+      this.deadEnd = deadEnd;
     }
   }
 
@@ -989,6 +1014,58 @@ public final class LocalDeclarationOrder {
       return var;
     }
     return null;
+  }
+
+  /**
+   * The end offset of the scope whose freed slot this variable took, or -1 when its slot was
+   * freshly allocated. javac reserves a local's slot at its declaration, so a different local
+   * owning the same slot earlier proves the declaration came after that scope closed. A row
+   * carrying the same name is one source variable whose scope is discontinuous (javac writes a
+   * row per range), not a second owner of the slot.
+   */
+  private static int slotReuseEnd(VarExprent var) {
+    LocalVariable lvt = var.getLVT();
+    if (lvt == null) {
+      return -1;
+    }
+    MethodWrapper wrapper = (MethodWrapper)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    if (wrapper == null || wrapper.methodStruct == null) {
+      return -1;
+    }
+    StructLocalVariableTableAttribute table = wrapper.methodStruct.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    int end = -1;
+    for (LocalVariable other : table.getVariables().toList()) {
+      if (other.getIndex() == lvt.getIndex()
+        && !java.util.Objects.equals(other.getName(), lvt.getName())
+        && other.getEnd() <= lvt.getStart()) {
+        end = Math.max(end, other.getEnd());
+      }
+    }
+    return end;
+  }
+
+  /** Whether a declaration printed at this position lies past the dead scope's end. */
+  private static boolean afterDeadScope(Position candidate, int deadEnd) {
+    if (deadEnd < 0) {
+      return true;
+    }
+    // The target's end offset is exclusive: an instruction at exactly that offset is past the
+    // scope. An initialized declaration prints at its own first instruction; a bare one has none,
+    // so the statement holding it stands in.
+    int offset = printedOffset(candidate.exprent);
+    if (offset < 0 && candidate.owner != null) {
+      offset = RoundTrip.firstOffset(candidate.owner);
+    }
+    return offset >= 0 && offset >= deadEnd;
+  }
+
+  private static int printedOffset(Exprent exprent) {
+    java.util.BitSet offsets = new java.util.BitSet();
+    exprent.getBytecodeRange(offsets);
+    return offsets.nextSetBit(0);
   }
 
   private static int slotOf(VarExprent var, VarProcessor varproc) {
