@@ -1988,6 +1988,42 @@ public final class RoundTrip {
   }
 
   /**
+   * Records that this exit's instruction is already accounted for by the form the printer emits, so
+   * it must not be printed a second time. A compact record constructor's implicit return is the
+   * caller: the closing brace stands for it, and the tree keeps the exprent.
+   */
+  public static void consumeExit(StructMethod method, Exprent exit) {
+    if (method == null || exit == null || exit.bytecode == null) {
+      return;
+    }
+    for (int offset = exit.bytecode.nextSetBit(0); offset >= 0; offset = exit.bytecode.nextSetBit(offset + 1)) {
+      markGuardExit(method, offset);
+    }
+  }
+
+  /** True when this exprent is an exit whose instruction a printed form already accounts for. */
+  public static boolean isConsumedExit(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || !(exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent)) {
+      return false;
+    }
+    BitSet offsets = exprent.bytecode;
+    if (offsets == null) {
+      return false;
+    }
+    java.util.Set<Integer> consumed = CONSUMED_GUARD_EXITS.get(method);
+    if (consumed == null || consumed.isEmpty()) {
+      return false;
+    }
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      if (consumed.contains(offset)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * True when this statement is a single exit already printed as a guard: the guard made the rest of
    * the sequence unconditional, so the same return instruction must not be printed again.
    */

@@ -1270,6 +1270,11 @@ public class ExprProcessor implements CodeConstants {
     lst = Exprent.sortIndexed(lst);
 
     for (Exprent expr : lst) {
+      // The form being printed already stands for this exit (a compact record constructor's
+      // implicit return); printing the exprent would add a statement the source does not have.
+      if (RoundTrip.isConsumedExit(expr)) {
+        continue;
+      }
       if (buf.length() > 0 && expr instanceof VarExprent && ((VarExprent)expr).isClassDef()) {
         // separates local class definition from previous statements
         buf.appendLineSeparator();

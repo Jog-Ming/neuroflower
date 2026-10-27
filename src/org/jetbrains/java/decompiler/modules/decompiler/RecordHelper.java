@@ -351,7 +351,19 @@ public final class RecordHelper {
         if (found ||
             block.getExprents().size() < components.size()) return false;
 
-        int offset = block.getExprents().size() - components.size();
+        // A validating compact constructor ends with javac's implicit return, which the closing
+        // brace stands for; the assignments to match sit just before it.
+        int end = block.getExprents().size();
+        Exprent trailing = block.getExprents().get(end - 1);
+        boolean implicitReturn = trailing instanceof ExitExprent exitExprent
+            && exitExprent.getExitType() == ExitExprent.Type.RETURN
+            && exitExprent.getValue() == null;
+        if (implicitReturn) {
+          end--;
+        }
+        if (end < components.size()) return false;
+
+        int offset = end - components.size();
         int lastIndex = 0;
         for (int i = 0; i < components.size(); i++) {
           // Check for this.<field> = <parameter>
@@ -368,6 +380,9 @@ public final class RecordHelper {
           int index = ((VarExprent) right).getIndex();
           if (index <= lastIndex) return false;
           lastIndex = index;
+        }
+        if (implicitReturn) {
+          RoundTrip.consumeExit(mw.methodStruct, trailing);
         }
         found = true;
       }
