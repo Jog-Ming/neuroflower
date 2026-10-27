@@ -1,8 +1,8 @@
 # neuroflower
 
-The Vineflower fork and its experimental pipeline. This file holds only conventions that outlive any
-particular stage; project facts — numbers, commands, file paths, the current objective and where the
-work stands — belong in project memory.
+The Vineflower fork and its experimental pipeline. This file may hold whatever a session needs to
+work correctly — conventions, the pipeline's interface, current facts, numbers and paths — and it is
+allowed to change as the work does.
 
 ## Rules
 
