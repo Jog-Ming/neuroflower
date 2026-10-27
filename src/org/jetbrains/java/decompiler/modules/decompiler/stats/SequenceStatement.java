@@ -761,6 +761,34 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (C) { rest } tail`: the target's last condition branch lands on the rest, which javac
+      // only does for the arm the source wrote after the test, so the source wrote the negated
+      // test with the tail first: `if (!C) { tail } rest`. Both arms have to leave on their own —
+      // otherwise one printed form falls into the other arm the other does not reach — and no
+      // local the tail declares may be read after it, since its scope ends at the brace.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !ifStatement.isPatternMatched()
+          && ifStatement.getIfstat() != null && cannotComplete(ifStatement.getIfstat())
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && RoundTrip.swapIfArmsByLastTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat())) {
+        Statement tail = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        if (cannotComplete(tail) && !tailLocalsUsedAfter(tail, ifStatement.getIfstat())) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          for (int k = i + 1; k < stats.size(); k++) {
+            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+          }
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          notempty = true;
+          break;
+        }
+      }
+
       TextBuffer str = ExprProcessor.jmpWrapper(st, indent, false);
 
       if (i > 0 && !str.containsOnlyWhitespaces() && notempty) {
@@ -1165,6 +1193,17 @@ public class SequenceStatement extends Statement {
     }
     for (int k = from; k < stats.size(); k++) {
       if (readsVariable(stats.get(k), variable.getIndex(), variable.getVersion())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** True when a local the tail declares is read by the statement printed after the guard. */
+  private static boolean tailLocalsUsedAfter(Statement tail, Statement after) {
+    for (Exprent exprent : allExprents(tail)) {
+      if (exprent instanceof VarExprent variable && variable.isDefinition()
+          && readsVariable(after, variable.getIndex(), variable.getVersion())) {
         return true;
       }
     }

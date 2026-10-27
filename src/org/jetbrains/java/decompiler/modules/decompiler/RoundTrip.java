@@ -504,6 +504,68 @@ public final class RoundTrip {
     return or ? target == thenStart : target == elseStart;
   }
 
+  /** The first instruction offset a statement covers, including its condition's operands. */
+  public static int statementOffset(Statement statement) {
+    if (statement == null) {
+      return -1;
+    }
+    BitSet bits = new BitSet();
+    statement.getOffset(bits);
+    return bits.nextSetBit(0);
+  }
+
+  /**
+   * True when the head's last condition branch lands on the first instruction of the arm the tree
+   * prints as its then arm. javac sends a condition's last test to the else arm (or to the
+   * statement after an else-less if), never to the then arm, so a branch that lands there proves
+   * the tree labelled the arms the wrong way round: the source wrote the disjunction positively
+   * with this arm after the other one. The head has to carry the whole printed condition; a head
+   * that merged another statement's test spans offsets the condition's own operands do not.
+   */
+  public static boolean swapIfArmsByLastTarget(Exprent head, Statement thenArm) {
+    if (!selector("ifarmtarget") || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || thenArm == null || ifHead.bytecode == null || ifHead.bytecode.isEmpty()) {
+      return false;
+    }
+    Exprent condition = ifHead.getCondition();
+    if (condition == null || declaresPatternVariable(condition)) {
+      return false;
+    }
+    BitSet conditionRange = new BitSet();
+    condition.getBytecodeRange(conditionRange);
+    if (conditionRange.isEmpty() || conditionRange.length() != ifHead.bytecode.length()) {
+      return false;
+    }
+    // An unconditional jump inside the test region is the `continue`/`break` of a guard the tree
+    // merged into this condition: the source wrote several statements, not one disjunction.
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos != null) {
+      for (int at = ifHead.bytecode.nextSetBit(0); at >= 0 && at < ifHead.bytecode.length();
+           at = ifHead.bytecode.nextSetBit(at + 1)) {
+        if (gotos.containsKey(at)) {
+          return false;
+        }
+      }
+    }
+    int target = lastBranchTarget(ifHead.bytecode);
+    return target > 0 && target == statementOffset(thenArm);
+  }
+
+  /** Whether the expression declares a pattern variable of its own. */
+  private static boolean declaresPatternVariable(Exprent exprent) {
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** The destination of the last conditional branch inside these offsets, or -1. */
   private static int lastBranchTarget(BitSet bytecode) {
     StructMethod method = currentMethod();

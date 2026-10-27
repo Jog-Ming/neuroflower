@@ -306,10 +306,15 @@ public class IfStatement extends Statement {
     }
 
     // `if (C) A else B` and `if (!C) B else A` are the same program in different bytes; the target's
-    // branch opcode or the arm lines' order says which one was written.
-    if (ifstat != null && elsestat != null && !(elsestat instanceof IfStatement)
+    // branch opcode, the arms' lines, or the last condition branch says which one was written. A
+    // last branch that lands on the arm the tree prints as then contradicts the test printed there
+    // whenever the condition is a disjunction, so the arms come back the other way round; an else-if
+    // chain takes the same repair, its nested if being just this test's else arm.
+    if (ifstat != null && elsestat != null
         && condition instanceof IfExprent ifHead
-        && (RoundTrip.swapIfArms(ifHead)
+        && ((!isLabeled() && !isPatternMatched() && !declaresPattern(ifHead.getCondition())
+              && RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat))
+            || RoundTrip.swapIfArms(ifHead)
             || (RoundTrip.swapIfArmsByLine(ifstat, elsestat)
                 && !RoundTrip.polaritySelfConsistent(ifHead, ifstat, elsestat)))) {
       IfExprent head = (IfExprent) ifHead.copy();
@@ -322,7 +327,7 @@ public class IfStatement extends Statement {
       if (guard) {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
-      } else {
+      } else if (!printElseIfArm(buf, indent, ifstat)) {
         buf.appendIndent(indent).append("} else {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
         buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -396,17 +401,7 @@ public class IfStatement extends Statement {
     boolean elseif = false;
 
     if (elsestat != null) {
-      if (elsestat instanceof IfStatement
-          && elsestat.varDefinitions.isEmpty() && (elsestat.getFirst().getExprents() != null && elsestat.getFirst().getExprents().isEmpty()) &&
-          !elsestat.isLabeled() &&
-          (elsestat.getSuccessorEdges(STATEDGE_DIRECT_ALL).isEmpty()
-           || !elsestat.getSuccessorEdges(STATEDGE_DIRECT_ALL).get(0).explicit)) { // else if
-        buf.appendIndent(indent).append("} else ");
-
-        TextBuffer content = ExprProcessor.jmpWrapper(elsestat, indent, false);
-        content.setStart(TextUtil.getIndentString(indent).length());
-        buf.append(content);
-
+      if (printElseIfArm(buf, indent, elsestat)) {
         elseif = true;
       }
       else {
@@ -422,6 +417,26 @@ public class IfStatement extends Statement {
     if (!elseif) {
       buf.appendIndent(indent).append("}").appendLineSeparator();
     }
+  }
+
+  /**
+   * Prints `} else ` and the nested if when the arm still qualifies as an else-if chain, leaving
+   * the closing brace to the caller; false, printing nothing, otherwise.
+   */
+  private static boolean printElseIfArm(TextBuffer buf, int indent, Statement arm) {
+    if (arm instanceof IfStatement
+        && arm.varDefinitions.isEmpty() && (arm.getFirst().getExprents() != null && arm.getFirst().getExprents().isEmpty()) &&
+        !arm.isLabeled() &&
+        (arm.getSuccessorEdges(STATEDGE_DIRECT_ALL).isEmpty()
+         || !arm.getSuccessorEdges(STATEDGE_DIRECT_ALL).get(0).explicit)) { // else if
+      buf.appendIndent(indent).append("} else ");
+
+      TextBuffer content = ExprProcessor.jmpWrapper(arm, indent, false);
+      content.setStart(TextUtil.getIndentString(indent).length());
+      buf.append(content);
+      return true;
+    }
+    return false;
   }
 
   /**
