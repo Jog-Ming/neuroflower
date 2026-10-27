@@ -518,11 +518,7 @@ public class SwitchStatement extends Statement {
     return slots;
   }
 
-  /**
-   * The order the original source wrote the case bodies in. A switch instruction sorts its labels
-   * by value, so the bytecode cannot tell `case 40964:` before `case 40963:`; the target's line
-   * table can, because every body's first instruction carries the line of the statement behind it.
-   */
+  /** Collects the local names this arm declares at its own level, looking through nested statements. */
   private static void collectCaseNames(Statement stat, Set<String> names, SwitchStatement inner) {
     if (stat instanceof SwitchStatement) {
       inner = (SwitchStatement) stat; // an inner switch scopes its own arms
@@ -546,6 +542,71 @@ public class SwitchStatement extends Statement {
     }
   }
 
+  /**
+   * The offset of the block this arm's labels enter. The switch instruction's targets name it even
+   * when the arm prints no statement of its own: a dummy arm's range is empty, so its line would
+   * read as the method's first one. Falls back to the statement's range when the table cannot say.
+   */
+  private int entryOffset(int index) {
+    List<StatEdge> edges = index < caseEdges.size() ? caseEdges.get(index) : null;
+    SwitchInstruction instruction = switchInstruction();
+    int[] targets = instruction == null ? null : RoundTrip.switchTargetsAt(instruction.startOffset);
+    if (edges != null && !edges.isEmpty() && targets != null) {
+      List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+      int entry = -1;
+      for (StatEdge edge : edges) {
+        int at = successors.indexOf(edge);
+        if (at < 0 || at >= targets.length) {
+          entry = -1;
+          break;
+        }
+        if (entry < 0 || targets[at] < entry) {
+          entry = targets[at];
+        }
+      }
+      if (entry >= 0) {
+        return entry;
+      }
+    }
+    StartEndPair range = caseStatements.get(index).getStartEndRange();
+    return range == null ? -1 : range.start;
+  }
+
+  /**
+   * Whether the arms' line-table spans run forward in this order. The printed output can only
+   * push a line down, so an arm whose recorded body ends on a line past the next arm's start
+   * cannot be laid out in this sequence: something the source wrote after the switch was glued
+   * onto it. An arm that records no span at all puts nothing in the way.
+   */
+  private boolean spansRunForward(List<Integer> sorted, StructLineNumberTableAttribute table) {
+    int previous = -1;
+    for (int i : sorted) {
+      Statement stat = caseStatements.get(i);
+      int first = RoundTrip.firstOffset(stat);
+      int last = RoundTrip.lastOffset(stat);
+      if (first < 0 || last < first) {
+        continue;
+      }
+      int firstLine = table.findLineNumber(first);
+      int lastLine = table.findLineNumber(last);
+      if (firstLine < 0 || lastLine < 0) {
+        continue;
+      }
+      if (previous >= 0 && firstLine < previous) {
+        return false;
+      }
+      previous = Math.max(previous, lastLine);
+    }
+    return true;
+  }
+
+  /**
+   * The order the original source wrote the case bodies in. A switch instruction sorts its labels
+   * by value, so the bytecode cannot tell `case 40964:` before `case 40963:`; the target's line
+   * table can, because every body's first instruction carries the line of the statement behind it.
+   * The same holds for an enum label recovered from a synthetic map: its group's block sits where
+   * the source wrote it even though the table key is not the label.
+   */
   private List<Integer> sourceOrder() {
     int size = caseStatements.size();
     List<Integer> order = new ArrayList<>(size);
@@ -563,15 +624,15 @@ public class SwitchStatement extends Statement {
     // The target's arm blocks record the source order directly when the switch instruction's keys
     // are the labels themselves: a plain int switch or a direct ordinal switch. A `$SwitchMap`
     // enum switch keys its table with synthetic numbers and a string switch keys it with hashes,
-    // so there the labels prove nothing; those switches and pattern switches stay untouched.
+    // so there the keys prove nothing and the line table below decides.
     List<Integer> byOffset = offsetOrder();
     if (byOffset != null) {
       return byOffset;
     }
-    // Pattern labels, guards and `case null` have ordering rules of their own; only a plain
-    // constant switch may be written in an order the switch instruction does not define.
+    // Pattern labels, guards and `case null` have ordering rules of their own; a constant or an
+    // enum field is a label whose group the source may have written in any order.
     if (isPattern() || caseValues.stream().flatMap(List::stream)
-        .anyMatch(v -> v != null && (!(v instanceof ConstExprent) || ((ConstExprent)v).isNull()))) {
+        .anyMatch(v -> v != null && !labelOrdersByLine(v))) {
       return order;
     }
     StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
@@ -589,8 +650,7 @@ public class SwitchStatement extends Statement {
       if (stat == null) {
         return order;
       }
-      StartEndPair range = stat.getStartEndRange();
-      int line = range == null ? -1 : table.findLineNumber(range.start);
+      int line = table.findLineNumber(entryOffset(i));
       if (line < 0) {
         if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
           System.err.println("switch order skipped, line " + line + " case " + i + " of " + size);
@@ -600,6 +660,22 @@ public class SwitchStatement extends Statement {
       lines[i] = line;
     }
     order.sort(Comparator.comparingInt(i -> lines[i]));
+    // The line alignment only ever pushes a printed line down, so the sorted order has to run
+    // forward in the target's own spans too: an arm whose recorded body ends past the next arm's
+    // first line cannot be laid out where it would now print. That happens when the tree glued a
+    // statement the source wrote after the whole switch — a lambda's tail return, say — onto a
+    // group, and the written order is then not one this printer can reproduce.
+    if (!spansRunForward(order, table)) {
+      if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
+        System.err.println("switch order spans overlap " + method.getName() + method.getDescriptor()
+          + " lines " + java.util.Arrays.toString(lines) + " -> " + order);
+      }
+      List<Integer> unchanged = new ArrayList<>(size);
+      for (int i = 0; i < size; i++) {
+        unchanged.add(i);
+      }
+      return unchanged;
+    }
     if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
       System.err.println("switch order " + method.getName() + method.getDescriptor() + " lines "
         + java.util.Arrays.toString(lines) + " -> " + order);
@@ -666,6 +742,19 @@ public class SwitchStatement extends Statement {
       }
     }
     return order;
+  }
+
+  /**
+   * Whether this case label's arm order is the one the class file records: a constant, or the
+   * static field an enum switch was recovered to. Either way javac laid the group's block out
+   * where the source wrote it, so the line table orders it. A `case null` label or a pattern
+   * label follows rules of its own and stays in the key order.
+   */
+  private static boolean labelOrdersByLine(Exprent value) {
+    if (value instanceof ConstExprent constant) {
+      return !constant.isNull();
+    }
+    return value instanceof FieldExprent field && field.isStatic();
   }
 
   /** Whether a printed case label names the switch instruction's key at that position. */
