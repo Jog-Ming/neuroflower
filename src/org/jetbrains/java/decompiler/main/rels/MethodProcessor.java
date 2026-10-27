@@ -439,6 +439,12 @@ public class MethodProcessor implements Runnable {
     root = pctx.getRoot();
     debugCurrentlyDecompiling.set(root);
 
+    // A `dup; store N` leaves the same value on the stack and in local N; fold the stack copy
+    // back onto the local before definitions are chosen, so no synthetic name is declared.
+    if (DupStoreFolding.fold(root, mt)) {
+      decompileRecord.add("DupStoreFolding", root);
+    }
+
     varProc.setVarDefinitions(root);
     decompileRecord.add("SetVarDefinitions", root);
 

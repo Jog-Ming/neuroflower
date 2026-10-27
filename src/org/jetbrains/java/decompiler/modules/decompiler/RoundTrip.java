@@ -61,6 +61,10 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instructions that store or discard the stack's value: a call's result ends its statement here. */
   private static final java.util.Map<StructMethod, BitSet> VALUE_SINKS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** `dup; store N`: the duplicated value is the one the local N receives, keyed by the dup's start. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> DUP_STORES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Start offsets of every store to a slot, keyed by the slot. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, BitSet>> STORE_SITES = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -80,10 +84,24 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
     java.util.Map<Integer, int[]> switches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> dupStores = new java.util.HashMap<>();
+    java.util.Map<Integer, BitSet> storeSites = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode >= CodeConstants.opc_istore && instr.opcode <= CodeConstants.opc_astore) {
+        storeSites.computeIfAbsent(instr.operand(0), k -> new BitSet()).set(instr.startOffset);
+        // `dup; store N`: the duplicate on the stack and the local N are the same value version,
+        // so the store's own value is also the value the source assigned to N.
+        if (i > 0) {
+          int prev = seq.getInstr(i - 1).opcode;
+          if (prev == CodeConstants.opc_dup || prev == CodeConstants.opc_dup2) {
+            dupStores.put(instr.startOffset, instr.operand(0));
+          }
+        }
+
+      }
       if (instr.opcode >= CodeConstants.opc_istore && instr.opcode <= CodeConstants.opc_astore
         || instr.opcode == CodeConstants.opc_putfield || instr.opcode == CodeConstants.opc_putstatic
         || instr.opcode == CodeConstants.opc_pop || instr.opcode == CodeConstants.opc_pop2) {
@@ -117,7 +135,9 @@ public final class RoundTrip {
         }
       }
       // `store N; load N; return`: javac's copy of a value the source kept in a variable. The
-      // printer folded the copy away; the slot's LVT entry proves the variable existed.
+      // printer folded the copy away; the slot's LVT entry proves the variable existed. A store
+      // inside a try is not adjacent to the load, which sits after the catch: there the try body
+      // ends with `store N; goto L` and L is exactly `load N; return`.
       if (i >= 2 && instr.opcode >= CodeConstants.opc_ireturn && instr.opcode <= CodeConstants.opc_areturn) {
         Instruction load = seq.getInstr(i - 1);
         Instruction store = seq.getInstr(i - 2);
@@ -259,6 +279,8 @@ public final class RoundTrip {
     SWITCH_TARGETS.put(method, switches);
     BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
+    DUP_STORES.put(method, dupStores);
+    STORE_SITES.put(method, storeSites);
   }
 
   /**
@@ -1190,6 +1212,49 @@ public final class RoundTrip {
       }
     }
     return -1;
+  }
+
+  /** As {@link #lastInstructionStart(BitSet)} over an explicit method's instruction table. */
+  public static int lastInstructionStart(BitSet bytecode, StructMethod method) {
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null || bytecode == null) {
+      return -1;
+    }
+    for (int offset = bytecode.previousSetBit(Integer.MAX_VALUE); offset >= 0;
+         offset = bytecode.previousSetBit(offset - 1)) {
+      if (ends.containsKey(offset)) {
+        return offset;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The slot a {@code dup; store N} pair starting at this store offset writes, or -1. The
+   * duplicate on the operand stack and the local N are the same value version.
+   */
+  public static int dupStoreSlot(StructMethod method, int storeOffset) {
+    java.util.Map<Integer, Integer> map = method == null ? null : DUP_STORES.get(method);
+    Integer slot = map == null ? null : map.get(storeOffset);
+    return slot == null ? -1 : slot;
+  }
+
+  /** The offset just past the instruction at this start offset, or -1. */
+  public static int instructionEnd(StructMethod method, int offset) {
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    Integer end = ends == null ? null : ends.get(offset);
+    return end == null ? -1 : end;
+  }
+
+  /** Whether some store to {@code slot} starts after {@code from} and no later than {@code to}. */
+  public static boolean storedIn(StructMethod method, int slot, int from, int to) {
+    java.util.Map<Integer, BitSet> map = method == null ? null : STORE_SITES.get(method);
+    BitSet sites = map == null ? null : map.get(slot);
+    if (sites == null || to <= from) {
+      return false;
+    }
+    int next = sites.nextSetBit(from + 1);
+    return next >= 0 && next <= to;
   }
 
   /** Whether the instruction right after {@code offset} stores or discards the call's value. */
