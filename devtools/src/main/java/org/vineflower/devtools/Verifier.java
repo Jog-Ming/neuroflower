@@ -84,7 +84,17 @@ public final class Verifier {
     this.minecraft = minecraft;
   }
 
-  public List<FileResult> score(String version, Path target, String only, int threads, boolean json) throws Exception {
+  public List<FileResult> score(String version, Path target, String only, int threads, boolean json)
+      throws Exception {
+    return score(version, target, only, threads, json, null);
+  }
+
+  /**
+   * Scores a tree, and when {@code since} is given also lists which files changed relative to that
+   * earlier tree — the attribution half of an A/B, which the attribute counts cannot show.
+   */
+  public List<FileResult> score(String version, Path target, String only, int threads, boolean json,
+                                Path since) throws Exception {
     Path client = minecraft.clientJar(version, false);
     Path originalClasses = minecraft.extractedClasses(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
@@ -129,7 +139,124 @@ public final class Verifier {
     long totalClasses = Files.isDirectory(target) && only == null
       ? countClasses(originalClasses) : 0;
     report(version, target, results, elapsed, json, totalClasses);
+    if (since != null) {
+      System.out.print(treeSince(target, since));
+    }
     return results;
+  }
+
+  /**
+   * Which generated files differ between two trees. Both trees are content-addressed outputs of a
+   * decompile, so the comparison is a hash walk: no decompile, no compile, no verifier.
+   */
+  static String treeSince(Path current, Path previous) throws IOException {
+    Map<String, String> before = treeHashes(previous);
+    Map<String, String> now = treeHashes(current);
+    List<String> added = new ArrayList<>();
+    List<String> removed = new ArrayList<>();
+    List<String> changed = new ArrayList<>();
+    for (Map.Entry<String, String> entry : now.entrySet()) {
+      String old = before.get(entry.getKey());
+      if (old == null) {
+        added.add(entry.getKey());
+      } else if (!old.equals(entry.getValue())) {
+        changed.add(entry.getKey());
+      }
+    }
+    for (String key : before.keySet()) {
+      if (!now.containsKey(key)) {
+        removed.add(key);
+      }
+    }
+    StringBuilder out = new StringBuilder();
+    out.append(String.format(Locale.ROOT, "since %s:%n  %d changed, %d added, %d removed%n",
+      previous, changed.size(), added.size(), removed.size()));
+    listTreeChanges(out, "changed", changed);
+    listTreeChanges(out, "added", added);
+    listTreeChanges(out, "removed", removed);
+    return out.toString();
+  }
+
+  private static void listTreeChanges(StringBuilder out, String label, List<String> names) {
+    int shown = Math.min(names.size(), 40);
+    for (int i = 0; i < shown; i++) {
+      out.append("  ").append(label.charAt(0)).append(' ').append(names.get(i)).append('\n');
+    }
+    if (names.size() > shown) {
+      out.append("  ... ").append(names.size() - shown).append(" more ").append(label).append('\n');
+    }
+  }
+
+  private static Map<String, String> treeHashes(Path root) throws IOException {
+    Map<String, String> out = new java.util.TreeMap<>();
+    try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+      for (Path path : (Iterable<Path>) walk.filter(Files::isRegularFile)
+          .filter(p -> p.getFileName().toString().endsWith(".java"))::iterator) {
+        out.put(root.relativize(path).toString().replace('\\', '/'),
+          Workspace.sha256(Files.readAllBytes(path)));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * One class, verified and explained: every attribute and the per-method detail behind each
+   * failure. This is what a per-class A/B needs, in one process instead of a decompile, a compile
+   * and two {@code javap} runs.
+   */
+  public boolean diff(String version, Path tree, String only, int threads) throws Exception {
+    Path client = minecraft.clientJar(version, false);
+    Path originalClasses = minecraft.extractedClasses(version, false);
+    List<Path> classpath = minecraft.classpath(version, false);
+    int release = releaseOf(client);
+    String stamp = stamp(client, classpath, release);
+    List<Path> sources = sources(tree, only);
+    if (sources.isEmpty()) {
+      throw new IllegalArgumentException("no sources for " + only + " under " + tree);
+    }
+    System.out.println("tree:   " + tree);
+    boolean ok = true;
+    Path compileCache = workspace.cache.resolve("compile");
+    for (Path source : sources) {
+      System.out.println("source: " + tree.relativize(source));
+      FileResult result = scoreFile(source, originalClasses, classpath, release, stamp, compileCache);
+      for (String error : result.errors()) {
+        System.out.println("  error " + error);
+      }
+      for (ClassResult cls : result.classes()) {
+        if (cls.extra()) {
+          System.out.println(cls.name() + "  extra (no original class)");
+          ok = false;
+          continue;
+        }
+        if (!cls.compiled()) {
+          System.out.println(cls.name() + "  did not compile");
+          ok = false;
+          continue;
+        }
+        List<String> failed = new ArrayList<>();
+        for (String attribute : ClassDiff.ATTRIBUTES) {
+          if (!cls.flags().getOrDefault(attribute, false)) {
+            failed.add(attribute);
+          }
+        }
+        System.out.println(cls.name() + "  " + (failed.isEmpty() ? "identical" : String.join(",", failed)));
+        boolean structure = false;
+        for (String detail : cls.details()) {
+          if (detail.equals("bytes: raw bytes differ")) {
+            continue; // the strictest check; every other detail says what actually diverged
+          }
+          structure = true;
+          System.out.println("    " + detail);
+        }
+        if (!structure && failed.size() == 1 && failed.get(0).equals("bytes")) {
+          System.out.println("    every structural attribute matches: only the constant pool or its"
+            + " ordering differs");
+        }
+        ok &= failed.isEmpty();
+      }
+    }
+    return ok;
   }
 
   private FileResult scoreFile(Path source, Path originalClasses, List<Path> classpath, int release,

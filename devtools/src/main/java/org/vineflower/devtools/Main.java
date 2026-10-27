@@ -23,7 +23,8 @@ import java.util.concurrent.Future;
  *   versions [--no-cache]
  *   decompile &lt;version&gt; [--no-cache] [--threads N] [--only Class] [--options "..."]
  *   tree      &lt;version&gt; [--only Class]
- *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+ *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--since Tree]
+ *   diff      &lt;version&gt; &lt;Class&gt;
  *   compile   &lt;version&gt; &lt;Class&gt;
  *   corpus    &lt;version&gt; --ground-truth &lt;dir&gt;
  *   dataset   &lt;version&gt;
@@ -51,7 +52,9 @@ public final class Main {
 
     if (needsTargetJdk(command)) {
       List<String> targets = positionals(rest);
-      if (targets.size() == 1) {
+      // The first positional is the version for every command that needs the target JDK: a
+      // multi-version score and diff's <version> <Class> both name it first.
+      if (!targets.isEmpty()) {
         ensureTargetJdk(minecraft, targets.get(0), args);
       }
     }
@@ -82,6 +85,9 @@ public final class Main {
           throw new IllegalArgumentException("missing version");
         }
         if (versions.size() > 1) {
+          if (stringFlag(rest, "--since", null) != null) {
+            throw new IllegalArgumentException("--since needs a single version");
+          }
           scoreMany(workspace, versions, rest);
         } else {
           String version = versions.get(0);
@@ -89,8 +95,28 @@ public final class Main {
           String only = stringFlag(rest, "--only", null);
           int threads = intFlag(rest, "--threads", threadsDefault());
           boolean json = rest.contains("--json");
+          String since = stringFlag(rest, "--since", null);
+          if (since != null && only != null) {
+            throw new IllegalArgumentException("--since compares whole trees; it cannot be used with --only");
+          }
           Path tree = decompiler.tree(version, threads, noCache, only, optionsFlag(rest));
-          new Verifier(workspace, minecraft).score(version, tree, only, threads, json);
+          new Verifier(workspace, minecraft).score(version, tree, only, threads, json,
+            since == null ? null : Path.of(since));
+        }
+      }
+      case "diff" -> {
+        List<String> positional = positionals(rest);
+        if (positional.size() < 2) {
+          throw new IllegalArgumentException("usage: diff <version> <Class> [--no-cache] [--options \"...\"]");
+        }
+        String version = positional.get(0);
+        String className = positional.get(1);
+        boolean noCache = rest.contains("--no-cache");
+        int threads = intFlag(rest, "--threads", threadsDefault());
+        Path tree = decompiler.tree(version, threads, noCache, className, optionsFlag(rest));
+        boolean ok = new Verifier(workspace, minecraft).diff(version, tree, className, threads);
+        if (!ok) {
+          System.exit(1);
         }
       }
       case "compile" -> {
@@ -548,7 +574,7 @@ public final class Main {
 
   private static boolean needsTargetJdk(String command) {
     return switch (command) {
-      case "score", "dataset", "corpus", "compile" -> true;
+      case "score", "dataset", "corpus", "compile", "diff" -> true;
       default -> false;
     };
   }
@@ -720,7 +746,7 @@ public final class Main {
     for (int i = 0; i < args.size(); i++) {
       String arg = args.get(i);
       if (arg.equals("--threads") || arg.equals("--only") || arg.equals("--jobs")
-          || arg.equals("--options") || arg.equals("--timeout")) {
+          || arg.equals("--options") || arg.equals("--timeout") || arg.equals("--since")) {
         i++;
         continue;
       }
@@ -765,8 +791,10 @@ public final class Main {
         versions [--no-cache]                  list Mojang's versions
         decompile <version> [--no-cache] [--threads N] [--only Class]
         tree      <version> [--only Class]    print the cached tree path
-        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes]
-                                             several versions run concurrently, --jobs at a time
+        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes] [--since Tree]
+                                             several versions run concurrently, --jobs at a time;
+                                             --since lists what changed against an earlier tree
+        diff      <version> <Class>            verify one class and explain every failing attribute
         compile   <version> <Class>            compile that one class with the verifier's javac
                                              settings and print its errors
         corpus    <version> --ground-truth D  write the class-to-ground-truth corpus

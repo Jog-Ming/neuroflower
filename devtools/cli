@@ -4,7 +4,8 @@
 #   ./devtools/cli versions [--no-cache]
 #   ./devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class]
 #   ./devtools/cli tree <version> [--only Class]
-#   ./devtools/cli score <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N]
+#   ./devtools/cli score <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--since Tree]
+#   ./devtools/cli diff <version> <Class> [--no-cache] [--options "..."]
 #   ./devtools/cli compile <version> <Class> [--no-cache] [--options "..."]
 #   ./devtools/cli corpus <version> --ground-truth <dir>
 #   ./devtools/cli dataset <version>
