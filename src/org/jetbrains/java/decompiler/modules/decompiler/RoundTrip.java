@@ -2331,6 +2331,21 @@ public final class RoundTrip {
   }
 
   /**
+   * The goto the guard's printed {@code continue;} compiles to: the jump the target's table puts on
+   * the line the source wrote it on, which starts where the head's branch ends. Minus one when the
+   * head does not end at a recorded guard.
+   */
+  public static int continueGoto(Exprent head) {
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return -1;
+    }
+    java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(head.bytecode.length());
+    return site == null ? -1 : site[0];
+  }
+
+  /**
    * True when this declaration belongs to the for loop after it: the target's table gives the
    * variable a scope that opens at the loop's head and closes with the loop, and the loop's own
    * init declares another variable of the same type. The source wrote `for (T a = …, b = …; …)`,

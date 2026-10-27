@@ -17,6 +17,7 @@ import org.jetbrains.java.decompiler.util.TextBuffer;
 import org.jetbrains.java.decompiler.util.TextUtil;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 
 
@@ -238,12 +239,19 @@ public class IfStatement extends Statement {
             // A pattern if's head also spans the nested condition, and its guard belongs to that
             // inner test, so a condition that declares a pattern variable is refused outright.
             // Otherwise the head's length is a fallback: a condition the decompiler built itself
-            // carries no offsets, and refusing those would lose every compound guard.
+            // carries no offsets, and refusing those would lose every compound guard. A test that
+            // is a boolean call or field access is simplified to the call itself, which drops the
+            // comparison wrapper along with the branch offsets, so its bytes end flush against a
+            // lone branch: the branch then consumes exactly the value the condition computes and
+            // the printed condition is the whole test.
             || RoundTrip.endsLoopBody(this)
                && ifHead.bytecode != null
                && !declaresPattern(ifHead.getCondition())
                && (ifHead.getCondition().bytecode == null
-                   || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()))
+                   || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
+                   || loneBranch(ifHead)
+                      && !ifHead.getCondition().bytecode.isEmpty()
+                      && ifHead.getCondition().bytecode.length() == ifHead.bytecode.nextSetBit(0)))
         && RoundTrip.printContinueGuard(ifHead, this)) {
       Exprent printed = ifHead.getCondition();
       Exprent source = printed instanceof FunctionExprent not
@@ -258,12 +266,20 @@ public class IfStatement extends Statement {
       if (groups == null) {
         groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
       }
+      // A single guard compiles the printed `continue;` to the goto the target's table puts on the
+      // line the source wrote it on; the line alignment has to see that jump to place it.
+      int gotoOffset = groups.size() == 1 ? RoundTrip.continueGoto(ifHead) : -1;
       for (List<Exprent> group : groups) {
         IfExprent guard = (IfExprent) ifHead.copy();
         guard.setCondition(orOf(group));
         buf.appendIndent(indent);
         buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
-        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        if (gotoOffset >= 0) {
+          continueLine.addStartBytecodeMapping(gotoOffset);
+        }
+        buf.append(continueLine);
         buf.appendIndent(indent).append("}").appendLineSeparator();
       }
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
@@ -612,6 +628,16 @@ public class IfStatement extends Statement {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether the head's bytes are exactly the three bytes of one branch instruction. A head that
+   * merged a nested if carries that if's branch as well, and then its condition is not this
+   * branch's test alone.
+   */
+  private static boolean loneBranch(IfExprent head) {
+    BitSet bits = head.bytecode;
+    return bits.cardinality() == 3 && bits.nextSetBit(0) + 3 == bits.length();
   }
 
   /** One operand, or the operands joined by `&&` again, as an if condition prints it. */
