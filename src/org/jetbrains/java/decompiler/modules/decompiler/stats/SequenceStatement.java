@@ -1872,7 +1872,11 @@ public class SequenceStatement extends Statement {
         }
       }
       else if (parent instanceof IfStatement ifStatement) {
-        if (ifStatement.getIfstat() != stat) {
+        // The else arm is the loop's last work when the enclosing if ends the loop body: the
+        // sibling's guard hoists the arm out of the block, and everything in it then runs last
+        // (ProjectileUtil's exact-hit guard lives in the raider-style guard's else arm).
+        if (ifStatement.getIfstat() != stat
+            && !(ifStatement.getElsestat() == stat && RoundTrip.endsLoopBody(ifStatement))) {
           return false;
         }
       }

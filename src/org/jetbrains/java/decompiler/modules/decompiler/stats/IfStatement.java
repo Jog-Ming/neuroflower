@@ -283,7 +283,7 @@ public class IfStatement extends Statement {
             // The same holds for the else arm of an if that ends the loop body: the arm is the
             // loop's tail too once its sibling hoisted the arm out of the block (Raid keeps
             // `if (tickCount <= 600) continue;` as the else arm of the raider guard).
-            || (RoundTrip.endsLoopBody(this) || endsInLoopTailElse(this))
+            || RoundTrip.endsLoopBody(this)
                && ifHead.bytecode != null
                && !declaresPattern(ifHead.getCondition())
                && (ifHead.getCondition().bytecode == null
@@ -555,16 +555,6 @@ public class IfStatement extends Statement {
   }
 
   /**
-   * Whether this statement is the else arm of an if that itself ends the loop body. The arm is
-   * then the loop's last work even though the enclosing if's then arm is not an ancestor of it; a
-   * guard's continue printed at the arm's end skips nothing the loop still needs.
-   */
-  private static boolean endsInLoopTailElse(Statement stat) {
-    return stat.getParent() instanceof IfStatement parent && parent.getElsestat() == stat
-      && RoundTrip.endsLoopBody(parent);
-  }
-
-  /**
    * Whether this statement is the last thing every enclosing statement up to the loop runs, so a
    * guard printed at its end skips nothing the loop still needs and hoisting an arm into it keeps
    * every scope's end where it was.
@@ -579,7 +569,10 @@ public class IfStatement extends Statement {
           return false;
         }
       } else if (parent instanceof IfStatement ifStatement) {
-        if (ifStatement.getIfstat() != stat) {
+        // The else arm is the loop's last work when the enclosing if ends the loop body: the
+        // sibling's guard hoists the arm out of the block and everything in it then runs last.
+        if (ifStatement.getIfstat() != stat
+            && !(ifStatement.getElsestat() == stat && RoundTrip.endsLoopBody(ifStatement))) {
           return false;
         }
       } else {

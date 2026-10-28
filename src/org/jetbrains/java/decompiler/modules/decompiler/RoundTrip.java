@@ -4414,8 +4414,12 @@ public final class RoundTrip {
           return false;
         }
       } else if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement) {
-        if (ifStatement.getIfstat() != cur
-            || (ifStatement.getElsestat() != null && !printsNothing(ifStatement.getElsestat()))) {
+        // The then arm tails the loop when nothing printable follows; the else arm tails it when
+        // the enclosing if itself reaches the loop's end (the sibling guard hoists it out).
+        boolean thenTail = ifStatement.getIfstat() == cur
+          && (ifStatement.getElsestat() == null || printsNothing(ifStatement.getElsestat()));
+        boolean elseTail = ifStatement.getElsestat() == cur && endsLoopBody(ifStatement);
+        if (!thenTail && !elseTail) {
           return false;
         }
       } else {
