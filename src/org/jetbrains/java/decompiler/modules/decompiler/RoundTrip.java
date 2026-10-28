@@ -728,8 +728,10 @@ public final class RoundTrip {
     if (method == null) {
       return false;
     }
-    int thenStart = firstOffset(thenArm);
-    int elseStart = firstOffset(elseArm);
+    // An arm's entry point is the first instruction the statement covers, its own head test
+    // included: a branch to an arm lands on the arm's condition, not on the code behind it.
+    int thenStart = statementOffset(thenArm);
+    int elseStart = statementOffset(elseArm);
     int target = lastBranchTarget(ifHead.bytecode);
     if (thenStart < 0 || elseStart < 0 || target < 0 || thenStart == elseStart) {
       return false;
@@ -2080,7 +2082,9 @@ public final class RoundTrip {
   public static boolean soleEntry(Statement stat) {
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
-    int start = stat == null ? -1 : firstOffset(stat);
+    // A branch to an arm lands on the first instruction the arm covers, which for an if arm is
+    // its own test's first operand; firstOffset alone would skip past the head and find nothing.
+    int start = stat == null ? -1 : statementOffset(stat);
     if (targets == null || start < 0) {
       return false;
     }
