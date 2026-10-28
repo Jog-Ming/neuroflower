@@ -342,9 +342,15 @@ public class SwitchStatement extends Statement {
       if (i == lastPrinted) {
         lastJoins = joins;
       }
+      // The arm's tail instruction is a jump past the switch, but the source may have written the
+      // break inside a nested branch: an arm ending in `if (...) { ...; break; }` falls through on
+      // the other path, and the explicit jump edge hanging off that branch is what the printer
+      // already rendered. Only an arm whose tail path carries no explicit jump owes a break at its
+      // end for the target's tail goto.
+      boolean breakPrinted = RoundTrip.printsExplicitJump(stat);
       boolean breakInside = false;
       if (RoundTrip.selector("switchbreak") && joins && !yields && !orderUnknown
-          && guard == null && !patternArm
+          && guard == null && !patternArm && !breakPrinted
           && RoundTrip.canCompleteNormally(stat) && !armLeaves) {
         // A braced arm holds the break inside the brace when the target's table still has a local
         // the arm declared alive past the jump: the block was open there.
