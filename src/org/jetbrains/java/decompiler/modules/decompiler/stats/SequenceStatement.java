@@ -498,12 +498,25 @@ public class SequenceStatement extends Statement {
         // A sequence arm may carry the join it jumps to as its own last statement; the sequence
         // holds the same statements after the if, so print those once and leave the arm's copy out.
         int bodyEnd = arm.getStats().size();
+        boolean finalReturnTail = false;
         if (elseStop > 0 && bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
           while (bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
             bodyEnd--;
+            if (RoundTrip.isTailReturnCopy(arm.getStats().get(bodyEnd))) {
+              finalReturnTail = true;
+            }
           }
-          if (bodyEnd == 0 || elseEnd + 1 >= stats.size()
-              || RoundTrip.firstOffset(stats.get(elseEnd + 1)) != elseStop) {
+          // The join has to be printed exactly once after the else: by the next statement here,
+          // or — when the else runs to the end of this sequence — by the enclosing flow. The arm
+          // may only lean on the enclosing flow when the copy it absorbed is the method's own
+          // final return, which that flow does print after the whole if.
+          int join;
+          if (elseEnd + 1 < stats.size()) {
+            join = RoundTrip.firstOffset(stats.get(elseEnd + 1));
+          } else {
+            join = finalReturnTail ? RoundTrip.printedAfter(this) : -1;
+          }
+          if (bodyEnd == 0 || join != elseStop) {
             elseEnd = -1;
           }
         }
@@ -522,8 +535,10 @@ public class SequenceStatement extends Statement {
               armSeq.getStats().removeWithKey(dropped.id);
             }
             try {
+              RoundTrip.pushJoinOffset(elseStop);
               buf.append(ExprProcessor.jmpWrapper(armSeq, indent + 1, true));
             } finally {
+              RoundTrip.popJoinOffset();
               for (Statement dropped : tail) {
                 armSeq.getStats().addWithKey(dropped, dropped.id);
               }
@@ -532,8 +547,10 @@ public class SequenceStatement extends Statement {
             // The arm's trailing jump is the loop's own continue: the else arm's end carries it.
             Statement previous = RoundTrip.suppressJump(arm);
             try {
+              RoundTrip.pushJoinOffset(elseStop);
               buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
             } finally {
+              RoundTrip.popJoinOffset();
               RoundTrip.restoreJump(previous);
             }
           }
@@ -951,6 +968,25 @@ public class SequenceStatement extends Statement {
             straddle = last;
           }
         }
+        // Both arms may end with a copy of the method's final return: the jumps go there, and the
+        // enclosing flow prints the return once after the whole if, so the copies fall out.
+        Statement elseArm = ifStatement.getIfstat();
+        Statement elseCopy = elseArm instanceof SequenceStatement elseSeq && !elseSeq.getStats().isEmpty()
+          ? elseSeq.getStats().get(elseSeq.getStats().size() - 1) : null;
+        int exitStart = elseCopy == null ? -1 : RoundTrip.tailReturnCopyOffset(elseCopy);
+        boolean joinAfterArms = exitStart >= 0
+          && (RoundTrip.joinOffset() == exitStart || RoundTrip.printedAfter(this) == exitStart);
+        if (!joinAfterArms && !restStats.isEmpty()) {
+          exitStart = RoundTrip.tailReturnCopyOffset(restStats.get(restStats.size() - 1));
+          joinAfterArms = exitStart >= 0
+            && (RoundTrip.joinOffset() == exitStart || RoundTrip.printedAfter(this) == exitStart);
+        }
+        Statement restCopy = joinAfterArms && !restStats.isEmpty()
+            && RoundTrip.isTailReturnCopy(restStats.get(restStats.size() - 1))
+          ? restStats.get(restStats.size() - 1) : null;
+        if (restCopy != null) {
+          rest = new SequenceStatement(restStats.subList(0, restStats.size() - 1));
+        }
         RoundTrip.markAfterIf(afterIf);
         buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
         List<Exprent> savedExprents = straddle == null ? null : straddle.getExprents();
@@ -958,14 +994,27 @@ public class SequenceStatement extends Statement {
           straddle.setExprents(new ArrayList<>(savedExprents.subList(0, savedExprents.size() - shellTail.size())));
         }
         try {
+          RoundTrip.pushJoinOffset(exitStart);
           buf.append(ExprProcessor.jmpWrapper(rest, indent + 1, true));
         } finally {
+          RoundTrip.popJoinOffset();
           if (straddle != null) {
             straddle.setExprents(savedExprents);
           }
         }
         buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+        if (elseCopy != null && joinAfterArms && RoundTrip.isTailReturnCopy(elseCopy)) {
+          ((SequenceStatement) elseArm).getStats().removeWithKey(elseCopy.id);
+        }
+        try {
+          RoundTrip.pushJoinOffset(exitStart);
+          buf.append(ExprProcessor.jmpWrapper(elseArm, indent + 1, true));
+        } finally {
+          RoundTrip.popJoinOffset();
+          if (elseCopy != null && joinAfterArms && RoundTrip.isTailReturnCopy(elseCopy)) {
+            ((SequenceStatement) elseArm).getStats().addWithKey(elseCopy, elseCopy.id);
+          }
+        }
         buf.appendIndent(indent).append("}").appendLineSeparator();
         if (!shellTail.isEmpty()) {
           buf.append(ExprProcessor.listToJava(shellTail, indent));
@@ -1016,12 +1065,42 @@ public class SequenceStatement extends Statement {
           // out after the if, and the arm's jump went over them to the exit block.
           List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
             RoundTrip.lastEnd(ifStatement.getIfstat()));
+          // The arms' copies of the method's final return stand for the jump the source took
+          // there; the enclosing flow prints that return once, so the arms fall out to it.
+          int exitStart = headExit.bytecode == null ? -1 : headExit.bytecode.nextSetBit(0);
+          boolean joinAfterArms = asElse && exitStart >= 0
+            && (RoundTrip.joinOffset() == exitStart || RoundTrip.printedAfter(this) == exitStart);
+          List<Statement> restAll = new ArrayList<>(stats.subList(i + 1, stats.size()));
+          if (joinAfterArms && !restAll.isEmpty()
+              && RoundTrip.isTailReturnCopy(restAll.get(restAll.size() - 1))) {
+            restAll.remove(restAll.size() - 1);
+            movedRest = new SequenceStatement(restAll);
+          }
+          Statement elseArm = ifStatement.getIfstat();
+          Statement elseCopy = null;
+          if (joinAfterArms && elseArm instanceof SequenceStatement elseSeq && !elseSeq.getStats().isEmpty()) {
+            Statement lastElse = elseSeq.getStats().get(elseSeq.getStats().size() - 1);
+            if (RoundTrip.isTailReturnCopy(lastElse)) {
+              elseCopy = lastElse;
+            }
+          }
           RoundTrip.markAfterIf(afterIf);
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(movedRest, indent + 1, true));
           if (asElse) {
             buf.appendIndent(indent).append("} else {").appendLineSeparator();
-            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+            if (elseCopy != null) {
+              ((SequenceStatement) elseArm).getStats().removeWithKey(elseCopy.id);
+            }
+            try {
+              RoundTrip.pushJoinOffset(exitStart);
+              buf.append(ExprProcessor.jmpWrapper(elseArm, indent + 1, true));
+            } finally {
+              RoundTrip.popJoinOffset();
+              if (elseCopy != null) {
+                ((SequenceStatement) elseArm).getStats().addWithKey(elseCopy, elseCopy.id);
+              }
+            }
             buf.appendIndent(indent).append("}").appendLineSeparator();
           } else {
             buf.appendIndent(indent).append("}").appendLineSeparator();

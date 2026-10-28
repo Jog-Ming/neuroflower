@@ -665,6 +665,134 @@ public final class RoundTrip {
     return exitLine >= 0 && bodyLine >= 0 && exitLine < bodyLine ? exit : -1;
   }
 
+  /** Join offsets of the arms an enclosing print is emitting as an else, innermost last. */
+  private static final ThreadLocal<java.util.ArrayDeque<Integer>> JOIN_PRINTS =
+    ThreadLocal.withInitial(java.util.ArrayDeque::new);
+
+  /** Tells a nested print that the code after its enclosing else starts at this offset. */
+  public static void pushJoinOffset(int offset) {
+    JOIN_PRINTS.get().push(offset);
+  }
+
+  public static void popJoinOffset() {
+    java.util.ArrayDeque<Integer> stack = JOIN_PRINTS.get();
+    if (!stack.isEmpty()) {
+      stack.poll();
+    }
+  }
+
+  /** The join offset the enclosing else print reaches, or -1. */
+  public static int joinOffset() {
+    Integer top = JOIN_PRINTS.get().peek();
+    return top == null ? -1 : top;
+  }
+
+  /**
+   * True when this block is a copy of the method's final return: the return instruction is the
+   * method's last, and the same instruction is printed by the statement the tree prints last.
+   * The arm's copy stands for the jump the source took there; printing it would emit a second
+   * areturn, so the arm falls out to the return the tail prints.
+   */
+  public static boolean isTailReturnCopy(Statement stat) {
+    return tailReturnCopyOffset(stat) >= 0;
+  }
+
+  /** The return offset when this block is a copy of the method's final return, or -1. */
+  public static int tailReturnCopyOffset(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null || stat.getExprents() == null) {
+      return -1;
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents.isEmpty()) {
+      return -1;
+    }
+    Exprent last = exprents.get(exprents.size() - 1);
+    if (!(last instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit)
+        || exit.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+        || exit.bytecode == null) {
+      return -1;
+    }
+    int start = exit.bytecode.nextSetBit(0);
+    int ret = exit.bytecode.previousSetBit(Integer.MAX_VALUE);
+    Integer methodLast = LAST_INSTRUCTION.get(method);
+    if (start < 0 || ret < 0 || methodLast == null || ret != methodLast) {
+      return -1;
+    }
+    Statement root = stat;
+    while (root.getParent() != null) {
+      root = root.getParent();
+    }
+    Statement tail = lastPrinted(root);
+    if (tail == stat) {
+      return -1;
+    }
+    BitSet tailOffsets = new BitSet();
+    tail.getOffset(tailOffsets);
+    int join = firstOffset(stat);
+    return tailOffsets.get(start) && join >= 0 ? join : -1;
+  }
+
+  /** The statement the printer reaches last: the last printed child, through nested statements. */
+  private static Statement lastPrinted(Statement stat) {
+    while (true) {
+      List<Statement> stats = stat.getStats();
+      if (stats.isEmpty()) {
+        return stat;
+      }
+      Statement next = null;
+      for (int i = stats.size() - 1; i >= 0; i--) {
+        if (!printsNothing(stats.get(i))) {
+          next = stats.get(i);
+          break;
+        }
+      }
+      if (next == null) {
+        return stat;
+      }
+      stat = next;
+    }
+  }
+
+  /**
+   * The first offset the enclosing flow prints after this statement, or -1 when it cannot be told.
+   * Walking up through sequences and if arms: a statement falling out of an arm runs whatever
+   * follows the if. A loop or switch boundary stops the walk — falling out of those goes
+   * somewhere else than the next statement.
+   */
+  public static int printedAfter(Statement stat) {
+    Statement cur = stat;
+    while (cur != null) {
+      Statement parent = cur.getParent();
+      if (parent == null) {
+        return -1;
+      }
+      List<Statement> siblings = parent.getStats();
+      int index = -1;
+      for (int i = 0; i < siblings.size(); i++) {
+        if (siblings.get(i) == cur) {
+          index = i;
+          break;
+        }
+      }
+      if (index < 0) {
+        return -1;
+      }
+      for (int k = index + 1; k < siblings.size(); k++) {
+        if (!printsNothing(siblings.get(k))) {
+          return firstOffset(siblings.get(k));
+        }
+      }
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement
+          || parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement) {
+        cur = parent;
+        continue;
+      }
+      return -1;
+    }
+    return -1;
+  }
+
   /** True when this statement would print no text at all (an empty arm or block). */
   public static boolean printsNothing(Statement statement) {
     if (statement == null) {
