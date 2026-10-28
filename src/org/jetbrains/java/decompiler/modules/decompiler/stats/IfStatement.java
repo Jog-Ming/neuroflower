@@ -398,9 +398,12 @@ public class IfStatement extends Statement {
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       // The arm the swap prints second was declared in the method body, so the source closed
       // the branch before it and wrote the other arm as a guard.
-      boolean guard = endsWithExit(elsestat) && RoundTrip.startsWithMethodScopeLocal(ifstat);
+      boolean targetReturn = targetVoidReturn(elsestat, ifstat);
+      boolean guard = (endsWithExit(elsestat) || targetReturn)
+        && RoundTrip.startsWithMethodScopeLocal(ifstat);
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
+      appendVoidArmReturn(buf, elsestat, ifstat, indent + 1);
       if (guard) {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
@@ -415,10 +418,12 @@ public class IfStatement extends Statement {
     // A guard whose else was declared in the method body: the table writes the else's first
     // local after the parameters, so the original source closed the branch before it.
     if (ifstat != null && elsestat != null
-        && condition != null && !isLabeled() && endsWithExit(ifstat)
+        && condition != null && !isLabeled()
+        && (endsWithExit(ifstat) || targetVoidReturn(ifstat, elsestat))
         && RoundTrip.startsWithMethodScopeLocal(elsestat)) {
       buf.appendIndent(indent).append(condition.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
+      appendVoidArmReturn(buf, ifstat, elsestat, indent + 1);
       buf.appendIndent(indent).append("}").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
       return buf;
@@ -466,11 +471,65 @@ public class IfStatement extends Statement {
     }
     else {
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
+      appendVoidArmReturn(buf, ifstat, elsestat, indent + 1);
     }
 
     appendElse(buf, indent);
 
     return buf;
+  }
+
+  /**
+   * True when the target ends the arm with a void return the writer dropped: its last instruction
+   * is a return exactly where the other arm begins, and the arm's print does not already carry
+   * one. The source closed the branch there, so the other arm prints after the if, not as an else.
+   */
+  private static boolean targetVoidReturn(Statement arm, Statement next) {
+    if (arm == null || next == null || endsWithVoidReturn(arm)) {
+      return false;
+    }
+    return RoundTrip.voidReturnEndingAt(RoundTrip.firstOffset(next)) >= 0;
+  }
+
+  /**
+   * Prints the void return the source ended this arm with, when the target's last instruction
+   * before the other arm is one: the arm then falls through to the code printed after the if, so
+   * the return is not redundant in the source and the writer, which folded it into the method's
+   * end, dropped it. Pinned to its instruction so the line alignment keeps the line.
+   */
+  private static void appendVoidArmReturn(TextBuffer buf, Statement arm, Statement next, int indent) {
+    if (arm == null || next == null || endsWithVoidReturn(arm)) {
+      return;
+    }
+    int exit = RoundTrip.voidReturnEndingAt(RoundTrip.firstOffset(next));
+    if (exit < 0) {
+      return;
+    }
+    TextBuffer line = new TextBuffer();
+    line.appendIndent(indent).append("return;").appendLineSeparator();
+    RoundTrip.mapSynthesizedLine(line, exit);
+    buf.append(line);
+  }
+
+  /** True when the statement's print already ends with a bare `return;`. */
+  private static boolean endsWithVoidReturn(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (int i = exprents.size() - 1; i >= 0; i--) {
+        if (exprents.get(i) != null) {
+          return exprents.get(i) instanceof ExitExprent exit
+            && exit.getExitType() == ExitExprent.Type.RETURN && exit.getValue() == null;
+        }
+      }
+      return false;
+    }
+    if (!stat.getStats().isEmpty()) {
+      return endsWithVoidReturn(stat.getStats().get(stat.getStats().size() - 1));
+    }
+    return false;
   }
 
   /** Prints the closing brace of the then arm and the else arm, if any, at this indent. */

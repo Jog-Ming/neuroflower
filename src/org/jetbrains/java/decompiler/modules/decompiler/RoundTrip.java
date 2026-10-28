@@ -41,6 +41,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instruction end offset by start offset; the live sequence is released before printing. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The instruction that ends at an offset, keyed by that end: an arm's last instruction. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_BY_END = new java.util.concurrent.ConcurrentHashMap<>();
   /** Per method: handler bytecode offset -> first offset after its protected range. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> HANDLER_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Returns already printed as guard exits; the same instruction must not print a second time. */
@@ -234,6 +236,7 @@ public final class RoundTrip {
     BRANCHES.put(method, branches);
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
+    INSTRUCTION_BY_END.put(method, prevByEnd);
     java.util.Map<Integer, Integer> handlerEnds = new java.util.HashMap<>();
     java.util.List<int[]> exceptionRanges = new java.util.ArrayList<>();
     org.jetbrains.java.decompiler.code.ExceptionTable table = seq.exceptionTable();
@@ -1035,6 +1038,22 @@ public final class RoundTrip {
     StructMethod method = currentMethod();
     BitSet returns = method == null ? null : VOID_RETURNS.get(method);
     return returns != null && returns.get(offset);
+  }
+
+  /**
+   * The offset of the void return whose instruction ends exactly where {@code end} begins, or -1.
+   * An arm that falls through to the code printed next ends with this instruction in the target;
+   * the writer folded the return into the method's end and dropped it from the arm.
+   */
+  public static int voidReturnEndingAt(int end) {
+    StructMethod method = currentMethod();
+    if (method == null || end < 0) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    BitSet returns = VOID_RETURNS.get(method);
+    Integer start = byEnd == null ? null : byEnd.get(end);
+    return start != null && returns != null && returns.get(start) ? start : -1;
   }
 
   /** Whether the instruction at this offset ends the path: a return, a throw, or a ret. */
