@@ -195,13 +195,20 @@ public class SwitchStatement extends Statement {
     // the arm, so the block closed before that jump and the row ends where the jump starts
     // instead of at the switch's join.
     java.util.Map<Integer, Integer> gotos = RoundTrip.gotosHere();
+    int[] armClose = new int[caseStatements.size()];
+    java.util.Arrays.fill(armClose, -1);
     if (gotos != null) {
       for (int a = 0; a < caseStatements.size(); a++) {
         for (int[] row : armSlots.get(a).values()) {
           Integer dest = row[1] >= 0 ? gotos.get(row[1]) : null;
           if (dest != null && dest == switchEnd) {
             braced.add(caseStatements.get(a));
-            break;
+            // The break this arm prints after its brace is the jump another jump lands on; the
+            // arm's own close is the furthest such row, so the choice does not depend on the
+            // table's row order.
+            if (RoundTrip.jumpsOnto(row[1]) && row[1] > armClose[a]) {
+              armClose[a] = row[1];
+            }
           }
         }
       }
@@ -342,11 +349,26 @@ public class SwitchStatement extends Statement {
         && !yields && !orderUnknown && guard == null && !patternArm
         && RoundTrip.canCompleteNormally(stat) && !RoundTrip.declaredScopePast(stat, breakJump)
         && RoundTrip.selector("switchbreak") && RoundTrip.jumpsOnto(breakJump);
+      // A local the arm declares ends its row exactly at the break's jump, and another jump lands
+      // on that jump: the source closed the arm's block before the break, so the break prints
+      // after the closing brace instead of inside whatever branch the tree hung it off.
+      int deferredBreak = -1;
+      if (armClose[i] > 0 && braced.contains(stat) && !breakOutside && !yields && !orderUnknown
+          && guard == null && !patternArm && RoundTrip.selector("switchbreak")
+          && (breakJump < 0 || breakJump == armClose[i])
+          && !RoundTrip.declaredScopePast(stat, armClose[i])
+          && RoundTrip.jumpsOnto(armClose[i]) && RoundTrip.breaksTo(stat, this)) {
+        deferredBreak = armClose[i];
+      }
       Statement previousJump = breakOutside ? RoundTrip.suppressJump(stat) : null;
+      Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(this) : null;
       TextBuffer armBuf;
       try {
         armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
       } finally {
+        if (deferredBreak > 0) {
+          RoundTrip.restoreDeferredBreak(previousDefer);
+        }
         if (breakOutside) {
           RoundTrip.restoreJump(previousJump);
         }
@@ -388,13 +410,15 @@ public class SwitchStatement extends Statement {
         buf.appendIndent(indent + 1);
         buf.append("}");
         // The source wrote `} break;` for an arm braced to scope its locals; the same conditions
-        // that decide a dropped `break` apply, since the brace does not change reachability.
-        if ((breakOutside || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
-            && breakJump >= 0 && !breakInside && guard == null && !patternArm
-            && RoundTrip.canCompleteNormally(stat)) {
+        // that decide a dropped `break` apply, since the brace does not change reachability. A
+        // deferred break is the one the table proves: its jump is reachable from the jump onto it.
+        if ((breakOutside || deferredBreak > 0
+             || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
+            && (breakJump >= 0 || deferredBreak > 0) && !breakInside && guard == null && !patternArm
+            && (deferredBreak > 0 || RoundTrip.canCompleteNormally(stat))) {
           int at = buf.length();
           buf.append(" break;");
-          buf.addBytecodeMappingAt(at, breakJump, null, null);
+          buf.addBytecodeMappingAt(at, deferredBreak > 0 ? deferredBreak : breakJump, null, null);
         }
         buf.appendLineSeparator();
       }

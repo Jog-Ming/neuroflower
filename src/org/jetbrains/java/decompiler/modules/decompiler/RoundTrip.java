@@ -3993,6 +3993,24 @@ public final class RoundTrip {
     }
   }
 
+  /** The end offset of the bare block being printed; a nested run ending there is that brace. */
+  private static final ThreadLocal<Integer> HANDOVER_END = new ThreadLocal<>();
+
+  /** Marks the block a handover run prints as open until its closing brace; returns the old. */
+  public static int handoverEnd(int end) {
+    Integer old = HANDOVER_END.get();
+    HANDOVER_END.set(end);
+    return old == null ? -1 : old;
+  }
+
+  public static void restoreHandoverEnd(int old) {
+    if (old < 0) {
+      HANDOVER_END.remove();
+    } else {
+      HANDOVER_END.set(old);
+    }
+  }
+
   public static boolean isJumpSuppressed(Statement stat) {
     Statement suppressed = SUPPRESSED_JUMP.get();
     if (stat == null || suppressed == null) {
@@ -4010,6 +4028,94 @@ public final class RoundTrip {
       }
       last = last.getStats().get(last.getStats().size() - 1);
     }
+  }
+
+  /**
+   * The break edge the enclosing print will emit after a closing brace, or null. Set while a
+   * switch arm is printed whose break the target's table proves stood outside the arm's block;
+   * the statement that holds the edge must not print it, since the caller prints it back there.
+   */
+  private static final ThreadLocal<Statement> DEFERRED_BREAK = new ThreadLocal<>();
+
+  /** Defers the break edges closing over {@code closure} to the caller; returns the previous. */
+  public static Statement deferBreakTo(Statement closure) {
+    Statement old = DEFERRED_BREAK.get();
+    DEFERRED_BREAK.set(closure);
+    return old;
+  }
+
+  public static void restoreDeferredBreak(Statement old) {
+    if (old == null) {
+      DEFERRED_BREAK.remove();
+    } else {
+      DEFERRED_BREAK.set(old);
+    }
+  }
+
+  /** True when this edge is a break to the switch whose break the caller prints after a brace. */
+  public static boolean isDeferredBreak(StatEdge edge) {
+    Statement closure = DEFERRED_BREAK.get();
+    return edge != null && closure != null && edge.getType() == StatEdge.TYPE_BREAK
+      && edge.explicit && edge.closure == closure;
+  }
+
+  /** True when a break edge to the deferred switch hangs off this statement or its head block. */
+  public static boolean holdsDeferredBreak(Statement stat) {
+    if (stat == null || DEFERRED_BREAK.get() == null) {
+      return false;
+    }
+    for (StatEdge edge : stat.getAllSuccessorEdges()) {
+      if (isDeferredBreak(edge)) {
+        return true;
+      }
+    }
+    Statement head = stat.getFirst();
+    return head != null && head != stat && holdsDeferredBreak(head);
+  }
+
+  /** True when the arm holds a break edge closing over {@code switchStat}. */
+  public static boolean breaksTo(Statement stat, Statement switchStat) {
+    if (stat == null) {
+      return false;
+    }
+    for (StatEdge edge : stat.getAllSuccessorEdges()) {
+      if (edge.getType() == StatEdge.TYPE_BREAK && edge.explicit && edge.closure == switchStat) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (breaksTo(child, switchStat)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The offset of a jumped-onto goto that a local the statement declares ends at — the target's
+   * table closes the block holding that local right before the jump, so the jump is the break the
+   * source wrote after the closing brace.
+   */
+  public static int blockClosingBreak(Statement stat) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table =
+      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    int start = firstOffset(stat);
+    int end = lastOffset(stat);
+    if (table == null || start < 0 || end < 0) {
+      return -1;
+    }
+    for (LocalVariable row : table.getVariables().toList()) {
+      int close = row.getEnd();
+      if (row.getStart() < start || row.getStart() > end || close <= row.getStart()) {
+        continue;
+      }
+      if (jumpTargetAt(close) < 0 || !jumpsOnto(close)) {
+        continue;
+      }
+      return close;
+    }
+    return -1;
   }
 
   /** The first instruction offset of a statement, counting an if statement's head condition. */
@@ -5230,6 +5336,11 @@ public final class RoundTrip {
           continue;
         }
         int e1 = row.getEnd();
+        Integer openEnd = HANDOVER_END.get();
+        if (openEnd != null && openEnd == e1) {
+          // The block this run would print is the one already open: one brace, not two.
+          continue;
+        }
         LocalVariable next = slotHandover(row.getIndex(), s1, e1);
         if (next == null) {
           continue;
@@ -5257,6 +5368,17 @@ public final class RoundTrip {
               for (int b = 0; b < inside.size(); b++) {
                 if (printedEnd(inside.get(b)) == e1) {
                   return new int[]{from, a, j, b, row.getIndex(), s1, e1, next.getStart(), next.getEnd()};
+                }
+              }
+            }
+            // A nested sequence prints its statements in order: a boundary between two of them
+            // is where that sequence's print splits, and the run closes there.
+            if (stats.get(j) instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement nested
+                && !nested.isLabeled() && nested.getVarDefinitions().isEmpty()) {
+              List<Statement> children = nested.getStats();
+              for (int k = 0; k < children.size() - 1; k++) {
+                if (printEnd(children.get(k)) == e1) {
+                  return new int[]{from, a, j, -1, row.getIndex(), s1, e1, next.getStart(), next.getEnd(), k};
                 }
               }
             }

@@ -131,6 +131,15 @@ public class SequenceStatement extends Statement {
       return buf;
     }
 
+    // A break that closed this block: a local declared here has its scope ending at a goto another
+    // jump lands on, and the run leaves only through the break to a switch. javac ends the local's
+    // row where the source's closing brace stood, so the source wrote `{ … } break;` and the break
+    // is not part of the run.
+    if (!islabeled && RoundTrip.selector("bareblock") && RoundTrip.selector("switchbreak")
+        && printClosedBlockBreak(buf, indent)) {
+      return buf;
+    }
+
     if (islabeled) {
       buf.appendIndent(indent++).append("label").append(this.id).append(": {").appendLineSeparator();
     }
@@ -219,7 +228,8 @@ public class SequenceStatement extends Statement {
         // Closing the block takes every local it declares out of scope: a use past the boundary
         // has to land in the row that takes its slot over at a store, which the printer writes as
         // a declaration. Anything else and the brace would name a variable that is gone.
-        if (run != null && splittable(stats.get(run[0])) && splittable(stats.get(run[2]))
+        if (run != null && splittable(stats.get(run[0]))
+            && (run[3] < 0 || splittable(stats.get(run[2])))
             && RoundTrip.closesCleanly(run[5], run[6])) {
           int openExp = run[1];
           int closeExp = run[3];
@@ -230,27 +240,46 @@ public class SequenceStatement extends Statement {
           }
           RoundTrip.armSplitDeclarations(run[5], run[6]);
           buf.appendIndent(indent).append("{").appendLineSeparator();
-          if (run[2] == run[0] && closeExp < 0) {
-            printFrom(stats.get(run[0]), openExp, indent + 1, buf);
-            buf.appendIndent(indent).append("}").appendLineSeparator();
-          } else if (run[2] == run[0]) {
-            buf.append(ExprProcessor.listToJava(leading.subList(openExp, closeExp + 1), indent + 1));
-            buf.appendIndent(indent).append("}").appendLineSeparator();
-            printAfter(stats.get(run[0]), closeExp, indent, buf);
-          } else {
-            printFrom(stats.get(run[0]), openExp, indent + 1, buf);
-            for (int j = run[0] + 1; j < run[2]; j++) {
-              buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent + 1, true));
-            }
-            if (closeExp < 0) {
-              buf.append(ExprProcessor.jmpWrapper(stats.get(run[2]), indent + 1, true));
+          // A block nested in this run that ends where this one does closes on the same brace;
+          // the source's single brace is this one.
+          int previousEnd = RoundTrip.handoverEnd(run[6]);
+          try {
+            if (run[2] == run[0] && closeExp < 0) {
+              printFrom(stats.get(run[0]), openExp, indent + 1, buf);
               buf.appendIndent(indent).append("}").appendLineSeparator();
+            } else if (run[2] == run[0]) {
+              buf.append(ExprProcessor.listToJava(leading.subList(openExp, closeExp + 1), indent + 1));
+              buf.appendIndent(indent).append("}").appendLineSeparator();
+              printAfter(stats.get(run[0]), closeExp, indent, buf);
             } else {
-              List<Exprent> tail = RoundTrip.leadingExprents(stats.get(run[2]));
-              buf.append(ExprProcessor.listToJava(tail.subList(0, closeExp + 1), indent + 1));
-              buf.appendIndent(indent).append("}").appendLineSeparator();
-              printAfter(stats.get(run[2]), closeExp, indent, buf);
+              printFrom(stats.get(run[0]), openExp, indent + 1, buf);
+              for (int j = run[0] + 1; j < run[2]; j++) {
+                buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent + 1, true));
+              }
+              List<Statement> childSplit = run.length > 9 && run[9] >= 0
+                ? ((SequenceStatement) stats.get(run[2])).getStats() : null;
+              if (childSplit != null) {
+                // The boundary is between two of the closing sequence's statements: its print
+                // splits there, and the rest runs after the brace.
+                for (int k = 0; k <= run[9]; k++) {
+                  buf.append(ExprProcessor.jmpWrapper(childSplit.get(k), indent + 1, true));
+                }
+                buf.appendIndent(indent).append("}").appendLineSeparator();
+                for (int k = run[9] + 1; k < childSplit.size(); k++) {
+                  buf.append(ExprProcessor.jmpWrapper(childSplit.get(k), indent, true));
+                }
+              } else if (closeExp < 0) {
+                buf.append(ExprProcessor.jmpWrapper(stats.get(run[2]), indent + 1, true));
+                buf.appendIndent(indent).append("}").appendLineSeparator();
+              } else {
+                List<Exprent> tail = RoundTrip.leadingExprents(stats.get(run[2]));
+                buf.append(ExprProcessor.listToJava(tail.subList(0, closeExp + 1), indent + 1));
+                buf.appendIndent(indent).append("}").appendLineSeparator();
+                printAfter(stats.get(run[2]), closeExp, indent, buf);
+              }
             }
+          } finally {
+            RoundTrip.restoreHandoverEnd(previousEnd);
           }
           notempty = true;
           i = run[2];
@@ -366,10 +395,14 @@ public class SequenceStatement extends Statement {
         for (int k = i + 1; k < stats.size(); k++) {
           buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
         }
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.appendIndent(indent + 1)
-          .append(ifStatement.getIfEdge().getType() == StatEdge.TYPE_BREAK ? "break;" : "continue;")
-          .appendLineSeparator();
+        if (!RoundTrip.holdsDeferredBreak(ifStatement)) {
+          // The enclosing arm prints the break after its closing brace: the target's block closed
+          // before the break's jump, so the source wrote no else here.
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.appendIndent(indent + 1)
+            .append(ifStatement.getIfEdge().getType() == StatEdge.TYPE_BREAK ? "break;" : "continue;")
+            .appendLineSeparator();
+        }
         buf.appendIndent(indent).append("}").appendLineSeparator();
         notempty = true;
         break;
@@ -911,8 +944,12 @@ public class SequenceStatement extends Statement {
         buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(
           new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
-        buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+        if (!RoundTrip.holdsDeferredBreak(ifStatement)) {
+          // The break this arm stood for is the one the enclosing arm prints after its brace: the
+          // source closed the arm there and wrote no else.
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+        }
         buf.appendIndent(indent).append("}").appendLineSeparator();
         notempty = true;
         break;
@@ -1437,6 +1474,47 @@ public class SequenceStatement extends Statement {
       return false;
     }
     return a.bytecode.nextSetBit(0) == b.bytecode.nextSetBit(0);
+  }
+
+  /**
+   * Prints the run inside braces and the break after them when the target's table proves the
+   * source closed this block before the break: a local declared in the run has its scope ending
+   * at a goto another jump lands on, and the run leaves only through a break out of a switch.
+   * The statement holding the edge keeps its print; the break is printed here, after the brace.
+   */
+  private boolean printClosedBlockBreak(TextBuffer buf, int indent) {
+    if (stats.isEmpty() || !varDefinitions.isEmpty() || getParent() instanceof SwitchStatement
+        || isLabeled()) {
+      return false;
+    }
+    Statement last = stats.get(stats.size() - 1);
+    List<StatEdge> exits = last.getAllSuccessorEdges();
+    if (exits.size() != 1 || exits.get(0).getType() != StatEdge.TYPE_BREAK
+        || !exits.get(0).explicit || exits.get(0).labeled
+        || !(exits.get(0).closure instanceof SwitchStatement)) {
+      return false;
+    }
+    int close = RoundTrip.blockClosingBreak(this);
+    if (close <= 0) {
+      return false;
+    }
+    buf.appendIndent(indent).append("{").appendLineSeparator();
+    Statement previous = RoundTrip.deferBreakTo(exits.get(0).closure);
+    try {
+      for (Statement stat : stats) {
+        buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, true));
+      }
+    } finally {
+      RoundTrip.restoreDeferredBreak(previous);
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    TextBuffer line = new TextBuffer();
+    line.appendIndent(indent);
+    int at = line.length();
+    line.append("break;").appendLineSeparator();
+    line.addBytecodeMappingAt(at, close, null, null);
+    buf.append(line);
+    return true;
   }
 
   /** Appends the arms as {@code if (a) { … } else if (b) { … } …,} the source's chain. */
