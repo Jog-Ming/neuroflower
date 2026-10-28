@@ -191,6 +191,10 @@ public final class LocalDeclarationOrder {
         debug(method, var, "rejected: another local prints as " + var.getName());
         continue;
       }
+      if (RoundTrip.isCatchParameter(new VarVersionPair(var))) {
+        debug(method, var, "rejected: the catch header declares it");
+        continue;
+      }
       if (mentionsField(root, var.getName())) {
         debug(method, var, "rejected: the method names a field " + var.getName());
         continue;

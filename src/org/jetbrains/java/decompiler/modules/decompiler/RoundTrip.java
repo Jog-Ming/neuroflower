@@ -3226,6 +3226,10 @@ public final class RoundTrip {
   private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> AFTER_IF =
     ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
 
+  /** Each method's catch parameters: the catch header declares them and they cannot be hoisted. */
+  private static final java.util.Map<StructMethod, java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair>> CATCH_PARAMS =
+    new java.util.concurrent.ConcurrentHashMap<>();
+
   /** Statements that printed the break their trailing jump edge would otherwise add. */
   private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> PRINTED_BREAKS =
     ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
@@ -3290,7 +3294,8 @@ public final class RoundTrip {
               }
             }
           }
-          if (declaration == null) {
+          if (declaration == null
+              || isCatchParameter(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(declaration))) {
             blocked = true;
             break;
           }
@@ -3330,6 +3335,44 @@ public final class RoundTrip {
     }
     for (Statement child : stat.getStats()) {
       collectArmDefinitions(child, moved, out);
+    }
+  }
+
+  /**
+   * True when this local is a catch parameter. The catch header declares it, so a bare
+   * declaration elsewhere in its scope would redeclare it and not compile; it cannot be hoisted.
+   */
+  public static boolean isCatchParameter(org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair) {
+    StructMethod method = currentMethod();
+    Statement root = methodRoot();
+    if (method == null || root == null) {
+      return false;
+    }
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> params =
+      CATCH_PARAMS.computeIfAbsent(method, key -> {
+        java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out = new java.util.HashSet<>();
+        collectCatchParameters(root, out);
+        return out;
+      });
+    return params.contains(pair);
+  }
+
+  private static void collectCatchParameters(Statement stat,
+                                             java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out) {
+    if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement catchStatement) {
+      for (Exprent exprent : catchStatement.getStatExprents()) {
+        if (exprent == null) {
+          continue;
+        }
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          if (inner instanceof VarExprent var) {
+            out.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      collectCatchParameters(child, out);
     }
   }
 
