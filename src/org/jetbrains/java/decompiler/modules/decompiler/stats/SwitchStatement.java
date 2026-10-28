@@ -224,6 +224,7 @@ public class SwitchStatement extends Statement {
     // enclosing block's scope, where a block-scoped one would have closed first. The label was
     // empty then, and the statements belong after the switch's closing brace.
     Statement joinArm = defaultJoinArm(yields);
+    Statement caseJoinArm = caseJoinArm(yields, switchEnd);
 
     boolean defaultPrinted = false;
     boolean lastJoins = false;
@@ -292,6 +293,17 @@ public class SwitchStatement extends Statement {
       // Every label this arm carried was the joined default, which the source did not write
       // here: the arm is no group at all, and its body would attach to the arm before it.
       if (!anyLabel) {
+        continue;
+      }
+
+      // The arm's block is the join itself: its table targets jump there, and the statements it
+      // holds are the ones the source wrote after the switch. Only the label and its `break;`
+      // belong to the switch; the body prints after the closing brace.
+      if (stat == caseJoinArm) {
+        int jump = caseJoinJump(caseStatements.indexOf(stat), switchEnd);
+        if (jump >= 0) {
+          buf.append(breakLine(indent + 2, jump));
+        }
         continue;
       }
 
@@ -374,12 +386,69 @@ public class SwitchStatement extends Statement {
     if (joinArm != null) {
       buf.append(ExprProcessor.jmpWrapper(joinArm, indent, false));
     }
+    if (caseJoinArm != null) {
+      buf.append(ExprProcessor.jmpWrapper(caseJoinArm, indent, false));
+    }
 
     if (this.isPhantom()) {
       buf.append("*/");
     }
 
     return buf;
+  }
+
+  /**
+   * The case arm whose block is the join: the switch table's target for its label is a jump to the
+   * instruction after the switch, and the arm's own block starts there. The source wrote the
+   * labels with an empty body and the statements after the switch.
+   */
+  private Statement caseJoinArm(boolean yields, int switchEnd) {
+    if (!RoundTrip.selector("switchcasejoin") || switchEnd < 0 || yields || isPattern()
+        || caseGuards.stream().anyMatch(Objects::nonNull)) {
+      return null;
+    }
+    for (int i = 0; i < caseStatements.size(); i++) {
+      Statement arm = caseStatements.get(i);
+      if (arm != null && arm != joinArmForDefault() && RoundTrip.firstOffset(arm) == switchEnd
+          && caseJoinJump(i, switchEnd) >= 0) {
+        return arm;
+      }
+    }
+    return null;
+  }
+
+  /** The label's table target when it is a jump to the join, or -1. */
+  private int caseJoinJump(int index, int switchEnd) {
+    if (switchEnd < 0 || index < 0 || index >= caseEdges.size()) {
+      return -1;
+    }
+    List<StatEdge> edges = caseEdges.get(index);
+    SwitchInstruction instruction = switchInstruction();
+    int[] targets = instruction == null ? null : RoundTrip.switchTargetsAt(instruction.startOffset);
+    if (targets == null || edges.isEmpty()) {
+      return -1;
+    }
+    List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    int jump = -1;
+    for (StatEdge edge : edges) {
+      if (edge == defaultEdge) {
+        return -1;
+      }
+      int at = successors.indexOf(edge);
+      if (at < 0 || at >= targets.length) {
+        return -1;
+      }
+      int target = targets[at];
+      if (RoundTrip.jumpTargetAt(target) != switchEnd || (jump >= 0 && jump != target)) {
+        return -1;
+      }
+      jump = target;
+    }
+    return jump;
+  }
+
+  private Statement joinArmForDefault() {
+    return defaultEdge == null ? null : defaultEdge.getDestination();
   }
 
   /**
@@ -455,15 +524,24 @@ public class SwitchStatement extends Statement {
     if (size < 2) {
       return false;
     }
+    // The join block is no arm: its instructions lie after the switch, so they say nothing about
+    // where its label stood in the source.
+    int join = RoundTrip.selector("switchcasejoin") ? switchEndFromJumps() : -1;
     List<Integer> layout = new ArrayList<>(size);
     for (int i = 0; i < size; i++) {
-      if (RoundTrip.firstOffset(caseStatements.get(i)) < 0) {
+      int first = RoundTrip.firstOffset(caseStatements.get(i));
+      if (first < 0) {
         return false;
+      }
+      if (first == join) {
+        continue;
       }
       layout.add(i);
     }
     layout.sort(Comparator.comparingInt(i -> RoundTrip.firstOffset(caseStatements.get(i))));
-    return !layout.equals(order);
+    List<Integer> printed = new ArrayList<>(order);
+    printed.retainAll(layout);
+    return !layout.equals(printed);
   }
 
   /** The offset just past the switch, read from the statement that follows it, or -1. */
@@ -491,9 +569,24 @@ public class SwitchStatement extends Statement {
     if (!RoundTrip.selector("switchjump")) {
       return -1;
     }
+    // An arm is the join itself when another arm's tail jump lands on its first instruction: that
+    // block is the code after the switch, and its own instructions must not raise the bar the
+    // join has to clear.
     int limit = -1;
     for (Statement arm : caseStatements) {
-      limit = Math.max(limit, RoundTrip.blockEnd(arm));
+      int first = RoundTrip.firstOffset(arm);
+      boolean isJoinBlock = false;
+      if (first >= 0 && RoundTrip.selector("switchcasejoin")) {
+        for (Statement other : caseStatements) {
+          if (other != arm && RoundTrip.tailJumpTarget(other) == first) {
+            isJoinBlock = true;
+            break;
+          }
+        }
+      }
+      if (!isJoinBlock) {
+        limit = Math.max(limit, RoundTrip.blockEnd(arm));
+      }
     }
     int join = -1;
     for (Statement arm : caseStatements) {
@@ -640,10 +733,16 @@ public class SwitchStatement extends Statement {
    */
   private boolean spansRunForward(List<Integer> sorted, StructLineNumberTableAttribute table) {
     int previous = -1;
+    int join = switchEndFromJumps();
     for (int i : sorted) {
       Statement stat = caseStatements.get(i);
       int first = RoundTrip.firstOffset(stat);
       int last = RoundTrip.lastOffset(stat);
+      // An arm whose block is the join holds none of its own statements: what it records was
+      // written after the switch and says nothing about the arm's place in the source.
+      if (join >= 0 && first == join) {
+        continue;
+      }
       if (first < 0 || last < first) {
         continue;
       }
