@@ -1199,6 +1199,18 @@ public class ExprProcessor implements CodeConstants {
   }
 
   public static TextBuffer jmpWrapper(Statement stat, int indent, boolean semicolon) {
+    if (RoundTrip.isDeferredExit(stat)) {
+      // The loop prints this block after its closing brace; here the source jumped to it.
+      TextBuffer jump = new TextBuffer();
+      if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat
+          && ifstat.getFirst() != null) {
+        // A head block the if merged before the tail ran where it stands; only what follows moves.
+        jump.append(ifstat.getFirst().toJava(indent));
+        RoundTrip.consumeHead(stat);
+      }
+      jump.appendIndent(indent).append("break;").appendLineSeparator();
+      return jump;
+    }
     TextBuffer buf = stat.toJava(indent);
 
     List<StatEdge> lstSuccs = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);

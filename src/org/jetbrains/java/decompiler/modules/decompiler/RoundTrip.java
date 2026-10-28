@@ -2267,6 +2267,262 @@ public final class RoundTrip {
     return max;
   }
 
+  /** Statements a loop prints after its closing brace; their prints on the way through are breaks. */
+  private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> DEFERRED_EXITS =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+  /** Deferred ifs whose merged head block already printed where the source ran it. */
+  private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> CONSUMED_HEADS =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+
+  /**
+   * The statements this loop must print after its closing brace: the target laid them out past the
+   * loop's back edge, so they are the block a {@code break} jumps to, not part of the body. The
+   * source wrote the break and the block after the loop; printing the block inside the arm would
+   * move it ahead of the body and drop the jump. Empty when the target's layout shows no such
+   * block, and when a test inside the body jumps into it as well — then it belongs to the body.
+   */
+  public static java.util.List<Statement> deferExitsAfter(Statement loop) {
+    java.util.List<Statement> out = new java.util.ArrayList<>();
+    StructMethod method = currentMethod();
+    if (method == null || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      return out;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> branches = BRANCH_TARGETS.get(method);
+    int head = firstOffset(loop);
+    int loopEnd = lastOffset(loop);
+    if (gotos == null || head < 0 || loopEnd < 0) {
+      return out;
+    }
+    int backEdge = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() != null && entry.getValue() == head && entry.getKey() > backEdge) {
+        backEdge = entry.getKey();
+      }
+    }
+    if (backEdge < 0) {
+      return out;
+    }
+    // The first instruction after the back edge that an unconditional jump reaches is the block's
+    // start; the source's break is that jump.
+    int tail = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      int from = entry.getKey();
+      Integer to = entry.getValue();
+      if (to != null && from > head && from < to && to > backEdge && to <= loopEnd && (tail < 0 || to < tail)) {
+        tail = to;
+      }
+    }
+    if (tail < 0) {
+      return out;
+    }
+    if (branches != null) {
+      for (java.util.Map.Entry<Integer, Integer> entry : branches.entrySet()) {
+        Integer to = entry.getValue();
+        if (to != null && to >= tail && entry.getKey() > head && entry.getKey() <= backEdge) {
+          // A test in the body reaches the block without jumping out of the loop: it is body.
+          return out;
+        }
+      }
+    }
+    collectDeferred(loop, tail, out);
+    if (!out.isEmpty() && (usesLoopLocals(loop, out) || reachesFromOutside(loop, out))) {
+      // A value the body declares is not in scope after the loop; the block cannot move. And a
+      // block another path enters is not the loop's own exit.
+      out.clear();
+    }
+    if (!out.isEmpty()) {
+      out.sort(java.util.Comparator.comparingInt(RoundTrip::firstOffset));
+      DEFERRED_EXITS.get().computeIfAbsent(method, key -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).addAll(out);
+    }
+    return out;
+  }
+
+  /**
+   * True when something outside the loop jumps to a block the loop would move, or when the jump
+   * that reaches it comes from inside a switch — there a printed {@code break} would leave the
+   * switch instead of the loop.
+   */
+  private static boolean reachesFromOutside(Statement loop, java.util.List<Statement> deferred) {
+    for (Statement stat : deferred) {
+      for (StatEdge edge : stat.getAllPredecessorEdges()) {
+        Statement source = edge.getSource();
+        if (!loop.containsStatementStrict(source)) {
+          return true;
+        }
+        for (Statement parent = source; parent != null && parent != loop; parent = parent.getParent()) {
+          if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /** True when a statement the loop would move reads a variable the loop body declares. */
+  private static boolean usesLoopLocals(Statement loop, java.util.List<Statement> deferred) {
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined = new java.util.HashSet<>();
+    collectDefinitions(loop, deferred, defined);
+    if (defined.isEmpty()) {
+      return false;
+    }
+    for (Statement stat : deferred) {
+      if (readsAny(stat, defined)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static void collectDefinitions(Statement stat, java.util.List<Statement> deferred,
+                                         java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out) {
+    for (Exprent exprent : ownExprents(stat)) {
+      if (exprent instanceof VarExprent var && var.isDefinition()) {
+        out.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (deferred.contains(child)) {
+        // A deferred if's head block prints where it stands, so it stays inside the loop.
+        if (child instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat
+            && ifstat.getFirst() != null) {
+          collectDefinitions(ifstat.getFirst(), deferred, out);
+        }
+        continue;
+      }
+      collectDefinitions(child, deferred, out);
+    }
+  }
+
+  private static boolean readsAny(Statement stat, java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined) {
+    for (Exprent exprent : ownExprents(stat)) {
+      if (exprent instanceof VarExprent var && defined.contains(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var))) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      // An if's head block printed in place and is not part of what moves.
+      if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat
+          && child == ifstat.getFirst()) {
+        continue;
+      }
+      if (readsAny(child, defined)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The exprents a statement prints itself, nested expressions included. */
+  private static java.util.List<Exprent> ownExprents(Statement stat) {
+    java.util.List<Exprent> out = new java.util.ArrayList<>();
+    java.util.List<Exprent> direct = stat.getExprents() != null ? stat.getExprents() : stat.getStatExprents();
+    for (Exprent exprent : direct) {
+      if (exprent != null) {
+        out.addAll(exprent.getAllExprents(true, true));
+      }
+    }
+    return out;
+  }
+
+  /** Collects the outermost statements that start at or after the tail, without descending into them. */
+  private static void collectDeferred(Statement stat, int tail, java.util.List<Statement> out) {
+    for (Statement child : stat.getStats()) {
+      if (startsAtTail(child, tail)) {
+        // A bare void return is the loop's own exit and already prints as the break that reaches
+        // it; there is nothing to move past the loop.
+        if (!isBareVoidReturn(child)) {
+          out.add(child);
+        }
+      }
+      else {
+        collectDeferred(child, tail, out);
+      }
+    }
+  }
+
+  /** True when the statement is one bare void return and nothing else. */
+  private static boolean isBareVoidReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    return exprents != null && exprents.size() == 1
+      && exprents.get(0) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+      && exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+      && exit.getValue() == null;
+  }
+
+  /**
+   * True when the statement's own instructions all lie in the tail. An if may hold, as its head
+   * block, statements the decompiler merged before the test; those print where they ran and only
+   * the test and its arms move, so the head is not part of the test.
+   */
+  private static boolean startsAtTail(Statement stat, int tail) {
+    int start = startOffset(stat);
+    if (start >= tail) {
+      return true;
+    }
+    if (!(stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat)
+        || ifstat.getFirst() == null || stat.getStats().size() < 2) {
+      return false;
+    }
+    if (ifstat.getHeadexprent() != null) {
+      BitSet condition = ifstat.getHeadexprent().getCondition().bytecode;
+      if (condition == null || condition.isEmpty() || condition.nextSetBit(0) < tail) {
+        return false;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (child == ifstat.getFirst()) {
+        continue;
+      }
+      int childStart = startOffset(child);
+      if (childStart < 0 || childStart < tail) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** True when this statement's position prints as the break that jumps to the moved block. */
+  public static boolean isDeferredExit(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    java.util.Set<Statement> deferred = DEFERRED_EXITS.get().get(method);
+    return deferred != null && deferred.contains(stat);
+  }
+
+  /** True when the statement's merged head block belongs where the body printed it, not here. */
+  public static boolean isHeadConsumed(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    java.util.Set<Statement> consumed = CONSUMED_HEADS.get().get(method);
+    return consumed != null && consumed.contains(stat);
+  }
+
+  /** Records that a deferred if's head block printed where the source ran it. */
+  public static void consumeHead(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method != null && stat != null) {
+      CONSUMED_HEADS.get().computeIfAbsent(method, key -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).add(stat);
+    }
+  }
+
+  /** Forgets the deferred set once the loop is about to print the statements itself. */
+  public static void releaseDeferredExits(java.util.List<Statement> deferred) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return;
+    }
+    java.util.Set<Statement> set = DEFERRED_EXITS.get().get(method);
+    if (set != null) {
+      set.removeAll(deferred);
+    }
+  }
+
   private static void markGuardExit(StructMethod method, int offset) {
     CONSUMED_GUARD_EXITS.computeIfAbsent(method, key -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(offset);
   }

@@ -119,6 +119,12 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // The loop moved this block after its closing brace; the run's first statement printed the
+      // break that reaches it, and nothing after a break in the same block can run.
+      if (RoundTrip.isDeferredExit(st) && i > 0 && RoundTrip.isDeferredExit(stats.get(i - 1))) {
+        continue;
+      }
+
       // A `||` arm with its body left after it: print the test positively and the body as its arm.
       if (printDisjunctiveArm(buf, indent, i)) {
         notempty = true;

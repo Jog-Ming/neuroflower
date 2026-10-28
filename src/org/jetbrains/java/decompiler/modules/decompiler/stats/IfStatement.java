@@ -198,7 +198,10 @@ public class IfStatement extends Statement {
 
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
-    buf.append(first.toJava(indent));
+    // A merged head block stays where the arm printed it; only the test and arms moved.
+    if (!RoundTrip.isHeadConsumed(this)) {
+      buf.append(first.toJava(indent));
+    }
 
     if (isLabeled()) {
       buf.appendIndent(indent).append("label").append(this.id).append(":").appendLineSeparator();

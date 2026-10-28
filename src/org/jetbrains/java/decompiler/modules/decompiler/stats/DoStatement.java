@@ -119,9 +119,20 @@ public class DoStatement extends Statement {
           if (printBreakGuard(buf, indent)) {
             break;
           }
+          // A block the target laid out past the back edge is the loop's exit: the arms print the
+          // break that reached it, and it prints again after the closing brace.
+          List<Statement> deferred = RoundTrip.deferExitsAfter(this);
           buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
           buf.appendIndent(indent).append("}").appendLineSeparator();
+          if (!deferred.isEmpty()) {
+            RoundTrip.releaseDeferredExits(deferred);
+            for (Statement exit : deferred) {
+              // The block's own jump edge is the flow into the statement the loop's parent prints
+              // next, so only its content moves here.
+              buf.append(exit.toJava(indent));
+            }
+          }
         } finally {
           RoundTrip.exitLoop();
         }
