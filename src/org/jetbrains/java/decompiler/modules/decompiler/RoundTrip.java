@@ -3968,6 +3968,25 @@ public final class RoundTrip {
   }
 
   /**
+   * The goto the guard written just before this next test compiles to, or -1. The printed
+   * {@code continue;} takes its line from the target's table entry at that jump, exactly as
+   * {@link #continueGoto} does for the last guard of a merged condition.
+   */
+  public static int continueGotoBefore(Exprent next, Statement around) {
+    if (!selector("continueguard")) {
+      return -1;
+    }
+    int start = firstOffsetOf(next);
+    if (start < 3 || !continuesAt(start - 3, around)) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, int[]> sites = method == null ? null : CONTINUE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(start - 3);
+    return site == null ? -1 : site[0];
+  }
+
+  /**
    * True when this condition merges that many {@code continue} guards: the target records one jump
    * back to the loop head per statement, so an {@code ||} of n tests came from n separate
    * {@code if (C) continue;} statements rather than one shared condition.

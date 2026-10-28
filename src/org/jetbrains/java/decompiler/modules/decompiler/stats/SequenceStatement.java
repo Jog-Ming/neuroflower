@@ -371,6 +371,9 @@ public class SequenceStatement extends Statement {
       // The target's branch-then-goto shape and line table prove the continue. The mirror is the
       // loop's whole remaining body, so the guard is exact only when this sequence is the loop
       // body and the if is its last statement; otherwise the continue would skip the tail.
+      // A run of such guards merged into one test splits back at the continue jumps the target
+      // records for each statement, exactly as the same shape does when the if prints itself
+      // (IfStatement's mirror): each guard's goto ends where the next test begins.
       if (st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isPatternMatched() && !ifStatement.isLabeled() && !st.isLabeled()
@@ -378,17 +381,38 @@ public class SequenceStatement extends Statement {
           && i == stats.size() - 1 && endsLoopBody()
           && RoundTrip.printContinueGuard(ifStatement.getHeadexprent(), this)) {
         Exprent condition = ifStatement.getHeadexprent().getCondition();
-        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
-        head.setCondition(condition instanceof FunctionExprent not
+        Exprent source = condition instanceof FunctionExprent not
             && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT
             && not.getLstOperands().size() == 1
           ? not.getLstOperands().get(0)
-          : RoundTrip.negateCondition(condition));
+          : RoundTrip.negateCondition(condition);
+        List<Exprent> ors = IfStatement.orOperands(source);
+        List<List<Exprent>> groups = RoundTrip.guardGroups(ifStatement.getHeadexprent(), ors, this);
+        if (groups == null) {
+          groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
+        }
+        // Each guard compiles the printed `continue;` to the goto the target's table puts on the
+        // line the source wrote it on; the line alignment has to see that jump to place it. A
+        // cut-out group's jump sits right before the next group's first instruction, and the
+        // head's own test is the one the if's last branch belongs to.
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
-        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
-        buf.appendIndent(indent).append("}").appendLineSeparator();
+        for (int groupIndex = 0; groupIndex < groups.size(); groupIndex++) {
+          List<Exprent> group = groups.get(groupIndex);
+          int gotoOffset = groupIndex + 1 < groups.size()
+            ? RoundTrip.continueGotoBefore(groups.get(groupIndex + 1).get(0), this)
+            : RoundTrip.continueGoto(ifStatement.getHeadexprent());
+          IfExprent guard = (IfExprent) ifStatement.getHeadexprent().copy();
+          guard.setCondition(IfStatement.orOf(group));
+          buf.appendIndent(indent).append(guard.toJava(indent)).append(" {").appendLineSeparator();
+          TextBuffer continueLine = new TextBuffer();
+          continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+          if (gotoOffset >= 0) {
+            continueLine.addStartBytecodeMapping(gotoOffset);
+          }
+          buf.append(continueLine);
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
         buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
         notempty = true;
         continue;

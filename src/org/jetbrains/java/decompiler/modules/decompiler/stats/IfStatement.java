@@ -757,7 +757,7 @@ public class IfStatement extends Statement {
   }
 
   /** One operand, or the operands joined by `||` again, as a guard condition prints it. */
-  private static Exprent orOf(List<Exprent> operands) {
+  static Exprent orOf(List<Exprent> operands) {
     if (operands.size() == 1) {
       return operands.get(0);
     }
@@ -769,7 +769,7 @@ public class IfStatement extends Statement {
   }
 
   /** The operands of a boolean-or condition, flattened; a single expression comes back alone. */
-  private static List<Exprent> orOperands(Exprent condition) {
+  static List<Exprent> orOperands(Exprent condition) {
     List<Exprent> operands = new ArrayList<>();
     collectOrOperands(condition, operands);
     return operands;
