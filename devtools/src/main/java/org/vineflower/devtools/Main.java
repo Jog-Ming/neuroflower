@@ -708,6 +708,11 @@ public final class Main {
     if (System.getenv("DECOMPILER_JAR") != null && !System.getenv("DECOMPILER_JAR").isBlank()) {
       return;
     }
+    // A read-only caller — a research agent compiling one class with the verifier's javac — must
+    // not rebuild the jar a measuring agent is using.
+    if (System.getenv("DEVTOOLS_NO_BUILD") != null) {
+      return;
+    }
     Path root = projectRoot();
     if (root == null) {
       return;

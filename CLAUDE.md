@@ -134,3 +134,8 @@ iteration loop; score the whole goal set only after a batch of large gains.
 **Changing this interface means changing this block.** Any new, removed or renamed command, flag or
 default must be reflected here in the same change; an out-of-date usage block is a broken interface.
 
+`DEVTOOLS_NO_BUILD=1` skips the decompiler-jar freshness check, which every command otherwise runs.
+A read-only caller — a research agent compiling one class with the verifier's javac — sets it so a
+compile never rebuilds the jar a measuring agent is using: `DEVTOOLS_NO_BUILD=1 devtools/cli compile
+<version> <Class>`. It is never set for a command whose result is a measurement.
+
