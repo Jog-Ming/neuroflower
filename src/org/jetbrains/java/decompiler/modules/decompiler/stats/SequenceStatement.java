@@ -155,8 +155,40 @@ public class SequenceStatement extends Statement {
               break;
             }
           }
-          if (close > i && close < stats.size() - 1
-              && !RoundTrip.slotUsedFrom(stats, close + 1, scope[2])) {
+          boolean exact = close > i;
+          // Closing the block moves everything after it out of the local's scope: allowed only
+          // when nothing there reads the local. Where the target hands the slot to a later local,
+          // the scope provably ended and no read can follow; that also bounds the block for a run
+          // whose last statement ends well before the scope does (a loop's back edge).
+          VarExprent declared = declaredAt(st, scope[0], scope[2]);
+          boolean reusable = declared != null && RoundTrip.slotReusedAfter(scope[2], scope[1]);
+          boolean basicBlock = st.getExprents() != null && !st.getExprents().isEmpty();
+          if (!exact && basicBlock) {
+            for (int j = i; j < stats.size(); j++) {
+              int end = RoundTrip.blockEnd(stats.get(j));
+              boolean atBoundary = j + 1 >= stats.size()
+                || RoundTrip.statementStart(stats.get(j + 1)) >= scope[1];
+              if (end <= scope[1] + 5 && atBoundary) {
+                close = j;
+                break;
+              }
+              if (end > scope[1] + 5) {
+                break;
+              }
+            }
+            // A loop's own variable opens at the loop's head; its declaration belongs to the for
+            // statement, not to a block in front of it.
+            if (close > i && loopHeadReads(stats.get(close), scope[0], scope[2])) {
+              close = -1;
+              basicBlock = false;
+            }
+          }
+          boolean closedEarly = exact
+            ? !RoundTrip.slotUsedFrom(stats, close + 1, scope[2])
+            : close > i && basicBlock
+              && (!RoundTrip.slotUsedFrom(stats, close + 1, scope[2])
+                  || reusable && !usedLater(stats, close + 1, declared));
+          if (close > i && close < stats.size() - 1 && closedEarly) {
             int split = RoundTrip.exprentAtOffset(st, scope[0]);
             List<Exprent> exprents = st.getExprents();
             if (split < 0 && exprents != null && !exprents.isEmpty()) {
@@ -1252,6 +1284,45 @@ public class SequenceStatement extends Statement {
       return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
     }
     return endsWithExit(last.getStats());
+  }
+
+  /**
+   * Whether this loop's own head declares the local that opens at that offset: the variable the
+   * for statement owns, which the printer binds to the loop rather than to a block before it.
+   */
+  private static boolean loopHeadReads(Statement stat, int start, int slot) {
+    if (!(stat instanceof DoStatement loop)) {
+      return false;
+    }
+    for (Exprent exprent : new Exprent[]{loop.getConditionExprent(), loop.getIncExprent()}) {
+      if (exprent == null) {
+        continue;
+      }
+      for (Exprent part : exprent.getAllExprents(true, true)) {
+        if (part instanceof VarExprent variable && variable.getLVT() != null
+            && variable.getLVT().getStartPC() == start && variable.getLVT().getIndex() == slot) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The definition of the local this statement declares at that offset and slot, or null. */
+  private static VarExprent declaredAt(Statement stat, int start, int slot) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents == null) {
+      return null;
+    }
+    for (Exprent exprent : exprents) {
+      for (Exprent part : exprent.getAllExprents(true, true)) {
+        if (part instanceof VarExprent variable && variable.isDefinition() && variable.getLVT() != null
+            && variable.getLVT().getStartPC() == start && variable.getLVT().getIndex() == slot) {
+          return variable;
+        }
+      }
+    }
+    return null;
   }
 
   /** The target's slot for the first local this statement declares, or -1. */

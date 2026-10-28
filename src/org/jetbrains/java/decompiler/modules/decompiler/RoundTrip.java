@@ -3722,6 +3722,24 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target hands this slot to another local at or after that offset: the local
+   * that held it ended there, so the source closed a block the printer has no brace for.
+   */
+  public static boolean slotReusedAfter(int slot, int after) {
+    StructMethod method = currentMethod();
+    if (method == null || slot < 0 || after < 0) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    return table.getVariables().anyMatch(entry -> entry.getIndex() == slot
+      && entry.getStartPC() >= after && entry.getLength() > 0);
+  }
+
+  /**
    * True when any statement from {@code from} on still reads the local in this slot: closing a
    * block in front of it would put the read outside the local's scope.
    */
