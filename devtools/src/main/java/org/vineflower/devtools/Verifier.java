@@ -272,7 +272,7 @@ public final class Verifier {
     // name compiles to different bytes.
     String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + source.getFileName() + "|" + stamp);
     Path cached = compileCache.resolve(key.substring(0, 2)).resolve(key + ".json");
-    if (Files.exists(cached)) {
+    if (Files.exists(cached) && System.getenv("NEUROFLOWER_DIFF_DUMP") == null) {
       Files.setLastModifiedTime(cached, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
       return readCache(source, cached);
     }

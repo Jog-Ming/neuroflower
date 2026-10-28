@@ -123,6 +123,11 @@ public final class ClassDiff {
       }
       if (!lvt(theirs).equals(lvt(ours))) {
         diff.fail("lvt", entry.getKey());
+        if (System.getenv("NEUROFLOWER_DIFF_DUMP") != null) {
+          System.err.println("LVT " + entry.getKey());
+          System.err.println("LVT jar " + localRows(theirs));
+          System.err.println("LVT our " + localRows(ours));
+        }
       }
       if (!parameters(theirs).equals(parameters(ours))) {
         diff.fail("params", entry.getKey());
@@ -318,6 +323,23 @@ public final class ClassDiff {
   private static String firstInstructionDifference(MethodNode original, MethodNode recompiled) {
     List<String> a = renderedInstructions(original);
     List<String> b = renderedInstructions(recompiled);
+    if (System.getenv("NEUROFLOWER_DIFF_DUMP") != null) {
+      int limit = Math.min(a.size(), b.size());
+      int at = -1;
+      for (int i = 0; i < limit; i++) {
+        if (!a.get(i).equals(b.get(i))) {
+          at = i;
+          break;
+        }
+      }
+      int from = Math.max(0, at - 25);
+      int to = Math.min(limit, at + 25);
+      System.err.println("DUMP " + original.name + original.desc + " first=" + at);
+      for (int i = from; i < to; i++) {
+        boolean same = a.get(i).equals(b.get(i));
+        System.err.println("DUMP " + i + (same ? "  " : " *") + " " + a.get(i) + (same ? "" : "   ||   " + b.get(i)));
+      }
+    }
     int limit = Math.min(a.size(), b.size());
     for (int i = 0; i < limit; i++) {
       if (!a.get(i).equals(b.get(i))) {
@@ -475,6 +497,17 @@ public final class ClassDiff {
   private static int lineOf(List<String> entries, int index) {
     String entry = entries.get(index);
     return Integer.parseInt(entry.substring(entry.indexOf(':') + 1));
+  }
+
+  private static String localRows(MethodNode method) {
+    if (method.localVariables == null) {
+      return "";
+    }
+    List<String> entries = new ArrayList<>();
+    for (LocalVariableNode local : method.localVariables) {
+      entries.add(local.name + "@" + local.index + "[" + local.start.getLabel() + "+" + local.end.getLabel() + "]");
+    }
+    return entries.toString();
   }
 
   private static String lvt(MethodNode method) {
