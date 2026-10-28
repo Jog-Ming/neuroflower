@@ -1093,6 +1093,27 @@ public final class RoundTrip {
     return inc >= 0 && nxt >= 0 && inc < nxt;
   }
 
+  /**
+   * True when the target ran this increment before the expression's first instruction and on a line
+   * of its own: the source wrote `++x;` as a statement, so inlining would both move the iinc behind
+   * whatever the expression evaluates first and print two source lines as one. When the increment and
+   * the expression share a line the two forms compile to the same bytes, and the printer's inline
+   * form is the source's.
+   */
+  public static boolean updatePrecedesExpression(Exprent update, Exprent expression) {
+    if (!selector("ppmmearly")) {
+      return false;
+    }
+    int inc = firstOffsetOf(update);
+    int first = firstOffsetOf(expression);
+    if (inc < 0 || first < 0 || inc >= first) {
+      return false;
+    }
+    int incLine = lineAtOffset(inc);
+    int firstLine = lineAtOffset(first);
+    return incLine >= 0 && firstLine >= 0 && incLine != firstLine;
+  }
+
   /** The smallest instruction offset any part of the expression owns, or -1. */
   private static int firstOffsetOf(Exprent exprent) {
     int first = -1;

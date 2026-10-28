@@ -234,6 +234,12 @@ public class SimplifyExprentsHelper {
         continue;
       }
 
+      if (firstInvocation && inlineCompoundAssign(current, next)) {
+        list.remove(index);
+        res = true;
+        continue;
+      }
+
       index++;
     }
 
@@ -680,6 +686,60 @@ public class SimplifyExprentsHelper {
     }
 
     return false;
+  }
+
+  // Inlines an iinc (`v = v ± const`) into the next expression's use of v, the same way PPI/MMI
+  // inlines: `v = v + 36; f(v);` becomes `f(v = v + 36)`, which the assignment pass then prints as
+  // `f(v += 36)`. The target's iinc runs after the first thing the expression evaluates, which is
+  // what an inlined compound assignment compiles back to.
+  private static boolean inlineCompoundAssign(Exprent expr, Exprent next) {
+    if (!(expr instanceof AssignmentExprent as) ||
+      as.getCondType() != null ||
+      !(as.getLeft() instanceof VarExprent left) ||
+      left.isStack() ||
+      !(as.getRight() instanceof FunctionExprent func)) {
+      return false;
+    }
+
+    FunctionType type = func.getFuncType();
+    if (type != FunctionType.ADD && type != FunctionType.SUB) {
+      return false;
+    }
+
+    List<Exprent> operands = func.getLstOperands();
+    Exprent econd = operands.get(0);
+    Exprent econst = operands.get(1);
+
+    if (!(econst instanceof ConstExprent) && econd instanceof ConstExprent && type == FunctionType.ADD) {
+      econd = econst;
+      econst = operands.get(0);
+    }
+
+    // The iinc's read carries the previous SSA version of the slot, so the two operands are the
+    // same variable by slot, not by version.
+    if (!(econst instanceof ConstExprent)
+      || !(econd instanceof VarExprent read)
+      || read.getIndex() != left.getIndex()) {
+      return false;
+    }
+
+    // A target whose iinc runs before the expression's first instruction holds the source's own
+    // statement; inlining would move it after the receiver or first argument.
+    if (RoundTrip.updatePrecedesExpression(as, next)) {
+      return false;
+    }
+
+    Pair<Exprent, VarExprent> usage = findFirstValidUsage(left, next);
+    if (usage == null) {
+      return false;
+    }
+
+    // The write carries the slot's new SSA version, whose name may not be recorded; the read is the
+    // same local and keeps the table entry, so the compound form is built from it.
+    AssignmentExprent compound = new AssignmentExprent(read.copy(), econst, as.bytecode);
+    compound.setCondType(type);
+    usage.a.replaceExprent(usage.b, compound);
+    return true;
   }
 
   // Try to find the first valid usage of a variable for PPMM inlining.

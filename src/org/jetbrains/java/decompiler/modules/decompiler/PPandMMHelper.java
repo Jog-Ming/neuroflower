@@ -247,7 +247,10 @@ public class PPandMMHelper {
         // parent, var
         Pair<Exprent, VarExprent> usage = findFirstValidUsage(inner, destination.getHeadexprent().getCondition());
 
-        if (usage != null) {
+        // The target ran the increment before the condition's first instruction, on a line of
+        // its own: the source wrote `++x;` as a statement, and inlining would move the iinc
+        // behind whatever the condition evaluates first.
+        if (usage != null && !RoundTrip.updatePrecedesExpression(func, destination.getHeadexprent().getCondition())) {
           var parent = usage.a;
           var old = usage.b;
           // Replace variable with ppi/mmi
