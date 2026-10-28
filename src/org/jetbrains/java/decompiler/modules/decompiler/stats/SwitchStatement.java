@@ -190,6 +190,22 @@ public class SwitchStatement extends Statement {
     if (jumpEnd >= 0 && (switchEnd < 0 || jumpEnd < switchEnd)) {
       switchEnd = jumpEnd;
     }
+
+    // A local the arm declares whose target row ends at a jump out of the arm: the source braced
+    // the arm, so the block closed before that jump and the row ends where the jump starts
+    // instead of at the switch's join.
+    java.util.Map<Integer, Integer> gotos = RoundTrip.gotosHere();
+    if (gotos != null) {
+      for (int a = 0; a < caseStatements.size(); a++) {
+        for (int[] row : armSlots.get(a).values()) {
+          Integer dest = row[1] >= 0 ? gotos.get(row[1]) : null;
+          if (dest != null && dest == switchEnd) {
+            braced.add(caseStatements.get(a));
+            break;
+          }
+        }
+      }
+    }
     List<Integer> order = sourceOrder();
     // When the printed order leaves the arms' bytecode blocks in another sequence, the source was
     // written in an order the class file did not record and the jumps say nothing about a break

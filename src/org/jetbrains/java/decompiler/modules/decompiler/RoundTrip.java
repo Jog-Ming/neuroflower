@@ -5184,6 +5184,12 @@ public final class RoundTrip {
   }
 
   /** Last instruction end covered by a statement, or -1. */
+  /** Every recorded goto, keyed by its own start offset, or null without a current method. */
+  public static java.util.Map<Integer, Integer> gotosHere() {
+    StructMethod method = currentMethod();
+    return method == null ? null : GOTO_TARGETS.get(method);
+  }
+
   public static int blockEnd(Statement stat) {
     return stat == null ? -1 : lastEnd(stat);
   }
