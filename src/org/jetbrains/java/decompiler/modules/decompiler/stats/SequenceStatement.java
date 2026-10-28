@@ -12,6 +12,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.util.TextBuffer;
+import org.jetbrains.java.decompiler.util.TextUtil;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -103,6 +104,25 @@ public class SequenceStatement extends Statement {
 
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
+    // A labelled block that is really the source's else-if chain, or an if whose two arms were
+    // swapped: print the source shape and drop the label the class file needed for the breaks.
+    if (islabeled && RoundTrip.selector("elseifchain") && printLabelledChain(buf, indent)) {
+      return buf;
+    }
+
+    // The rest of an else-if chain the enclosing print is rebuilding: the source wrote these as
+    // further `else if` clauses, not as statements after the arm's break.
+    if (!islabeled && RoundTrip.selector("elseifchain") && printsAsChainArm()) {
+      appendChain(buf, indent);
+      return buf;
+    }
+
+    // A run of ifs an arm at a time falling into the same exit: once the arms are a chain, the
+    // copy of that exit the printer left in each arm is the chain's own end, printed after it.
+    if (!islabeled && RoundTrip.selector("elseifchain") && printTailChain(buf, indent)) {
+      return buf;
+    }
+
     if (islabeled) {
       buf.appendIndent(indent++).append("label").append(this.id).append(": {").appendLineSeparator();
     }
@@ -113,6 +133,12 @@ public class SequenceStatement extends Statement {
     for (int i = 0; i < stats.size(); i++) {
 
       Statement st = stats.get(i);
+
+      // The caller printed this statement already as part of a wider shape; it is one
+      // instruction and must not print twice.
+      if (RoundTrip.isStatementSkipped(st)) {
+        continue;
+      }
 
       // A guard printed this exit already; the rest of the sequence became unconditional.
       if (RoundTrip.isConsumedGuardExit(st)) {
@@ -960,6 +986,330 @@ public class SequenceStatement extends Statement {
     }
 
     return buf;
+  }
+
+  /**
+   * Prints a labelled block back as the source shape it encodes. javac labels a block only when a
+   * jump leaves it from the middle; a run of ifs whose arms all leave the block, and one if whose
+   * inverted arm the printer could not place against the arm the source wrote, are both source
+   * shapes with no label at all. False, printing nothing, for any other block.
+   */
+  private boolean printLabelledChain(TextBuffer buf, int indent) {
+    return stats.size() >= 2 && (printChainArms(buf, indent) || printFlippedArms(buf, indent));
+  }
+
+  /**
+   * Prints a labelled run of ifs as the source's {@code else if} chain. Every arm leaves the block
+   * through the same break, so the arms are the chain's arms: each one that is not taken runs the
+   * next test, and the label only exists because the compiler could not link the last branch to
+   * the block's end. The break edges are the chain's own exits and print nothing.
+   */
+  private boolean printChainArms(TextBuffer buf, int indent) {
+    if (!isChainOf(this, this) || !terminalExitsOnly(this, this) || !labelConfined()) {
+      return false;
+    }
+    Statement previous = RoundTrip.hideClosure(this);
+    try {
+      appendChain(buf, indent);
+    }
+    finally {
+      RoundTrip.restoreClosure(previous);
+    }
+    return true;
+  }
+
+  /**
+   * Whether the block is a run of ifs whose arms all leave through the same break: the clauses of
+   * the source's {@code else if} chain. The last arm may instead fall out of the block, which is
+   * the chain's own end.
+   */
+  private static boolean isChainOf(SequenceStatement sequence, Statement closure) {
+    List<Statement> stats = sequence.stats;
+    if (stats.size() < 3) {
+      return false;
+    }
+    for (Statement stat : stats) {
+      if (!isPlainIf(stat)) {
+        return false;
+      }
+    }
+    for (int i = 0; i < stats.size() - 1; i++) {
+      StatEdge exit = terminalExit(stats.get(i));
+      if (exit == null || !exit.explicit || exit.getType() != StatEdge.TYPE_BREAK || exit.closure != closure) {
+        return false;
+      }
+    }
+    StatEdge last = terminalExit(stats.get(stats.size() - 1));
+    return last == null || last.getType() == StatEdge.TYPE_BREAK && last.closure == closure;
+  }
+
+  /**
+   * Prints a run of ifs whose arms each end by re-running the exit that follows them as the
+   * source's {@code else if} chain and the one exit after it. An arm that leaves through that
+   * exit can only do so by skipping every arm below it, which is what a chain's arm does; the
+   * exit itself is the same instruction in the class file, so it prints once, at the end.
+   */
+  private boolean printTailChain(TextBuffer buf, int indent) {
+    if (stats.size() < 2 || RoundTrip.hiddenClosure() == null) {
+      return false;
+    }
+    Statement tail = stats.get(stats.size() - 1);
+    if (!isSingleExit(tail)) {
+      return false;
+    }
+    boolean duplicated = false;
+    for (int i = 0; i < stats.size() - 1; i++) {
+      Statement arm = stats.get(i);
+      if (!(arm instanceof IfStatement clause) || !isPlainIf(clause)) {
+        return false;
+      }
+      duplicated |= sameExit(tailStatement(clause.getIfstat()), tail);
+    }
+    if (!duplicated) {
+      return false;
+    }
+    boolean open = false;
+    for (int i = 0; i < stats.size() - 1; i++) {
+      Statement arm = stats.get(i);
+      Statement copy = tailStatement(((IfStatement) arm).getIfstat());
+      Statement previous = sameExit(copy, tail) ? RoundTrip.skipStatement(copy) : null;
+      try {
+        open = appendArm(buf, indent, arm, i + 1 < stats.size() - 1, i == 0, open);
+      }
+      finally {
+        RoundTrip.restoreStatement(previous);
+      }
+    }
+    buf.append(ExprProcessor.jmpWrapper(tail, indent, true));
+    return true;
+  }
+
+  /** The statement's last exprent, when the whole statement is a lone return or throw. */
+  private static boolean isSingleExit(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    List<Exprent> exprents = stat.getExprents();
+    return exprents != null && exprents.size() == 1 && exprents.get(0) instanceof ExitExprent;
+  }
+
+  /** The statement the body ends with on the printed tail path, or null. */
+  private static Statement tailStatement(Statement stat) {
+    while (stat != null) {
+      List<Statement> children = stat.getStats();
+      if (children == null || children.isEmpty()) {
+        return isSingleExit(stat) ? stat : null;
+      }
+      stat = children.get(children.size() - 1);
+    }
+    return null;
+  }
+
+  /**
+   * Whether the two statements print the same exit instruction. The class file keeps one
+   * {@code return} where the tree holds a copy per arm; the offset is what says so.
+   */
+  private static boolean sameExit(Statement first, Statement second) {
+    if (!isSingleExit(first) || !isSingleExit(second)) {
+      return false;
+    }
+    Exprent a = first.getExprents().get(0);
+    Exprent b = second.getExprents().get(0);
+    if (a.bytecode == null || b.bytecode == null || a.bytecode.isEmpty() || b.bytecode.isEmpty()
+        || a.getClass() != b.getClass()) {
+      return false;
+    }
+    return a.bytecode.nextSetBit(0) == b.bytecode.nextSetBit(0);
+  }
+
+  /** Appends the arms as {@code if (a) { … } else if (b) { … } …,} the source's chain. */
+  private void appendChain(TextBuffer buf, int indent) {
+    boolean open = false;
+    for (int i = 0; i < stats.size(); i++) {
+      open = appendArm(buf, indent, stats.get(i), i + 1 < stats.size(), i == 0, open);
+    }
+  }
+
+  /**
+   * Appends one arm of a chain — {@code if} for the first and {@code else if} for the rest — and
+   * reports whether it left its closing brace for the next arm's {@code else} line, which is how
+   * the source writes {@code } else if (c) {} on one line.
+   */
+  private static boolean appendArm(TextBuffer buf, int indent, Statement arm, boolean more,
+                                   boolean first, boolean previousOpen) {
+    Statement previous = more ? RoundTrip.openArm(arm) : null;
+    TextBuffer content;
+    boolean open = false;
+    try {
+      content = ExprProcessor.jmpWrapper(arm, indent, false);
+    }
+    finally {
+      open = more && RoundTrip.closeArm(previous);
+    }
+    if (first) {
+      buf.append(content);
+    }
+    else {
+      buf.appendIndent(indent).append(previousOpen ? "} else " : "else ");
+      content.setStart(TextUtil.getIndentString(indent).length());
+      buf.append(content);
+    }
+    return open;
+  }
+
+  /**
+   * Whether this unlabelled block is the rest of the else-if chain the enclosing print is
+   * rebuilding: its arms leave through the block the caller is unwrapping, so the source wrote
+   * them as further {@code else if} clauses rather than as statements after an arm.
+   */
+  public boolean printsAsChainArm() {
+    Statement closure = RoundTrip.hiddenClosure();
+    return closure != null && stats.size() >= 2 && varDefinitions.isEmpty()
+      && isChainOf(this, closure);
+  }
+
+  /**
+   * Prints a labelled block whose first if is inverted against the source. The arm ends with the
+   * break that leaves the block, so it never runs the statements after it: those are the source's
+   * other arm, and the printed form is {@code if (!C) { rest } else { chain }} written the way
+   * the source wrote it — every arm of the chain is embedded in the if, so swapping them changes
+   * nothing but the branch targets the compiler picked.
+   */
+  private boolean printFlippedArms(TextBuffer buf, int indent) {
+    // Two statements are the printer's own if/else; a third means the arm the source wrote after
+    // the block really was a run of statements, which is what makes the swap the source's shape.
+    if (stats.size() < 3 || !(stats.get(0) instanceof IfStatement branch) || !isPlainIf(branch)) {
+      return false;
+    }
+    Statement chain = branch.getIfstat();
+    Statement rest = stats.get(1);
+    StatEdge exit = terminalExit(chain);
+    if (exit == null || !exit.explicit || exit.getType() != StatEdge.TYPE_BREAK || exit.closure != this) {
+      return false;
+    }
+    boolean fallsToRest = false;
+    for (StatEdge edge : branch.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.getType() == StatEdge.TYPE_REGULAR && edge.getDestination() == rest) {
+        fallsToRest = true;
+      }
+    }
+    if (!fallsToRest) {
+      return false;
+    }
+    // Swapping the arms is only the source's order when the block the printer took as the then
+    // arm comes after the one it left outside: the target's lines say which arm ran first.
+    if (!RoundTrip.swapIfArmsByLine(chain, rest)) {
+      return false;
+    }
+    // The statements after the branch reach the block's end without a jump of their own; a break
+    // among them would be one the swap loses.
+    for (int i = 1; i < stats.size(); i++) {
+      for (StatEdge edge : stats.get(i).getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+        if (edge.explicit && edge.getType() != StatEdge.TYPE_REGULAR && edge.closure == this) {
+          return false;
+        }
+      }
+    }
+    if (!terminalExitsOnly(this, this) || !labelConfined()) {
+      return false;
+    }
+    IfExprent head = (IfExprent) branch.getHeadexprent().copy();
+    head.setCondition(RoundTrip.negateCondition(branch.getHeadexprent().getCondition()));
+    // The statements that ran before the test live on the head block; the flip prints the if
+    // itself, so they have to be printed here or they are lost.
+    if (!RoundTrip.isHeadConsumed(branch)) {
+      buf.append(branch.getFirst().toJava(indent));
+    }
+    buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+    for (int i = 1; i < stats.size(); i++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(i), indent + 1, i == 1));
+    }
+    buf.appendIndent(indent).append("} else {").appendLineSeparator();
+    Statement previous = RoundTrip.hideClosure(this);
+    try {
+      buf.append(ExprProcessor.jmpWrapper(chain, indent + 1, false));
+    }
+    finally {
+      RoundTrip.restoreClosure(previous);
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    return true;
+  }
+
+  /** An if with a single arm, no label and no pattern: a clause an else-if chain can be made of. */
+  private static boolean isPlainIf(Statement stat) {
+    return stat instanceof IfStatement arm
+      && arm.iftype == IfStatement.IFTYPE_IF
+      && arm.getElsestat() == null
+      && arm.getIfstat() != null
+      && !arm.isLabeled()
+      && !arm.isPatternMatched()
+      && arm.getHeadexprent() != null
+      && arm.getHeadexprent().getCondition() != null;
+  }
+
+  /**
+   * The jump the statement's last printed statement ends with, or null. Walks the tail path the
+   * same way the printer does, so the edge found is the one that will be printed last.
+   */
+  private static StatEdge terminalExit(Statement stat) {
+    while (true) {
+      List<StatEdge> edges = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+      if (edges.size() == 1 && edges.get(0).getType() != StatEdge.TYPE_REGULAR) {
+        return edges.get(0);
+      }
+      List<Statement> children = stat.getStats();
+      if (children == null || children.isEmpty()) {
+        return null;
+      }
+      stat = children.get(children.size() - 1);
+    }
+  }
+
+  /**
+   * Whether every explicit jump to the closure under this statement is that statement's only
+   * successor, so it is an arm's own exit and prints nothing once the label is gone.
+   */
+  private static boolean terminalExitsOnly(Statement stat, Statement closure) {
+    List<StatEdge> edges = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    for (StatEdge edge : edges) {
+      if (edge.explicit && edge.getType() != StatEdge.TYPE_REGULAR && edge.closure == closure
+          && edges.size() != 1) {
+        return false;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (!terminalExitsOnly(child, closure)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Whether nothing outside this block jumps to its label, so the label has no printed use. */
+  private boolean labelConfined() {
+    Statement root = this;
+    while (root.getParent() != null) {
+      root = root.getParent();
+    }
+    return !breaksTo(root, this);
+  }
+
+  private static boolean breaksTo(Statement stat, Statement closure) {
+    if (stat == closure) {
+      return false;
+    }
+    for (StatEdge edge : stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.closure == closure) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (breaksTo(child, closure)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

@@ -388,7 +388,7 @@ public class IfStatement extends Statement {
 
     if (ifstat == null) {
       boolean semicolon = false;
-      if (ifedge.explicit) {
+      if (ifedge.explicit && !RoundTrip.isClosureHidden(ifedge)) {
         semicolon = true;
         if (ifedge.getType() == StatEdge.TYPE_BREAK) {
           // break
@@ -435,7 +435,14 @@ public class IfStatement extends Statement {
     }
 
     if (!elseif) {
-      buf.appendIndent(indent).append("}").appendLineSeparator();
+      // A chain prints this arm's closing brace together with the next `else` on one line, the
+      // way the source wrote it.
+      if (RoundTrip.isArmOpen(this)) {
+        RoundTrip.armClosed();
+      }
+      else {
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
     }
   }
 
@@ -444,6 +451,14 @@ public class IfStatement extends Statement {
    * the closing brace to the caller; false, printing nothing, otherwise.
    */
   static boolean printElseIfArm(TextBuffer buf, int indent, Statement arm) {
+    if (arm instanceof SequenceStatement sequence && RoundTrip.selector("elseifchain")
+        && sequence.printsAsChainArm()) {
+      buf.appendIndent(indent).append("} else ");
+      TextBuffer content = ExprProcessor.jmpWrapper(arm, indent, false);
+      content.setStart(TextUtil.getIndentString(indent).length());
+      buf.append(content);
+      return true;
+    }
     if (arm instanceof IfStatement
         && arm.varDefinitions.isEmpty() && (arm.getFirst().getExprents() != null && arm.getFirst().getExprents().isEmpty()) &&
         !arm.isLabeled() &&

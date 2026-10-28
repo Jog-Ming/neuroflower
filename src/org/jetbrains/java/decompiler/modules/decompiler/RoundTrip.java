@@ -31,6 +31,13 @@ import java.util.List;
 public final class RoundTrip {
   /** A statement whose trailing jump an enclosing print has taken over (an else's implicit exit). */
   private static final ThreadLocal<Statement> SUPPRESSED_JUMP = new ThreadLocal<>();
+  /** A labelled block being printed as an else-if chain; its breaks are implicit in the source. */
+  private static final ThreadLocal<Statement> HIDDEN_CLOSURE = new ThreadLocal<>();
+  /** A statement already printed as part of a wider shape; printing it again would duplicate it. */
+  private static final ThreadLocal<Statement> SKIPPED_STATEMENT = new ThreadLocal<>();
+  /** An if of an else-if chain whose closing brace the chain prints on the `else` line. */
+  private static final ThreadLocal<Statement> OPEN_ARM = new ThreadLocal<>();
+  private static final ThreadLocal<Boolean> ARM_CLOSED = new ThreadLocal<>();
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instruction end offset by start offset; the live sequence is released before printing. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
@@ -2908,6 +2915,92 @@ public final class RoundTrip {
       return false;
     }
     return guards == null || !guards.containsKey(end);
+  }
+
+  /**
+   * Hides a labelled block's jumps while a caller prints that block as an else-if chain. The arms'
+   * terminal breaks are the chain's own exits, so the source has no `break label` there; every
+   * edge to the closure is dropped for the duration of the print.
+   */
+  public static Statement hideClosure(Statement closure) {
+    Statement old = HIDDEN_CLOSURE.get();
+    HIDDEN_CLOSURE.set(closure);
+    return old;
+  }
+
+  public static void restoreClosure(Statement old) {
+    if (old == null) {
+      HIDDEN_CLOSURE.remove();
+    }
+    else {
+      HIDDEN_CLOSURE.set(old);
+    }
+  }
+
+  public static boolean isClosureHidden(StatEdge edge) {
+    Statement hidden = HIDDEN_CLOSURE.get();
+    return hidden != null && edge != null && edge.closure == hidden;
+  }
+
+  /** The block being printed as an else-if chain right now, or null. */
+  public static Statement hiddenClosure() {
+    return HIDDEN_CLOSURE.get();
+  }
+
+  /**
+   * A statement the caller has already accounted for: an arm's trailing copy of the exit the
+   * chain prints once after it, which is the same instruction and must not be printed twice.
+   */
+  public static Statement skipStatement(Statement stat) {
+    Statement old = SKIPPED_STATEMENT.get();
+    SKIPPED_STATEMENT.set(stat);
+    return old;
+  }
+
+  public static void restoreStatement(Statement old) {
+    if (old == null) {
+      SKIPPED_STATEMENT.remove();
+    }
+    else {
+      SKIPPED_STATEMENT.set(old);
+    }
+  }
+
+  public static boolean isStatementSkipped(Statement stat) {
+    Statement skipped = SKIPPED_STATEMENT.get();
+    return skipped != null && skipped == stat;
+  }
+
+  /**
+   * Marks an if whose closing brace the caller prints on the next line with `else`, the way the
+   * source writes a chain: `} else if (c) {`. Returns whether the printer honoured it.
+   */
+  public static Statement openArm(Statement stat) {
+    Statement old = OPEN_ARM.get();
+    OPEN_ARM.set(stat);
+    ARM_CLOSED.set(Boolean.FALSE);
+    return old;
+  }
+
+  public static boolean closeArm(Statement old) {
+    boolean closed = Boolean.TRUE.equals(ARM_CLOSED.get());
+    if (old == null) {
+      OPEN_ARM.remove();
+    }
+    else {
+      OPEN_ARM.set(old);
+    }
+    ARM_CLOSED.remove();
+    return closed;
+  }
+
+  public static boolean isArmOpen(Statement stat) {
+    return stat != null && stat == OPEN_ARM.get();
+  }
+
+  /** Called by the arm the caller left open once it has printed its closing brace. */
+  public static void armClosed() {
+    ARM_CLOSED.set(Boolean.TRUE);
   }
 
   /** Marks a statement whose trailing jump the caller prints as part of a wider shape. */
