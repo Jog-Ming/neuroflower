@@ -226,10 +226,13 @@ public final class Main {
             command.add("--no-cache");
           }
           long begin = System.nanoTime();
-          Process process = new ProcessBuilder(command)
+          ProcessBuilder builder = new ProcessBuilder(command)
             .redirectErrorStream(true)
-            .redirectOutput(log.toFile())
-            .start();
+            .redirectOutput(log.toFile());
+          // This process may itself have been re-executed into one version's JDK; a child must be
+          // free to pick its own, or every version after the first compiles at the wrong release.
+          builder.environment().remove(REEXEC);
+          Process process = builder.start();
           boolean finished = process.waitFor(timeout, TimeUnit.MINUTES);
           long seconds = (System.nanoTime() - begin) / 1_000_000_000L;
           if (!finished) {
