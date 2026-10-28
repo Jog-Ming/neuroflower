@@ -2018,10 +2018,18 @@ public final class RoundTrip {
     if (ends == null || branchStarts == null || gotos == null) {
       return false;
     }
-    int bodyStart = firstOffset(body);
+    // The body's first instruction may be an if's test, which the statement holds as a condition
+    // exprent rather than in a block; firstOffset would report the arm's start instead.
+    int bodyStart = startOffset(body);
     int tailStart = firstOffset(tailFirst);
     int tailEnd = lastEnd(tailLast);
     if (bodyStart < 0 || tailStart < 0 || tailEnd < 0 || tailEnd != bodyStart) {
+      return false;
+    }
+    if (bodyStart != firstOffset(body) && !tailExits(tailFirst, tailLast)) {
+      // Only the test's own instruction widens the body's start; such a body begins with an if, so
+      // the guard's arm has to leave the method at its end. A tail that ends inside the body would
+      // print its fall-through as the arm's closing brace, and the exit it takes with it is lost.
       return false;
     }
     Integer conditionTarget = ownBranchTarget(condition, branchStarts);
@@ -2044,6 +2052,18 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /** True when the tail is one statement that leaves the method: a single return or throw. */
+  private static boolean tailExits(Statement tailFirst, Statement tailLast) {
+    if (tailFirst != tailLast) {
+      return false;
+    }
+    List<Exprent> exprents = tailFirst.getExprents();
+    return exprents != null && exprents.size() == 1
+      && exprents.get(0) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+      && (exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+          || exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.THROW);
   }
 
   /** True when the arm's last instruction is a goto that lands beyond the tail's end. */
@@ -3789,6 +3809,17 @@ public final class RoundTrip {
       queue.addAll(cur.getStats());
     }
     return false;
+  }
+
+  /**
+   * The first instruction offset the statement covers, counting the condition exprents a compound
+   * statement holds itself: an if whose test is the first thing it runs starts at the test, not at
+   * its first child block.
+   */
+  public static int startOffset(Statement statement) {
+    java.util.BitSet bits = new java.util.BitSet();
+    statement.getOffset(bits);
+    return bits.nextSetBit(0);
   }
 
   /** First target offset covered by a statement, or -1. */
