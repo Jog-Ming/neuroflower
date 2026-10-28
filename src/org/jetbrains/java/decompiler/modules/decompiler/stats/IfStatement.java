@@ -280,7 +280,10 @@ public class IfStatement extends Statement {
             // comparison wrapper along with the branch offsets, so its bytes end flush against a
             // lone branch: the branch then consumes exactly the value the condition computes and
             // the printed condition is the whole test.
-            || RoundTrip.endsLoopBody(this)
+            // The same holds for the else arm of an if that ends the loop body: the arm is the
+            // loop's tail too once its sibling hoisted the arm out of the block (Raid keeps
+            // `if (tickCount <= 600) continue;` as the else arm of the raider guard).
+            || (RoundTrip.endsLoopBody(this) || endsInLoopTailElse(this))
                && ifHead.bytecode != null
                && !declaresPattern(ifHead.getCondition())
                && (ifHead.getCondition().bytecode == null
@@ -549,6 +552,16 @@ public class IfStatement extends Statement {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Whether this statement is the else arm of an if that itself ends the loop body. The arm is
+   * then the loop's last work even though the enclosing if's then arm is not an ancestor of it; a
+   * guard's continue printed at the arm's end skips nothing the loop still needs.
+   */
+  private static boolean endsInLoopTailElse(Statement stat) {
+    return stat.getParent() instanceof IfStatement parent && parent.getElsestat() == stat
+      && RoundTrip.endsLoopBody(parent);
   }
 
   /**
