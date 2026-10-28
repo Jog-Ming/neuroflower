@@ -105,7 +105,10 @@ public final class BasicBlockStatement extends Statement {
       changed = openAt[i] || closeBefore[i];
     }
     if (!changed) {
-      tb.append(ExprProcessor.listToJava(exprents, indent));
+      // A local whose scope the table proves ended inside this block: the slot is handed to a
+      // later local, so the run that starts at the declaration was a block of its own.
+      tb.append(org.jetbrains.java.decompiler.modules.decompiler.RoundTrip
+        .withBlocks(exprents, 0, size, indent, printsOwnEnd()));
       return tb;
     }
     for (int i = 0; i < size; i++) {
@@ -121,6 +124,21 @@ public final class BasicBlockStatement extends Statement {
       tb.appendIndent(indent).append("}").appendLineSeparator();
     }
     return tb;
+  }
+
+  /**
+   * Whether a block closing at this one's end would be a block of its own: a sequence prints no
+   * brace around its statements, but a loop body, an arm or a try already does, and there the
+   * closing brace of the construct is the one that ends the scope.
+   */
+  private boolean printsOwnEnd() {
+    if (!(getParent() instanceof SequenceStatement sequence)) {
+      return false;
+    }
+    Statement above = sequence.getParent();
+    return above == null || !(above instanceof DoStatement || above instanceof IfStatement
+      || above instanceof CatchAllStatement || above instanceof CatchStatement
+      || above instanceof SynchronizedStatement);
   }
 
   private void planBlockScopes(boolean[] openAt, boolean[] closeBefore) {

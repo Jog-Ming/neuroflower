@@ -157,9 +157,58 @@ public class SequenceStatement extends Statement {
         break;
       }
 
-      // A local the source declared inside a nested block: its target scope ends before this block
-      // does, at the statement boundary the closing brace stood on. Print `{ … }` around the run
-      // that starts at that declaration, so the local's scope ends where the target's does.
+      // A local whose scope the target's table proves ended at this block's boundary: the slot is
+      // handed to a later local, which a source can only do by closing the block the first one
+      // lived in. Print `{ … }` around the run of exprents that starts at the declaration and ends
+      // where the table says its scope did. Both ends are exprent boundaries — the declaration's
+      // own store and the last instruction of the run's last statement — so the braces land
+      // exactly where javac closed the source's block.
+      if (RoundTrip.selector("bareblock")) {
+        int[] run = RoundTrip.handoverRun(stats, i, RoundTrip.blockEnd(this));
+        // Closing the block takes every local it declares out of scope: a use past the boundary
+        // has to land in the row that takes its slot over at a store, which the printer writes as
+        // a declaration. Anything else and the brace would name a variable that is gone.
+        if (run != null && splittable(stats.get(run[0])) && splittable(stats.get(run[2]))
+            && RoundTrip.closesCleanly(run[5], run[6])) {
+          int openExp = run[1];
+          int closeExp = run[3];
+          List<Exprent> leading = RoundTrip.leadingExprents(stats.get(run[0]));
+          if (openExp > 0) {
+            // The declarations before the block's own stay outside it.
+            buf.append(ExprProcessor.listToJava(leading.subList(0, openExp), indent));
+          }
+          RoundTrip.armSplitDeclarations(run[5], run[6]);
+          buf.appendIndent(indent).append("{").appendLineSeparator();
+          if (run[2] == run[0] && closeExp < 0) {
+            printFrom(stats.get(run[0]), openExp, indent + 1, buf);
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+          } else if (run[2] == run[0]) {
+            buf.append(ExprProcessor.listToJava(leading.subList(openExp, closeExp + 1), indent + 1));
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            printAfter(stats.get(run[0]), closeExp, indent, buf);
+          } else {
+            printFrom(stats.get(run[0]), openExp, indent + 1, buf);
+            for (int j = run[0] + 1; j < run[2]; j++) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent + 1, true));
+            }
+            if (closeExp < 0) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(run[2]), indent + 1, true));
+              buf.appendIndent(indent).append("}").appendLineSeparator();
+            } else {
+              List<Exprent> tail = RoundTrip.leadingExprents(stats.get(run[2]));
+              buf.append(ExprProcessor.listToJava(tail.subList(0, closeExp + 1), indent + 1));
+              buf.appendIndent(indent).append("}").appendLineSeparator();
+              printAfter(stats.get(run[2]), closeExp, indent, buf);
+            }
+          }
+          notempty = true;
+          i = run[2];
+          continue;
+        }
+      }
+      // A local whose row ends at a statement boundary inside this block, without a handover to
+      // prove it — a loop's head variable is the common case. Closing the block there keeps the
+      // scope javac recorded; the printer still has no `for` for the loop it belongs to.
       if (RoundTrip.selector("bareblock")) {
         int windowEnd = i + 1 < stats.size()
           ? Math.max(RoundTrip.blockEnd(st), RoundTrip.firstOffset(stats.get(i + 1)) - 1)
@@ -242,7 +291,6 @@ public class SequenceStatement extends Statement {
           }
         }
       }
-
 
       // `if (C) { rest } else { continue; }` printed by us as the guard `if (!C) { continue; }
       // rest`: the target's branch lands straight on the exit block, so the branch-then-goto pair
@@ -1609,33 +1657,6 @@ public class SequenceStatement extends Statement {
     return getParent() instanceof CatchStatement catchStatement && !catchStatement.getResources().isEmpty();
   }
 
-  /** True when any of these statements prints anything. */
-  private static boolean hasContent(List<Statement> statements) {
-    for (Statement statement : statements) {
-      List<Exprent> exprents = statement.getExprents();
-      if (exprents != null && !exprents.isEmpty()) {
-        return true;
-      }
-      if (exprents == null && hasContent(statement.getStats())) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /** True when the last of these statements ends in a return or throw. */
-  private static boolean endsWithExit(List<Statement> statements) {
-    if (statements.isEmpty()) {
-      return false;
-    }
-    Statement last = statements.get(statements.size() - 1);
-    List<Exprent> exprents = last.getExprents();
-    if (exprents != null) {
-      return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
-    }
-    return endsWithExit(last.getStats());
-  }
-
   /**
    * Whether this loop's own head declares the local that opens at that offset: the variable the
    * for statement owns, which the printer binds to the loop rather than to a block before it.
@@ -1673,6 +1694,98 @@ public class SequenceStatement extends Statement {
       }
     }
     return null;
+  }
+
+  /** Whether this statement's print can be cut at an exprent boundary without losing an edge. */
+  private static boolean splittable(Statement stat) {
+    if (stat == null || stat.getExprents() == null && !(stat instanceof IfStatement)) {
+      return false;
+    }
+    if (stat instanceof IfStatement ifstat) {
+      if (!ifstat.getVarDefinitions().isEmpty()) {
+        return false;
+      }
+      Statement head = ifstat.getFirst();
+      if (head == null || head.getExprents() == null) {
+        return false;
+      }
+    }
+    List<StatEdge> successors = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (successors.size() == 1) {
+      StatEdge edge = successors.get(0);
+      // A trailing break or continue is printed by the wrapper this path does not call.
+      return edge.getType() == StatEdge.TYPE_REGULAR || !edge.explicit;
+    }
+    return true;
+  }
+
+  /**
+   * Whether a block closing at this statement's end would be a block of its own: a sequence prints
+   * no brace around its statements, but a loop body, an arm or a try already does.
+   */
+  private static boolean printsOwnEnd(Statement stat) {
+    if (!(stat.getParent() instanceof SequenceStatement sequence)) {
+      return false;
+    }
+    Statement above = sequence.getParent();
+    return above == null || !(above instanceof DoStatement || above instanceof IfStatement
+      || above instanceof CatchAllStatement || above instanceof CatchStatement
+      || above instanceof SynchronizedStatement);
+  }
+
+  /** Prints a statement from its exprent {@code from} on, followed by its own body. */
+  private static void printFrom(Statement stat, int from, int indent, TextBuffer buf) {
+    List<Exprent> exprents = stat.getExprents();
+    boolean closeAtEnd = exprents != null && printsOwnEnd(stat);
+    if (exprents != null) {
+      buf.append(RoundTrip.withBlocks(exprents, from, exprents.size(), indent, closeAtEnd));
+      return;
+    }
+    List<Exprent> head = RoundTrip.leadingExprents(stat);
+    buf.append(RoundTrip.withBlocks(head, from, head.size(), indent, closeAtEnd));
+    RoundTrip.consumeHead(stat);
+    buf.append(ExprProcessor.jmpWrapper(stat, indent, true));
+  }
+
+  /** Prints what a split statement's head still owes after exprent {@code after}. */
+  private static void printAfter(Statement stat, int after, int indent, TextBuffer buf) {
+    List<Exprent> exprents = stat.getExprents();
+    boolean closeAtEnd = exprents != null && printsOwnEnd(stat);
+    if (exprents != null) {
+      buf.append(RoundTrip.withBlocks(exprents, after + 1, exprents.size(), indent, closeAtEnd));
+      return;
+    }
+    List<Exprent> head = RoundTrip.leadingExprents(stat);
+    buf.append(RoundTrip.withBlocks(head, after + 1, head.size(), indent, closeAtEnd));
+    RoundTrip.consumeHead(stat);
+    buf.append(ExprProcessor.jmpWrapper(stat, indent, true));
+  }
+
+  /** True when any of these statements prints anything. */
+  private static boolean hasContent(List<Statement> statements) {
+    for (Statement statement : statements) {
+      List<Exprent> exprents = statement.getExprents();
+      if (exprents != null && !exprents.isEmpty()) {
+        return true;
+      }
+      if (exprents == null && hasContent(statement.getStats())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** True when the last of these statements ends in a return or throw. */
+  private static boolean endsWithExit(List<Statement> statements) {
+    if (statements.isEmpty()) {
+      return false;
+    }
+    Statement last = statements.get(statements.size() - 1);
+    List<Exprent> exprents = last.getExprents();
+    if (exprents != null) {
+      return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
+    }
+    return endsWithExit(last.getStats());
   }
 
   /** The target's slot for the first local this statement declares, or -1. */

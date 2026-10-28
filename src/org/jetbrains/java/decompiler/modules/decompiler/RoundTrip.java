@@ -67,6 +67,19 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> FINALLY_COPY_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The method's last instruction start offset. */
   private static final java.util.Map<StructMethod, Integer> LAST_INSTRUCTION = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The method's first instruction start offset: the entry a dominance check starts from. */
+  private static final java.util.Map<StructMethod, Integer> METHOD_ENTRY = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Instructions that do not fall through: returns and {@code athrow}. */
+  private static final java.util.Map<StructMethod, BitSet> NO_FALLTHROUGH = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Starts of the {@code pop} that discards a void call's value: the statement ends past it. */
+  private static final java.util.Map<StructMethod, BitSet> POP_SITES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Protected ranges as {@code {from start, to end (exclusive or MAX_VALUE), handler start}}. */
+  private static final java.util.Map<StructMethod, java.util.List<int[]>> EXCEPTION_RANGES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Store offsets that open a row taking over an earlier local's slot: a new declaration. */
+  private static final java.util.Map<StructMethod, BitSet> HANDOVER_STARTS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Handover stores a printed brace just closed the previous local before: declare them. */
+  private static final ThreadLocal<java.util.Map<StructMethod, BitSet>> SPLIT_DECLARATIONS =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instructions that store or discard the stack's value: a call's result ends its statement here. */
@@ -107,9 +120,18 @@ public final class RoundTrip {
     java.util.Map<Integer, BitSet> loadSites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> storeSlots = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
+    BitSet noFallThrough = new BitSet();
+    BitSet popSites = new BitSet();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode == CodeConstants.opc_pop || instr.opcode == CodeConstants.opc_pop2) {
+        popSites.set(instr.startOffset);
+      }
+      if (instr.opcode >= CodeConstants.opc_ireturn && instr.opcode <= CodeConstants.opc_return
+        || instr.opcode == CodeConstants.opc_athrow || instr.opcode == CodeConstants.opc_ret) {
+        noFallThrough.set(instr.startOffset);
+      }
       if (instr.opcode >= CodeConstants.opc_iload && instr.opcode <= CodeConstants.opc_aload) {
         loadSites.computeIfAbsent(instr.operand(0), k -> new BitSet()).set(instr.startOffset);
       }
@@ -213,11 +235,23 @@ public final class RoundTrip {
     BRANCH_TARGETS.put(method, branchTargets);
     INSTRUCTION_ENDS.put(method, ends);
     java.util.Map<Integer, Integer> handlerEnds = new java.util.HashMap<>();
+    java.util.List<int[]> exceptionRanges = new java.util.ArrayList<>();
     org.jetbrains.java.decompiler.code.ExceptionTable table = seq.exceptionTable();
     if (table != null) {
       for (org.jetbrains.java.decompiler.code.ExceptionHandler handler : table.getHandlers()) {
         int handlerIndex = handler.handler();
         int toIndex = handler.to();
+        if (handler.from() >= 0 && handler.from() < seq.length()
+          && handlerIndex >= 0 && handlerIndex < seq.length()) {
+          // Every instruction of the protected range may reach the handler by an exception; a
+          // dominance check has to see that edge, or a local assigned inside a try would seem to
+          // precede whatever the catch runs.
+          exceptionRanges.add(new int[]{
+            seq.getInstr(handler.from()).startOffset,
+            toIndex >= 0 && toIndex < seq.length() ? seq.getInstr(toIndex).startOffset : Integer.MAX_VALUE,
+            seq.getInstr(handlerIndex).startOffset
+          });
+        }
         if (handlerIndex < 0 || handlerIndex >= seq.length() || toIndex < 0 || toIndex >= seq.length()) {
           continue;
         }
@@ -377,6 +411,10 @@ public final class RoundTrip {
     }
     FINALLY_COPY_ENDS.put(method, copyEnds);
     LAST_INSTRUCTION.put(method, seq.length() == 0 ? -1 : seq.getInstr(seq.length() - 1).startOffset);
+    METHOD_ENTRY.put(method, seq.length() == 0 ? -1 : seq.getInstr(0).startOffset);
+    NO_FALLTHROUGH.put(method, noFallThrough);
+    POP_SITES.put(method, popSites);
+    EXCEPTION_RANGES.put(method, exceptionRanges);
     GOTO_TARGETS.put(method, gotos);
     SWITCH_TARGETS.put(method, switches);
     BRANCH_STARTS.put(method, branchStarts);
@@ -385,6 +423,42 @@ public final class RoundTrip {
     STORE_SITES.put(method, storeSites);
     LOAD_SITES.put(method, loadSites);
     STORE_SLOTS.put(method, storeSlots);
+    HANDOVER_STARTS.put(method, handoverStarts(method));
+  }
+
+  /**
+   * The store offsets that open a slot's next table row while every path to them passes the
+   * previous row's declaration: each is a local the source declared in a block of its own.
+   */
+  private static BitSet handoverStarts(StructMethod method) {
+    BitSet starts = new BitSet();
+    if (!selector("bareblock")) {
+      return starts;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return starts;
+    }
+    List<LocalVariable> rows = table.getVariables().toList();
+    for (LocalVariable first : rows) {
+      int s1 = first.getStart();
+      int e1 = first.getEnd();
+      if (e1 <= s1) {
+        continue;
+      }
+      for (LocalVariable second : rows) {
+        if (second.getIndex() != first.getIndex() || second.getStart() <= e1
+          || second.getEnd() <= second.getStart()) {
+          continue;
+        }
+        int s2 = second.getStart();
+        if (storesInto(method, first.getIndex(), s2) && dominates(method, s1, s2)) {
+          starts.set(s2);
+        }
+      }
+    }
+    return starts;
   }
 
   /**
@@ -4128,6 +4202,406 @@ public final class RoundTrip {
   }
 
   /**
+   * The run of exprents the target's table proves was a block, or null. A local declared by one of
+   * this statement's leading exprents has its slot handed to a later local at the offset its row
+   * ends; the exprent whose last instruction ends exactly there is the run's last. Returns
+   * {@code {open statement, open exprent, close statement, close exprent or -1 for the whole
+   * statement, slot, start, end, next row start, next row end}}. Every boundary is an exprent's
+   * own end, so the printer can cut the run out of the exprent lists it was going to print.
+   */
+  public static int[] handoverRun(List<Statement> stats, int from, int blockEnd) {
+    if (!selector("bareblock") || stats == null || from < 0 || from >= stats.size()) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null || blockEnd <= 0) {
+      return null;
+    }
+    List<Exprent> leading = leadingExprents(stats.get(from));
+    if (leading == null) {
+      return null;
+    }
+    List<LocalVariable> rows = table.getVariables().toList();
+    for (int a = 0; a < leading.size(); a++) {
+      int s1 = lastEndOf(leading.get(a));
+      if (s1 < 0) {
+        continue;
+      }
+      for (LocalVariable row : rows) {
+        if (row.getStart() != s1 || row.getEnd() <= s1 || row.getEnd() >= blockEnd) {
+          continue;
+        }
+        int e1 = row.getEnd();
+        LocalVariable next = slotHandover(row.getIndex(), s1, e1);
+        if (next == null) {
+          continue;
+        }
+        // A run that starts and ends inside one block is that block's own print, unless the block
+        // is an if's head, whose closing boundary is the end of the whole statement.
+        if (!(stats.get(from) instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement)
+            && printEnd(stats.get(from)) <= e1) {
+          continue;
+        }
+        for (int j = from; j < stats.size(); j++) {
+          int end = printEnd(stats.get(j));
+          if (end == e1) {
+            // The run ends with this statement; the rest of the sequence prints outside.
+            if (j == stats.size() - 1) {
+              break;
+            }
+            return new int[]{from, a, j, -1, row.getIndex(), s1, e1, next.getStart(), next.getEnd()};
+          }
+          if (end > e1) {
+            // The boundary is inside this statement's leading exprents: the statement itself is
+            // split, and what follows the boundary prints outside the brace.
+            List<Exprent> inside = leadingExprents(stats.get(j));
+            if (inside != null) {
+              for (int b = 0; b < inside.size(); b++) {
+                if (printedEnd(inside.get(b)) == e1) {
+                  return new int[]{from, a, j, b, row.getIndex(), s1, e1, next.getStart(), next.getEnd()};
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The offset this exprent's statement ends at: its last instruction, plus the {@code pop} that
+   * discards a void call's value — that instruction belongs to the statement but no exprent owns
+   * it, so the target's table ends the local past it.
+   */
+  public static int printedEnd(Exprent exprent) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    BitSet pops = method == null ? null : POP_SITES.get(method);
+    if (ends == null) {
+      return -1;
+    }
+    int end = lastEndOf(exprent);
+    while (end >= 0 && pops != null && pops.get(end)) {
+      Integer next = ends.get(end);
+      if (next == null || next <= end) {
+        break;
+      }
+      end = next;
+    }
+    return end;
+  }
+
+  /**
+   * The offset this statement's own print ends at: the last body instruction of it and its
+   * children, ignoring the stores carried by declarations hoisted to its head. Those print as
+   * `Type name;` first and their store runs inside the body, so they cannot mark an end.
+   */
+  public static int printEnd(Statement stat) {
+    if (stat == null) {
+      return -1;
+    }
+    int max = -1;
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (exprent instanceof VarExprent var && var.isDefinition()) {
+          continue;
+        }
+        int end = printedEnd(exprent);
+        if (end > max) {
+          max = end;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      int end = printEnd(child);
+      if (end > max) {
+        max = end;
+      }
+    }
+    return max;
+  }
+
+  /**
+   * Prints these exprents, wrapping the runs the target's table proves were blocks. A run is
+   * wholly inside the list: the exprent whose last instruction ends where a local's row does, and
+   * the exprent whose last instruction ends where the slot is handed over. Runs that cross into a
+   * later statement are the sequence printer's, since only it can close them there. A run ending
+   * with the list is only ours when {@code closeAtEnd}: otherwise the construct around the list
+   * already prints the brace that ends the scope.
+   */
+  public static org.jetbrains.java.decompiler.util.TextBuffer withBlocks(List<Exprent> exprents, int from, int to,
+                                                                         int indent, boolean closeAtEnd) {
+    if (!selector("bareblock") || exprents == null) {
+      return ExprProcessor.listToJava(exprents == null ? null : exprents.subList(from, to), indent);
+    }
+    org.jetbrains.java.decompiler.util.TextBuffer buf = new org.jetbrains.java.decompiler.util.TextBuffer();
+    int at = from;
+    while (at < to) {
+      int[] run = innerRun(exprents, at, to, closeAtEnd);
+      if (run == null) {
+        buf.append(ExprProcessor.listToJava(exprents.subList(at, to), indent));
+        break;
+      }
+      if (run[0] > at) {
+        buf.append(ExprProcessor.listToJava(exprents.subList(at, run[0]), indent));
+      }
+      armSplitDeclarations(run[2], run[3]);
+      buf.appendIndent(indent).append("{").appendLineSeparator();
+      buf.append(ExprProcessor.listToJava(exprents.subList(run[0], run[1] + 1), indent + 1));
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      at = run[1] + 1;
+    }
+    return buf;
+  }
+
+  /**
+   * The first block run inside this list as {@code {open exprent, close exprent, start, end}}, or
+   * null.
+   */
+  private static int[] innerRun(List<Exprent> exprents, int from, int to, boolean closeAtEnd) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table =
+      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    List<LocalVariable> rows = table.getVariables().toList();
+    for (int a = from; a < to; a++) {
+      int s1 = lastEndOf(exprents.get(a));
+      if (s1 < 0) {
+        continue;
+      }
+      for (LocalVariable row : rows) {
+        if (row.getStart() != s1 || row.getEnd() <= s1) {
+          continue;
+        }
+        int e1 = row.getEnd();
+        if (slotHandover(row.getIndex(), s1, e1) == null) {
+          continue;
+        }
+        for (int b = a + 1; b < to; b++) {
+          if (printedEnd(exprents.get(b)) == e1 && closesCleanly(s1, e1)) {
+            // The list's own end is the closing brace of whatever prints it — a try, a loop, an
+            // arm — unless nothing does, and then the block the source closed is ours.
+            if (b == to - 1 && !closeAtEnd) {
+              continue;
+            }
+            return new int[]{a, b, s1, e1};
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /** The exprents a statement prints before its own body, or null when its print cannot split. */
+  public static List<Exprent> leadingExprents(Statement stat) {
+    if (stat == null) {
+      return null;
+    }
+    if (stat.getExprents() != null) {
+      return stat.getExprents();
+    }
+    if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat) {
+      Statement head = ifstat.getFirst();
+      return head == null ? null : head.getExprents();
+    }
+    return null;
+  }
+
+  /** Last instruction end covered by one exprent, or -1. */
+  public static int lastEndOf(Exprent exprent) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    if (ends == null || exprent == null) {
+      return -1;
+    }
+    int max = -1;
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      BitSet bits = part.bytecode;
+      if (bits == null) {
+        continue;
+      }
+      for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+        Integer end = ends.get(off);
+        if (end != null && end > max) {
+          max = end;
+        }
+      }
+    }
+    return max;
+  }
+
+  /**
+   * True when this store is the one the target's table opens a new local with: its slot's previous
+   * row ended before it, every path here passes that declaration, and the row starts at this
+   * store's own end. The source wrote a declaration here, whatever the tree merged it into.
+   */
+  public static boolean opensHandover(VarExprent variable) {
+    StructMethod method = currentMethod();
+    BitSet armed = method == null ? null : SPLIT_DECLARATIONS.get().get(method);
+    if (armed == null || armed.isEmpty() || variable == null || variable.bytecode == null) {
+      return false;
+    }
+    int end = lastEndOf(variable);
+    return end >= 0 && armed.get(end) && storesInto(method, originalSlot(variable), end);
+  }
+
+  /**
+   * Registers the declarations a brace closing these locals at {@code end} leaves behind: each
+   * slot may be read past the boundary only inside the row that takes it over at a store, and
+   * that store now has to print as a declaration. Called just before the brace prints, so no
+   * declaration appears where no brace closed the earlier local.
+   */
+  public static void armSplitDeclarations(int start, int end) {
+    StructMethod method = currentMethod();
+    BitSet starts = method == null ? null : HANDOVER_STARTS.get(method);
+    if (starts == null || starts.isEmpty()) {
+      return;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return;
+    }
+    List<LocalVariable> rows = table.getVariables().toList();
+    BitSet armed = SPLIT_DECLARATIONS.get().computeIfAbsent(method, key -> new BitSet());
+    for (LocalVariable closed : rows) {
+      if (closed.getStart() < start || closed.getStart() >= end || closed.getEnd() != end) {
+        continue;
+      }
+      for (LocalVariable next : rows) {
+        if (next.getIndex() == closed.getIndex() && next.getStart() > end && starts.get(next.getStart())) {
+          armed.set(next.getStart());
+        }
+      }
+    }
+  }
+
+  /** The slot the class file gave this local; the tree's index is a renumbering of it. */
+  private static int originalSlot(VarExprent variable) {
+    org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor processor = variable.getProcessor();
+    Integer original = processor == null ? null : processor.getVarOriginalIndex(variable.getIndex());
+    if (original != null) {
+      return original;
+    }
+    return variable.getLVT() != null ? variable.getLVT().getIndex() : variable.getIndex();
+  }
+
+  /**
+   * True when every local this run declares is out of scope past {@code end}: no use of a slot
+   * whose row ends there may follow, unless it falls inside the row that takes the slot over at a
+   * store — the printer writes a declaration at that store, so the use has a local to name. A use
+   * anywhere else would name a variable the closing brace took out of scope.
+   */
+  public static boolean closesCleanly(int start, int end) {
+    StructMethod method = currentMethod();
+    Statement root = methodRoot();
+    if (method == null || root == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    List<LocalVariable> rows = table.getVariables().toList();
+    BitSet handovers = HANDOVER_STARTS.get(method);
+    if (handovers == null) {
+      handovers = new BitSet();
+    }
+    for (LocalVariable closed : rows) {
+      if (closed.getStart() < start || closed.getStart() >= end || closed.getEnd() != end) {
+        continue;
+      }
+      if (slotUseOutside(root, closed.getIndex(), end, rows, handovers)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** True when a use of this slot lands past {@code end} outside every row opened by a handover. */
+  private static boolean slotUseOutside(Statement stat, int slot, int end, List<LocalVariable> rows,
+                                        BitSet handovers) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        for (Exprent part : exprent.getAllExprents(true, true)) {
+          if (!(part instanceof VarExprent var) || originalSlot(var) != slot) {
+            continue;
+          }
+          int pos = lastEndOf(var);
+          if (pos < end) {
+            continue;
+          }
+          boolean placed = false;
+          for (LocalVariable row : rows) {
+            if (row.getIndex() != slot || row.getStart() <= end || row.getStart() > pos
+                || pos >= row.getEnd() || !handovers.get(row.getStart())) {
+              continue;
+            }
+            placed = true;
+            break;
+          }
+          if (!placed) {
+            return true;
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (slotUseOutside(child, slot, end, rows, handovers)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The method's root statement, the scope every printed exprent belongs to. */
+  private static Statement methodRoot() {
+    MethodWrapper wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+    return wrapper == null ? null : wrapper.root;
+  }
+
+  /**
+   * The later local that takes over this slot after {@code e1}, or null. The table must hold a
+   * second row that opens after {@code e1} with a store to the slot right before it, and every path
+   * from the method's entry to that store must pass {@code s1} — else the two rows are one variable
+   * whose scope the branches cut, and closing a block between them would be wrong.
+   */
+  public static LocalVariable slotHandover(int slot, int s1, int e1) {
+    StructMethod method = currentMethod();
+    if (method == null || slot < 0 || s1 < 0 || e1 <= s1) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    for (LocalVariable second : table.getVariables().toList()) {
+      if (second.getIndex() != slot || second.getStart() <= e1 || second.getEnd() <= second.getStart()) {
+        continue;
+      }
+      int s2 = second.getStart();
+      if (!storesInto(method, slot, s2) || !dominates(method, s1, s2)) {
+        continue;
+      }
+      return second;
+    }
+    return null;
+  }
+
+  /**
    * The first local declared at or inside this statement whose target scope ends before the
    * enclosing block does, as {@code {start, end}}, or null. Such a local was declared inside a
    * nested block whose closing brace stood where its scope ends.
@@ -4216,6 +4690,98 @@ public final class RoundTrip {
       }
     }
     return -1;
+  }
+
+  /** True when the instruction that falls through to {@code offset} stores into this slot. */
+  private static boolean storesInto(StructMethod method, int slot, int offset) {
+    java.util.Map<Integer, BitSet> sites = STORE_SITES.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    BitSet starts = sites == null ? null : sites.get(slot);
+    if (starts == null || ends == null) {
+      return false;
+    }
+    for (int at = starts.nextSetBit(0); at >= 0; at = starts.nextSetBit(at + 1)) {
+      Integer end = ends.get(at);
+      if (end != null && end == offset) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when every path from the method's entry to {@code to} passes {@code from}. Removing
+   * {@code from} from the flow graph decides it: {@code to} is then unreachable only if no path
+   * skirts the node. Exception edges count, so an assignment inside a try does not dominate code
+   * the catch can reach by jumping past it.
+   */
+  public static boolean dominates(StructMethod method, int from, int to) {
+    Integer entry = METHOD_ENTRY.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (entry == null || ends == null || from == to || !ends.containsKey(from) || !ends.containsKey(to)) {
+      return false;
+    }
+    // A node no path reaches proves nothing about order; require the target to be live first.
+    if (!reaches(method, entry, -1, to)) {
+      return false;
+    }
+    return from == entry || !reaches(method, entry, from, to);
+  }
+
+  /** Whether {@code to} is reachable from {@code start} without stepping on {@code forbidden}. */
+  private static boolean reaches(StructMethod method, int start, int forbidden, int to) {
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (ends == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    java.util.Map<Integer, int[]> switches = SWITCH_TARGETS.get(method);
+    BitSet noFall = NO_FALLTHROUGH.get(method);
+    java.util.List<int[]> excepts = EXCEPTION_RANGES.get(method);
+    BitSet seen = new BitSet();
+    java.util.ArrayDeque<Integer> work = new java.util.ArrayDeque<>();
+    work.add(start);
+    while (!work.isEmpty()) {
+      int at = work.poll();
+      if (at == forbidden || seen.get(at)) {
+        continue;
+      }
+      if (at == to) {
+        return true;
+      }
+      if (!ends.containsKey(at)) {
+        continue;
+      }
+      seen.set(at);
+      Integer target = gotos == null ? null : gotos.get(at);
+      if (target != null) {
+        work.add(target);
+      } else {
+        Integer branch = branchStarts == null ? null : branchStarts.get(at);
+        int[] table = switches == null ? null : switches.get(at);
+        if (table != null) {
+          for (int destination : table) {
+            work.add(destination);
+          }
+        } else {
+          if (branch != null) {
+            work.add(branch);
+          }
+          if ((noFall == null || !noFall.get(at)) && ends.containsKey(ends.get(at))) {
+            work.add(ends.get(at));
+          }
+        }
+      }
+      if (excepts != null) {
+        for (int[] range : excepts) {
+          if (range[0] <= at && at < range[1]) {
+            work.add(range[2]);
+          }
+        }
+      }
+    }
+    return false;
   }
 
   /**

@@ -2195,40 +2195,17 @@ public class VarDefinitionHelper {
   }
 
   /**
-   * Whether the two variables' recorded scopes in {@code mt} never intersect. Every entry of
-   * either slot counts: the table may carry several ranges for one variable whose declaration a
-   * branch split, and a slot can hold different variables at different times. Without entries for
-   * both the table proves nothing and the caller keeps the conservative rename.
+   * Whether the two variables' recorded scopes in {@code mt} never intersect. The two rows are
+   * compared as they are: a slot holds one variable at a time, so two rows of one slot are either
+   * disjoint — sibling blocks, a shadowing declaration, or several ranges of one split variable —
+   * or an entry that is reused. Comparing every row of the slot instead would make two variables
+   * that merely share a slot look live together and rename the later one.
    */
   private static boolean disjointInTable(StructMethod mt, LocalVariable a, LocalVariable b) {
     if (a == null || b == null) {
       return false;
     }
-    StructLocalVariableTableAttribute attr = mt.getLocalVariableAttr();
-    if (attr == null) {
-      return false;
-    }
-    List<LocalVariable> mine = new ArrayList<>();
-    List<LocalVariable> theirs = new ArrayList<>();
-    attr.getVariables().forEach(v -> {
-      if (v.getVersion().var == a.getVersion().var) {
-        mine.add(v);
-      }
-      if (v.getVersion().var == b.getVersion().var) {
-        theirs.add(v);
-      }
-    });
-    if (mine.isEmpty() || theirs.isEmpty()) {
-      return false;
-    }
-    for (LocalVariable x : mine) {
-      for (LocalVariable y : theirs) {
-        if (x.getStart() < y.getEnd() && y.getStart() < x.getEnd()) {
-          return false;
-        }
-      }
-    }
-    return true;
+    return a.getStart() >= b.getEnd() || b.getStart() >= a.getEnd();
   }
 
   // Finds the case statement that the given statement belongs to

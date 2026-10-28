@@ -10,6 +10,7 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -183,7 +184,11 @@ public class VarExprent extends Exprent implements Pattern {
     } else {
       VarVersionPair varVersion = getVarVersionPair();
 
-      if (definition) {
+      // The target's table opens a new local at this store: the source declared the name here,
+      // inside the block that ended the previous local's scope, whatever the tree merged them into.
+      boolean defining = definition || RoundTrip.opensHandover(this);
+
+      if (defining) {
         if (!writingPattern && processor != null && processor.getVarFinal(varVersion) == FinalType.EXPLICIT_FINAL) {
           buffer.append("final ");
         }
@@ -237,7 +242,7 @@ public class VarExprent extends Exprent implements Pattern {
             writeName = getVarVerName(getVarVersionPair());
           }
 
-          buffer.appendVariable(writeName, definition, param, method.classStruct.qualifiedName, method.methodStruct.getName(), descriptor, varIndex, name);
+          buffer.appendVariable(writeName, defining, param, method.classStruct.qualifiedName, method.methodStruct.getName(), descriptor, varIndex, name);
           if (!writeName.equals(name)) {
             buffer.append("/* $VF was: ").append(name).append(" */");
           }
