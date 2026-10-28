@@ -220,6 +220,7 @@ public final class Verifier {
       files.addAll(found);
     }
     System.out.println("tree:   " + tree);
+    System.out.println("note:   a subset decompile; the whole-tree score is the only evidence");
     boolean ok = true;
     Path compileCache = workspace.cache.resolve("compile");
     for (Path source : files) {
