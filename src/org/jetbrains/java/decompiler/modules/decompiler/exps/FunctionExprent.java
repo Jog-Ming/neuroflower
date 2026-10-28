@@ -142,8 +142,18 @@ public class FunctionExprent extends Exprent {
     }
   }
 
+  /**
+   * The operators whose right-nested operand may print without parentheses.
+   *
+   * <p>Java's binary operators are left-associative, so {@code a + (b + c)} written flat as
+   * {@code a + b + c} recompiles as {@code (a + b) + c}: the same value for integral operands,
+   * but different bytecode, and this decompiler's output is judged on the bytes. Short-circuit
+   * {@code &&}/{@code ||} have the same code whichever way the chain nests, and a string
+   * concatenation is lowered to one {@code invokedynamic} recipe whose operands are flattened
+   * left to right, so only those two forms are safe to print flat.
+   */
   private static final Set<FunctionType> ASSOCIATIVITY = new HashSet<>(Arrays.asList(
-    FunctionType.ADD, FunctionType.MUL, FunctionType.AND, FunctionType.OR, FunctionType.XOR, FunctionType.BOOLEAN_AND, FunctionType.BOOLEAN_OR, FunctionType.STR_CONCAT));
+    FunctionType.BOOLEAN_AND, FunctionType.BOOLEAN_OR, FunctionType.STR_CONCAT));
 
   private FunctionType funcType;
   private VarType implicitType;
