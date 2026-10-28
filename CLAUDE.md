@@ -54,6 +54,11 @@ allowed to change as the work does.
 - **Commits are unsigned; pushing is signed and only on request.** Commit with `git commit --no-gpg-sign`;
   do not change the git configuration. Push only when the user asks, re-signing the branch before
   the push.
+- **History is only ever appended.** A subagent may commit its own verified change and may revert its
+  own uncommitted edit with `git checkout -- <path>`; it may not rebase, reset, amend, force-push or
+  touch another agent's commit. Signing rewrites history in the main process, and it happens only
+  when the user asks for a push — never while an agent is working, because a working tree with
+  uncommitted edits cannot be rebased safely.
 - **A subagent's tool calls never prompt the user for approval.** A wave of agents that each stop on a
   permission dialog buries the user. The brief must name only paths and commands the agent can run
   without a prompt — reading, grepping, the project's own scripts under `.dev/tmp` — and must state
