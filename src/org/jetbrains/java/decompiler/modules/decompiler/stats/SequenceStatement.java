@@ -123,6 +123,14 @@ public class SequenceStatement extends Statement {
       return buf;
     }
 
+    // `while (true) { while (A && B) { x++; } if (A) break; body }`: both written loops jump back
+    // to the same test, so the CFG builder made the body the inner loop's and left the increment
+    // outside it. The target's offsets put the increment first, then the guard, then the body, and
+    // the guard repeats the first atom of the merged test.
+    if (!islabeled && RoundTrip.selector("incrementloop") && printFoldedIncrementLoop(buf, indent)) {
+      return buf;
+    }
+
     if (islabeled) {
       buf.appendIndent(indent++).append("label").append(this.id).append(": {").appendLineSeparator();
     }
@@ -1997,6 +2005,80 @@ public class SequenceStatement extends Statement {
     buf.append(RoundTrip.withBlocks(head, after + 1, head.size(), indent, closeAtEnd));
     RoundTrip.consumeHead(stat);
     buf.append(ExprProcessor.jmpWrapper(stat, indent, true));
+  }
+
+  /**
+   * The two statements the target wrote as a small counting loop and a break guard, folded into
+   * one loop by the shared test: {@code while (A && B) { x++; } if (A) break; body}. The tree has
+   * the test's negation as the inner loop's condition with the body inside it, the break as a
+   * leading guard whose arm is the loop's exit, and the increment as the outer body's tail. The
+   * class file proves the order: the increment's instructions, then the guard's test, then the
+   * body's, and the guard's test is the merged condition's first atom.
+   */
+  private boolean printFoldedIncrementLoop(TextBuffer buf, int indent) {
+    if (stats.size() != 2 || !varDefinitions.isEmpty()) {
+      return false;
+    }
+    if (!(getParent() instanceof DoStatement outer) || outer.getLooptype() != DoStatement.Type.INFINITE) {
+      return false;
+    }
+    if (!(stats.get(0) instanceof DoStatement inner) || inner.getLooptype() != DoStatement.Type.WHILE
+        || inner.isLabeled() || !inner.getVarDefinitions().isEmpty()
+        || !(inner.getFirst() instanceof SequenceStatement body) || !body.getVarDefinitions().isEmpty()
+        || body.getStats().size() < 2) {
+      return false;
+    }
+    if (!(body.getStats().get(0) instanceof IfStatement guard) || guard.getElsestat() != null
+        || guard.getIfstat() == null || guard.getHeadexprent() == null) {
+      return false;
+    }
+    IfExprent guardHead = guard.getHeadexprent();
+    Exprent condition = inner.getConditionExprent();
+    if (!(condition instanceof FunctionExprent merged)
+        || merged.getFuncType() != FunctionExprent.FunctionType.BOOLEAN_OR
+        || merged.getLstOperands().size() != 2) {
+      return false;
+    }
+    Exprent atom = merged.getLstOperands().get(0);
+    Exprent test = guardHead.getCondition();
+    // The guard re-tests the value the loop's own test computed, so the two are different
+    // instructions with the same source expression; the printed form is what proves they agree.
+    if (!test.toString().equals(atom.toString())) {
+      return false;
+    }
+    List<Exprent> exitExprents = guard.getIfstat().getExprents();
+    if (exitExprents == null || exitExprents.size() != 1
+        || !(exitExprents.get(0) instanceof ExitExprent exit)
+        || exit.getExitType() != ExitExprent.Type.RETURN || exit.getValue() == null) {
+      return false;
+    }
+    List<Exprent> increments = stats.get(1).getExprents();
+    if (increments == null || increments.size() != 1
+        || !(increments.get(0) instanceof FunctionExprent increment) || !increment.getFuncType().isPPMM()) {
+      return false;
+    }
+    int incrementStart = RoundTrip.firstOffset(stats.get(1));
+    // The guard's arm holds the loop's exit, far past the body; the test's own branch is the
+    // offset that proves the guard sits between the increment and the body.
+    int guardStart = test.bytecode == null ? -1 : test.bytecode.nextSetBit(0);
+    int restStart = RoundTrip.firstOffset(body.getStats().get(1));
+    if (incrementStart < 0 || guardStart < 0 || restStart < 0
+        || incrementStart >= guardStart || guardStart >= restStart) {
+      return false;
+    }
+    buf.appendIndent(indent).append("while (")
+      .append(RoundTrip.negateCondition(condition).toJava(indent)).append(") {").appendLineSeparator();
+    buf.append(ExprProcessor.listToJava(increments, indent + 1));
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    buf.appendIndent(indent).append("if (").append(test.toJava(indent)).append(") {").appendLineSeparator();
+    buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    for (int i = 1; i < body.getStats().size(); i++) {
+      buf.append(ExprProcessor.jmpWrapper(body.getStats().get(i), indent, true));
+    }
+    // The guard's arm is the loop's exit; the source wrote it as the `return …;` after the loop.
+    RoundTrip.deferIncrementLoopExit(guard.getIfstat());
+    return true;
   }
 
   /** True when any of these statements prints anything. */

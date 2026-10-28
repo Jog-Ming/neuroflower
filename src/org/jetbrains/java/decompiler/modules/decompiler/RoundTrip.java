@@ -2970,6 +2970,24 @@ public final class RoundTrip {
   }
 
   /** Statements a loop prints after its closing brace; their prints on the way through are breaks. */
+  /**
+   * The exit block a folded increment loop's break leaves by; the loop prints it after its
+   * closing brace, where the source's `return …;` sat.
+   */
+  private static final ThreadLocal<Statement> INCREMENT_LOOP_EXIT = new ThreadLocal<>();
+
+  /** Defers the exit of a folded increment loop to its loop's closing brace. */
+  public static void deferIncrementLoopExit(Statement exit) {
+    INCREMENT_LOOP_EXIT.set(exit);
+  }
+
+  /** The deferred exit, consumed once: the loop that prints next after the body takes it. */
+  public static Statement takeIncrementLoopExit() {
+    Statement exit = INCREMENT_LOOP_EXIT.get();
+    INCREMENT_LOOP_EXIT.remove();
+    return exit;
+  }
+
   private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> DEFERRED_EXITS =
     ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
   /** Deferred ifs whose merged head block already printed where the source ran it. */

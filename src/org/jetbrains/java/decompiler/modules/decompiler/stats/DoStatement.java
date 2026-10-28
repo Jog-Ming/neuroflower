@@ -133,6 +133,11 @@ public class DoStatement extends Statement {
               buf.append(exit.toJava(indent));
             }
           }
+          // A folded increment loop's break leaves for this same block; the body deferred it.
+          Statement foldedExit = RoundTrip.takeIncrementLoopExit();
+          if (foldedExit != null) {
+            buf.append(ExprProcessor.jmpWrapper(foldedExit, indent, false));
+          }
         } finally {
           RoundTrip.exitLoop();
         }
