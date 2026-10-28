@@ -500,7 +500,12 @@ public class MergeHelper {
       }
     }
 
-    if (hasinit || issingle) {  // FIXME: issingle sufficient?
+    // A loop with no initialiser still has a for header when the target's line table puts the
+    // update on the head's line: the source wrote `for (; cond; update)`, whose header javac
+    // marks with one line. Without the initialiser nothing else can prove the header.
+    boolean headerUpdate = updateFrom < 0 && RoundTrip.updateOnHeaderLine(stat.getConditionExprent(), lastDoExprent);
+
+    if (hasinit || issingle || headerUpdate) {  // FIXME: issingle sufficient?
       Set<Statement> set = stat.getNeighboursSet(StatEdge.TYPE_CONTINUE, EdgeDirection.BACKWARD);
       set.remove(lastData);
 

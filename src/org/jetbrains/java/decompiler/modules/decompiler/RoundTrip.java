@@ -1535,6 +1535,30 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target's line table puts this increment on the loop head's own line, proving the
+   * source wrote it in the for header. The two forms compile to the same instructions, so only the
+   * table separates them: a header's update carries the header's line, a body statement its own.
+   * This is the hoisting direction only — a distinct line is handled where the update already sits
+   * in the body, and the demotion of an existing for is never decided here.
+   */
+  public static boolean updateOnHeaderLine(Exprent condition, Exprent update) {
+    if (!selector("forheadline")) {
+      return false;
+    }
+    if (!(update instanceof FunctionExprent function)) {
+      return false;
+    }
+    FunctionExprent.FunctionType type = function.getFuncType();
+    if (type != FunctionExprent.FunctionType.PPI && type != FunctionExprent.FunctionType.IPP
+        && type != FunctionExprent.FunctionType.MMI && type != FunctionExprent.FunctionType.IMM) {
+      return false;
+    }
+    int updateLine = sourceLine(update);
+    int conditionLine = sourceLine(condition);
+    return updateLine >= 0 && conditionLine >= 0 && updateLine == conditionLine;
+  }
+
+  /**
    * Whether the target's line table has an entry exactly at the expression's first instruction.
    * javac only marks lines where an AST node's position sits, so an argument that merely inherits
    * the enclosing statement's line has no entry of its own; a break there is layout the original
