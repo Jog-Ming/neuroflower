@@ -1091,9 +1091,15 @@ public final class RoundTrip {
         VarType right = function.getLstOperands().get(1).getExprType();
         if (left != null && right != null) {
           boolean refs = left.typeFamily == TypeFamily.OBJECT && right.typeFamily == TypeFamily.OBJECT;
-          boolean ints = isIntegerFamily(left) && isIntegerFamily(right);
+          // A comparison the decompiler still holds as `__dcmpl__(a, b) > 0` is javac's single
+          // `dcmpl; if<op>` on the sign, not a two-operand int compare: the result of a lcmp/fcmp/
+          // dcmp tested against the literal 0 keeps the wide comparison's opcode.
+          boolean cmpZero = isCmpResult(function.getLstOperands().get(0), function.getLstOperands().get(1))
+            || isCmpResult(function.getLstOperands().get(1), function.getLstOperands().get(0));
+          boolean ints = !cmpZero && isIntegerFamily(left) && isIntegerFamily(right);
           // long/float/double compare through lcmp/fcmp and then branch on the int result.
-          boolean wide = (left.typeFamily == TypeFamily.LONG && right.typeFamily == TypeFamily.LONG)
+          boolean wide = cmpZero
+            || (left.typeFamily == TypeFamily.LONG && right.typeFamily == TypeFamily.LONG)
             || (left.typeFamily == TypeFamily.FLOAT && right.typeFamily == TypeFamily.FLOAT);
           switch (type) {
             case EQ:
@@ -1131,6 +1137,22 @@ public final class RoundTrip {
 
   private static boolean isIntegerFamily(VarType type) {
     return type.typeFamily == TypeFamily.INTEGER || type.typeFamily == TypeFamily.BOOLEAN;
+  }
+
+  /**
+   * True when {@code value} is a {@code lcmp}/{@code fcmp}/{@code dcmp} call and {@code other} is
+   * the literal int 0: javac keeps the compare's result on the stack and branches on its sign, so
+   * the test is the wide comparison's, not an int compare of two values.
+   */
+  private static boolean isCmpResult(Exprent value, Exprent other) {
+    if (!(value instanceof FunctionExprent call) || !(other instanceof ConstExprent constant)
+        || !(constant.getValue() instanceof Integer zero) || zero != 0) {
+      return false;
+    }
+    return switch (call.getFuncType()) {
+      case LCMP, FCMPL, FCMPG, DCMPL, DCMPG -> true;
+      default -> false;
+    };
   }
 
   private static boolean booleanOperands(FunctionExprent function) {
