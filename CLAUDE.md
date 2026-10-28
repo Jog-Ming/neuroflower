@@ -59,6 +59,11 @@ allowed to change as the work does.
   touch another agent's commit. Signing rewrites history in the main process, and it happens only
   when the user asks for a push — never while an agent is working, because a working tree with
   uncommitted edits cannot be rebased safely.
+- **Measurement happens in the main checkout, never in a worktree.** The devtools caches are shared
+  state under `.dev/`; a decompile or score run inside a second checkout builds its own tree and
+  compile caches from scratch and its numbers are not comparable with the ones in the reports. To
+  read an earlier revision of a file, use `git show <rev>:<path>`; to measure a variant, edit the
+  main working tree, measure, and revert with `git checkout -- <path>`.
 - **A subagent's tool calls never prompt the user for approval.** A wave of agents that each stop on a
   permission dialog buries the user. The brief must name only paths and commands the agent can run
   without a prompt — reading, grepping, the project's own scripts under `.dev/tmp` — and must state
