@@ -364,6 +364,10 @@ public class IfStatement extends Statement {
         && condition instanceof IfExprent ifHead
         && !RoundTrip.printsNothing(elsestat)
         && !RoundTrip.declaresLocalToEnd(ifstat)
+        // An if/else whose last branch lands on the arm the tree prints as then has its arms the
+        // wrong way round: the jump between the arms is the join, not a continue the source wrote
+        // (TripWireHookBlock's tripwire test). Let the swap below print it as the if/else it is.
+        && !RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat)
         && endsLoopBody(this)
         && RoundTrip.printContinueElse(ifHead, this)) {
       buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();

@@ -429,6 +429,9 @@ public class SequenceStatement extends Statement {
           && ifStatement.getIfstat() != null
           && !RoundTrip.printsNothing(ifStatement.getElsestat())
           && !RoundTrip.declaresLocalToEnd(ifStatement.getIfstat())
+          // An if/else whose last branch lands on the arm the tree prints as then has its arms
+          // the wrong way round: the jump between them is the join, not a written continue.
+          && !RoundTrip.swapIfArmsByLastTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat())
           && i == stats.size() - 1 && endsLoopBody()
           && RoundTrip.printContinueElse(ifStatement.getHeadexprent(), this)) {
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
