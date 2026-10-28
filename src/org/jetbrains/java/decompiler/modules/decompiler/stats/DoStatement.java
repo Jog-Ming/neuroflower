@@ -212,7 +212,11 @@ public class DoStatement extends Statement {
             }
             buf.appendIndent(indent).append("while (").append(conditionExprent.get(0).toJava(indent)).append(") {").appendLineSeparator();
             buf.append(body);
-            buf.appendIndent(indent + 1).append(incExprent.get(0).toJava(indent + 1)).append(";").appendLineSeparator();
+            for (Exprent inc : incExprent) {
+              if (inc != null) {
+                buf.appendIndent(indent + 1).append(inc.toJava(indent + 1)).append(";").appendLineSeparator();
+              }
+            }
             buf.appendIndent(indent).append("}").appendLineSeparator();
             break;
           }
@@ -228,7 +232,7 @@ public class DoStatement extends Statement {
           .append(forGuard == null ? conditionExprent.get(0).toJava(indent)
             : ((FunctionExprent) conditionExprent.get(0)).getLstOperands().get(0).toJava(indent))
           .append(";").appendPossibleNewline(" ")
-          .append(incExprent.get(0).toJava(indent))
+          .append(incToJava(indent))
           .appendPossibleNewline("", true);
         buf.popNewlineGroup();
         buf.append(") {").appendLineSeparator();
@@ -312,7 +316,11 @@ public class DoStatement extends Statement {
         lst.add(getConditionExprent());
         break;
       case FOR:
-        lst.add(getIncExprent());
+        for (Exprent inc : incExprent) {
+          if (inc != null) {
+            lst.add(inc);
+          }
+        }
     }
 
     return lst;
@@ -326,8 +334,12 @@ public class DoStatement extends Statement {
     if (conditionExprent.get(0) == oldexpr) {
       conditionExprent.set(0, newexpr);
     }
-    if (incExprent.get(0) == oldexpr) {
-      incExprent.set(0, newexpr);
+    // A comma-separated update keeps several; the pass that replaces exprents loops until
+    // nothing changed, so every slot has to accept its replacement or it spins forever.
+    for (int i = 0; i < incExprent.size(); i++) {
+      if (incExprent.get(i) == oldexpr) {
+        incExprent.set(i, newexpr);
+      }
     }
   }
 
@@ -474,6 +486,30 @@ public class DoStatement extends Statement {
 
   public void setIncExprent(Exprent incExprent) {
     this.incExprent.set(0, incExprent);
+  }
+
+  /** Adds a further update expression: the source's for header wrote several, comma-separated. */
+  public void addIncExprent(Exprent exprent) {
+    if (this.incExprent.get(0) == null) {
+      this.incExprent.set(0, exprent);
+    } else {
+      this.incExprent.add(exprent);
+    }
+  }
+
+  /** The for header's update text: every recorded increment, comma-separated. */
+  private String incToJava(int indent) {
+    StringBuilder out = new StringBuilder();
+    for (Exprent inc : incExprent) {
+      if (inc == null) {
+        continue;
+      }
+      if (out.length() > 0) {
+        out.append(", ");
+      }
+      out.append(inc.toJava(indent));
+    }
+    return out.toString();
   }
 
   public Exprent getInitExprent() {

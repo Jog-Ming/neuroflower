@@ -1235,6 +1235,46 @@ public final class RoundTrip {
   }
 
   /**
+   * The index in {@code exprents} where the loop's update block starts, or -1 when the target
+   * records no proof. javac sends every {@code continue} inside the loop to the first instruction
+   * of the update block, and the scan records those jumps; an exprent that starts exactly where a
+   * recorded continue lands begins the source's for-update, so it and every exprent after it
+   * belong in the header rather than in the body.
+   */
+  public static int updateBlockStart(Statement loop, java.util.List<Exprent> exprents) {
+    if (!selector("forupdate")) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || loop == null || exprents == null || exprents.size() < 2) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
+    if (guards == null || guards.isEmpty()) {
+      return -1;
+    }
+    BitSet range = new BitSet();
+    loop.getOffset(range);
+    int start = range.nextSetBit(0);
+    int end = range.length();
+    if (start < 0) {
+      return -1;
+    }
+    java.util.Set<Integer> targets = new java.util.HashSet<>(guards.values());
+    for (int k = 0; k < exprents.size(); k++) {
+      Exprent exprent = exprents.get(k);
+      if (exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+        continue;
+      }
+      int offset = exprent.bytecode.nextSetBit(0);
+      if (offset >= start && offset < end && targets.contains(offset)) {
+        return k;
+      }
+    }
+    return -1;
+  }
+
+  /**
    * True when the target's line table puts a candidate for-update on a line distinct from the
    * condition's, proving the source wrote it as the loop body's last statement rather than in a
    * for header. A for header's update carries the header's line, which the condition shares
@@ -2363,7 +2403,11 @@ public final class RoundTrip {
       return null;
     }
     int bodyStart = firstOffset(body);
-    int loopEnd = lastOffset(loop);
+    // The loop's header exprents count: a for-update the tree moved into the header sits past the
+    // body, and lastOffset only walks child statements.
+    BitSet loopBits = new BitSet();
+    loop.getOffset(loopBits);
+    int loopEnd = loopBits.length() - 1;
     if (bodyStart < 0 || loopEnd < 0) {
       return null;
     }

@@ -445,6 +445,11 @@ public class MergeHelper {
 
     List<Exprent> lstExpr = lastData.getExprents();
     lastDoExprent = lstExpr.get(lstExpr.size() - 1);
+    // javac sends every `continue` to the first instruction of the update block, so an exprent
+    // starting exactly where one lands is part of the header: the source wrote a comma-separated
+    // update, and only its last expression would have been moved without this evidence.
+    int updateFrom = RoundTrip.updateBlockStart(stat, lstExpr);
+    Exprent firstUpdate = updateFrom >= 0 ? lstExpr.get(updateFrom) : lastDoExprent;
 
     boolean issingle = false;
     if (lstExpr.size() == 1) {  // single exprent
@@ -453,7 +458,8 @@ public class MergeHelper {
       }
     }
 
-    boolean haslast = issingle || lastDoExprent instanceof AssignmentExprent || lastDoExprent instanceof FunctionExprent;
+    boolean haslast = issingle || firstUpdate instanceof AssignmentExprent || firstUpdate instanceof FunctionExprent
+      || (updateFrom >= 0 && firstUpdate instanceof InvocationExprent);
     if (!haslast) {
       return;
     }
@@ -528,12 +534,16 @@ public class MergeHelper {
       }
 
       Exprent lastExp = lastData.getExprents().get(lastData.getExprents().size() - 1);
+      List<Exprent> moved = updateFrom >= 0
+        ? new ArrayList<>(lastData.getExprents().subList(updateFrom, lastData.getExprents().size()))
+        : Collections.singletonList(lastExp);
 
       // A for header's update takes the header's line while a while body's last statement takes
       // its own: a distinct line proves the source kept this exprent in the body, so the loop stays
       // a while and the exprent prints where the source wrote it (inside a guard's arm, for one).
       // Both forms compile to the same instructions, so only the target's table separates them.
-      if (RoundTrip.updateIsBodyStatement(stat.getConditionExprent(), lastExp)) {
+      // A run the recorded continue proves is the update block keeps the header whatever its line.
+      if (updateFrom < 0 && RoundTrip.updateIsBodyStatement(stat.getConditionExprent(), lastExp)) {
         return;
       }
 
@@ -541,26 +551,35 @@ public class MergeHelper {
       if (lastExp instanceof ExitExprent) {
         return;
       }
-
-      // Check if any final variable assignments in the loop are used in the line that is being moved to the final part of the for loop
-      Set<VarExprent> finalVariables = getFinalVariables(stat, new HashSet<>());
-      if (finalVariables.stream().anyMatch(exp -> exp.isVarReferenced(lastExp))) {
+      // A call can be an update only when the continue target proves the whole run is the header;
+      // otherwise the source wrote it as the body's last statement.
+      if (updateFrom >= 0 && !(moved.get(0) instanceof AssignmentExprent
+          || moved.get(0) instanceof FunctionExprent || moved.get(0) instanceof InvocationExprent)) {
         return;
       }
 
-      for (Exprent e : lastExp.getAllExprents(true, true)) {
-        if (!(e instanceof VarExprent)) {
-          continue;
-        }
+      // Check if any final variable assignments in the loop are used in the line that is being moved to the final part of the for loop
+      Set<VarExprent> finalVariables = getFinalVariables(stat, new HashSet<>());
+      if (moved.stream().anyMatch(exp -> finalVariables.stream().anyMatch(v -> v.isVarReferenced(exp)))) {
+        return;
+      }
 
-        if (!isVarUsedBefore((VarExprent) e, stat)) {
-          return;
+      for (Exprent move : moved) {
+        for (Exprent e : move.getAllExprents(true, true)) {
+          if (!(e instanceof VarExprent)) {
+            continue;
+          }
+
+          if (!isVarUsedBefore((VarExprent) e, stat)) {
+            return;
+          }
         }
       }
 
       // Check if the init var is contained in the cond var or the inc var, otherwise don't make the loop
       if (hasinit && preData.getExprents().get(preData.getExprents().size() - 1) instanceof AssignmentExprent assign) {
-        if (assign.getLeft() instanceof VarExprent var && !stat.getConditionExprent().containsVar(var.getVarVersionPair()) && !lastExp.containsVar(var.getVarVersionPair())) {
+        if (assign.getLeft() instanceof VarExprent var && !stat.getConditionExprent().containsVar(var.getVarVersionPair())
+            && moved.stream().noneMatch(exp -> exp.containsVar(var.getVarVersionPair()))) {
           return;
         }
       }
@@ -573,11 +592,15 @@ public class MergeHelper {
         }
         stat.setInitExprent(exp);
       }
-      lastData.getExprents().remove(lastExp);
-      if (stat.getIncExprent() != null) {
-        lastExp.addBytecodeOffsets(stat.getIncExprent().bytecode);
+      lastData.getExprents().removeAll(moved);
+      Exprent previous = stat.getIncExprent();
+      for (Exprent move : moved) {
+        if (previous != null) {
+          move.addBytecodeOffsets(previous.bytecode);
+          previous = null;
+        }
+        stat.addIncExprent(move);
       }
-      stat.setIncExprent(lastExp);
     }
 
     cleanEmptyStatements(stat, lastData);
