@@ -139,3 +139,9 @@ A read-only caller — a research agent compiling one class with the verifier's 
 compile never rebuilds the jar a measuring agent is using: `DEVTOOLS_NO_BUILD=1 devtools/cli compile
 <version> <Class>`. It is never set for a command whose result is a measurement.
 
+**Never call the jar or a compiler directly.** `java -jar build/libs/…`, `javac`, and any other raw
+tool invocation prompt the user for approval, and a subagent's tool calls must never do that. Go
+through the subcommands: `compile` for one class with the verifier's javac, `decompile --only` for
+one class's source, `diff` for verification. A debugging environment variable is still fine — it is
+inherited by the child process: `DEVTOOLS_NO_BUILD=1 NF_TRACE_IF=1 devtools/cli decompile …`.
+
