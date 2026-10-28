@@ -4856,6 +4856,52 @@ public final class RoundTrip {
   }
 
   /**
+   * The goto that leaves the then arm for the loop head when a detached block stands between it and
+   * the arm that follows: {loop head, goto offset, next arm start}, or null. The block is the else
+   * part of an inner if, which javac places after the arm's last jump; the jump is still the arm's
+   * written continue, and the arm's own end is the last condition branch's target.
+   */
+  private static int[] armContinueGoto(Exprent head) {
+    if (!selector("continuearm")) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    BitSet offsets = head.bytecode;
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> branches = BRANCH_TARGETS.get(method);
+    if (gotos == null || branches == null || offsets == null || offsets.isEmpty()) {
+      return null;
+    }
+    // The condition's last branch is the fall-through into the then arm; its target is the arm
+    // that follows the if.
+    int armStart = offsets.length();
+    Integer armEnd = branches.get(armStart);
+    if (armEnd == null || armEnd <= armStart) {
+      return null;
+    }
+    int best = -1;
+    for (java.util.Map.Entry<Integer, Integer> goto_ : gotos.entrySet()) {
+      int offset = goto_.getKey();
+      int dest = goto_.getValue();
+      if (offset < armStart || offset >= armEnd) {
+        continue;
+      }
+      if (dest >= armStart && dest < armEnd) {
+        // A jump inside the arm is an inner loop's continue, not the arm's own exit.
+        continue;
+      }
+      if (offset > best) {
+        best = offset;
+      }
+    }
+    // The destination is checked against the enclosing loop by the caller.
+    return best < 0 ? null : new int[]{gotos.get(best), best, armEnd};
+  }
+
+  /**
    * The mirror of {@link #printContinueGuard} for an else arm: {@code if (C) { ...; continue; } rest}
    * where the decompiler kept {@code rest} as the else arm. The branch jumps over the then arm and
    * the goto ending that arm is the continue. The caller proves the arm is the rest of the loop
@@ -4874,16 +4920,33 @@ public final class RoundTrip {
     if (guards == null || guards.isEmpty() || offsets == null || offsets.isEmpty()) {
       return false;
     }
-    Integer target = guards.get(offsets.length());
-    if (target == null) {
-      return false;
-    }
     Statement loop = sequence.getParent();
     while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
       loop = loop.getParent();
     }
     if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
       return false;
+    }
+    Integer target = guards.get(offsets.length());
+    java.util.Map<Integer, int[]> sites = CONTINUE_ELSE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(offsets.length());
+    boolean adjacent = target != null && site != null;
+    if (!adjacent) {
+      // The written continue need not stand immediately before the arm that follows: when it ends
+      // the arm's last statement, javac places the else block of an inner if between the two. The
+      // goto that leaves the arm for the loop head then sits before that block, and the arm's own
+      // end is the branch target that begins the arm we print next. Only an arm whose own end edge
+      // is that continue can have written it; any other arm's jump belongs to a nested statement.
+      if (!(sequence instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement)
+          || !endsWithContinueEdge(ifStatement.getIfstat(), doStatement)) {
+        return false;
+      }
+      int[] found = armContinueGoto(head);
+      if (found == null) {
+        return false;
+      }
+      target = found[0];
+      site = new int[]{found[1], found[2]};
     }
     // Only a jump to the loop head counts. An ordinary if/else joins after its else arm, which
     // is still inside the loop, so the loop's extent alone cannot tell the two apart.
@@ -4893,12 +4956,12 @@ public final class RoundTrip {
     // The source wrote `continue;` on a line of its own, so the table starts an entry at its goto
     // and puts it before the else arm's first line. An if/else's closing jump inherits the line of
     // the arm before it and starts nothing; when the table has no entry at the goto, the extra
-    // `continue` line would change the table and the arm is an ordinary else.
-    java.util.Map<Integer, int[]> sites = CONTINUE_ELSE_SITES.get(method);
-    int[] site = sites == null ? null : sites.get(offsets.length());
+    // `continue` line would change the table and the arm is an ordinary else. A continue that
+    // closes a statement run inside the arm gets no entry of its own; there the arm's own edge and
+    // the jump to the loop head are the proof.
     StructLineNumberTableAttribute table =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
-    if (site == null || table == null || !startsLine(table, site[0])) {
+    if (table == null || adjacent && !startsLine(table, site[0])) {
       return false;
     }
     int continueLine = table.findLineNumber(site[0]);
@@ -4907,6 +4970,23 @@ public final class RoundTrip {
       return false;
     }
     return true;
+  }
+
+  /** True when the statement's own last edge is a continue to this loop. */
+  private static boolean endsWithContinueEdge(Statement stat, Statement loop) {
+    if (stat == null) {
+      return false;
+    }
+    Statement last = stat;
+    while (last.getExprents() == null && !last.getStats().isEmpty()) {
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
+    for (StatEdge edge : last.getAllSuccessorEdges()) {
+      if (edge.getType() == StatEdge.TYPE_CONTINUE && edge.getDestination() == loop) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
