@@ -1114,6 +1114,29 @@ public final class RoundTrip {
     return incLine >= 0 && firstLine >= 0 && incLine != firstLine;
   }
 
+  /**
+   * The smallest instruction offset the expression's evaluation touches, or -1. A switch expression
+   * owns no offsets of its own; its instructions are its backing statement's, and the evaluation
+   * starts at that statement's first one.
+   */
+  public static int evaluationOffset(Exprent exprent) {
+    if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.SwitchExprent sw
+        && selector("switchline")) {
+      // The switch's own instructions begin at the block holding its selector; its arms start
+      // later, and an empty head block would make the arms look like the start.
+      Statement head = sw.getBacking().getFirst();
+      org.jetbrains.java.decompiler.util.StartEndPair range = head == null ? null : head.getStartEndRange();
+      int offset = range == null ? -1 : range.start;
+      if (offset < 0) {
+        offset = firstOffset(sw.getBacking());
+      }
+      if (offset >= 0) {
+        return offset;
+      }
+    }
+    return firstOffsetOf(exprent);
+  }
+
   /** The smallest instruction offset any part of the expression owns, or -1. */
   private static int firstOffsetOf(Exprent exprent) {
     int first = -1;

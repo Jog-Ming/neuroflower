@@ -492,8 +492,14 @@ public class StackVarsProcessor {
     for (VarVersionNode usedvar : usedVers) {
       VarVersionPair usedver = new VarVersionPair(usedvar.var, usedvar.version);
 
+      // A switch expression's value only exists to be read once; the join block the tree stored it
+      // in may be empty and the use may sit past the statement the flat flow reaches next, which is
+      // what the value is there for. Its evaluation stays in the printed expression, in front of
+      // whatever else that expression evaluates.
+      boolean soleSwitchUse = right instanceof SwitchExprent && usedVers.size() == 1
+        && RoundTrip.selector("switchinline");
       if (isVersionToBeReplaced(usedver, mapVars, ssau, leftVar) &&
-          (right instanceof ConstExprent || right instanceof VarExprent || right instanceof FieldExprent
+          (soleSwitchUse || right instanceof ConstExprent || right instanceof VarExprent || right instanceof FieldExprent
            || setNextVars == null || setNextVars.contains(usedver))) {
 
         setTempUsedVers.add(usedver);

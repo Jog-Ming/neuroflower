@@ -199,10 +199,10 @@ public class ExitExprent extends Exprent {
     int firstLine = -1;
     int minLine = -1;
     for (Exprent part : value.getAllExprents(true, true)) {
-      if (part.bytecode == null || part.bytecode.isEmpty()) {
+      int offset = RoundTrip.evaluationOffset(part);
+      if (offset < 0) {
         continue;
       }
-      int offset = part.bytecode.nextSetBit(0);
       int line = RoundTrip.lineAtOffset(offset);
       if (minOffset < 0 || offset < minOffset) {
         minOffset = offset;
