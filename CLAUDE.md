@@ -139,6 +139,10 @@ A read-only caller — a research agent compiling one class with the verifier's 
 compile never rebuilds the jar a measuring agent is using: `DEVTOOLS_NO_BUILD=1 devtools/cli compile
 <version> <Class>`. It is never set for a command whose result is a measurement.
 
+**One devtools command at a time inside a process tree.** A background `score` running while another
+call rebuilds the jar gives `NoClassDefFoundError` and caches a broken tree; the rebuild is only
+serialised against other *builds*, not against a decompile already in flight.
+
 **Never call the jar or a compiler directly.** `java -jar build/libs/…`, `javac`, and any other raw
 tool invocation prompt the user for approval, and a subagent's tool calls must never do that. Go
 through the subcommands: `compile` for one class with the verifier's javac, `decompile --only` for
