@@ -950,7 +950,11 @@ public class SequenceStatement extends Statement {
         if (exit instanceof ExitExprent headExit
             && (headExit.getExitType() == ExitExprent.Type.RETURN || headExit.getExitType() == ExitExprent.Type.THROW)
             && !writesAny(stats.subList(i + 1, stats.size()), readLocals(headExit.getValue()))
-            && RoundTrip.exitAfterBody(ifStatement.getIfstat(), stats.get(i + 1))) {
+            && RoundTrip.exitAfterBody(ifStatement.getIfstat(), stats.get(i + 1))
+            // Only the mirror form's condition branches onto the exit block: the guard
+            // `if (C) { …; return X; } rest` branches past the arm to the rest, and its exit
+            // block is a loop exit or a plain return that the line table cannot tell apart.
+            && RoundTrip.branchesToBody(ifStatement.getHeadexprent(), ifStatement.getIfstat())) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
           head.setCondition(RoundTrip.negateCondition(head.getCondition()));
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
