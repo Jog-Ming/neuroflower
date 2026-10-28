@@ -163,6 +163,12 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // A branch printed this block inside its braces: the target's code lay inside the loop the
+      // branch exits, so the source ran it there and the tree only placed it here.
+      if (RoundTrip.isPrintedInBranch(st)) {
+        continue;
+      }
+
       // A guard printed this exit already; the rest of the sequence became unconditional.
       if (RoundTrip.isConsumedGuardExit(st)) {
         continue;

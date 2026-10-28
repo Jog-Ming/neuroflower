@@ -102,6 +102,20 @@ public class DoStatement extends Statement {
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
 
+    // When the guard prints its exit inside the loop, a local it reads that the tree declared
+    // before the brace belongs at the assignment the source wrote in the body; the definition has
+    // to move before the declarations print here.
+    Statement guardReturn = null;
+    if (looptype == Type.DO_WHILE && conditionExprent.get(0) != null
+        && RoundTrip.loopGuardInsideBody(conditionExprent.get(0), first)) {
+      Statement exitTarget = getAllSuccessorEdges().isEmpty()
+        ? null : getAllSuccessorEdges().get(0).getDestination();
+      guardReturn = RoundTrip.returnInsideLoop(this, exitTarget);
+      if (guardReturn != null) {
+        RoundTrip.moveDeclarationIntoBody(this, guardReturn, first);
+      }
+    }
+
     int varDefsStart = buf.length();
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
@@ -161,11 +175,20 @@ public class DoStatement extends Statement {
           if (moved != null) {
             buf.appendIndent(indent + 1).append(moved.toJava(indent + 1)).append(";").appendLineSeparator();
           }
+          // The guard's exit is the block after the loop. When the target laid that block's code
+          // inside the loop, before the back edge, the source returned there and the tree only
+          // moved the return after the loop: print it in the arm and let the sequence skip it.
+          Statement insideReturn = guardReturn;
           buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
           buf.appendIndent(indent + 1).append("if (")
             .append(RoundTrip.negateCondition(conditionExprent.get(0)).toJava(indent + 1))
             .append(") {").appendLineSeparator();
-          buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+          if (insideReturn != null) {
+            buf.append(insideReturn.toJava(indent + 2));
+            RoundTrip.markPrintedInBranch(insideReturn);
+          } else {
+            buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+          }
           buf.appendIndent(indent + 1).append("}").appendLineSeparator();
           buf.appendIndent(indent).append("}").appendLineSeparator();
           break;

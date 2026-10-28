@@ -3266,6 +3266,138 @@ public final class RoundTrip {
     }
   }
 
+  /** Statements a branch printed inside its braces; the sequence must not print them again. */
+  private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> PRINTED_IN_BRANCH =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+
+  public static void markPrintedInBranch(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method != null && stat != null) {
+      PRINTED_IN_BRANCH.get().computeIfAbsent(method,
+        key -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).add(stat);
+    }
+  }
+
+  /** True when a branch already printed this statement where the source ran it. */
+  public static boolean isPrintedInBranch(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    java.util.Set<Statement> set = PRINTED_IN_BRANCH.get().get(method);
+    return set != null && set.contains(stat);
+  }
+
+  /** The offset of the goto that returns to this loop's head, or -1. */
+  public static int backEdgeOffset(Statement loop) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    int head = firstOffset(loop);
+    if (gotos == null || head < 0) {
+      return -1;
+    }
+    int back = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() != null && entry.getValue() == head && entry.getKey() > back) {
+        back = entry.getKey();
+      }
+    }
+    return back >= 0 ? back : tailJumpOffset(loop);
+  }
+
+  /**
+   * The return a loop's exit block holds when the target laid that block's code inside the loop:
+   * javac placed the return before the back edge, so the source wrote {@code return ...;} in the
+   * branch and the tree only moved the exit block after the loop. A block the compiler laid out
+   * past the back edge is a real statement after the loop.
+   */
+  public static Statement returnInsideLoop(Statement loop, Statement target) {
+    if (!selector("returninloop") || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)
+        || target == null || !(loop.getParent() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence)) {
+      return null;
+    }
+    java.util.List<Statement> siblings = sequence.getStats();
+    int at = siblings.indexOf(loop);
+    if (at < 0 || at + 1 >= siblings.size() || siblings.get(at + 1) != target) {
+      return null;
+    }
+    int back = backEdgeOffset(loop);
+    int start = firstOffset(target);
+    if (back < 0 || start < 0 || start >= back) {
+      return null;
+    }
+    if (target.getExprents() == null || target.getExprents().size() != 1
+        || !(target.getExprents().get(0) instanceof ExitExprent exit)
+        || exit.getExitType() != ExitExprent.Type.RETURN || exit.getValue() == null) {
+      return null;
+    }
+    return target;
+  }
+
+  /**
+   * A local the loop declares before its brace whose first store is inside the body, and which
+   * only the guard's return reads: with the return printed inside the loop the source declared it
+   * at that assignment, so move the definition there. The class file's table agrees — the row
+   * starts at the store.
+   */
+  public static void moveDeclarationIntoBody(Statement loop, Statement insideReturn, Statement body) {
+    if (!selector("returninloop") || insideReturn == null || body == null || loop.getVarDefinitions().isEmpty()) {
+      return;
+    }
+    java.util.Set<Integer> used = new java.util.HashSet<>();
+    if (insideReturn.getExprents() != null) {
+      for (Exprent exprent : insideReturn.getExprents()) {
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          if (inner instanceof VarExprent var) {
+            used.add(var.getIndex());
+          }
+        }
+      }
+    }
+    java.util.Iterator<Exprent> declarations = loop.getVarDefinitions().iterator();
+    while (declarations.hasNext()) {
+      Exprent declaration = declarations.next();
+      if (!(declaration instanceof VarExprent decl) || !used.contains(decl.getIndex())) {
+        continue;
+      }
+      org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assign =
+        firstAssignment(body, decl.getIndex());
+      if (assign == null || !(assign.getLeft() instanceof VarExprent left) || left.isDefinition()) {
+        continue;
+      }
+      left.setDefinition(true);
+      declarations.remove();
+    }
+  }
+
+  /**
+   * The assignment that first mentions the slot in print order, or null. A read before the store
+   * means the declaration has to stay where it is.
+   */
+  private static org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent firstAssignment(
+      Statement stat, int index) {
+    if (stat.getExprents() != null) {
+      for (Exprent exprent : stat.getExprents()) {
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          if (inner instanceof VarExprent var && var.getIndex() == index) {
+            if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assign
+                && assign.getLeft() == inner) {
+              return assign;
+            }
+            return null;
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent found = firstAssignment(child, index);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
   /** True when this statement's print already carries the break its trailing edge stands for. */
   public static boolean printedBreak(Statement stat) {
     StructMethod method = currentMethod();
@@ -6168,6 +6300,37 @@ public final class RoundTrip {
       if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
           && isContinueTarget(loop, target)) {
         return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when the offset is the head an enclosing loop's {@code continue} jumps to, read from the
+   * loop's own exprents. This is the narrow test: {@link #enclosingContinueTarget} also calls an
+   * offset inside the loop a continue landing, which would hide the join of a switch that is the
+   * loop body's last statement — there the update block the switch's {@code break;} lands on is
+   * inside the loop by construction.
+   */
+  public static boolean continuesAtLoopHead(Statement statement, int target) {
+    for (Statement cur = statement == null ? null : statement.getParent(); cur != null; cur = cur.getParent()) {
+      if (!(cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop)) {
+        continue;
+      }
+      int bodyStart = firstOffset(loop.getFirst());
+      if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
+        return true;
+      }
+      Exprent head = switch (loop.getLooptype()) {
+        case WHILE, DO_WHILE -> loop.getConditionExprent();
+        case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
+        default -> null;
+      };
+      if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
+        int start = head.bytecode.nextSetBit(0);
+        if (target <= start && target >= start - 3) {
+          return true;
+        }
       }
     }
     return false;

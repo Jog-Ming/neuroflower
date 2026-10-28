@@ -187,6 +187,10 @@ public class SwitchStatement extends Statement {
     // so an arm's own landing that sits before it names the join more precisely.
     int switchEnd = switchEndFromSibling();
     int jumpEnd = switchEndFromJumps();
+    int targetEnd = switchEndFromTargetJumps();
+    if (targetEnd >= 0 && (jumpEnd < 0 || targetEnd < jumpEnd)) {
+      jumpEnd = targetEnd;
+    }
     if (jumpEnd >= 0 && (switchEnd < 0 || jumpEnd < switchEnd)) {
       switchEnd = jumpEnd;
     }
@@ -213,7 +217,7 @@ public class SwitchStatement extends Statement {
         }
       }
     }
-    List<Integer> order = sourceOrder();
+    List<Integer> order = sourceOrder(switchEnd);
     // When the printed order leaves the arms' bytecode blocks in another sequence, the source was
     // written in an order the class file did not record and the jumps say nothing about a break
     // this printer could put back: the group a jump belongs to is not the group it prints in.
@@ -249,13 +253,48 @@ public class SwitchStatement extends Statement {
     Statement joinArm = defaultJoinArm(yields);
     Statement caseJoinArm = caseJoinArm(yields, switchEnd);
 
+    // An empty `default: break;` group compiles to a jump the table's default target points at.
+    // No arm carries that edge when the group holds nothing of its own, so the label is printed
+    // where the target's block sits among the arms: at the table's default offset, not at the join
+    // the jump lands on.
+    int defaultBreakJump = -1;
+    if (switchEnd >= 0 && !yields && !isPattern() && caseGuards.stream().noneMatch(Objects::nonNull)
+        && RoundTrip.selector("switchbreak") && RoundTrip.selector("switchdefault")) {
+      int target = defaultTargetOffset();
+      // The jump has to stand among the arm blocks: one past all of them is the switch's own
+      // join, the instruction every arm falls through to, not a group the source wrote.
+      int armLimit = -1;
+      for (Statement arm : caseStatements) {
+        armLimit = Math.max(armLimit, RoundTrip.blockEnd(arm));
+      }
+      if (target >= 0 && target < armLimit && RoundTrip.jumpTargetAt(target) == switchEnd) {
+        boolean onArm = false;
+        for (List<StatEdge> edges : caseEdges) {
+          for (StatEdge edge : edges) {
+            if (edge == defaultEdge) {
+              onArm = true;
+            }
+          }
+        }
+        if (!onArm) {
+          defaultBreakJump = target;
+        }
+      }
+    }
+
     boolean defaultPrinted = false;
+    boolean defaultBreakPrinted = false;
     boolean lastJoins = false;
     for (int i : order) {
 
       Statement stat = caseStatements.get(i);
       if (skipMatch && RoundTrip.synthesizedMatchThrow(stat)) {
         continue;
+      }
+      if (defaultBreakJump >= 0 && !defaultBreakPrinted && entryOffset(i) > defaultBreakJump) {
+        buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
+        buf.append(breakLine(indent + 2, defaultBreakJump));
+        defaultBreakPrinted = true;
       }
       List<StatEdge> edges = caseEdges.get(i);
       List<Exprent> values = caseValues.get(i);
@@ -422,6 +461,12 @@ public class SwitchStatement extends Statement {
         }
         buf.appendLineSeparator();
       }
+    }
+
+    if (defaultBreakJump >= 0 && !defaultBreakPrinted) {
+      buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
+      buf.append(breakLine(indent + 2, defaultBreakJump));
+      defaultBreakPrinted = true;
     }
 
     // A `default:` the arms never print and whose table entry lands on the join had an empty body
@@ -699,6 +744,47 @@ public class SwitchStatement extends Statement {
     return join;
   }
 
+  /**
+   * The join a label's table target names through its own jump. An empty group's {@code break;}
+   * compiles to a jump the case label points at, and that jump lands on the instruction after the
+   * switch: when the group is the body's last statement the loop makes the landing the only such
+   * evidence there is. A destination before the labels (a {@code continue;} to the loop head) or
+   * one an enclosing loop continues to says nothing, and two different landings are not a join.
+   */
+  private int switchEndFromTargetJumps() {
+    if (!RoundTrip.selector("switchjump")) {
+      return -1;
+    }
+    SwitchInstruction instruction = switchInstruction();
+    int[] targets = instruction == null ? null : RoundTrip.switchTargetsAt(instruction.startOffset);
+    if (targets == null) {
+      return -1;
+    }
+    List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    int limit = -1;
+    for (int i = 0; i < caseStatements.size(); i++) {
+      limit = Math.max(limit, entryOffset(i));
+    }
+    int join = -1;
+    for (List<StatEdge> edges : caseEdges) {
+      for (StatEdge edge : edges) {
+        int at = successors.indexOf(edge);
+        if (at < 0 || at >= targets.length) {
+          continue;
+        }
+        int landed = RoundTrip.jumpTargetAt(targets[at]);
+        if (landed < 0 || landed < limit || RoundTrip.continuesAtLoopHead(this, landed)) {
+          continue;
+        }
+        if (join >= 0 && join != landed) {
+          return -1;
+        }
+        join = landed;
+      }
+    }
+    return join;
+  }
+
   /** The switch instruction starting this statement, or null when the head holds none. */
   private SwitchInstruction switchInstruction() {
     if (first instanceof BasicBlockStatement head
@@ -828,9 +914,9 @@ public class SwitchStatement extends Statement {
    * cannot be laid out in this sequence: something the source wrote after the switch was glued
    * onto it. An arm that records no span at all puts nothing in the way.
    */
-  private boolean spansRunForward(List<Integer> sorted, StructLineNumberTableAttribute table) {
+  private boolean spansRunForward(List<Integer> sorted, StructLineNumberTableAttribute table, int switchEnd) {
     int previous = -1;
-    int join = switchEndFromJumps();
+    int join = switchEnd >= 0 ? switchEnd : switchEndFromJumps();
     for (int i : sorted) {
       Statement stat = caseStatements.get(i);
       int first = RoundTrip.firstOffset(stat);
@@ -863,7 +949,7 @@ public class SwitchStatement extends Statement {
    * The same holds for an enum label recovered from a synthetic map: its group's block sits where
    * the source wrote it even though the table key is not the label.
    */
-  private List<Integer> sourceOrder() {
+  private List<Integer> sourceOrder(int switchEnd) {
     int size = caseStatements.size();
     List<Integer> order = new ArrayList<>(size);
     for (int i = 0; i < size; i++) {
@@ -921,7 +1007,7 @@ public class SwitchStatement extends Statement {
     // first line cannot be laid out where it would now print. That happens when the tree glued a
     // statement the source wrote after the whole switch — a lambda's tail return, say — onto a
     // group, and the written order is then not one this printer can reproduce.
-    if (!spansRunForward(order, table)) {
+    if (!spansRunForward(order, table, switchEnd)) {
       if (System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null) {
         System.err.println("switch order spans overlap " + method.getName() + method.getDescriptor()
           + " lines " + java.util.Arrays.toString(lines) + " -> " + order);
