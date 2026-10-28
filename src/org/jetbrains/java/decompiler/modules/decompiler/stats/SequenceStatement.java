@@ -984,14 +984,16 @@ public class SequenceStatement extends Statement {
           && RoundTrip.swapIfArmsByTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat(), stats.get(i + 1))) {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         head.setCondition(RoundTrip.negateCondition(head.getCondition()));
-        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
-        buf.append(ifStatement.getFirst().toJava(indent));
-        Statement rest = new SequenceStatement(stats.subList(i + 1, stats.size()));
         // The rest runs only up to the branch shell; the target laid the statements past it out
-        // after the if, and the arm's jump went over them to the exit block.
+        // after the if, and the arm's jump went over them to the exit block. The split decides
+        // what stays in the arm before the arm's declarations print: a variable the moved block
+        // reads has its declaration printed above the if.
         int shellEnd = RoundTrip.lastEnd(ifStatement.getIfstat());
         List<Statement> restStats = stats.subList(i + 1, stats.size());
         List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), restStats, shellEnd);
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        Statement rest = new SequenceStatement(restStats);
         // One basic block can hold exprents from both sides of the shell: the ones at or past it
         // ran after the arm, so print them after the brace and keep only the head inside.
         Statement straddle = null;
@@ -1090,16 +1092,18 @@ public class SequenceStatement extends Statement {
             && RoundTrip.branchesToBody(ifStatement.getHeadexprent(), ifStatement.getIfstat())) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
           head.setCondition(RoundTrip.negateCondition(head.getCondition()));
-          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
-          buf.append(ifStatement.getFirst().toJava(indent));
           Statement movedRest = new SequenceStatement(stats.subList(i + 1, stats.size()));
           boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest)
             || RoundTrip.jumpsOnto(RoundTrip.firstOffset(movedRest),
                  RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()));
           // The rest runs only up to the branch shell; the target laid the statements past it
-          // out after the if, and the arm's jump went over them to the exit block.
+          // out after the if, and the arm's jump went over them to the exit block. The split
+          // decides what stays in the arm before the arm's declarations print: a variable the
+          // moved block reads has its declaration printed above the if.
           List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
             RoundTrip.lastEnd(ifStatement.getIfstat()));
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
           // The arms' copies of the method's final return stand for the jump the source took
           // there; the enclosing flow prints that return once, so the arms fall out to it.
           int exitStart = headExit.bytecode == null ? -1 : headExit.bytecode.nextSetBit(0);

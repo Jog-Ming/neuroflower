@@ -3245,17 +3245,46 @@ public final class RoundTrip {
     }
     if (!out.isEmpty()) {
       // What the arm prints is the rest before the split; a variable it declares there is out of
-      // scope after the brace, so a moved block that reads one would not compile.
+      // scope after the brace, so a moved block that reads one would not compile — unless the
+      // source declared the variable above the if, which the moved block's own use after the
+      // brace proves it did. The declaration moves out bare and its store stays in the arm.
       java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined = new java.util.HashSet<>();
       collectArmDefinitions(arm, out, defined);
       for (Statement stat : rest) {
         collectArmDefinitions(stat, out, defined);
       }
+      java.util.List<VarExprent> hoisted = new java.util.ArrayList<>();
+      boolean blocked = false;
       for (Statement stat : out) {
-        if (readsAny(stat, defined)) {
-          out.clear();
+        for (org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair : readPairs(stat)) {
+          if (!defined.contains(pair)) {
+            continue;
+          }
+          VarExprent declaration = findDefinition(arm, pair);
+          if (declaration == null) {
+            for (Statement fromRest : rest) {
+              if (!out.contains(fromRest)) {
+                declaration = findDefinition(fromRest, pair);
+              }
+              if (declaration != null) {
+                break;
+              }
+            }
+          }
+          if (declaration == null) {
+            blocked = true;
+            break;
+          }
+          if (!hoisted.contains(declaration)) {
+            hoisted.add(declaration);
+          }
+        }
+        if (blocked) {
           break;
         }
+      }
+      if (blocked || (!hoisted.isEmpty() && !hoistBeforeArm(arm, hoisted))) {
+        out.clear();
       }
     }
     return out;
@@ -3283,6 +3312,91 @@ public final class RoundTrip {
     for (Statement child : stat.getStats()) {
       collectArmDefinitions(child, moved, out);
     }
+  }
+
+  /** The variable a declaration exprent defines, bare or initialized, or null. */
+  private static VarExprent definedVar(Exprent exprent) {
+    if (exprent instanceof VarExprent var) {
+      return var;
+    }
+    if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assignment
+        && assignment.getLeft() instanceof VarExprent var) {
+      return var;
+    }
+    return null;
+  }
+
+  /**
+   * The locals a statement reads, which a move out of the arm must keep in scope. A definition of
+   * the statement itself is not a read.
+   */
+  private static java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> readPairs(Statement stat) {
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out = new java.util.HashSet<>();
+    for (Exprent exprent : ownExprents(stat)) {
+      if (exprent instanceof VarExprent var && !var.isDefinition()) {
+        out.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat
+          && child == ifstat.getFirst()) {
+        continue;
+      }
+      out.addAll(readPairs(child));
+    }
+    return out;
+  }
+
+  /** The definition of this local inside the arm, or null. */
+  private static VarExprent findDefinition(Statement arm, org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair) {
+    for (Exprent exprent : ownExprents(arm)) {
+      if (exprent instanceof VarExprent var && var.isDefinition()
+          && pair.equals(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var))) {
+        return var;
+      }
+    }
+    for (Statement child : arm.getStats()) {
+      VarExprent found = findDefinition(child, pair);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Prints the declarations above the if the arm belongs to: the source declared them before the
+   * test, and the moved block's use after the brace proves the wider scope. The stores stay.
+   */
+  private static boolean hoistBeforeArm(Statement arm, java.util.List<VarExprent> declarations) {
+    Statement parent = arm.getParent();
+    if (!(parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement)) {
+      return false;
+    }
+    for (VarExprent var : declarations) {
+      VarExprent bare = (VarExprent)var.copy();
+      // A bare declaration has no instruction of its own; carrying the store's offsets would
+      // place it where the store runs.
+      bare.bytecode = null;
+      var.setDefinition(false);
+      // The declaration has to print after every statement the if's head block carries and
+      // before the test: that is the last list printed ahead of the `if`.
+      Statement head = parent.getFirst();
+      java.util.List<Exprent> list = head != null && head.getExprents() != null && !head.getExprents().isEmpty()
+        ? head.getExprents() : parent.getVarDefinitions();
+      int slot = var.getLVT() == null ? -1 : var.getLVT().getIndex();
+      int at = list.size();
+      for (int i = 0; i < list.size(); i++) {
+        VarExprent other = definedVar(list.get(i));
+        int otherSlot = other == null || other.getLVT() == null ? -1 : other.getLVT().getIndex();
+        if (otherSlot > slot && slot >= 0) {
+          at = i;
+          break;
+        }
+      }
+      list.add(at, bare);
+    }
+    return true;
   }
 
   private static void collectAfterShell(Statement stat, int shellEnd, java.util.List<Statement> out) {
