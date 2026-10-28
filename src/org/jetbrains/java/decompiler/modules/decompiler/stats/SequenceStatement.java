@@ -151,6 +151,43 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // A negated pattern guard: `instanceof; ifeq/ifne T; …checkcast; astore…; goto U` with T
+      // exactly the instruction after that goto and U the code the source ran after the if. The
+      // tree kept the test positively with U as its then arm and the arm at T as the statement
+      // after it; print the source's order back — the negated test around the arm at T, U after
+      // it. That arm's own return was folded into the method's end when it was the last thing the
+      // printer wrote, so print the target's return again here; a value return is the tree's to
+      // print, and without one the shape stays as printed.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && !hasContent(stats.subList(i + 2, stats.size()))) {
+        int exit = RoundTrip.negatedPatternGuard(ifStatement.getHeadexprent(),
+          ifStatement.getIfstat(), stats.get(i + 1));
+        boolean printedExit = exits(stats.get(i + 1));
+        if (exit >= 0 && RoundTrip.exitsAt(exit) && (printedExit || RoundTrip.isVoidReturn(exit))) {
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          for (int k = i + 1; k < stats.size(); k++) {
+            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+          }
+          if (!printedExit) {
+            TextBuffer returnLine = new TextBuffer();
+            returnLine.appendIndent(indent + 1).append("return;").appendLineSeparator();
+            RoundTrip.mapSynthesizedLine(returnLine, exit);
+            buf.append(returnLine);
+          }
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          notempty = true;
+          break;
+        }
+      }
+
       // A `||` arm with its body left after it: print the test positively and the body as its arm.
       if (printDisjunctiveArm(buf, indent, i)) {
         notempty = true;

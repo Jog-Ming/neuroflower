@@ -336,7 +336,11 @@ public class IfStatement extends Statement {
               && RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat))
             || RoundTrip.swapIfArms(ifHead)
             || (RoundTrip.swapIfArmsByLine(ifstat, elsestat)
-                && !RoundTrip.polaritySelfConsistent(ifHead, ifstat, elsestat)))) {
+                && !RoundTrip.polaritySelfConsistent(ifHead, ifstat, elsestat))
+            // The target skipped a pattern arm with a goto and branched to it on the negated test:
+            // the source wrote `if (!(x instanceof T t)) { arm } else { rest }`, and the tree's
+            // positive test with the arms the other way round is the same program in other bytes.
+            || RoundTrip.negatedPatternGuard(ifHead, ifstat, elsestat) >= 0)) {
       IfExprent head = (IfExprent) ifHead.copy();
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       // The arm the swap prints second was declared in the method body, so the source closed

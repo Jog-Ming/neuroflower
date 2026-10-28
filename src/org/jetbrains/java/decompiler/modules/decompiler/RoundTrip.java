@@ -823,6 +823,114 @@ public final class RoundTrip {
     return false;
   }
 
+  /** The first offset a statement covers, its head exprents included, or -1. */
+  private static int rangeStart(Statement statement) {
+    BitSet bits = new BitSet();
+    statement.getOffset(bits);
+    return bits.isEmpty() ? -1 : bits.nextSetBit(0);
+  }
+
+  /**
+   * The target's proof that the source wrote a negated pattern guard around the arm at T:
+   * {@code instanceof; ifeq/ifne T; [load;] checkcast; astore; goto U} with T exactly the
+   * instruction after that goto, U the code after the whole if. The goto is the fact that
+   * separates this from the positive test {@code if (x instanceof T t) { … } rest}, where the
+   * pattern store's path falls straight into the arm and no jump skips anything. The arm at T
+   * also has to leave the test — a return/athrow of its own, or a jump past U — or it would run
+   * into the code the source ran after the if.
+   *
+   * <p>Returns the offset of the arm's last instruction, or -1 when the class file is not this
+   * shape.
+   */
+  public static int negatedPatternGuard(Exprent head, Statement thenArm, Statement guardArm) {
+    if (!selector("patternguard") || !(head instanceof IfExprent ifHead)) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || thenArm == null || guardArm == null) {
+      return -1;
+    }
+    Exprent condition = ifHead.getCondition();
+    if (condition == null || !declaresPatternVariable(condition)) {
+      return -1;
+    }
+    // The tree has to print the test positively: a test that is already negated is the source's
+    // own polarity, and flipping it here would print the double negation as a positive test.
+    if (condition instanceof FunctionExprent function
+        && function.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    BitSet noFallThrough = NO_FALLTHROUGH.get(method);
+    if (ends == null || gotos == null || noFallThrough == null) {
+      return -1;
+    }
+    int target = lastBranchTarget(ifHead.bytecode);
+    int guardStart = rangeStart(guardArm);
+    int thenStart = rangeStart(thenArm);
+    if (target < 0 || target != guardStart || thenStart <= target) {
+      return -1;
+    }
+    boolean skips = false;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      Integer end = ends.get(entry.getKey());
+      if (end != null && end == guardStart && entry.getValue() == thenStart) {
+        skips = true;
+        break;
+      }
+    }
+    if (!skips) {
+      return -1;
+    }
+    int exit = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : ends.entrySet()) {
+      if (entry.getValue() == thenStart) {
+        exit = entry.getKey();
+        break;
+      }
+    }
+    if (exit < 0) {
+      return -1;
+    }
+    if (noFallThrough.get(exit)) {
+      return exit;
+    }
+    Integer merge = gotos.get(exit);
+    return merge != null && merge >= thenStart ? exit : -1;
+  }
+
+  /** Whether the instruction at this offset is a void return, which prints as {@code return;}. */
+  public static boolean isVoidReturn(int offset) {
+    StructMethod method = currentMethod();
+    BitSet returns = method == null ? null : VOID_RETURNS.get(method);
+    return returns != null && returns.get(offset);
+  }
+
+  /** Whether the instruction at this offset ends the path: a return, a throw, or a ret. */
+  public static boolean exitsAt(int offset) {
+    StructMethod method = currentMethod();
+    BitSet ends = method == null ? null : NO_FALLTHROUGH.get(method);
+    return ends != null && ends.get(offset);
+  }
+
+  /**
+   * Pins a synthesized line to the target instruction it reproduces. The mapping carries the class
+   * and method names: the writer records a method's removed returns under no class so that every
+   * one of them lands on the method's last line, and that record would otherwise overwrite this
+   * one and undo the alignment.
+   */
+  public static void mapSynthesizedLine(org.jetbrains.java.decompiler.util.TextBuffer line, int offset) {
+    StructMethod method = currentMethod();
+    org.jetbrains.java.decompiler.struct.StructClass cl =
+      DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS);
+    if (method == null || cl == null) {
+      return;
+    }
+    line.addBytecodeMappingAt(0, offset, cl.qualifiedName,
+      org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
+  }
+
   /** The destination of the last conditional branch inside these offsets, or -1. */
   private static int lastBranchTarget(BitSet bytecode) {
     StructMethod method = currentMethod();
