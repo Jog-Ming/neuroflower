@@ -1849,6 +1849,9 @@ public class ClassWriter implements StatementWriter {
         if (root != null) { // check for existence
           try {
             ReturnedVariable.restore(root);
+            // A lambda body is a method of its own in the class file: its local table proves the
+            // declaration order the same way, and the context is the lambda's own method here.
+            LocalDeclarationOrder.reorder(root);
             TextBuffer childBuf = root.toJava(indent);
             childBuf.addBytecodeMapping(root.getDummyExit().bytecode);
             buffer.append(childBuf, classWrapper.getClassStruct().qualifiedName, InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));

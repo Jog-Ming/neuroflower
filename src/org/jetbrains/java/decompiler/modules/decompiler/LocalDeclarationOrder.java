@@ -61,6 +61,7 @@ public final class LocalDeclarationOrder {
     NameTable names = NameTable.build(root);
     hoistAcrossStatements(root, varproc, names, method);
     reorderWithinList(root, varproc);
+    hoistToPrintedOrder(root, varproc, names, method);
   }
 
   /**
@@ -139,6 +140,294 @@ public final class LocalDeclarationOrder {
           maxSlot = Math.max(maxSlot, targetSlot(exprent));
         }
       }
+    }
+  }
+
+  /**
+   * javac allocates a local's slot when its declaration statement is reached, so the class file's
+   * local table records where in the source each declaration was written. A declaration printed
+   * below a declaration the table gives a higher slot was therefore written above it — bare, with
+   * its first store left where it was. It is moved to the landing point the table proves, just
+   * above the first printed declaration with a higher slot, when that point is in a block that
+   * encloses the variable's store.
+   */
+  private static void hoistToPrintedOrder(Statement root, VarProcessor varproc, NameTable names, String method) {
+    if (!RoundTrip.selector("decllvt")) {
+      return;
+    }
+    List<DeclPos> order = new ArrayList<>();
+    collectPrintedOrder(root, order);
+    List<DeclPos> candidates = new ArrayList<>();
+    for (DeclPos position : order) {
+      if (position.list != null && position.var.getLVT() != null && position.slot >= 0) {
+        candidates.add(position);
+      }
+    }
+    // Ascending slot order: a declaration moved earlier is itself a landing point for the next.
+    candidates.sort((a, b) -> Integer.compare(a.slot, b.slot));
+    for (DeclPos candidate : candidates) {
+      VarExprent var = candidate.var;
+      if (!isRealDefinition(var)) {
+        continue;
+      }
+      int index = indexOfPosition(order, candidate);
+      if (index < 0) {
+        continue;
+      }
+      DeclPos anchor = null;
+      int anchorIndex = -1;
+      for (int i = 0; i < index; i++) {
+        DeclPos position = order.get(i);
+        if (position.slot > candidate.slot && anchorLiveAt(position, candidate)) {
+          anchor = position;
+          anchorIndex = i;
+          break;
+        }
+      }
+      if (anchor == null) {
+        continue;
+      }
+      if (!names.uniqueName(var)) {
+        debug(method, var, "rejected: another local prints as " + var.getName());
+        continue;
+      }
+      if (mentionsField(root, var.getName())) {
+        debug(method, var, "rejected: the method names a field " + var.getName());
+        continue;
+      }
+      int deadEnd = slotReuseEnd(var);
+      if (deadEnd >= 0 && !landsAfterDeadScope(anchor, deadEnd)) {
+        debug(method, var, "rejected: landing point lies inside the dead scope " + deadEnd);
+        continue;
+      }
+      if (!inScope(anchor, candidate.owner)) {
+        debug(method, var, "rejected: landing point is outside the declaration's scope chain");
+        continue;
+      }
+      if (!new Da(var).check(root)) {
+        debug(method, var, "rejected: not definitely assigned at a use");
+        continue;
+      }
+      Exprent declaration;
+      if (candidate.top == var) {
+        removeIdentity(candidate.list, candidate.top);
+        declaration = candidate.top;
+        declaration.bytecode = null;
+      } else {
+        declaration = var.copy();
+        // A bare declaration has no instruction of its own. Carrying the store's offsets would
+        // make the block-scope printer read the declaration as the statement that ends there.
+        declaration.bytecode = null;
+        var.setDefinition(false);
+      }
+      DeclPos inserted;
+      Statement head = headLanding(candidate, order, anchorIndex);
+      if (head != null && (deadEnd < 0 || firstOffsetAtLeast(head, deadEnd))) {
+        // The landing point opens the head of a block that encloses the store: the source wrote
+        // the declaration before that block, so it prints beside the block, not inside it. The
+        // wider scope is what the target's slots for later locals record.
+        int start = firstPositionIndex(order, head);
+        insertByTargetSlot(head.getVarDefinitions(), declaration);
+        inserted = new DeclPos((VarExprent)declaration, declaration, head.getVarDefinitions(),
+          head, candidate.slot);
+        order.add(start, inserted);
+        debug(method, var, "hoisted to the head of a " + head.type + " before slot-" + anchor.slot);
+      } else if (anchor.list == null) {
+        // A loop header's declaration prints where the loop is written: the variable was declared
+        // just above the loop, so it goes into the loop's own definitions.
+        insertByTargetSlot(anchor.owner.getVarDefinitions(), declaration);
+        inserted = new DeclPos((VarExprent)declaration, declaration, anchor.owner.getVarDefinitions(),
+          anchor.owner, candidate.slot);
+        order.add(anchorIndex, inserted);
+        debug(method, var, "hoisted to the loop header before slot-" + anchor.slot);
+      } else {
+        int at = indexOfIdentity(anchor.list, anchor.top);
+        anchor.list.add(at < 0 ? anchor.list.size() : at, declaration);
+        inserted = new DeclPos((VarExprent)declaration, declaration, anchor.list, anchor.owner,
+          candidate.slot);
+        order.add(anchorIndex, inserted);
+        debug(method, var, "hoisted to the printed order before slot-" + anchor.slot);
+      }
+    }
+  }
+
+  /**
+   * The outermost enclosing statement whose first declaration is the anchor itself: everything
+   * printed before it has a lower slot, so a declaration can open that block's head without
+   * disturbing the order, and the block's start is a wider scope than the store's own.
+   */
+  private static Statement headLanding(DeclPos candidate, List<DeclPos> order, int anchorIndex) {
+    int lastLower = -1;
+    for (int i = 0; i < anchorIndex; i++) {
+      int slot = order.get(i).slot;
+      if (slot >= 0 && slot < candidate.slot) {
+        lastLower = i;
+      }
+    }
+    List<Statement> ancestors = new ArrayList<>();
+    for (Statement stat = candidate.owner; stat != null; stat = stat.getParent()) {
+      ancestors.add(stat);
+    }
+    for (int i = ancestors.size() - 1; i >= 0; i--) {
+      Statement head = ancestors.get(i);
+      if (firstPositionIndex(order, head) == anchorIndex && anchorIndex > lastLower) {
+        return head;
+      }
+    }
+    return null;
+  }
+
+  /** The first printed declaration inside this statement's subtree, as an index in the order. */
+  private static int firstPositionIndex(List<DeclPos> order, Statement head) {
+    for (int i = 0; i < order.size(); i++) {
+      if (isAncestor(head, order.get(i).owner)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private static boolean isAncestor(Statement ancestor, Statement stat) {
+    for (Statement s = stat; s != null; s = s.getParent()) {
+      if (s == ancestor) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean firstOffsetAtLeast(Statement head, int offset) {
+    int first = RoundTrip.firstOffset(head);
+    return first >= 0 && first >= offset;
+  }
+
+  private static int indexOfPosition(List<DeclPos> order, DeclPos position) {
+    for (int i = 0; i < order.size(); i++) {
+      if (order.get(i) == position) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Every declaration in the order the printer emits them: a statement's own definitions, a loop's
+   * header, a block's statements, then its children. A definition nested in an expression is
+   * listed at the expression's own position, and a loop header's declaration carries no list: its
+   * landing point is the loop statement's definitions.
+   */
+  private static void collectPrintedOrder(Statement stat, List<DeclPos> out) {
+    addDefinitionPositions(stat, stat.getVarDefinitions(), out);
+    if (stat instanceof DoStatement loop && loop.getInitExprent() != null) {
+      for (Exprent inner : loop.getInitExprent().getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && isRealDefinition(var) && var.getLVT() != null) {
+          out.add(new DeclPos(var, loop.getInitExprent(), null, stat, var.getLVT().getIndex()));
+        }
+      }
+    }
+    if (stat.getExprents() != null) {
+      addDefinitionPositions(stat, stat.getExprents(), out);
+    }
+    for (Statement child : stat.getStats()) {
+      collectPrintedOrder(child, out);
+    }
+  }
+
+  private static void addDefinitionPositions(Statement owner, List<Exprent> exprents, List<DeclPos> out) {
+    for (Exprent exprent : exprents) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && isRealDefinition(var) && var.getLVT() != null) {
+          out.add(new DeclPos(var, exprent, exprents, owner, var.getLVT().getIndex()));
+        }
+      }
+    }
+  }
+
+  /**
+   * True when the anchor's own scope is still open where the candidate gets its first value. If
+   * it closed first, the slots it occupied were free when the candidate was declared, and a lower
+   * slot proves nothing: javac handed one of them over instead of the candidate being written
+   * earlier.
+   */
+  private static boolean anchorLiveAt(DeclPos anchor, DeclPos candidate) {
+    if (anchor.var.getLVT() == null || candidate.var.getLVT() == null) {
+      return false;
+    }
+    return anchor.var.getLVT().getEnd() > candidate.var.getLVT().getStart();
+  }
+
+  /** True when a declaration printed at this position lies past the end of a reused slot's scope. */
+  private static boolean landsAfterDeadScope(DeclPos anchor, int deadEnd) {
+    int offset = anchor.top == null ? -1 : printedOffset(anchor.top);
+    if (offset < 0 && anchor.owner != null) {
+      offset = RoundTrip.firstOffset(anchor.owner);
+    }
+    return offset >= 0 && offset >= deadEnd;
+  }
+
+  /**
+   * True when the anchor's declaration is in scope where the definition is printed: it is an
+   * ancestor's own declaration, or a preceding sibling's that prints in the same block — a plain
+   * block or sequence prints inline, an if's head prints before its test. An arm's block is a
+   * scope of its own, so a declaration there cannot land a variable used in the other arm.
+   */
+  private static boolean inScope(DeclPos anchor, Statement definitionOwner) {
+    Statement anchorOwner = anchor.owner;
+    Statement stat = definitionOwner;
+    while (stat != null) {
+      if (stat == anchorOwner) {
+        return true;
+      }
+      Statement parent = stat.getParent();
+      if (parent != null) {
+        for (Statement sibling : parent.getStats()) {
+          if (sibling == stat) {
+            break;
+          }
+          if (sibling == anchorOwner && printsAtParentLevel(anchor)) {
+            return true;
+          }
+        }
+      }
+      stat = parent;
+    }
+    return false;
+  }
+
+  /** True when the declaration prints in the block its owner's statement is written in. */
+  private static boolean printsAtParentLevel(DeclPos anchor) {
+    Statement owner = anchor.owner;
+    if (owner == null) {
+      return false;
+    }
+    if (anchor.list == null || anchor.list == owner.getVarDefinitions()) {
+      return true;
+    }
+    if (owner.type != Statement.StatementType.BASIC_BLOCK && owner.type != Statement.StatementType.SEQUENCE) {
+      return false;
+    }
+    Statement parent = owner.getParent();
+    if (parent == null || parent.type == Statement.StatementType.SEQUENCE
+        || parent.type == Statement.StatementType.ROOT) {
+      return true;
+    }
+    return parent instanceof IfStatement ifStatement && ifStatement.getFirst() == owner;
+  }
+
+  /** One declaration in printed order. {@code list} is null for a loop header's own definition. */
+  private static final class DeclPos {
+    final VarExprent var;
+    final Exprent top;
+    final List<Exprent> list;
+    final Statement owner;
+    final int slot;
+
+    DeclPos(VarExprent var, Exprent top, List<Exprent> list, Statement owner, int slot) {
+      this.var = var;
+      this.top = top;
+      this.list = list;
+      this.owner = owner;
+      this.slot = slot;
     }
   }
 
