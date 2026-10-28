@@ -378,6 +378,27 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // The same shape with the arms the other way round: the tree's else arm is the one the
+    // target prints as the then (its last branch lands on ifstat), so the arm to hoist is
+    // elsestat. The continue is that arm's terminal jump to the loop head; the rest of the body
+    // is ifstat and runs after the braces exactly as it did in the else.
+    if (ifstat != null && elsestat != null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && !RoundTrip.printsNothing(elsestat)
+        && !RoundTrip.declaresLocalToEnd(elsestat)
+        && RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat)
+        && endsLoopBody(this)
+        && RoundTrip.printContinueElse(ifHead, this)) {
+      IfExprent source = (IfExprent) ifHead.copy();
+      source.setCondition(RoundTrip.negateCondition(source.getCondition()));
+      buf.appendIndent(indent).append(source.toJava(indent)).append(" {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
+      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      return buf;
+    }
+
     // `if (C) A else B` and `if (!C) B else A` are the same program in different bytes; the target's
     // branch opcode, the arms' lines, or the last condition branch says which one was written. A
     // last branch that lands on the arm the tree prints as then contradicts the test printed there

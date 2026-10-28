@@ -3823,12 +3823,73 @@ public final class RoundTrip {
     }
     int end = head.bytecode.length();
     Integer target = targets.get(end);
-    // The branch has to leave the loop entirely: the exit is past everything the loop covers.
+    // The branch has to leave the loop entirely: the exit is past everything the loop covers,
+    // and it cannot land on the loop's own back edge — that is the continue a written test
+    // falls into, not a jump past the loop.
     int loopEnd = lastOffset(loop);
     if (target == null || loopEnd < 0 || target <= loopEnd) {
       return false;
     }
+    // A continue guard's branch goes to the loop's head, not past the loop; the break guard's
+    // does not, so only the continue-shaped test can land on the back edge by coincidence.
+    if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStatement
+        && ifStatement.getIfEdge() != null
+        && ifStatement.getIfEdge().getType() == StatEdge.TYPE_CONTINUE
+        && landsOnBackEdge(loop, target)) {
+      return false;
+    }
     return guards == null || !guards.containsKey(end);
+  }
+
+  /** True when {@code offset} is a jump back to this loop's head: its back edge or a copy of it. */
+  private static boolean landsOnBackEdge(Statement loop, int offset) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    Integer dest = gotos == null ? null : gotos.get(offset);
+    if (dest == null || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    // The destination has to be this loop's own head, not just any offset before its body: a
+    // break out of a nested loop lands on the outer loop's back edge, which also sits there.
+    Exprent head = switch (doStatement.getLooptype()) {
+      case WHILE, DO_WHILE -> doStatement.getConditionExprent();
+      case FOR, FOR_EACH -> doStatement.getIncExprent() != null ? doStatement.getIncExprent() : doStatement.getConditionExprent();
+      default -> null;
+    };
+    if (head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    // The loop's first instruction is the leftmost one any part of its test owns; the receiver
+    // chain a field access owns counts, so the destination is compared with that, not the test's
+    // own first byte.
+    int start = firstOffsetOf(head);
+    return start >= 0 && dest <= start && dest >= start - 3;
+  }
+
+  /**
+   * Whether a guard whose test skips to the loop's back edge is really an arm: the source wrote
+   * {@code if (cond) { rest }} and the branch over the arm lands on the jump back to the head.
+   * A written {@code if (!cond) continue;} compiles to a jump over a goto to the head instead,
+   * which {@link #CONTINUE_GUARDS} records.
+   */
+  public static boolean branchFallsToBackEdge(Exprent head, Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null || head.bytecode.isEmpty() || stat == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    if (targets == null) {
+      return false;
+    }
+    Statement loop = stat.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    if (loop == null) {
+      return false;
+    }
+    Integer target = targets.get(head.bytecode.length());
+    return target != null && landsOnBackEdge(loop, target);
   }
 
   /**

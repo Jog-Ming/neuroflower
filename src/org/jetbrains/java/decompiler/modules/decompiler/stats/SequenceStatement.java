@@ -918,6 +918,29 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (!C) continue; rest` where rest is the method's whole exit and the target's branch
+      // lands on the loop's back edge: the source wrote `if (C) { rest }` and let control fall
+      // back to the head. A written continue would have jumped over a goto to the head instead.
+      if (i + 2 == stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && ifStatement.getIfstat() == null && !ifStatement.isLabeled() && !st.isLabeled()
+          && !ifStatement.isPatternMatched()
+          && singleExit(stats.get(i + 1)) instanceof ExitExprent
+          && ifStatement.getIfEdge() != null
+          && ifStatement.getIfEdge().getType() == StatEdge.TYPE_CONTINUE
+          && ifStatement.getIfEdge().explicit
+          && RoundTrip.branchFallsToBackEdge(ifStatement.getHeadexprent(), ifStatement)) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(stats.get(i + 1), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) { body } return X;` where the target returns X first is a guard on !C.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
