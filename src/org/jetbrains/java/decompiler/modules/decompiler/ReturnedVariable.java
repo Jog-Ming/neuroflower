@@ -3,15 +3,21 @@
 
 package org.jetbrains.java.decompiler.modules.decompiler;
 
+import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarTypeProcessor.FinalType;
+import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 
+import java.util.BitSet;
 import java.util.List;
 
 /**
@@ -39,6 +45,13 @@ public final class ReturnedVariable {
           || exit.getExitType() != ExitExprent.Type.RETURN || exit.getValue() == null) {
           continue;
         }
+        // The target kept the value in a local across the catch: `T v; try { v = expr; } catch { }
+        // return v;`. The second table range for the slot is what makes the declaration outside.
+        int[] tryShape = RoundTrip.tryStoredBeforeReturn(exit.bytecode);
+        if (tryShape != null && restoreTryReturn(stat, exprents, i, exit, tryShape)) {
+          i++;
+          continue;
+        }
         int slot = RoundTrip.storedBeforeReturn(exit.bytecode);
         if (slot < 0) {
           continue;
@@ -52,7 +65,7 @@ public final class ReturnedVariable {
           continue;
         }
         Exprent value = exit.getValue();
-        AssignmentExprent assignment = new AssignmentExprent(variable.copy(), value, value.bytecode);
+        AssignmentExprent assignment = new AssignmentExprent((VarExprent) variable.copy(), value, value.bytecode);
         ExitExprent replacement = new ExitExprent(ExitExprent.Type.RETURN, variable.copy(),
           exit.getRetType(), exit.bytecode, exit.getMethodDescriptor());
         exprents.set(i, assignment);
@@ -63,6 +76,68 @@ public final class ReturnedVariable {
     for (Statement child : stat.getStats()) {
       restoreStat(child);
     }
+  }
+
+  /**
+   * Splits a return carried across a catch back into the assignment the try made and the return
+   * the source wrote after it. The variable's two table ranges prove it was declared outside, so
+   * the declaration goes on the try statement and the printer hoists the return past the brace.
+   */
+  private static boolean restoreTryReturn(Statement stat, List<Exprent> exprents, int index,
+                                          ExitExprent exit, int[] shape) {
+    Statement holder = stat;
+    while (holder != null && !(holder instanceof CatchStatement)) {
+      holder = holder.getParent();
+    }
+    if (holder == null) {
+      return false;
+    }
+    int slot = shape[0];
+    LocalVariable lvt = localOf(slot, shape[1]);
+    if (lvt == null) {
+      return false;
+    }
+    VarExprent variable = new VarExprent(slot, lvt.getVarType(), null);
+    variable.setLVT(lvt);
+    BitSet loadBits = new BitSet();
+    loadBits.set(shape[1]);
+    variable.addBytecodeOffsets(loadBits);
+
+    Exprent value = exit.getValue();
+    AssignmentExprent assignment = new AssignmentExprent((VarExprent) variable.copy(), value, value.bytecode);
+    VarExprent returned = (VarExprent) variable.copy();
+    BitSet returnBits = new BitSet();
+    returnBits.set(shape[2]);
+    returned.addBytecodeOffsets(returnBits);
+    ExitExprent replacement = new ExitExprent(ExitExprent.Type.RETURN, returned,
+      exit.getRetType(), returnBits, exit.getMethodDescriptor());
+
+    exprents.set(index, assignment);
+    exprents.add(index + 1, replacement);
+
+    // A declaration emits no instruction, so it carries no bytecode mapping: a covered offset
+    // would pull the line aligner's target for the load up to where the declaration prints.
+    VarExprent declaration = new VarExprent(slot, lvt.getVarType(), null);
+    declaration.setLVT(lvt);
+    declaration.setDefinition(true);
+    holder.getVarDefinitions().add(declaration);
+    return true;
+  }
+
+  /** The table entry for a slot whose range covers this offset. */
+  private static LocalVariable localOf(int slot, int offset) {
+    StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    StructLocalVariableTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    for (LocalVariable var : table.getVariables().toList()) {
+      if (var.getIndex() == slot && var.getStart() <= offset && var.getEnd() > offset) {
+        return var;
+      }
+    }
+    return null;
   }
 
   /** The printed variable the target stored into {@code slot}, or null when it is not printed. */

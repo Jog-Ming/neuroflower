@@ -72,6 +72,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, BitSet>> LOAD_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** The slot a store at this start offset writes. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Return instructions of a try-shaped `store S; goto M` / `M: load S; ret`, by the return's start. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> TRY_RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -237,6 +239,60 @@ public final class RoundTrip {
       }
     }
     HANDLER_ENDS.put(method, handlerEnds);
+    // A try body that ends `store S; goto M` with `M: load S; ret` keeps the value in a variable the
+    // source declared outside the block: the target's table has two ranges for the slot, one ending
+    // where the handler starts and one covering the load and the return. A single range is the
+    // source's own `v = expr; return …` inside the try instead.
+    java.util.Map<Integer, int[]> tryReturns = new java.util.HashMap<>();
+    StructLocalVariableTableAttribute lvt = method.getLocalVariableAttr();
+    if (table != null && lvt != null) {
+      for (org.jetbrains.java.decompiler.code.ExceptionHandler handler : table.getHandlers()) {
+        int toIndex = handler.to();
+        int handlerIndex = handler.handler();
+        if (toIndex <= 0 || toIndex >= seq.length() || handlerIndex < 0 || handlerIndex >= seq.length()) {
+          continue;
+        }
+        Instruction skip = seq.getInstr(toIndex);
+        if (skip.opcode != CodeConstants.opc_goto && skip.opcode != CodeConstants.opc_goto_w) {
+          continue;
+        }
+        Instruction store = seq.getInstr(toIndex - 1);
+        if (!isStore(store.opcode)) {
+          continue;
+        }
+        int slot = variableIndex(store);
+        int target = skip.startOffset + skip.operand(0);
+        Integer loadIndex = seq.offsetToIndex().get(target);
+        if (loadIndex == null || loadIndex + 1 >= seq.length()) {
+          continue;
+        }
+        Instruction load = seq.getInstr(loadIndex);
+        Instruction ret = seq.getInstr(loadIndex + 1);
+        if (!isLoad(load.opcode) || variableIndex(load) != slot
+          || ret.opcode < CodeConstants.opc_ireturn || ret.opcode > CodeConstants.opc_areturn) {
+          continue;
+        }
+        int handlerStart = seq.getInstr(handlerIndex).startOffset;
+        int retEnd = ret.startOffset + ret.length;
+        org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable first = null;
+        int matches = 0;
+        for (org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable var : lvt.getVariables().toList()) {
+          if (var.getIndex() != slot) {
+            continue;
+          }
+          if (var.getStart() == skip.startOffset && var.getEnd() == handlerStart) {
+            first = var;
+          } else if (var.getStart() == target && var.getEnd() == retEnd && first != null
+            && first.getName().equals(var.getName())) {
+            matches = 2;
+          }
+        }
+        if (matches == 2) {
+          tryReturns.put(ret.startOffset, new int[]{slot, load.startOffset, ret.startOffset});
+        }
+      }
+    }
+    TRY_RETURN_STORES.put(method, tryReturns);
     // Inlined copies of a finally body: every instruction of the handler up to its athrow, found
     // again elsewhere in the stream. Record the offset just past each copy and the method's last
     // instruction offset, so a `return` that only a copy jumps to can be recognised.
@@ -302,6 +358,28 @@ public final class RoundTrip {
    * The slot a value return's preceding load reads and the instruction store writes. -1 unless the
    * target's last three instructions before the return are exactly {@code store N; load N; ret}.
    */
+  /**
+   * The try-shaped `store S; goto M` / `M: load S; return` this exit belongs to, or null:
+   * {@code {slot, load offset, return offset}}.
+   */
+  public static int[] tryStoredBeforeReturn(BitSet offsets) {
+    StructMethod method = currentMethod();
+    if (method == null || offsets == null || !selector("tryreturn")) {
+      return null;
+    }
+    java.util.Map<Integer, int[]> stores = TRY_RETURN_STORES.get(method);
+    if (stores == null) {
+      return null;
+    }
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      int[] info = stores.get(offset);
+      if (info != null) {
+        return info;
+      }
+    }
+    return null;
+  }
+
   public static int storedBeforeReturn(BitSet offsets) {
     StructMethod method = currentMethod();
     if (method == null || offsets == null) {
