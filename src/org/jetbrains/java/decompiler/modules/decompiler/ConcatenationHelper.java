@@ -159,24 +159,8 @@ public final class ConcatenationHelper {
       lstOperands.add(0, new ConstExprent(VarType.VARTYPE_STRING, "", expr.bytecode));
     }
 
-    // remove redundant String.valueOf
-    for (int i = 0; i < lstOperands.size(); i++) {
-      Exprent rep = removeStringValueOf(lstOperands.get(i));
-
-      boolean ok = (i > 1);
-      if (!ok) {
-        boolean isstr = rep.getExprType().equals(VarType.VARTYPE_STRING);
-        ok = isstr || first2str != i + 1;
-
-        if (i == 0) {
-          first2str &= 2;
-        }
-      }
-
-      if (ok) {
-        lstOperands.set(i, rep);
-      }
-    }
+    // A String.valueOf call on an operand of a StringBuilder chain is the source's own: javac
+    // lowers a concat operand to append(Object) and never to append(String.valueOf(x)).
     return createConcatExprent(lstOperands, expr.bytecode);
   }
 
@@ -311,27 +295,25 @@ public final class ConcatenationHelper {
     return false;
   }
 
+  /**
+   * Drops the {@code String.valueOf(Object)} javac inserts for a reference operand of an
+   * {@code invokedynamic} concat.
+   *
+   * <p>The bootstrap's recipe converts a reference argument with {@code String.valueOf(Object)},
+   * and javac materializes that call in the bytecode before the concat, so the source's operand
+   * was the argument alone. A call on a primitive operand is not javac's: the recipe converts a
+   * primitive directly, so a {@code String.valueOf(char)} in the parameter list was written in
+   * the source and must stay — dropping it changes the concat's method type and its recipe, and
+   * the class file no longer matches.
+   */
   private static Exprent removeStringValueOf(Exprent exprent) {
 
     if (exprent instanceof InvocationExprent) {
       InvocationExprent iex = (InvocationExprent)exprent;
       if ("valueOf".equals(iex.getName()) && stringClass.equals(iex.getClassname())) {
         MethodDescriptor md = iex.getDescriptor();
-        if (md.params.length == 1) {
-          VarType param = md.params[0];
-          switch (param.type) {
-            case OBJECT:
-              if (!param.equals(VarType.VARTYPE_OBJECT)) {
-                break;
-              }
-            case BOOLEAN:
-            case CHAR:
-            case DOUBLE:
-            case FLOAT:
-            case INT:
-            case LONG:
-              return iex.getLstParameters().get(0);
-          }
+        if (md.params.length == 1 && md.params[0].equals(VarType.VARTYPE_OBJECT)) {
+          return iex.getLstParameters().get(0);
         }
       }
     }
