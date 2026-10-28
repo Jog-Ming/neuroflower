@@ -937,14 +937,39 @@ public class SequenceStatement extends Statement {
         Statement rest = new SequenceStatement(stats.subList(i + 1, stats.size()));
         // The rest runs only up to the branch shell; the target laid the statements past it out
         // after the if, and the arm's jump went over them to the exit block.
-        List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
-          RoundTrip.lastEnd(ifStatement.getIfstat()));
+        int shellEnd = RoundTrip.lastEnd(ifStatement.getIfstat());
+        List<Statement> restStats = stats.subList(i + 1, stats.size());
+        List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), restStats, shellEnd);
+        // One basic block can hold exprents from both sides of the shell: the ones at or past it
+        // ran after the arm, so print them after the brace and keep only the head inside.
+        Statement straddle = null;
+        List<Exprent> shellTail = java.util.Collections.emptyList();
+        if (afterIf.isEmpty() && !restStats.isEmpty()) {
+          Statement last = restStats.get(restStats.size() - 1);
+          shellTail = RoundTrip.exprentsAfterShell(last, ifStatement.getIfstat(), restStats, shellEnd);
+          if (!shellTail.isEmpty()) {
+            straddle = last;
+          }
+        }
         RoundTrip.markAfterIf(afterIf);
         buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-        buf.append(ExprProcessor.jmpWrapper(rest, indent + 1, true));
+        List<Exprent> savedExprents = straddle == null ? null : straddle.getExprents();
+        if (straddle != null) {
+          straddle.setExprents(new ArrayList<>(savedExprents.subList(0, savedExprents.size() - shellTail.size())));
+        }
+        try {
+          buf.append(ExprProcessor.jmpWrapper(rest, indent + 1, true));
+        } finally {
+          if (straddle != null) {
+            straddle.setExprents(savedExprents);
+          }
+        }
         buf.appendIndent(indent).append("} else {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
         buf.appendIndent(indent).append("}").appendLineSeparator();
+        if (!shellTail.isEmpty()) {
+          buf.append(ExprProcessor.listToJava(shellTail, indent));
+        }
         for (Statement after : afterIf) {
           buf.append(after.toJava(indent));
         }

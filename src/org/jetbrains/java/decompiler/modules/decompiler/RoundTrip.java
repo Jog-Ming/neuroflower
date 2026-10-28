@@ -2963,6 +2963,15 @@ public final class RoundTrip {
     return out;
   }
 
+  private static void collectExprentDefinitions(java.util.List<Exprent> exprents,
+                                                java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out) {
+    for (Exprent exprent : exprents) {
+      if (exprent instanceof VarExprent var && var.isDefinition()) {
+        out.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+      }
+    }
+  }
+
   private static void collectArmDefinitions(Statement stat, java.util.List<Statement> moved,
                                             java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out) {
     if (moved.contains(stat)) {
@@ -2987,6 +2996,52 @@ public final class RoundTrip {
     for (Statement child : stat.getStats()) {
       collectAfterShell(child, shellEnd, out);
     }
+  }
+
+  /**
+   * The exprents of a moved block that ran after the if's brace. A basic block can hold exprents
+   * from both sides of the arm's shell: the ones at or past it were laid out after the arm, in
+   * the source's order, and only they move out of the then arm. Empty when the block does not
+   * straddle the shell, and when a tail exprent reads a variable the arm declares.
+   */
+  public static java.util.List<Exprent> exprentsAfterShell(Statement stat, Statement arm,
+                                                           java.util.List<Statement> rest, int shellEnd) {
+    if (stat == null || arm == null || shellEnd <= 0) {
+      return java.util.Collections.emptyList();
+    }
+    java.util.List<Exprent> exprents = stat.getExprents();
+    if (exprents == null) {
+      return java.util.Collections.emptyList();
+    }
+    int split = exprents.size();
+    for (int i = 0; i < exprents.size(); i++) {
+      int start = firstOffsetOf(exprents.get(i));
+      if (start >= shellEnd) {
+        split = i;
+        break;
+      }
+    }
+    if (split <= 0 || split >= exprents.size()) {
+      return java.util.Collections.emptyList();
+    }
+    java.util.List<Exprent> tail = new java.util.ArrayList<>(exprents.subList(split, exprents.size()));
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined = new java.util.HashSet<>();
+    collectExprentDefinitions(ownExprents(arm), defined);
+    collectExprentDefinitions(exprents.subList(0, split), defined);
+    for (Statement other : rest) {
+      if (other != stat) {
+        collectArmDefinitions(other, java.util.Collections.emptyList(), defined);
+      }
+    }
+    for (Exprent exprent : tail) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var
+            && defined.contains(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var))) {
+          return java.util.Collections.emptyList();
+        }
+      }
+    }
+    return tail;
   }
 
   /**
