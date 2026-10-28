@@ -46,6 +46,16 @@ public final class Decompiler {
 
   public Path tree(String version, int threads, boolean noCache, String only,
                    List<String> options) throws Exception {
+    return tree(version, threads, noCache, only == null ? null : List.of(only), options);
+  }
+
+  /**
+   * A tree holding only the named classes (and each one's nest). Several classes share one
+   * decompile, one cache entry and one process: a verifier checking a family's members pays the
+   * startup once instead of once per class.
+   */
+  public Path tree(String version, int threads, boolean noCache, List<String> only,
+                   List<String> options) throws Exception {
     Path devJar = workspace.devJar();
     if (!Files.exists(devJar)) {
       throw new IllegalStateException("decompiler jar missing: " + devJar + " (run ./gradlew :allJar)");
@@ -54,9 +64,7 @@ public final class Decompiler {
     Path client = minecraft.clientJar(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
     String optionKey = options.isEmpty() ? "baked-defaults" : String.join(" ", options);
-    // An inner class pulls its outer class into the subset, so the subset is not the same tree a
-    // bare class name produced before this rule existed.
-    String onlyKey = only != null && only.indexOf('$') >= 0 ? only + "|nestall" : only;
+    String onlyKey = onlyKey(only);
     String key = Workspace.sha256(Workspace.sha256(client) + Workspace.sha256(devJar) + optionKey
       + classpathFingerprint(classpath) + (onlyKey == null ? "" : "|only=" + onlyKey));
     Path dir = workspace.trees.resolve(key);
@@ -72,7 +80,7 @@ public final class Decompiler {
     }
 
     Path input = client;
-    if (only != null) {
+    if (only != null && !only.isEmpty()) {
       input = subsetJar(version, only);
     }
 
@@ -153,7 +161,7 @@ public final class Decompiler {
     meta.addProperty("decompilerJarSha256", Workspace.sha256(devJar));
     meta.addProperty("options", optionKey);
     if (only != null) {
-      meta.addProperty("only", only);
+      meta.addProperty("only", String.join(",", only));
     }
     meta.addProperty("createdAt", System.currentTimeMillis());
     meta.addProperty("lastUsed", System.currentTimeMillis());
@@ -263,38 +271,76 @@ public final class Decompiler {
    * An inner class also brings its outermost class along: the decompiler names the source file
    * after the outer class, so a subset holding only X$Y would produce no X.java at all.
    */
-  private Path subsetJar(String version, String binaryName) throws Exception {
+  private Path subsetJar(String version, List<String> binaryNames) throws Exception {
     Path client = minecraft.clientJar(version, false);
-    String entryName = binaryName.replace('.', '/') + ".class";
-    String prefix = entryName.substring(0, entryName.length() - ".class".length());
-    int dollar = prefix.indexOf('$');
-    String outerPrefix = dollar > 0 ? prefix.substring(0, dollar) : null;
-    String outerName = outerPrefix == null ? null : outerPrefix + ".class";
-    boolean inner = outerName != null;
-    Path jar = workspace.tmp.resolve("subset-" + Workspace.sha256(version + "|" + binaryName + (inner ? "|nestall" : "")) + ".jar");
+    List<String> sorted = new ArrayList<>(binaryNames);
+    java.util.Collections.sort(sorted);
+    Path jar = workspace.tmp.resolve("subset-" + Workspace.sha256(version + "|" + String.join(",", sorted)) + ".jar");
     Files.createDirectories(jar.getParent());
+    // The subset depends only on the version and the names, so an entry written for this client
+    // jar is still right: rebuilding it on every call was pure cost.
+    if (Files.exists(jar)
+        && Files.getLastModifiedTime(jar).compareTo(Files.getLastModifiedTime(client)) >= 0) {
+      return jar;
+    }
+    List<String[]> selectors = new ArrayList<>();
+    List<Boolean> found = new ArrayList<>();
+    for (String binaryName : sorted) {
+      String entryName = binaryName.replace('.', '/') + ".class";
+      String prefix = entryName.substring(0, entryName.length() - ".class".length());
+      String outerPrefix = prefix.indexOf('$') > 0 ? prefix.substring(0, prefix.indexOf('$')) : null;
+      // An inner request takes the whole nest: the outer's source names its siblings, and a
+      // subset holding only one of them does not compile.
+      selectors.add(new String[]{entryName, prefix, outerPrefix});
+      found.add(false);
+    }
+    Path staging = jar.resolveSibling(jar.getFileName() + ".part-" + ProcessHandle.current().pid());
     try (ZipFile zip = new ZipFile(client.toFile());
-         ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(jar))) {
-      boolean found = false;
+         ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(staging))) {
       for (ZipEntry entry : java.util.Collections.list(zip.entries())) {
         String name = entry.getName();
-        // An inner request takes the whole nest: the outer's source names its siblings, and a
-        // subset holding only one of them does not compile.
-        if (name.equals(entryName) || name.startsWith(prefix + "$")
-            || (outerPrefix != null && (name.equals(outerName) || name.startsWith(outerPrefix + "$")))) {
-          found = true;
-          out.putNextEntry(new ZipEntry(name));
-          try (var in = zip.getInputStream(entry)) {
-            in.transferTo(out);
+        boolean any = false;
+        for (int i = 0; i < selectors.size(); i++) {
+          String[] s = selectors.get(i);
+          if (name.equals(s[0]) || name.startsWith(s[1] + "$")
+              || (s[2] != null && (name.equals(s[2] + ".class") || name.startsWith(s[2] + "$")))) {
+            found.set(i, true);
+            any = true;
           }
-          out.closeEntry();
         }
-      }
-      if (!found) {
-        throw new IllegalArgumentException("class " + binaryName + " is not in " + client.getFileName());
+        if (!any) {
+          continue;
+        }
+        out.putNextEntry(new ZipEntry(name));
+        try (var in = zip.getInputStream(entry)) {
+          in.transferTo(out);
+        }
+        out.closeEntry();
       }
     }
+    for (int i = 0; i < found.size(); i++) {
+      if (!found.get(i)) {
+        Files.deleteIfExists(staging);
+        throw new IllegalArgumentException("class " + sorted.get(i) + " is not in " + client.getFileName());
+      }
+    }
+    Files.move(staging, jar, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     return jar;
+  }
+
+  /** The cache key a class selection contributes; one class keeps the shape it always had. */
+  private static String onlyKey(List<String> only) {
+    if (only == null || only.isEmpty()) {
+      return null;
+    }
+    List<String> keys = new ArrayList<>();
+    for (String one : only) {
+      // An inner class pulls its outer class into the subset, so the subset is not the same tree a
+      // bare class name produced before this rule existed.
+      keys.add(one + (one.indexOf('$') >= 0 ? "|nestall" : ""));
+    }
+    java.util.Collections.sort(keys);
+    return String.join(",", keys);
   }
 
   /** Deletes the oldest cached trees, keeping {@link #KEEP} per version. */

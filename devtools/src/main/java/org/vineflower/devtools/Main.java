@@ -24,7 +24,7 @@ import java.util.concurrent.Future;
  *   decompile &lt;version&gt; [--no-cache] [--threads N] [--only Class] [--options "..."]
  *   tree      &lt;version&gt; [--only Class]
  *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--since Tree]
- *   diff      &lt;version&gt; &lt;Class&gt;
+ *   diff      &lt;version&gt; &lt;Class&gt; [&lt;Class&gt;...]
  *   compile   &lt;version&gt; &lt;Class&gt;
  *   corpus    &lt;version&gt; --ground-truth &lt;dir&gt;
  *   dataset   &lt;version&gt;
@@ -49,6 +49,8 @@ public final class Main {
     if (rest.contains("--refresh")) {
       throw new IllegalArgumentException("--refresh was renamed to --no-cache");
     }
+
+    rebuildDecompilerIfStale(workspace);
 
     if (needsTargetJdk(command)) {
       List<String> targets = positionals(rest);
@@ -107,14 +109,15 @@ public final class Main {
       case "diff" -> {
         List<String> positional = positionals(rest);
         if (positional.size() < 2) {
-          throw new IllegalArgumentException("usage: diff <version> <Class> [--no-cache] [--options \"...\"]");
+          throw new IllegalArgumentException(
+            "usage: diff <version> <Class> [<Class>...] [--no-cache] [--options \"...\"]");
         }
         String version = positional.get(0);
-        String className = positional.get(1);
+        List<String> classes = List.copyOf(positional.subList(1, positional.size()));
         boolean noCache = rest.contains("--no-cache");
         int threads = intFlag(rest, "--threads", threadsDefault());
-        Path tree = decompiler.tree(version, threads, noCache, className, optionsFlag(rest));
-        boolean ok = new Verifier(workspace, minecraft).diff(version, tree, className, threads);
+        Path tree = decompiler.tree(version, threads, noCache, classes, optionsFlag(rest));
+        boolean ok = new Verifier(workspace, minecraft).diff(version, tree, classes, threads);
         if (!ok) {
           System.exit(1);
         }
@@ -692,6 +695,71 @@ public final class Main {
   }
 
   /** The checkout carrying the Gradle build, found from the working directory or the jar. */
+  /**
+   * Rebuilds the decompiler jar when a source file is newer than it. The shell wrapper used to
+   * answer this with two {@code find} passes over the whole source tree, which cost seconds on
+   * every call — including the calls that had nothing to build; walking the same files in Java
+   * costs milliseconds.
+   */
+  private static void rebuildDecompilerIfStale(Workspace workspace) throws Exception {
+    if (System.getenv("DECOMPILER_JAR") != null && !System.getenv("DECOMPILER_JAR").isBlank()) {
+      return;
+    }
+    Path root = projectRoot();
+    if (root == null) {
+      return;
+    }
+    Path jar = workspace.devJar();
+    long built = Files.exists(jar) ? Files.getLastModifiedTime(jar).toMillis() : 0L;
+    long newest = 0L;
+    for (String part : List.of("src", "plugins")) {
+      Path dir = root.resolve(part);
+      if (!Files.isDirectory(dir)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
+        newest = Math.max(newest, walk.filter(Files::isRegularFile)
+          .mapToLong(path -> {
+            try {
+              return Files.getLastModifiedTime(path).toMillis();
+            } catch (IOException e) {
+              return 0L;
+            }
+          }).max().orElse(0L));
+      }
+    }
+    for (String file : List.of("build.gradle", "settings.gradle")) {
+      Path path = root.resolve(file);
+      if (Files.isRegularFile(path)) {
+        newest = Math.max(newest, Files.getLastModifiedTime(path).toMillis());
+      }
+    }
+    if (newest <= built) {
+      return;
+    }
+    System.err.println("devtools/cli: building the decompiler jar");
+    long started = System.nanoTime();
+    List<String> command = new ArrayList<>();
+    if (isWindows()) {
+      command.add("cmd.exe");
+      command.add("/c");
+      command.add(root.resolve("gradlew.bat").toString());
+    }
+    else {
+      command.add(root.resolve("gradlew").toString());
+    }
+    command.add("-q");
+    command.add(":allJar");
+    Process process = new ProcessBuilder(command).directory(root.toFile()).inheritIO().start();
+    if (process.waitFor() != 0) {
+      throw new IllegalStateException("gradlew :allJar failed");
+    }
+    // Gradle writes nothing when the inputs hash the same, so a source whose mtime moved without
+    // its content moving would keep the jar looking stale and every call would rebuild it.
+    Files.setLastModifiedTime(jar, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
+    System.err.printf(Locale.ROOT, "devtools/cli: built in %ds%n", (System.nanoTime() - started) / 1_000_000_000L);
+  }
+
   private static Path projectRoot() {
     List<Path> starts = new ArrayList<>();
     starts.add(Path.of("").toAbsolutePath());
@@ -794,7 +862,7 @@ public final class Main {
         score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes] [--since Tree]
                                              several versions run concurrently, --jobs at a time;
                                              --since lists what changed against an earlier tree
-        diff      <version> <Class>            verify one class and explain every failing attribute
+        diff      <version> <Class> [<Class>...] verify classes and explain every failing attribute
         compile   <version> <Class>            compile that one class with the verifier's javac
                                              settings and print its errors
         corpus    <version> --ground-truth D  write the class-to-ground-truth corpus

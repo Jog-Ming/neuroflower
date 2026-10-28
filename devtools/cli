@@ -5,7 +5,7 @@
 #   ./devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class]
 #   ./devtools/cli tree <version> [--only Class]
 #   ./devtools/cli score <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--since Tree]
-#   ./devtools/cli diff <version> <Class> [--no-cache] [--options "..."]
+#   ./devtools/cli diff <version> <Class> [<Class>...] [--no-cache] [--options "..."]
 #   ./devtools/cli compile <version> <Class> [--no-cache] [--options "..."]
 #   ./devtools/cli corpus <version> --ground-truth <dir>
 #   ./devtools/cli dataset <version>
@@ -22,20 +22,23 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar="$root/devtools/build/libs/devtools-all.jar"
 decompiler="$root/build/libs/vineflower-1.13.0+local.jar"
 
+# Only this jar is checked here: a shell `find` over the decompiler's source tree cost seconds on
+# every call. The pipeline rebuilds that jar itself, from Java, where the same walk costs
+# milliseconds (see Main.rebuildDecompilerIfStale).
 rebuild=""
 if [ ! -f "$jar" ] || [ -n "$(find "$root/devtools/src" "$root/devtools/build.gradle" -newer "$jar" -print -quit 2>/dev/null)" ]; then
   rebuild=1
-fi
-if [ -z "${DECOMPILER_JAR:-}" ]; then
-  if [ ! -f "$decompiler" ] || [ -n "$(find "$root/src" "$root/plugins" "$root/build.gradle" "$root/settings.gradle" \
-      -newer "$decompiler" -print -quit 2>/dev/null)" ]; then
-    rebuild=1
-  fi
 fi
 if [ -n "$rebuild" ]; then
   build_started=$SECONDS
   echo "devtools/cli: building jars" >&2
   (cd "$root" && ./gradlew :allJar :devtools:shadowJar -q)
+  # Gradle decides by content hash and writes nothing when the inputs are unchanged, so a source
+  # whose mtime moved without its content moving (a touch, a checkout) would leave the jar older
+  # than its sources and make every later call run a no-op build. The jar is correct at this
+  # point, so its timestamp is brought forward to say so.
+  touch "$jar"
+  [ -f "$decompiler" ] && touch "$decompiler"
   echo "devtools/cli: built in $((SECONDS - build_started))s" >&2
 fi
 if [ -n "${DECOMPILER_JAR:-}" ]; then

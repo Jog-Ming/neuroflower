@@ -204,20 +204,25 @@ public final class Verifier {
    * failure. This is what a per-class A/B needs, in one process instead of a decompile, a compile
    * and two {@code javap} runs.
    */
-  public boolean diff(String version, Path tree, String only, int threads) throws Exception {
+  public boolean diff(String version, Path tree, List<String> classes, int threads) throws Exception {
     Path client = minecraft.clientJar(version, false);
     Path originalClasses = minecraft.extractedClasses(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
     int release = releaseOf(client);
     String stamp = stamp(client, classpath, release);
-    List<Path> sources = sources(tree, only);
-    if (sources.isEmpty()) {
-      throw new IllegalArgumentException("no sources for " + only + " under " + tree);
+    // A file can hold several requested classes (an outer and its nests), so it is verified once.
+    java.util.LinkedHashSet<Path> files = new java.util.LinkedHashSet<>();
+    for (String className : classes) {
+      List<Path> found = sources(tree, className);
+      if (found.isEmpty()) {
+        throw new IllegalArgumentException("no source for " + className + " under " + tree);
+      }
+      files.addAll(found);
     }
     System.out.println("tree:   " + tree);
     boolean ok = true;
     Path compileCache = workspace.cache.resolve("compile");
-    for (Path source : sources) {
+    for (Path source : files) {
       System.out.println("source: " + tree.relativize(source));
       FileResult result = scoreFile(source, originalClasses, classpath, release, stamp, compileCache);
       for (String error : result.errors()) {
