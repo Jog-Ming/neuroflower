@@ -2407,6 +2407,41 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the loop's condition was written inside the body as a guard whose arm exits the
+   * loop: the condition's own branch lands on the body's start -- a written {@code while (C)}
+   * branches to the exit instead -- and the block the guard's break reaches sits before that
+   * start in the instruction layout. The source wrote
+   * {@code while (true) { if (!C) { exit-block; break; } body }}.
+   */
+  public static boolean whileGuardInsideBody(Exprent condition, Statement loop) {
+    if (!selector("loopguard") || condition == null || loop == null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    if (targets == null) {
+      return false;
+    }
+    Integer branchTarget = targets.get(condition.bytecode == null ? -1 : condition.bytecode.length());
+    java.util.List<StatEdge> successors = loop.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (branchTarget == null || successors.size() != 1
+        || (successors.get(0).getType() != StatEdge.TYPE_BREAK
+            && successors.get(0).getType() != StatEdge.TYPE_REGULAR)) {
+      return false;
+    }
+    Statement exit = successors.get(0).getDestination();
+    Statement body = loop.getFirst();
+    if (exit == null || body == null) {
+      return false;
+    }
+    int bodyStart = firstOffset(body);
+    int exitStart = firstOffset(exit);
+    // A written `while (C)` branches to the exit block itself; the guard's test branches past it
+    // into the body, and the exit block sits before the body in the target's layout.
+    return bodyStart >= 0 && exitStart >= 0 && exitStart < bodyStart && branchTarget > exitStart;
+  }
+
+  /**
    * True when the loop's condition was written inside the body as a break guard: the condition's
    * own conditional branch targets the exit rather than the body's start, and an unconditional
    * goto inside the body jumps back to that start -- while (true) { ... if (!cond) break; }.

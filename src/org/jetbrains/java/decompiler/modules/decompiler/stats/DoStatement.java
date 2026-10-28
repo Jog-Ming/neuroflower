@@ -176,6 +176,44 @@ public class DoStatement extends Statement {
         buf.append(");").appendLineSeparator();
         break;
       case WHILE:
+        // `while (true) { if (!C) { exit-block; break; } body }`: the target's test branches to
+        // the body and the exit block it sends the guard to sits before that body. The loop's
+        // successor is that block; print it inside the arm and let the sequence skip it there.
+        Statement exitBlock = null;
+        if (!isLabeled() && RoundTrip.whileGuardInsideBody(conditionExprent.get(0), this)) {
+          exitBlock = getAllSuccessorEdges().get(0).getDestination();
+          // The block prints inside the guard only when the sequence that follows the loop would
+          // print it next, and nothing but this loop's own jump reaches it: a shared exit stays
+          // where the tree put it.
+          boolean sibling = getParent() instanceof SequenceStatement sequence
+            && sequence.getStats().indexOf(exitBlock) == sequence.getStats().indexOf(this) + 1;
+          boolean ownExit = true;
+          for (StatEdge edge : exitBlock.getAllPredecessorEdges()) {
+            // A jump from inside the loop that carries a label is a `break label;` of the source,
+            // which prints where it stands; only this loop's own exit edge may move.
+            if (edge.getSource() != this
+                && (edge.labeled || !containsStatementStrict(edge.getSource()))) {
+              ownExit = false;
+              break;
+            }
+          }
+          if (!sibling || !ownExit) {
+            exitBlock = null;
+          }
+        }
+        if (exitBlock != null) {
+          buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
+          buf.appendIndent(indent + 1).append("if (")
+            .append(RoundTrip.negateCondition(conditionExprent.get(0)).toJava(indent + 1))
+            .append(") {").appendLineSeparator();
+          RoundTrip.markAfterIf(java.util.Collections.singletonList(exitBlock));
+          buf.append(ExprProcessor.jmpWrapper(exitBlock, indent + 2, true));
+          buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
+          buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          break;
+        }
         Exprent whileGuard = RoundTrip.foldedBreakGuard(conditionExprent.get(0), this, first);
         buf.appendIndent(indent).append("while (");
         buf.pushNewlineGroup(indent, 1);
