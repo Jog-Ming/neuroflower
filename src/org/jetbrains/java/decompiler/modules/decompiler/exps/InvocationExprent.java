@@ -1051,6 +1051,14 @@ public class InvocationExprent extends Exprent {
           if (!genericArgs.isEmpty() && witnessRepeatsErasure(fparams)) {
             genericArgs.clear();
           }
+          // The recorded functional instantiations arbitrate the witness: a witness whose
+          // substitution would instantiate a functional argument's SAM differently from the
+          // metafactory's instantiated method type was the printer's own target-derived value,
+          // not the source's, and the original let javac infer the variable again.
+          if (!genericArgs.isEmpty() && witnessContradictsFunctionalRecord(fparams)) {
+            genericArgs.clear();
+            lambdaBodyWitness = null;
+          }
 
           if (newRet != ret && newRet != null && !(newRet.isGeneric() && ((GenericType)newRet).hasUnknownGenericType(named.keySet()))) {
             return newRet;
@@ -5394,6 +5402,138 @@ public class InvocationExprent extends Exprent {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether the witness the printer settled on contradicts the instantiated method type the class
+   * file recorded for a functional argument. The metafactory's instantiated method type is the
+   * functional method's type after javac substituted the call's type arguments; substituting the
+   * printed witness into the declared parameter type must reproduce it. A mismatch means the
+   * witness is the printer's own target-derived value rather than the source's, and the original
+   * let javac infer the variable from the argument instead.
+   */
+  private boolean witnessContradictsFunctionalRecord(List<String> fparams) {
+    if (!RoundTrip.selector("witnessrecord") || genericArgs.isEmpty() || genericArgs.size() != fparams.size()
+      || desc == null || desc.getSignature() == null || lstParameters.isEmpty()) {
+      return false;
+    }
+    List<VarType> declaredParams = desc.getSignature().parameterTypes;
+    Map<VarType, VarType> substitution = new HashMap<>();
+    for (Map.Entry<VarType, VarType> entry : genericsMap.entrySet()) {
+      if (entry.getKey() != null && entry.getKey().type == CodeType.GENVAR
+        && entry.getValue() != null && !GenericType.DUMMY_VAR.equals(entry.getValue())) {
+        substitution.put(entry.getKey(), entry.getValue());
+      }
+    }
+    for (int i = 0; i < fparams.size(); i++) {
+      VarType value = genericArgs.get(i);
+      if (value == null || GenericType.DUMMY_VAR.equals(value)) {
+        return false;
+      }
+      substitution.put(GenericType.parse("T" + fparams.get(i) + ";"), value);
+    }
+    int count = Math.min(declaredParams.size(), lstParameters.size());
+    for (int p = 0; p < count; p++) {
+      if (!(lstParameters.get(p) instanceof NewExprent argument) || !argument.isLambda()
+        || argument.isMethodReference() || !(declaredParams.get(p) instanceof GenericType functional)) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(argument.getNewType().value);
+      if (node == null || node.lambdaInformation == null || node.lambdaInformation.method_descriptor == null) {
+        continue;
+      }
+      MethodDescriptor recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
+      StructClass samClass = DecompilerContext.getStructContext().getClass(functional.value);
+      if (samClass == null || samClass.getSignature() == null) {
+        continue;
+      }
+      List<String> interfaceParams = samClass.getSignature().fparameters;
+      VarType instantiated = functional.remap(substitution);
+      if (!(instantiated instanceof GenericType actual) || actual.getArguments().size() != interfaceParams.size()) {
+        continue;
+      }
+      List<VarType> interfaceArgs = actual.getArguments();
+      Map<VarType, VarType> interfaceMap = new HashMap<>();
+      boolean complete = true;
+      for (int k = 0; k < interfaceParams.size(); k++) {
+        VarType value = interfaceArgs.get(k);
+        if (value == null) {
+          complete = false;
+          break;
+        }
+        interfaceMap.put(GenericType.parse("T" + interfaceParams.get(k) + ";"), stripWitnessWildcard(value));
+      }
+      if (!complete) {
+        continue;
+      }
+      StructMethod sam = functionalMethod(samClass, node.lambdaInformation.method_name, recorded.params.length);
+      if (sam == null || sam.getSignature() == null) {
+        continue;
+      }
+      List<VarType> samParams = new ArrayList<>();
+      for (VarType parameter : sam.getSignature().parameterTypes) {
+        VarType value = parameter.remap(interfaceMap);
+        if (value == null || hasUnboundVariable(value) || GenericType.DUMMY_VAR.equals(value)) {
+          complete = false;
+          break;
+        }
+        samParams.add(value);
+      }
+      if (!complete || samParams.size() != recorded.params.length) {
+        continue;
+      }
+      VarType samReturn = sam.getSignature().returnType == null ? null : sam.getSignature().returnType.remap(interfaceMap);
+      if (samReturn == null || hasUnboundVariable(samReturn) || GenericType.DUMMY_VAR.equals(samReturn)) {
+        continue;
+      }
+      for (int k = 0; k < samParams.size(); k++) {
+        VarType erased = eraseWitnessType(samParams.get(k));
+        if (erased != null && !erased.equals(recorded.params[k])) {
+          return true;
+        }
+      }
+      VarType erasedReturn = eraseWitnessType(samReturn);
+      if (erasedReturn != null && !erasedReturn.equals(recorded.ret)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The unique abstract instance method of the functional interface with this name and arity. */
+  private static @Nullable StructMethod functionalMethod(StructClass iface, String name, int arity) {
+    StructMethod found = null;
+    for (StructMethod candidate : iface.getMethods()) {
+      if (!name.equals(candidate.getName()) || candidate.hasModifier(CodeConstants.ACC_STATIC)
+        || !candidate.hasModifier(CodeConstants.ACC_ABSTRACT)
+        || MethodDescriptor.parseDescriptor(candidate.getDescriptor()).params.length != arity) {
+        continue;
+      }
+      if (found != null) {
+        return null;
+      }
+      found = candidate;
+    }
+    return found;
+  }
+
+  /** The erasure of an instantiated signature type, or null when it still names a variable. */
+  private static @Nullable VarType eraseWitnessType(VarType type) {
+    if (type == null || type.type == CodeType.GENVAR) {
+      return null;
+    }
+    if (type instanceof GenericType) {
+      return new VarType(type.type, type.arrayDim, type.value);
+    }
+    return type;
+  }
+
+  /** Strip a wildcard wrapper to its bound; the instantiated method type uses the bound. */
+  private static VarType stripWitnessWildcard(VarType type) {
+    if (type instanceof GenericType generic && generic.getWildcard() != GenericType.WILDCARD_NO) {
+      return GenericType.withWildcard(generic, GenericType.WILDCARD_NO);
+    }
+    return type;
   }
 
   /** Whether a declared type names a type variable of the given name anywhere inside it. */
