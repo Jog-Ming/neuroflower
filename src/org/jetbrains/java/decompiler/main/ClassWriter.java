@@ -518,11 +518,21 @@ public class ClassWriter implements StatementWriter {
     if (seq == null || seq.isEmpty()) {
       return false;
     }
+    // A constructor reference: javac's bridge allocates the referenced class and hands the
+    // forwarded parameters to its constructor. A lambda's body carries the functional method's
+    // instantiated parameters, so the primitive or erased parameter types of the bridge are the
+    // record of the adaptation a `::new` performs.
+    if (RoundTrip.selector("methodrefbridge") && differs && staticNoCapture(prefix)
+        && writeConstructorReference(cl, seq, md_content, buffer)) {
+      return true;
+    }
     // A varargs method reference: javac's bridge packs the single parameter into an array and
     // calls the varargs method with it. A lambda's body has the functional method's own parameter
-    // types, so only a reference (whose bridge widens them) shows up with `differs` set.
-    if (RoundTrip.selector("methodrefvarargs") && differs && staticNoCapture(prefix)
-        && writeVarargsMethodReference(cl, mt, target0(seq, cl, md_content), buffer)) {
+    // types, so only a reference (whose bridge widens them) shows up with `differs` set. The
+    // varargs method may be static or an instance method on a captured receiver.
+    if (RoundTrip.selector("methodrefvarargs") && differs && prefix <= 1
+        && (prefix == 0 ? methodObject == null : methodObject != null)
+        && writeVarargsForward(cl, seq, md_content, md_lambda, prefix, methodObject, buffer, indent)) {
       return true;
     }
     int index = 0;
@@ -530,6 +540,7 @@ public class ClassWriter implements StatementWriter {
     int slot = 0;
     boolean sawLoad = false;
     String receiverCast = null;
+    String[] argCasts = new String[md_content.params.length];
     while (index < seq.length()) {
       Instruction ins = seq.getInstr(index);
       Integer load = loadSlot(ins);
@@ -544,8 +555,11 @@ public class ClassWriter implements StatementWriter {
       } else if (ins.opcode == CodeConstants.opc_checkcast && sawLoad) {
         // The reference's declared parameter type narrows a forwarded value; the cast belongs to
         // the reference, not to the printed text.
+        if (paramIndex >= 1 && paramIndex <= md_content.params.length) {
+          argCasts[paramIndex - 1] = cl.getPool().getPrimitiveConstant(ins.operand(0)).getString();
+        }
         if (paramIndex == 1) {
-          receiverCast = cl.getPool().getPrimitiveConstant(ins.operand(0)).getString();
+          receiverCast = argCasts[0];
         }
         index++;
       } else {
@@ -583,7 +597,14 @@ public class ClassWriter implements StatementWriter {
     // passes its captured receiver and every functional parameter as an argument.
     int argBase = !staticCall && prefix == 0 ? 1 : 0;
     for (int i = argBase; i < md_lambda.params.length; i++) {
-      if (!passable(md_lambda.params[i], md_target.params[i - argBase])) {
+      VarType targetParam = md_target.params[i - argBase];
+      // A static bridge that casts its forwarded argument to exactly the referenced method's
+      // parameter type is adapting the functional parameter's intersection-bound erasure: the
+      // source's reference was applicable through the cast, which javac inserted itself.
+      boolean adapted = staticCall && prefix == 0 && argCasts[i] != null
+        && targetParam != null && targetParam.type == CodeType.OBJECT && targetParam.arrayDim == 0
+        && argCasts[i].equals(targetParam.value);
+      if (!passable(md_lambda.params[i], targetParam) && !adapted) {
         return false;
       }
     }
@@ -650,45 +671,148 @@ public class ClassWriter implements StatementWriter {
     return prefix == 0;
   }
 
-  /** The static call a single-parameter varargs bridge forwards to, or null when the body differs. */
-  private static LinkConstant target0(FullInstructionSequence seq, StructClass cl, MethodDescriptor md_content) {
-    if (seq == null || md_content.params.length != 1 || seq.length() != 8) {
-      return null;
-    }
-    if (intConstant(seq.getInstr(0)) != 1
-        || seq.getInstr(1).opcode != CodeConstants.opc_anewarray
-        || seq.getInstr(2).opcode != CodeConstants.opc_dup
-        || intConstant(seq.getInstr(3)) != 0
-        || loadSlot(seq.getInstr(4)) == null || loadSlot(seq.getInstr(4)) != 0
-        || seq.getInstr(5).opcode != CodeConstants.opc_aastore
-        || seq.getInstr(6).opcode != CodeConstants.opc_invokestatic) {
-      return null;
-    }
-    Instruction ret = seq.getInstr(7);
-    if (!isReturn(ret.opcode)) {
-      return null;
-    }
-    LinkConstant target = cl.getPool().getLinkConstant(seq.getInstr(6).operand(0));
-    if (target == null || target.elementname == null || target.descriptor == null) {
-      return null;
-    }
-    String arrayType = cl.getPool().getPrimitiveConstant(seq.getInstr(1).operand(0)).getString();
-    MethodDescriptor md_target = MethodDescriptor.parseDescriptor(target.descriptor);
-    if (md_target.params.length != 1 || md_target.params[0].arrayDim != 1
-        || !md_target.params[0].value.equals(arrayType)) {
-      return null;
-    }
-    return target;
-  }
-
-  private boolean writeVarargsMethodReference(StructClass cl, StructMethod mt, LinkConstant target,
-                                              TextBuffer buffer) {
-    if (target == null) {
+  /**
+   * Writes a varargs method reference whose bridge packs the single functional argument into a
+   * one-element array. The bridge's shape is {@code [receiver;] iconst_1; anewarray A; dup;
+   * iconst_0; load x; aastore; invoke [A]; [pop]; return}: javac lowers {@code Type::name} or
+   * {@code recv::name} against a functional parameter narrower than the varargs method's element
+   * type into exactly this body. Returns false when the body differs.
+   */
+  private boolean writeVarargsForward(StructClass cl, FullInstructionSequence seq, MethodDescriptor md_content,
+                                      MethodDescriptor md_lambda, int prefix, Exprent methodObject,
+                                      TextBuffer buffer, int indent) {
+    if (md_content.params.length != prefix + 1 || md_lambda.params.length != 1
+        || seq.length() < prefix + 8) {
       return false;
     }
-    buffer.appendCastTypeName(new VarType(target.classname, true));
+    int index = 0;
+    if (prefix == 1) {
+      Integer receiver = loadSlot(seq.getInstr(index));
+      if (receiver == null || receiver != 0) {
+        return false;
+      }
+      index++;
+    }
+    int elementSlot = prefix == 1 ? md_content.params[0].stackSize : 0;
+    if (intConstant(seq.getInstr(index)) != 1
+        || seq.getInstr(index + 1).opcode != CodeConstants.opc_anewarray
+        || seq.getInstr(index + 2).opcode != CodeConstants.opc_dup
+        || intConstant(seq.getInstr(index + 3)) != 0
+        || loadSlot(seq.getInstr(index + 4)) == null
+        || loadSlot(seq.getInstr(index + 4)) != elementSlot
+        || seq.getInstr(index + 5).opcode != CodeConstants.opc_aastore) {
+      return false;
+    }
+    int callIndex = index + 6;
+    Instruction call = seq.getInstr(callIndex);
+    boolean staticCall = call.opcode == CodeConstants.opc_invokestatic;
+    if (!staticCall && call.opcode != CodeConstants.opc_invokevirtual
+        && call.opcode != CodeConstants.opc_invokeinterface) {
+      return false;
+    }
+    LinkConstant target = cl.getPool().getLinkConstant(call.operand(0));
+    if (target == null || target.elementname == null || target.descriptor == null) {
+      return false;
+    }
+    MethodDescriptor md_target = MethodDescriptor.parseDescriptor(target.descriptor);
+    if (md_target.params.length != 1 || md_target.params[0].arrayDim != 1) {
+      return false;
+    }
+    String arrayType = cl.getPool().getPrimitiveConstant(seq.getInstr(index + 1).operand(0)).getString();
+    if (!md_target.params[0].value.equals(arrayType)) {
+      return false;
+    }
+    VarType element = md_target.params[0].decreaseArrayDim();
+    if (!passable(md_lambda.params[0], element)) {
+      return false;
+    }
+    int tail = callIndex + 1;
+    while (tail < seq.length() && (seq.getInstr(tail).opcode == CodeConstants.opc_pop
+        || seq.getInstr(tail).opcode == CodeConstants.opc_pop2)) {
+      tail++;
+    }
+    if (tail + 1 != seq.length() || !isReturn(seq.getInstr(tail).opcode)) {
+      return false;
+    }
+    if (staticCall) {
+      if (prefix != 0) {
+        return false;
+      }
+      buffer.appendCastTypeName(new VarType(target.classname, true));
+      buffer.append("::").appendMethod(target.elementname, false, target.classname,
+        target.elementname, target.descriptor);
+      return true;
+    }
+    // The receiver is the captured value; its type must be an instance of the method's owner.
+    VarType receiverType = methodObject.getInferredExprType(md_content.params[0]);
+    if (receiverType == null || receiverType.type != CodeType.OBJECT
+      || !DecompilerContext.getStructContext().instanceOf(receiverType.value, target.classname)) {
+      return false;
+    }
+    TextBuffer instance = methodObject.toJava(indent);
+    if (methodObject instanceof FunctionExprent function && function.getFuncType() == FunctionType.CAST
+        && function.doesCast()) {
+      buffer.append('(').append(instance).append(')');
+    } else {
+      buffer.append(instance);
+    }
     buffer.append("::").appendMethod(target.elementname, false, target.classname,
       target.elementname, target.descriptor);
+    return true;
+  }
+
+  /**
+   * Writes a constructor reference whose bridge allocates the class and forwards the functional
+   * arguments to its constructor: {@code new T; dup; load...; invokespecial T.<init>; areturn}.
+   * javac creates this bridge when the reference needs an adaptation (a primitive parameter where
+   * the functional method instantiates a wrapper), which is what the bridge's parameter types
+   * record; a lambda's body carries the functional method's own types instead.
+   */
+  private boolean writeConstructorReference(StructClass cl, FullInstructionSequence seq,
+                                            MethodDescriptor md_content, TextBuffer buffer) {
+    if (seq.length() < 5
+        || seq.getInstr(0).opcode != CodeConstants.opc_new
+        || seq.getInstr(1).opcode != CodeConstants.opc_dup) {
+      return false;
+    }
+    String created = cl.getPool().getPrimitiveConstant(seq.getInstr(0).operand(0)).getString();
+    int index = 2;
+    int paramIndex = 0;
+    int slot = 0;
+    while (paramIndex < md_content.params.length) {
+      if (index >= seq.length()) {
+        return false;
+      }
+      Integer load = loadSlot(seq.getInstr(index));
+      if (load == null || load != slot) {
+        return false;
+      }
+      slot += md_content.params[paramIndex].stackSize;
+      paramIndex++;
+      index++;
+    }
+    if (seq.getInstr(index).opcode != CodeConstants.opc_invokespecial) {
+      return false;
+    }
+    LinkConstant constructor = cl.getPool().getLinkConstant(seq.getInstr(index).operand(0));
+    if (constructor == null || !CodeConstants.INIT_NAME.equals(constructor.elementname)
+      || constructor.descriptor == null || !created.equals(constructor.classname)) {
+      return false;
+    }
+    MethodDescriptor md_constructor = MethodDescriptor.parseDescriptor(constructor.descriptor);
+    if (md_constructor.params.length != md_content.params.length) {
+      return false;
+    }
+    for (int i = 0; i < md_content.params.length; i++) {
+      if (!md_content.params[i].equals(md_constructor.params[i])) {
+        return false;
+      }
+    }
+    index++;
+    if (index + 1 != seq.length() || seq.getInstr(index).opcode != CodeConstants.opc_areturn) {
+      return false;
+    }
+    buffer.appendCastTypeName(new VarType(created, true)).append("::new");
     return true;
   }
 
