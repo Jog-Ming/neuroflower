@@ -240,6 +240,9 @@ public class ClassWriter implements StatementWriter {
 
         if (!lambdaToAnonymous) {
           RootStatement root = wrapper.getMethodWrapper(mt.getName(), mt.getDescriptor()).root;
+          if (root != null) {
+            restoreFoldedInstanceField(node, methodWrapper, root);
+          }
           // A lambda body is a method of its own in the class file, and a `store N; load N; ret`
           // tail inside it is the same evidence as in any method. The restore has to run with the
           // lambda's method in scope: outside it, the enclosing method's instruction table answers
@@ -2926,6 +2929,176 @@ public class ClassWriter implements StatementWriter {
       ? -1 : RoundTrip.lineAt(struct, firstExpr.bytecode.previousSetBit(Integer.MAX_VALUE));
     return closingEntry && bodyLine >= 0 && closingLine > bodyLine && bodyEnd < closingLine
       ? closingLine : -1;
+  }
+
+  /**
+   * A lambda compiled as an instance method whose body never reads {@code this} was written
+   * against an instance member the class file does not record: a read of a final instance field
+   * with a constant initializer leaves no instruction behind, because javac folds the constant
+   * while the reference still makes the body instance. Print the field back where its value
+   * stands, or the recompiled lambda is static and captures one value fewer than the target.
+   */
+  private static void restoreFoldedInstanceField(ClassNode node, MethodWrapper methodWrapper, RootStatement root) {
+    if (node.lambdaInformation.is_content_method_static || node.parent == null
+        || methodWrapper.varproc == null || !RoundTrip.selector("lambdathis")) {
+      return;
+    }
+    if (usesThis(root)) {
+      return;
+    }
+    ClassNode content = node.parent;
+    for (ClassNode scope = content; scope != null; scope = scope.parent) {
+      ClassWrapper scopeWrapper = scope.getWrapper();
+      if (scopeWrapper == null || scope.classStruct == null) {
+        continue;
+      }
+      for (StructField field : scope.classStruct.getFields()) {
+        if (field.hasModifier(CodeConstants.ACC_STATIC) || !field.hasModifier(CodeConstants.ACC_FINAL)) {
+          continue;
+        }
+        Exprent initializer = scopeWrapper.getDynamicFieldInitializers()
+          .getWithKey(InterpreterUtil.makeUniqueKey(field.getName(), field.getDescriptor()));
+        if (!(initializer instanceof ConstExprent constant) || constant.isNull()) {
+          continue;
+        }
+        ConstExprent literal = findConstant(root, constant);
+        if (literal == null) {
+          continue;
+        }
+        if (shadowedFrom(content, scope, field.getName())) {
+          continue;
+        }
+        Exprent qualifier = enclosingInstance(scope, methodWrapper);
+        Exprent replacement = new FieldExprent(field.getName(), scope.classStruct.qualifiedName, false,
+          qualifier, FieldDescriptor.parseDescriptor(field.getDescriptor()), literal.bytecode);
+        if (replaceInStatement(root, literal, replacement)) {
+          return;
+        }
+      }
+    }
+  }
+
+  /** The expressions a statement owns directly: its blocks' and its own loop/if header's. */
+  private static List<Exprent> ownedExprents(Statement stat) {
+    List<Exprent> exprents = new ArrayList<>();
+    if (stat instanceof BasicBlockStatement basic && basic.getExprents() != null) {
+      exprents.addAll(basic.getExprents());
+    }
+    for (Exprent header : stat.getStatExprents()) {
+      if (header != null) {
+        exprents.add(header);
+      }
+    }
+    return exprents;
+  }
+
+  /** True when the statement's own expressions read the method's {@code this}. */
+  private static boolean usesThis(Statement stat) {
+    for (Exprent exprent : ownedExprents(stat)) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && var.getIndex() == 0 && !var.isStack()) {
+          return true;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (usesThis(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The first literal in the statement equal to the reference, in print order. */
+  private static ConstExprent findConstant(Statement stat, ConstExprent reference) {
+    for (Exprent exprent : ownedExprents(stat)) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof ConstExprent constant && constant.getValue() != null
+            && !constant.isNull() && constant.getValue().equals(reference.getValue())) {
+          return constant;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      ConstExprent found = findConstant(child, reference);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  private static boolean replaceInStatement(Statement stat, Exprent target, Exprent replacement) {
+    if (stat instanceof BasicBlockStatement basic && basic.getExprents() != null) {
+      List<Exprent> exprents = basic.getExprents();
+      for (int i = 0; i < exprents.size(); i++) {
+        Exprent exprent = exprents.get(i);
+        if (exprent == target) {
+          exprents.set(i, replacement);
+          return true;
+        }
+        if (replaceInExprent(exprent, target, replacement)) {
+          return true;
+        }
+      }
+    }
+    for (Exprent header : stat.getStatExprents()) {
+      if (header == null) {
+        continue;
+      }
+      if (header == target) {
+        stat.replaceExprent(target, replacement);
+        return true;
+      }
+      if (replaceInExprent(header, target, replacement)) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (replaceInStatement(child, target, replacement)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean replaceInExprent(Exprent parent, Exprent target, Exprent replacement) {
+    for (Exprent child : parent.getAllExprents()) {
+      if (child == target) {
+        parent.replaceExprent(target, replacement);
+        return true;
+      }
+      if (replaceInExprent(child, target, replacement)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The expression that qualifies a field of an enclosing class. It must print as nothing: an
+   * unqualified {@code radius} is a simple name and therefore a constant expression javac folds,
+   * where {@code Outer.this.radius} is a field access that compiles to a real read and forces a
+   * {@code this$0} field the target does not have. The nameless-enclosure spelling is the same
+   * form the tree already uses for an anonymous enclosing class.
+   */
+  private static Exprent enclosingInstance(ClassNode scope, MethodWrapper method) {
+    int index = method.counter.getCounterAndIncrement(org.jetbrains.java.decompiler.main.collectors.CounterContainer.VAR_COUNTER);
+    VarVersionPair pair = new VarVersionPair(index, 0);
+    method.varproc.setVarName(pair, VarExprent.VAR_NAMELESS_ENCLOSURE);
+    return new VarExprent(index, new VarType(CodeType.OBJECT, 0, scope.classStruct.qualifiedName), method.varproc);
+  }
+
+  /** True when an inner class between the content and the field's class declares that name. */
+  private static boolean shadowedFrom(ClassNode content, ClassNode scope, String name) {
+    for (ClassNode between = content; between != null && between != scope; between = between.parent) {
+      for (StructField field : between.classStruct.getFields()) {
+        if (field.getName().equals(name)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   public static boolean containsLambda(Exprent exprent) {

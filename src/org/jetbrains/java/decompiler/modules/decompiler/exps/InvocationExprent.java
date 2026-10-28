@@ -1901,6 +1901,54 @@ public class InvocationExprent extends Exprent {
   }
 
   /**
+   * A block lambda whose body returns a value cannot implement a functional method that returns
+   * void: JLS 15.27.2 makes such a body value-compatible but not void-compatible, so the overload
+   * was never applicable and javac had no ambiguity for the source to resolve with a cast. The
+   * block form is the class file's own evidence (a line entry at the implicit return); an
+   * expression body is skipped because a statement expression is compatible with both.
+   */
+  private static boolean blockLambdaRejectsVoidTarget(NewExprent lambda, StructMethod abstractMethod) {
+    if (!abstractMethod.methodDescriptor().ret.equals(VarType.VARTYPE_VOID)) {
+      return false;
+    }
+    MethodWrapper body = lambdaBody(lambda);
+    if (body == null || body.root == null) {
+      return false;
+    }
+    // A body of one returned expression can also be a statement expression, which is compatible
+    // with a void target; only the line entry the source left at the implicit return separates
+    // the expression form from a one-line block.
+    Statement first = body.root.getFirst();
+    boolean loneReturn = body.root.getStats().size() == 1
+      && first instanceof BasicBlockStatement basic && basic.getExprents() != null
+      && basic.getExprents().size() == 1
+      && basic.getExprents().get(0) instanceof ExitExprent exit
+      && exit.getExitType() == ExitExprent.Type.RETURN && exit.getValue() != null;
+    if (loneReturn) {
+      return ClassWriter.blockLambdaClosingLine(body) >= 0;
+    }
+    return returnsValue(body.root);
+  }
+
+  /** True when the statement holds a {@code return <value>;} at any depth. */
+  private static boolean returnsValue(Statement stat) {
+    if (stat instanceof BasicBlockStatement basic && basic.getExprents() != null) {
+      for (Exprent exprent : basic.getExprents()) {
+        if (exprent instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+            && exit.getValue() != null) {
+          return true;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (returnsValue(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * A cast around the receiver hides the chain link from the adjacency test; the inner
    * invocation's own invoke offset still carries an exact line-table entry, and the link exactly
    * one line later is the source's own break.
@@ -2906,7 +2954,8 @@ public class InvocationExprent extends Exprent {
           continue;
         }
         StructMethod abstractMethod = ExprProcessor.functionalMethod(paramType);
-        if (abstractMethod != null && abstractMethod.methodDescriptor().params.length == arity) {
+        if (abstractMethod != null && abstractMethod.methodDescriptor().params.length == arity
+            && !blockLambdaRejectsVoidTarget(lambda, abstractMethod)) {
           applicable++;
         }
       }
