@@ -3176,9 +3176,16 @@ public final class RoundTrip {
     if (guards == null || guards.isEmpty()) {
       return null;
     }
+    // The key filter is the condition's own byte range, not the head's bits: the merge drops the
+    // comparison wrapper of a boolean field or call, so the head's bits keep only the last guard's
+    // branch ([136,150) for BlockCollisions) and filtering on them loses every earlier one.
+    int[] range = head instanceof IfExprent ifHead ? byteRange(ifHead.getCondition()) : null;
+    if (range == null) {
+      return null;
+    }
     java.util.List<Integer> keys = new java.util.ArrayList<>();
     for (Integer end : guards.keySet()) {
-      if (end > head.bytecode.length() || end <= 0 || !head.bytecode.get(end - 1)) {
+      if (end <= range[0] || end > range[1]) {
         continue;
       }
       if (continuesAt(end, around)) {
@@ -3219,6 +3226,139 @@ public final class RoundTrip {
     return groups.size() > 1 ? groups : null;
   }
 
+  /**
+   * The operand groups a condition that folded a run of {@code if (G) continue;} statements splits
+   * into at the target's recorded guards, or null when it holds fewer than two. The key filter is
+   * the condition's own byte range, not the head's bits: the merge drops the comparison wrapper of
+   * a boolean field or call, so the head's bits keep only the last guard's branch and filtering on
+   * them loses every earlier one. A key K ends the branch of one written guard and the statement
+   * after it began at K+3, so a group boundary must be exactly an operand start. Unlike
+   * {@link #guardGroups} this reads the condition the caller hands over, so a group can be a chain
+   * of several tests rather than one guard per operand.
+   */
+  public static GuardSplit mergedGuards(Exprent head,
+                                        java.util.List<Exprent> operands,
+                                        Statement around) {
+    if (!selector("continueguard") || !(head instanceof IfExprent ifHead) || operands.size() < 2) {
+      return null;
+    }
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(currentMethod());
+    int[] range = byteRange(ifHead.getCondition());
+    if (guards == null || guards.isEmpty() || range == null) {
+      return null;
+    }
+    java.util.List<Integer> keys = new java.util.ArrayList<>();
+    for (Integer end : guards.keySet()) {
+      if (end <= range[0] || end > range[1]) {
+        continue;
+      }
+      if (continuesAt(end, around)) {
+        keys.add(end);
+      }
+    }
+    if (keys.isEmpty()) {
+      return null;
+    }
+    java.util.Collections.sort(keys);
+    int[] starts = new int[operands.size()];
+    for (int i = 0; i < starts.length; i++) {
+      starts[i] = firstOffsetOf(operands.get(i));
+      if (starts[i] < 0) {
+        return null;
+      }
+    }
+    java.util.List<java.util.List<Exprent>> groups = new java.util.ArrayList<>();
+    int headGroup = -1;
+    int from = 0;
+    for (Integer key : keys) {
+      int boundary = key + 3;
+      int next = from;
+      while (next < starts.length && starts[next] < boundary) {
+        next++;
+      }
+      // A key with no operand of its own would print a guard with no test; a boundary inside an
+      // operand means the key belongs to something the condition only contains.
+      if (next == from || (next < starts.length && starts[next] != boundary)) {
+        return null;
+      }
+      groups.add(new java.util.ArrayList<>(operands.subList(from, next)));
+      from = next;
+      if (from >= operands.size()) {
+        break;
+      }
+    }
+    if (from < operands.size()) {
+      headGroup = groups.size();
+      groups.add(new java.util.ArrayList<>(operands.subList(from, operands.size())));
+    }
+    return groups.size() > 1 ? new GuardSplit(groups, headGroup) : null;
+  }
+
+  /** A condition split at the target's recorded guards. */
+  public static final class GuardSplit {
+    public final java.util.List<java.util.List<Exprent>> groups;
+    /**
+     * Index of the group no guard closes — the head's own test, which the merge kept as written —
+     * or -1 when a guard closed the last group as well.
+     */
+    public final int headGroup;
+
+    GuardSplit(java.util.List<java.util.List<Exprent>> groups, int headGroup) {
+      this.groups = groups;
+      this.headGroup = headGroup;
+    }
+  }
+
+  /**
+   * The byte range [first, end) the expression's parts own, or null when none carries an offset.
+   * The end is exclusive, matching {@link BitSet#length()}: a guard key is the offset just past a
+   * branch, so it sits at or below the end of the last part that covers that branch.
+   */
+  private static int[] byteRange(Exprent exprent) {
+    int first = -1;
+    int end = -1;
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part.bytecode == null || part.bytecode.isEmpty()) {
+        continue;
+      }
+      int start = part.bytecode.nextSetBit(0);
+      if (first < 0 || start < first) {
+        first = start;
+      }
+      if (part.bytecode.length() > end) {
+        end = part.bytecode.length();
+      }
+    }
+    return first < 0 ? null : new int[]{first, end};
+  }
+
+  /**
+   * True when the head's own branch jumps to the enclosing loop's continue target. The last guard a
+   * merge folded into the condition keeps no goto: javac collapses {@code if (G) goto L} whose
+   * fall-through is also L into the opposite branch, so its bytes live in the head and that branch
+   * is the only proof the trailing test was a guard of its own.
+   */
+  public static boolean headBranchContinues(Exprent head, Statement around) {
+    StructMethod method = currentMethod();
+    if (method == null || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    if (ends == null || targets == null) {
+      return false;
+    }
+    int lastStart = -1;
+    for (int offset = head.bytecode.nextSetBit(0); offset >= 0; offset = head.bytecode.nextSetBit(offset + 1)) {
+      if (ends.containsKey(offset) && offset > lastStart) {
+        lastStart = offset;
+      }
+    }
+    Integer end = lastStart < 0 ? null : ends.get(lastStart);
+    Integer target = end == null ? null : targets.get(end);
+    return target != null && targetContinues(target, around);
+  }
+
   public static boolean splitsIntoGuards(Exprent head, int operands, Statement around) {
     if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()
         || operands < 2) {
@@ -3241,6 +3381,16 @@ public final class RoundTrip {
     return count == operands;
   }
 
+  /** Whether this offset is the continue target of the loop the statement sits in. */
+  private static boolean targetContinues(int target, Statement around) {
+    Statement loop = around == null ? null : around.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    return loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement
+      && isContinueTarget(doStatement, target);
+  }
+
   private static boolean continuesAt(int end, Statement around) {
     StructMethod method = currentMethod();
     if (method == null) {
@@ -3248,17 +3398,7 @@ public final class RoundTrip {
     }
     java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
     Integer target = guards == null ? null : guards.get(end);
-    if (target == null) {
-      return false;
-    }
-    Statement loop = around == null ? null : around.getParent();
-    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
-      loop = loop.getParent();
-    }
-    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
-      return false;
-    }
-    if (!isContinueTarget(doStatement, target)) {
+    if (target == null || !targetContinues(target, around)) {
       return false;
     }
     // The target's table must put the continue's line before the body's first line.

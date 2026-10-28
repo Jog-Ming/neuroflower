@@ -233,6 +233,23 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (G1) continue; if (G2) continue; …` merged into one test whose body is the loop's own
+    // end: every guard but a redundant last one leaves a branch-then-goto pair behind, and the
+    // condition the merge built to shortcut through them splits back apart at those points. The
+    // merge reads each written test as the condition for reaching the next statement, so the
+    // groups print negated; where the head's own branch is the continue instead, the condition
+    // already is the guards and every group prints as written.
+    if (ifstat == null && elsestat == null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && !declaresPattern(ifHead.getCondition())
+        && ifedge != null && ifedge.getType() == StatEdge.TYPE_CONTINUE
+        // An explicit jump edge carries the continue; a labeled one is `continue outer;` and does
+        // not print here.
+        && (!ifedge.explicit || !ifedge.labeled)
+        && printMergedGuards(buf, ifHead, indent)) {
+      return buf;
+    }
+
     // `if (C) continue; body`: the loop printed the mirror `if (!C) { body }` as its body.
     // The target's branch-then-goto shape and line table prove the continue; the printed
     // condition may be any expression, and its negation is what the source wrote.
@@ -472,15 +489,17 @@ public class IfStatement extends Statement {
    * Where a `&&` condition splits back into nested ifs, as operand indices, or an empty list.
    * A pattern variable declared by a later operand lives to the end of the same statement in the
    * flat form; nesting puts its declaration inside a block, and javac then numbers local slots
-   * differently. The flat compile is the only one the table proves, so those stay flat.
+   * differently, so those stay flat — unless the target proves the operand began a statement of
+   * its own: a continue guard's goto ends exactly where it starts, which no boolean operand of a
+   * shared condition can have.
    */
-  static List<Integer> nestedIfGroups(IfExprent head) {
+  static List<Integer> nestedIfGroups(IfExprent head, Statement arm) {
     List<Exprent> operands = booleanOperands(head.getCondition());
     if (operands.size() < 2) {
       return java.util.Collections.emptyList();
     }
     for (int i = 1; i < operands.size(); i++) {
-      if (declaresPattern(operands.get(i))) {
+      if (declaresPattern(operands.get(i)) && !RoundTrip.continuesBefore(operands.get(i), arm)) {
         return java.util.Collections.emptyList();
       }
     }
@@ -504,7 +523,7 @@ public class IfStatement extends Statement {
    */
   static boolean printSplitIf(TextBuffer buf, IfExprent head, Statement arm, Statement elseArm,
                               int indent, boolean elseSemicolon) {
-    List<Integer> groups = nestedIfGroups(head);
+    List<Integer> groups = nestedIfGroups(head, arm);
     if (groups.isEmpty()
         || (elseArm != null && (!endsWithExit(arm) || RoundTrip.declaresLocal(elseArm)))) {
       return false;
@@ -584,6 +603,54 @@ public class IfStatement extends Statement {
       }
     }
     return -1;
+  }
+
+  /**
+   * Prints a condition that folded a run of `if (G) continue;` statements back as one guard per
+   * group; the loop's own end follows the last group, so nothing is printed after them. False,
+   * printing nothing, when the condition does not split.
+   */
+  private boolean printMergedGuards(TextBuffer buf, IfExprent head, int indent) {
+    // The head's edge to the continue decides which way the merge read the written tests: a jump
+    // is the continue itself, so each test prints as written; a fall-through is the continue, so
+    // the merge kept the test for reaching the next statement and each group needs its complement.
+    boolean written = ifedge.explicit;
+    List<Exprent> operands = written ? orOperands(head.getCondition()) : booleanOperands(head.getCondition());
+    RoundTrip.GuardSplit split = RoundTrip.mergedGuards(head, operands, this);
+    if (split == null) {
+      return false;
+    }
+    // With the continue as the fall-through the head's branch is the last guard's whole test, so a
+    // head group that branch does not send to the loop would print a guard the target lacks.
+    if (!written && !RoundTrip.headBranchContinues(head, this)) {
+      return false;
+    }
+    // The merge folded each written guard as the test for reaching the next statement, so a group
+    // it closed prints its complement; the head's own test was never folded and keeps its polarity.
+    for (int i = 0; i < split.groups.size(); i++) {
+      List<Exprent> group = split.groups.get(i);
+      Exprent test = written ? orOf(group) : andOf(group, 0, group.size());
+      IfExprent guard = (IfExprent) head.copy();
+      guard.setCondition(written || i == split.headGroup ? test : complement(test));
+      buf.appendIndent(indent);
+      buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+    }
+    return true;
+  }
+
+  /**
+   * The complement of a printed test as the source wrote it: a `!` the merge left is dropped and
+   * anything else is wrapped in one. The wrapper stays literal on purpose — De Morgan would print
+   * an equivalent test whose jumps javac lays out differently.
+   */
+  private static Exprent complement(Exprent exprent) {
+    if (exprent instanceof FunctionExprent not && not.getFuncType() == FunctionType.BOOL_NOT
+        && not.getLstOperands().size() == 1) {
+      return not.getLstOperands().get(0);
+    }
+    return new FunctionExprent(FunctionType.BOOL_NOT, exprent, null);
   }
 
   /** One operand, or the operands joined by `||` again, as a guard condition prints it. */
