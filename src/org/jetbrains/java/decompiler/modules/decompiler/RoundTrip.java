@@ -2857,6 +2857,139 @@ public final class RoundTrip {
     return true;
   }
 
+  /** Statements an if prints after its closing brace, where the target laid them out. */
+  private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> AFTER_IF =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+
+  /**
+   * The statements of this run the target laid out past the branch shell, whose last instruction
+   * ends at {@code shellEnd}: they are the code the source ran after the if, not part of the arm
+   * the run was folded into. Empty when the whole run sits before the shell, and when a moved
+   * block reads a variable the arm declares — a declaration cannot leave the arm with it.
+   */
+  public static java.util.List<Statement> afterShell(Statement arm, java.util.List<Statement> rest, int shellEnd) {
+    java.util.List<Statement> out = new java.util.ArrayList<>();
+    if (shellEnd <= 0 || arm == null) {
+      return out;
+    }
+    for (Statement stat : rest) {
+      collectAfterShell(stat, shellEnd, out);
+    }
+    if (!out.isEmpty()) {
+      // What the arm prints is the rest before the split; a variable it declares there is out of
+      // scope after the brace, so a moved block that reads one would not compile.
+      java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined = new java.util.HashSet<>();
+      collectArmDefinitions(arm, out, defined);
+      for (Statement stat : rest) {
+        collectArmDefinitions(stat, out, defined);
+      }
+      for (Statement stat : out) {
+        if (readsAny(stat, defined)) {
+          out.clear();
+          break;
+        }
+      }
+    }
+    return out;
+  }
+
+  private static void collectArmDefinitions(Statement stat, java.util.List<Statement> moved,
+                                            java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> out) {
+    if (moved.contains(stat)) {
+      return;
+    }
+    for (Exprent exprent : ownExprents(stat)) {
+      if (exprent instanceof VarExprent var && var.isDefinition()) {
+        out.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      collectArmDefinitions(child, moved, out);
+    }
+  }
+
+  private static void collectAfterShell(Statement stat, int shellEnd, java.util.List<Statement> out) {
+    int start = firstOffset(stat);
+    if (start >= 0 && start >= shellEnd) {
+      out.add(stat);
+      return;
+    }
+    for (Statement child : stat.getStats()) {
+      collectAfterShell(child, shellEnd, out);
+    }
+  }
+
+  /**
+   * True when the arm folds in a bare void return the target placed past the statements the run
+   * prints after the if: the return is the method's last instruction, a goto inside the arm lands
+   * on it, and those statements end just before it. The source wrote `if (C) { A } else { rest }`
+   * and the closing brace stands for the return.
+   */
+  public static boolean returnsPastRest(Statement arm, Statement restFirst, Statement restLast) {
+    StructMethod method = currentMethod();
+    if (method == null || arm == null || restFirst == null || restLast == null || !arm.getStats().isEmpty()) {
+      return false;
+    }
+    List<Exprent> exprents = arm.getExprents();
+    if (exprents == null || exprents.size() < 2) {
+      return false;
+    }
+    if (!(exprents.get(exprents.size() - 1) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit)
+        || exit.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+        || exit.getValue() != null || exit.bytecode == null) {
+      return false;
+    }
+    int exitStart = exit.bytecode.nextSetBit(0);
+    Integer last = LAST_INSTRUCTION.get(method);
+    if (exitStart < 0 || last == null || exitStart != last || lastEnd(restLast) != exitStart) {
+      return false;
+    }
+    int armStart = firstOffset(arm);
+    int restStart = firstOffset(restFirst);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (armStart < 0 || restStart < 0 || gotos == null) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getKey() >= armStart && entry.getKey() < restStart
+          && entry.getValue() != null && entry.getValue() == exitStart) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Records the statements an if prints after its closing brace, so the arm prints nothing there. */
+  public static void markAfterIf(java.util.List<Statement> statements) {
+    StructMethod method = currentMethod();
+    if (method == null || statements.isEmpty()) {
+      return;
+    }
+    AFTER_IF.get().computeIfAbsent(method, key -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).addAll(statements);
+  }
+
+  /** Forgets the recorded statements once the if has printed them. */
+  public static void releaseAfterIf(java.util.List<Statement> statements) {
+    StructMethod method = currentMethod();
+    if (method == null || statements.isEmpty()) {
+      return;
+    }
+    java.util.Set<Statement> set = AFTER_IF.get().get(method);
+    if (set != null) {
+      set.removeAll(statements);
+    }
+  }
+
+  /** True when the enclosing if prints this statement after its closing brace. */
+  public static boolean isAfterIf(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    java.util.Set<Statement> set = AFTER_IF.get().get(method);
+    return set != null && set.contains(stat);
+  }
+
   /** True when this statement's position prints as the break that jumps to the moved block. */
   public static boolean isDeferredExit(Statement stat) {
     StructMethod method = currentMethod();

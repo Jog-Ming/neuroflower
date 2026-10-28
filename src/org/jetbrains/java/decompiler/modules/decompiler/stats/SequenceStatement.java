@@ -140,6 +140,12 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // The if this run was folded into prints this block after its closing brace: the target
+      // laid it out past the branch shell, so the arm ends where the source's brace was.
+      if (RoundTrip.isAfterIf(st)) {
+        continue;
+      }
+
       // A guard printed this exit already; the rest of the sequence became unconditional.
       if (RoundTrip.isConsumedGuardExit(st)) {
         continue;
@@ -656,6 +662,9 @@ public class SequenceStatement extends Statement {
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
         Statement splitArm = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
+          RoundTrip.lastEnd(ifStatement.getIfstat()));
+        RoundTrip.markAfterIf(afterIf);
         if (!IfStatement.printSplitIf(buf, head, splitArm, ifStatement.getIfstat(), indent, false)) {
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(splitArm, indent + 1, true));
@@ -663,6 +672,12 @@ public class SequenceStatement extends Statement {
           buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, false));
           buf.appendIndent(indent).append("}").appendLineSeparator();
         }
+        for (Statement after : afterIf) {
+          // The block's own jump edge is the flow into the statement the if's parent prints
+          // next, so only its content moves here.
+          buf.append(after.toJava(indent));
+        }
+        RoundTrip.releaseAfterIf(afterIf);
         notempty = true;
         break;
       }
@@ -920,11 +935,20 @@ public class SequenceStatement extends Statement {
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
         Statement rest = new SequenceStatement(stats.subList(i + 1, stats.size()));
+        // The rest runs only up to the branch shell; the target laid the statements past it out
+        // after the if, and the arm's jump went over them to the exit block.
+        List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
+          RoundTrip.lastEnd(ifStatement.getIfstat()));
+        RoundTrip.markAfterIf(afterIf);
         buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(rest, indent + 1, true));
         buf.appendIndent(indent).append("} else {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
         buf.appendIndent(indent).append("}").appendLineSeparator();
+        for (Statement after : afterIf) {
+          buf.append(after.toJava(indent));
+        }
+        RoundTrip.releaseAfterIf(afterIf);
         notempty = true;
         break;
       }
@@ -963,6 +987,11 @@ public class SequenceStatement extends Statement {
           boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest)
             || RoundTrip.jumpsOnto(RoundTrip.firstOffset(movedRest),
                  RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()));
+          // The rest runs only up to the branch shell; the target laid the statements past it
+          // out after the if, and the arm's jump went over them to the exit block.
+          List<Statement> afterIf = RoundTrip.afterShell(ifStatement.getIfstat(), stats.subList(i + 1, stats.size()),
+            RoundTrip.lastEnd(ifStatement.getIfstat()));
+          RoundTrip.markAfterIf(afterIf);
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(movedRest, indent + 1, true));
           if (asElse) {
@@ -973,6 +1002,10 @@ public class SequenceStatement extends Statement {
             buf.appendIndent(indent).append("}").appendLineSeparator();
             buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
           }
+          for (Statement after : afterIf) {
+            buf.append(after.toJava(indent));
+          }
+          RoundTrip.releaseAfterIf(afterIf);
           notempty = true;
           break;
         }
@@ -1028,6 +1061,35 @@ public class SequenceStatement extends Statement {
         notempty = true;
         i++;
         continue;
+      }
+
+      // `if (C) { A; return; } rest` where the return is not the arm's own: the target jumped
+      // over the rest to it, and its instruction is the method's last, so the source wrote
+      // `if (C) { A } else { rest }` and let the closing brace close the method. Printing the
+      // return inside the arm would turn the else into an early exit.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && !ifStatement.isPatternMatched()
+          && RoundTrip.returnsPastRest(ifStatement.getIfstat(), stats.get(i + 1),
+               stats.get(stats.size() - 1))) {
+        List<Exprent> armExprents = ifStatement.getIfstat().getExprents();
+        Exprent foldedReturn = armExprents.remove(armExprents.size() - 1);
+        try {
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(
+            new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        } finally {
+          armExprents.add(foldedReturn);
+        }
+        notempty = true;
+        break;
       }
 
       // `if (C) { rest } tail`: the target's last condition branch lands on the rest, which javac
