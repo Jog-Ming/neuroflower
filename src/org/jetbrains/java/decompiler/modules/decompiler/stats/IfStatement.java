@@ -253,6 +253,19 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (!C) break;` at the end of a loop body: the tree kept the branch condition as
+    // `if (C) continue;` with the loop's exit as the fall-through edge. The target's first
+    // condition branch lands on that exit, where a written continue would send it back to the
+    // loop's head, so the source wrote the negated test with the break inside it. The edge's
+    // break is what the printed body carries; the wrapper must not print it again.
+    if (ifstat == null && elsestat == null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && ifedge != null && ifedge.getType() == StatEdge.TYPE_CONTINUE && ifedge.explicit && !ifedge.labeled
+        && printBreakGuardByTarget(buf, ifHead, indent)) {
+      RoundTrip.markBreakPrinted(this);
+      return buf;
+    }
+
     // `if (C) continue; body`: the loop printed the mirror `if (!C) { body }` as its body.
     // The target's branch-then-goto shape and line table prove the continue; the printed
     // condition may be any expression, and its negation is what the source wrote.
@@ -451,6 +464,33 @@ public class IfStatement extends Statement {
         buf.appendIndent(indent).append("}").appendLineSeparator();
       }
     }
+  }
+
+  /**
+   * Prints `if (!C) break;` when the target proves that a continue-shaped if was really the
+   * source's break guard: the guard is the statement's only exit and the condition's first test
+   * lands on the loop's exit. False, printing nothing, otherwise.
+   */
+  private boolean printBreakGuardByTarget(TextBuffer buf, IfExprent ifHead, int indent) {
+    java.util.List<StatEdge> successors = getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (successors.size() != 1 || successors.get(0).getType() != StatEdge.TYPE_BREAK
+        || !successors.get(0).explicit || successors.get(0).labeled) {
+      return false;
+    }
+    if (!RoundTrip.breakGuardByTarget(ifHead, this)) {
+      return false;
+    }
+    Exprent printed = ifHead.getCondition();
+    Exprent source = printed instanceof FunctionExprent not
+        && not.getFuncType() == FunctionType.BOOL_NOT && not.getLstOperands().size() == 1
+      ? not.getLstOperands().get(0)
+      : RoundTrip.negateCondition(printed);
+    IfExprent guard = (IfExprent) ifHead.copy();
+    guard.setCondition(source);
+    buf.appendIndent(indent).append(guard.toJava(indent)).append(" {").appendLineSeparator();
+    buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    return true;
   }
 
   /**

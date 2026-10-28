@@ -933,7 +933,74 @@ public final class RoundTrip {
       org.jetbrains.java.decompiler.util.InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
   }
 
-  /** The destination of the last conditional branch inside these offsets, or -1. */
+  /** The destination of the first conditional branch inside the head's offsets, or -1. */
+  public static int firstBranchTarget(Exprent head) {
+    StructMethod method = currentMethod();
+    BitSet bytecode = head == null ? null : head.bytecode;
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    if (ends == null || targets == null || bytecode == null) {
+      return -1;
+    }
+    int first = -1;
+    int bestStart = Integer.MAX_VALUE;
+    for (int offset = bytecode.nextSetBit(0); offset >= 0; offset = bytecode.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end) && offset < bestStart) {
+        bestStart = offset;
+        first = targets.get(end);
+      }
+    }
+    return first;
+  }
+
+  /**
+   * True when an if the tree prints as {@code if (C) continue;} at the end of its loop body is
+   * really the source's {@code if (!C) break;}. A written continue sends the condition's first
+   * test back to the loop's head; the target sends it to the statement past the loop, and the
+   * guard pair at the condition's end leaves by that same break. Only a condition whose top-level
+   * connective is {@code &&} has that layout, and the fall-through after the if has to reach the
+   * loop's end so the negated test skips nothing a continue would not.
+   */
+  public static boolean breakGuardByTarget(Exprent head, Statement around) {
+    if (!selector("breakguard") || !(head instanceof IfExprent ifHead) || around == null) {
+      return false;
+    }
+    if (currentMethod() == null || lastAtomUnderOr(ifHead.getCondition(), false)) {
+      return false;
+    }
+    int firstTarget = firstBranchTarget(ifHead);
+    return firstTarget >= 0 && targetBreaks(firstTarget, around) && reachesLoopEnd(around);
+  }
+
+  /**
+   * True when control falling out of this statement runs nothing else on the way to the loop's
+   * back edge: every enclosing sequence has it last (empty blocks aside), and an enclosing if
+   * converges after itself whichever arm ran, so the arm it sits in only has to end at the if.
+   */
+  public static boolean reachesLoopEnd(Statement stat) {
+    Statement cur = stat;
+    for (Statement parent = cur.getParent(); parent != null; parent = cur.getParent()) {
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement) {
+        return true;
+      }
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence) {
+        java.util.List<Statement> stats = sequence.getStats();
+        int last = stats.size() - 1;
+        while (last >= 0 && printsNothing(stats.get(last))) {
+          last--;
+        }
+        if (last < 0 || stats.get(last) != cur) {
+          return false;
+        }
+      } else if (!(parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement)) {
+        return false;
+      }
+      cur = parent;
+    }
+    return false;
+  }
+
   private static int lastBranchTarget(BitSet bytecode) {
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
@@ -2930,6 +2997,28 @@ public final class RoundTrip {
   /** Statements an if prints after its closing brace, where the target laid them out. */
   private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> AFTER_IF =
     ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+
+  /** Statements that printed the break their trailing jump edge would otherwise add. */
+  private static final ThreadLocal<java.util.Map<StructMethod, java.util.Set<Statement>>> PRINTED_BREAKS =
+    ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
+
+  public static void markBreakPrinted(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method != null && stat != null) {
+      PRINTED_BREAKS.get().computeIfAbsent(method,
+        key -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).add(stat);
+    }
+  }
+
+  /** True when this statement's print already carries the break its trailing edge stands for. */
+  public static boolean printedBreak(Statement stat) {
+    StructMethod method = currentMethod();
+    if (method == null || stat == null) {
+      return false;
+    }
+    java.util.Set<Statement> set = PRINTED_BREAKS.get().get(method);
+    return set != null && set.contains(stat);
+  }
 
   /**
    * The statements of this run the target laid out past the branch shell, whose last instruction

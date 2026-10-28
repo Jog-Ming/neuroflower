@@ -1217,7 +1217,8 @@ public class ExprProcessor implements CodeConstants {
     if (lstSuccs.size() == 1) {
       StatEdge edge = lstSuccs.get(0);
       if (edge.getType() != StatEdge.TYPE_REGULAR && edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)
-        && !yieldsFromBlock(stat) && !RoundTrip.isJumpSuppressed(stat) && !RoundTrip.isClosureHidden(edge)) {
+        && !yieldsFromBlock(stat) && !RoundTrip.isJumpSuppressed(stat) && !RoundTrip.isClosureHidden(edge)
+        && !RoundTrip.printedBreak(stat)) {
         int jumpOffset = addDeletedGotoInstructionMapping(stat, buf);
         // The target starts no line at the jump when the source ended the previous statement with
         // `break;`/`continue;` on the same line; keep it there.
