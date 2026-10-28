@@ -422,6 +422,14 @@ public final class ExitHelper {
           Exprent expr = lstExpr.get(lstExpr.size() - 1);
           if (expr instanceof ExitExprent ex) {
             if (ex.getExitType() == ExitExprent.Type.RETURN && ex.getValue() == null) {
+              // A catch handler's `return;` is not the method's implicit one: the handler is its
+              // own block with its own return instruction, and a source that omitted it would
+              // fall through to the method's end instead. Dropping it adds an instruction. Only
+              // a handler is exempt: the try body is the catch statement's first child, and a
+              // return folded to its end is not an instruction at all.
+              if (isHandler(source)) {
+                continue;
+              }
               // remove redundant return
               dummyExit.addBytecodeOffsets(ex.bytecode);
               lstExpr.remove(lstExpr.size() - 1);
@@ -433,6 +441,15 @@ public final class ExitHelper {
     }
 
     return res;
+  }
+
+  /** Whether this statement is a catch or finally handler block, not a try body. */
+  private static boolean isHandler(Statement source) {
+    Statement parent = source.getParent();
+    if (parent instanceof CatchStatement catchStatement) {
+      return catchStatement.getStats().indexOf(source) > 0;
+    }
+    return parent instanceof CatchAllStatement;
   }
 
   // Fixes chars being returned when ints are required
