@@ -1106,6 +1106,34 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target proves the source wrote a break guard around this arm: the condition's
+   * last branch enters the arm, and the instruction right after that branch is an unconditional
+   * jump to the break's destination. javac lays a written {@code if (!C) break; arm} out that way;
+   * the plain {@code if (C) { arm } break;} branches past the arm to the break instead.
+   */
+  public static boolean breakGuardEntersArm(Exprent head, Statement arm, Statement breakTarget) {
+    if (!selector("breakarm") || !(head instanceof IfExprent ifHead) || arm == null || breakTarget == null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    BitSet offsets = ifHead.bytecode;
+    int armStart = statementOffset(arm);
+    int breakStart = statementOffset(breakTarget);
+    if (targets == null || gotos == null || offsets == null || offsets.isEmpty()
+        || armStart < 0 || breakStart < 0) {
+      return false;
+    }
+    Integer target = targets.get(offsets.length());
+    Integer after = gotos.get(offsets.length());
+    return target != null && target == armStart && after != null && after == breakStart;
+  }
+
+  /**
    * The branch opcode javac emits after the last test of this condition when the arm is skipped —
    * the opcode the target would carry had the condition been written this way. `&&` and `||` both
    * test their right operand last and jump to the else arm when it is false; a negation swaps the

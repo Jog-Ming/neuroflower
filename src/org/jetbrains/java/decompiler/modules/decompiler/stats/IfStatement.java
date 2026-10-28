@@ -322,6 +322,36 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (!C) break; arm` where the tree kept the break as the if's trailing edge and the arm as
+    // its then branch: javac branches into the arm and falls through to a jump to the break, which
+    // only the written guard lays out that way. The plain `if (C) { arm } break;` branches past the
+    // arm to the break instead, so the target's branch target and the jump right after it prove
+    // which form the source had. The arm leaves on its own, so printing it after the brace keeps
+    // the flow; the break it reaches is the guard the source wrote, printed inside the test.
+    java.util.List<StatEdge> breakSuccs = getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    boolean breakEdge = breakSuccs.size() == 1 && breakSuccs.get(0).getType() == StatEdge.TYPE_BREAK
+        && breakSuccs.get(0).explicit && !breakSuccs.get(0).labeled;
+    if (ifstat != null && elsestat == null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && breakEdge
+        && endsWithExit(ifstat) && !RoundTrip.declaresLocal(ifstat)
+        && RoundTrip.breakGuardEntersArm(ifHead, ifstat, breakSuccs.get(0).getDestination())) {
+      Exprent printed = ifHead.getCondition();
+      Exprent source = printed instanceof FunctionExprent not
+          && not.getFuncType() == FunctionType.BOOL_NOT
+          && not.getLstOperands().size() == 1
+        ? not.getLstOperands().get(0)
+        : RoundTrip.negateCondition(printed);
+      IfExprent guard = (IfExprent) ifHead.copy();
+      guard.setCondition(source);
+      buf.appendIndent(indent).append(guard.toJava(indent)).append(" {").appendLineSeparator();
+      buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      RoundTrip.markBreakPrinted(this);
+      return buf;
+    }
+
     // The same source shape with the rest of the body as the else arm: `if (C) { ...; continue; }
     // rest`. The arm's terminal goto to the loop head proves the continue; the arm always exits,
     // so the rest runs exactly where the else arm did. Hoisting is exact only when the if ends the
