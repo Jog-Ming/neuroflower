@@ -221,7 +221,8 @@ public final class ConstantNames {
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
-                           Set<String> earlyOwners, boolean ownEarly, boolean ownProven) {
+                           Set<String> earlyOwners, boolean ownEarly, boolean ownProven,
+                           StructClass cls) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -350,7 +351,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false, false);
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false, false, null);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -838,7 +839,7 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, earlyOwners, ownEarly, ownProven),
+        activeValues, earlyOwners, ownEarly, ownProven, own),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -1176,6 +1177,161 @@ public final class ConstantNames {
            CodeConstants.opc_instanceof, CodeConstants.opc_multianewarray -> instruction.operand(0);
       default -> -1;
     };
+  }
+
+  /**
+   * The instructions of the method whose generation rank is {@code rank}, or {@code null}.
+   *
+   * <p>The ranks are the ones {@link #firstUses} assigns: constructors first, then the other
+   * methods, then static initializers.
+   */
+  private static FullInstructionSequence codeOfRank(StructClass cls, int rank) {
+    VBStyleCollection<StructMethod, String> methods = cls.getMethods();
+    int count = methods.size();
+    for (int i = 0; i < count; i++) {
+      StructMethod method = methods.get(i);
+      int rankOf = CodeConstants.INIT_NAME.equals(method.getName()) ? i
+        : CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i
+        : count + i;
+      if (rankOf != rank) {
+        continue;
+      }
+      if (method.getInstructionSequence() == null) {
+        try {
+          method.expandData(cls); // released after decompilation; reparse for the operand window
+        }
+        catch (Exception e) {
+          return null;
+        }
+      }
+      return method.getInstructionSequence();
+    }
+    return null;
+  }
+
+  /**
+   * Whether the long literal at this printed position decides the type of its own expression.
+   *
+   * <p>javac folds an int constant written where a long is wanted into the same long constant, so
+   * naming an int constant at a long literal reproduces the bytes only where the surrounding
+   * context does that coercing. A long arithmetic operation whose sibling operand the class file
+   * widens with {@code i2l} is not such a context: that sibling was int-typed in the source, so
+   * the operation is long because of this operand, and an int constant written here would have
+   * compiled to int arithmetic. The widening conversion is the proof, and it can sit on either
+   * side of the literal: operands are generated left to right.
+   */
+  private static boolean drivesLongType(Placement placement, int start, long value) {
+    StructClass cls = placement.cls();
+    if (cls == null || placement.spaces() == null) {
+      return false;
+    }
+    long coordinate = siteCoordinate(placement.spaces(), start);
+    if (coordinate == NO_COORDINATE) {
+      return false;
+    }
+    FullInstructionSequence code = codeOfRank(cls, (int)(coordinate >>> 32));
+    if (code == null || code.isEmpty()) {
+      return false;
+    }
+    int offset = (int)(coordinate & 0xffffffffL);
+    int size = code.length();
+    int from = 0;
+    while (from < size && code.getInstr(from).startOffset < offset) {
+      from++;
+    }
+    // The printed position is the literal's own instruction, or the last printed one before it.
+    int literal = -1;
+    for (int i = from; i < size && i < from + 8; i++) {
+      Instruction insn = code.getInstr(i);
+      if (insn.opcode == CodeConstants.opc_ldc2_w && longConstant(cls, insn) == value) {
+        literal = i;
+        break;
+      }
+      if (consumes(cls, insn)) {
+        break;
+      }
+    }
+    if (literal < 0) {
+      return false;
+    }
+    boolean widened = false;
+    for (int i = literal - 1; i >= 0 && i >= literal - 16; i--) {
+      Instruction insn = code.getInstr(i);
+      if (insn.opcode == CodeConstants.opc_i2l) {
+        widened = true;
+        break;
+      }
+      if (consumes(cls, insn)) {
+        break;
+      }
+    }
+    for (int i = literal + 1; i < size && i <= literal + 32; i++) {
+      Instruction insn = code.getInstr(i);
+      int opcode = insn.opcode;
+      if (opcode == CodeConstants.opc_i2l) {
+        widened = true;
+      }
+      else if (isLongBinary(opcode)) {
+        return widened;
+      }
+      else if (consumes(cls, insn)) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /** The constant an {@code ldc2_w} pushes, when it is a long, or a value no literal has. */
+  private static long longConstant(StructClass cls, Instruction insn) {
+    PooledConstant constant = cls.getPool().getConstant(insn.operand(0));
+    return constant instanceof PrimitiveConstant primitive && primitive.value instanceof Long number
+      ? number : Long.MIN_VALUE;
+  }
+
+  private static boolean isLongBinary(int opcode) {
+    return switch (opcode) {
+      case CodeConstants.opc_ladd, CodeConstants.opc_lsub, CodeConstants.opc_lmul,
+           CodeConstants.opc_ldiv, CodeConstants.opc_lrem, CodeConstants.opc_land,
+           CodeConstants.opc_lor, CodeConstants.opc_lxor, CodeConstants.opc_lshl,
+           CodeConstants.opc_lshr, CodeConstants.opc_lushr -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * Whether an instruction ends this value's stay on the stack without a long arithmetic
+   * operation: a store, return, branch, comparison, narrowing conversion or consuming call.
+   */
+  private static boolean consumes(StructClass cls, Instruction insn) {
+    int opcode = insn.opcode;
+    if (opcode >= CodeConstants.opc_istore && opcode <= CodeConstants.opc_astore) {
+      return true;
+    }
+    if (opcode >= CodeConstants.opc_ireturn && opcode <= CodeConstants.opc_return) {
+      return true;
+    }
+    if (opcode >= CodeConstants.opc_ifeq && opcode <= CodeConstants.opc_if_acmpne) {
+      return true;
+    }
+    switch (opcode) {
+      case CodeConstants.opc_ifnull, CodeConstants.opc_ifnonnull, CodeConstants.opc_goto,
+           CodeConstants.opc_goto_w, CodeConstants.opc_tableswitch, CodeConstants.opc_lookupswitch,
+           CodeConstants.opc_lcmp, CodeConstants.opc_l2i, CodeConstants.opc_l2f,
+           CodeConstants.opc_l2d, CodeConstants.opc_lastore, CodeConstants.opc_pop,
+           CodeConstants.opc_pop2, CodeConstants.opc_athrow, CodeConstants.opc_putfield,
+           CodeConstants.opc_putstatic:
+        return true;
+      case CodeConstants.opc_invokevirtual, CodeConstants.opc_invokespecial,
+           CodeConstants.opc_invokestatic, CodeConstants.opc_invokeinterface,
+           CodeConstants.opc_invokedynamic:
+        // A call with parameters may be consuming this value as one of its arguments; only a
+        // parameterless call leaves it on the stack.
+        PooledConstant constant = cls.getPool().getConstant(insn.operand(0));
+        return !(constant instanceof LinkConstant link) || link.descriptor == null
+          || !link.descriptor.startsWith("()");
+      default:
+        return false;
+    }
   }
 
   /**
@@ -4597,10 +4753,14 @@ public final class ConstantNames {
         value = Long.toString(number);
         // An int constant used where a long is wanted widens at compile time, so the source can
         // read `Integer.MAX_VALUE` where the pool holds a long constant. When no long constant
-        // explains the literal, try the int constant of the same value.
+        // explains the literal, try the int constant of the same value -- but never where the
+        // literal itself decides the expression's type: a long operation whose sibling the class
+        // file widens with i2l would have been int arithmetic with an int constant there, so no
+        // source that compiled this class wrote one.
         List<Constant> asLong = candidates.get(kind + "|" + value);
         if ((asLong == null || asLong.size() != 1)
-            && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE) {
+            && number >= Integer.MIN_VALUE && number <= Integer.MAX_VALUE
+            && !drivesLongType(placement, start, number)) {
           addSite(sites, negative ? negativeAt : start, i, VariableType.INT.name() + "|" + number, "",
             candidates, imports, packageName, own, ownInitializers, placement, deferred, inWindow, invented, false);
         }
