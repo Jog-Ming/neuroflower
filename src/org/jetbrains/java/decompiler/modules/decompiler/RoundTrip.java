@@ -3509,11 +3509,15 @@ public final class RoundTrip {
    * them loses every earlier one. A key K ends the branch of one written guard and the statement
    * after it began at K+3, so a group boundary must be exactly an operand start. Unlike
    * {@link #guardGroups} this reads the condition the caller hands over, so a group can be a chain
-   * of several tests rather than one guard per operand.
+   * of several tests rather than one guard per operand. {@code breaks} selects which enclosing
+   * statement's exit the target's jump has to be: a loop's continue target or the break target of
+   * the enclosing loop or switch, the same shapes with a {@code break} instead of a
+   * {@code continue}.
    */
   public static GuardSplit mergedGuards(Exprent head,
                                         java.util.List<Exprent> operands,
-                                        Statement around) {
+                                        Statement around,
+                                        boolean breaks) {
     if (!selector("continueguard") || !(head instanceof IfExprent ifHead) || operands.size() < 2) {
       return null;
     }
@@ -3527,7 +3531,7 @@ public final class RoundTrip {
       if (end <= range[0] || end > range[1]) {
         continue;
       }
-      if (continuesAt(end, around)) {
+      if (exitsAt(end, around, breaks)) {
         keys.add(end);
       }
     }
@@ -3666,17 +3670,76 @@ public final class RoundTrip {
       && isContinueTarget(doStatement, target);
   }
 
+  /**
+   * Whether this offset is where a {@code break} of the statement would land: the target must be
+   * the instruction just past the innermost enclosing loop or switch, the statement a bare
+   * {@code break} leaves.
+   */
+  private static boolean targetBreaks(int target, Statement around) {
+    Statement inner = around == null ? null : around.getParent();
+    while (inner != null && !(inner instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)
+        && !(inner instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement)) {
+      inner = inner.getParent();
+    }
+    if (inner == null) {
+      return false;
+    }
+    int exit = exitAfter(inner);
+    return exit >= 0 && exit == target;
+  }
+
+  /**
+   * The first instruction offset after a statement's own extent. The statement's exprents stop at
+   * its last covered instruction, but the jumps that close it — a loop's back edge, a break it
+   * takes, a switch arm's join — belong to no exprent, so the statement ends after them.
+   */
+  private static int exitAfter(Statement stat) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (ends == null || gotos == null) {
+      return -1;
+    }
+    BitSet bits = new BitSet();
+    stat.getOffset(bits);
+    int end = bits.length();
+    if (end <= 0) {
+      return -1;
+    }
+    // A contiguous instruction layout puts at most a few closing jumps past the last covered
+    // instruction; a longer run means the offsets do not describe this statement's layout.
+    for (int jump = 0; jump < 8 && gotos.containsKey(end); jump++) {
+      Integer next = ends.get(end);
+      if (next == null) {
+        return -1;
+      }
+      end = next;
+    }
+    return end;
+  }
+
   private static boolean continuesAt(int end, Statement around) {
+    return exitsAt(end, around, false);
+  }
+
+  /**
+   * Whether the recorded guard key at this offset ends a statement whose jump leaves for the
+   * enclosing statement's {@code continue} target ({@code breaks} false) or break target
+   * ({@code breaks} true).
+   */
+  private static boolean exitsAt(int end, Statement around, boolean breaks) {
     StructMethod method = currentMethod();
     if (method == null) {
       return false;
     }
     java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
     Integer target = guards == null ? null : guards.get(end);
-    if (target == null || !targetContinues(target, around)) {
+    if (target == null
+        || (breaks ? !targetBreaks(target, around) : !targetContinues(target, around))) {
       return false;
     }
-    // The target's table must put the continue's line before the body's first line.
+    // The target's table must put the jump's line before the statement after it; the source wrote
+    // the `continue;` or `break;` on a line of its own above the rest of the body.
     java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
     int[] site = sites == null ? null : sites.get(end);
     StructLineNumberTableAttribute table =

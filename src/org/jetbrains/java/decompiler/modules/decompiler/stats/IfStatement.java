@@ -238,13 +238,16 @@ public class IfStatement extends Statement {
     // condition the merge built to shortcut through them splits back apart at those points. The
     // merge reads each written test as the condition for reaching the next statement, so the
     // groups print negated; where the head's own branch is the continue instead, the condition
-    // already is the guards and every group prints as written.
+    // already is the guards and every group prints as written. The same shape occurs with
+    // `break;` guards, whose jump leaves the enclosing loop or switch instead of returning to its
+    // head; the edge tells which keyword the guard printed.
     if (ifstat == null && elsestat == null && !isLabeled() && !isPatternMatched()
         && condition instanceof IfExprent ifHead
         && !declaresPattern(ifHead.getCondition())
-        && ifedge != null && ifedge.getType() == StatEdge.TYPE_CONTINUE
-        // An explicit jump edge carries the continue; a labeled one is `continue outer;` and does
-        // not print here.
+        && ifedge != null
+        && (ifedge.getType() == StatEdge.TYPE_CONTINUE || ifedge.getType() == StatEdge.TYPE_BREAK)
+        // An explicit jump edge carries the continue or break; a labeled one is `continue outer;`
+        // and does not print here.
         && (!ifedge.explicit || !ifedge.labeled)
         && printMergedGuards(buf, ifHead, indent)) {
       return buf;
@@ -630,12 +633,22 @@ public class IfStatement extends Statement {
    * printing nothing, when the condition does not split.
    */
   private boolean printMergedGuards(TextBuffer buf, IfExprent head, int indent) {
+    boolean breaks = ifedge.getType() == StatEdge.TYPE_BREAK;
+    // A break guard is a separate shape from the continue's; the selector keeps it switchable.
+    if (breaks && !RoundTrip.selector("breakguard")) {
+      return false;
+    }
+    // A break guard's jump is a statement of its own behind a test of its own; an edge that keeps
+    // no jump is not that shape, and the complement path below is the continue's own.
+    if (breaks && !ifedge.explicit) {
+      return false;
+    }
     // The head's edge to the continue decides which way the merge read the written tests: a jump
     // is the continue itself, so each test prints as written; a fall-through is the continue, so
     // the merge kept the test for reaching the next statement and each group needs its complement.
     boolean written = ifedge.explicit;
     List<Exprent> operands = written ? orOperands(head.getCondition()) : booleanOperands(head.getCondition());
-    RoundTrip.GuardSplit split = RoundTrip.mergedGuards(head, operands, this);
+    RoundTrip.GuardSplit split = RoundTrip.mergedGuards(head, operands, this, breaks);
     if (split == null) {
       return false;
     }
@@ -644,6 +657,7 @@ public class IfStatement extends Statement {
     if (!written && !RoundTrip.headBranchContinues(head, this)) {
       return false;
     }
+    String keyword = breaks ? "break;" : "continue;";
     // The merge folded each written guard as the test for reaching the next statement, so a group
     // it closed prints its complement; the head's own test was never folded and keeps its polarity.
     for (int i = 0; i < split.groups.size(); i++) {
@@ -653,7 +667,7 @@ public class IfStatement extends Statement {
       guard.setCondition(written || i == split.headGroup ? test : complement(test));
       buf.appendIndent(indent);
       buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
-      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      buf.appendIndent(indent + 1).append(keyword).appendLineSeparator();
       buf.appendIndent(indent).append("}").appendLineSeparator();
     }
     return true;
