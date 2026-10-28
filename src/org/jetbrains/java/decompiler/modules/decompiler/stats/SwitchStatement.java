@@ -289,7 +289,26 @@ public class SwitchStatement extends Statement {
         continue;
       }
 
-      TextBuffer armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
+      // The target's own jump lands on the break's jump: the arm ended at a closing brace, the
+      // `break;` stood outside it, and javac kept the two jumps apart. Print the break there, so
+      // it does not merge with the arm's last jump. Everything the `} break;` print below needs
+      // is decided here: removing the arm's own jump without printing it back would drop a break.
+      int breakJump = armBreakJump(stat, edges, switchEnd);
+      boolean patternArm = values.stream().anyMatch(value -> value instanceof FunctionExprent function
+        && function.getFuncType() == FunctionType.INSTANCEOF);
+      boolean breakOutside = braced.contains(stat) && bracedEarly.contains(stat) && breakJump >= 0
+        && !yields && !orderUnknown && guard == null && !patternArm
+        && RoundTrip.canCompleteNormally(stat) && !RoundTrip.declaredScopePast(stat, breakJump)
+        && RoundTrip.selector("switchbreak") && RoundTrip.jumpsOnto(breakJump);
+      Statement previousJump = breakOutside ? RoundTrip.suppressJump(stat) : null;
+      TextBuffer armBuf;
+      try {
+        armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
+      } finally {
+        if (breakOutside) {
+          RoundTrip.restoreJump(previousJump);
+        }
+      }
       buf.append(armBuf);
       // What the arm actually printed decides whether it still needs a `break;`. The tree's own
       // edge is not enough evidence: an explicit break edge can hang off a statement the printer
@@ -300,10 +319,7 @@ public class SwitchStatement extends Statement {
       // jump proves the source wrote one, and `canCompleteNormally` keeps it reachable. The last
       // group is no exception: javac keeps a break's jump whenever another group follows it, and
       // the trailing `default:` below supplies that group.
-      boolean patternArm = values.stream().anyMatch(value -> value instanceof FunctionExprent function
-        && function.getFuncType() == FunctionType.INSTANCEOF);
       boolean armLeaves = leavesArm(armText);
-      int breakJump = armBreakJump(stat, edges, switchEnd);
       boolean joins = breakJump >= 0;
       if (i == lastPrinted) {
         lastJoins = joins;
@@ -325,9 +341,9 @@ public class SwitchStatement extends Statement {
         buf.append("}");
         // The source wrote `} break;` for an arm braced to scope its locals; the same conditions
         // that decide a dropped `break` apply, since the brace does not change reachability.
-        if (bracedEarly.contains(stat) && breakJump >= 0 && !breakInside
-            && guard == null && !patternArm
-            && RoundTrip.canCompleteNormally(stat) && !RoundTrip.printsExplicitJump(stat)) {
+        if ((breakOutside || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
+            && breakJump >= 0 && !breakInside && guard == null && !patternArm
+            && RoundTrip.canCompleteNormally(stat)) {
           int at = buf.length();
           buf.append(" break;");
           buf.addBytecodeMappingAt(at, breakJump, null, null);

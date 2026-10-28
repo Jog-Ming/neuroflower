@@ -2743,7 +2743,22 @@ public final class RoundTrip {
   }
 
   public static boolean isJumpSuppressed(Statement stat) {
-    return stat != null && SUPPRESSED_JUMP.get() == stat;
+    Statement suppressed = SUPPRESSED_JUMP.get();
+    if (stat == null || suppressed == null) {
+      return false;
+    }
+    // The suppressed jump may hang off any statement on the tail path: an arm ending in
+    // `if (…) { … } else { … }` carries its break as the if's own edge.
+    Statement last = suppressed;
+    while (true) {
+      if (last == stat) {
+        return true;
+      }
+      if (last.getExprents() != null || last.getStats().isEmpty()) {
+        return false;
+      }
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
   }
 
   /** The first instruction offset of a statement, counting an if statement's head condition. */
@@ -2775,6 +2790,11 @@ public final class RoundTrip {
     }
     Integer target = targets.get(offsets.length());
     return target == null ? -1 : target;
+  }
+
+  /** True when any forward jump lands exactly on that offset: a jump to a jump, not a fall-in. */
+  public static boolean jumpsOnto(int target) {
+    return target > 0 && jumpsOnto(0, target, target);
   }
 
   /**
