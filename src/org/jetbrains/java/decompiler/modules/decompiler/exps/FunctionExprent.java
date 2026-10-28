@@ -157,6 +157,11 @@ public class FunctionExprent extends Exprent {
 
   private FunctionType funcType;
   private VarType implicitType;
+  /**
+   * When set, the ternary's constant arms print as constants of this narrow type. See
+   * {@link #narrowConstantArms}.
+   */
+  private VarType armConstantType;
   private final List<Exprent> lstOperands;
   private boolean needsCast = true;
   /** The cast is the compiler's conversion of an erased generic value back to its recorded type. */
@@ -777,14 +782,14 @@ public class FunctionExprent extends Exprent {
         InvocationExprent.enterPoly();
         try {
           markQualifierBreak(RoundTrip.sourceLine(this), lstOperands.get(1));
-          buf.append(wrapOperandString(lstOperands.get(1), true, indent));
+          buf.append(printArm(lstOperands.get(1), indent));
           if (RoundTrip.newlineBetweenOperands(lstOperands.get(1), lstOperands.get(2))) {
             buf.appendLineSeparator().appendIndent(indent + 1).append(": ");
           } else {
             buf.appendPossibleNewline(" ").append(": ");
           }
           markQualifierBreak(RoundTrip.sourceLineEnd(lstOperands.get(1)), lstOperands.get(2));
-          buf.append(wrapOperandString(lstOperands.get(2), true, indent));
+          buf.append(printArm(lstOperands.get(2), indent));
         } finally {
           InvocationExprent.exitPoly();
         }
@@ -882,6 +887,61 @@ public class FunctionExprent extends Exprent {
 
   public VarType getSimpleCastType() {
     return funcType.castType;
+  }
+
+  /**
+   * Prints this ternary's constant arms as constants of the narrowed target type.
+   *
+   * <p>A ternary of int constants assigned to a byte, short or char slot compiles without a
+   * narrowing instruction when the arms themselves are constants of that type: javac folds a
+   * constant cast at each arm, so {@code cond ? (byte)22 : (byte)23} pushes the same immediates
+   * as the class file and the assignment stores them with no {@code i2b}. The printer's own
+   * outer cast would add that instruction, so the arms — not the ternary — carry the type.
+   *
+   * @return whether both arms are integer constants that fit the target type
+   */
+  public boolean narrowConstantArms(VarType target) {
+    if (funcType != FunctionType.TERNARY || lstOperands.size() != 3) {
+      return false;
+    }
+    CodeType type = target.type;
+    if (type != CodeType.BYTE && type != CodeType.SHORT && type != CodeType.CHAR) {
+      return false;
+    }
+    for (int i = 1; i < 3; i++) {
+      if (!(lstOperands.get(i) instanceof ConstExprent constant)
+        || constant.getConstType().typeFamily != TypeFamily.INTEGER
+        || !fitsNarrow(constant.getIntValue(), type)) {
+        return false;
+      }
+    }
+    this.armConstantType = target;
+    return true;
+  }
+
+  private static boolean fitsNarrow(int value, CodeType type) {
+    return switch (type) {
+      case BYTE -> value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE;
+      case SHORT -> value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
+      case CHAR -> value >= Character.MIN_VALUE && value <= Character.MAX_VALUE;
+      default -> false;
+    };
+  }
+
+  /** One ternary arm, with its narrow constant form when the target asked for one. */
+  private TextBuffer printArm(Exprent arm, int indent) {
+    if (armConstantType != null && arm instanceof ConstExprent constant) {
+      if (armConstantType.type == CodeType.CHAR) {
+        // A char literal is already a constant of the target type; `(char)39` would be the same
+        // constant but the source form the decompiler restores char constants from is the literal.
+        constant.setConstType(VarType.VARTYPE_CHAR);
+      }
+      else {
+        return new TextBuffer().append("(").append(ExprProcessor.getTypeName(armConstantType))
+          .append(")").append(arm.toJava(indent));
+      }
+    }
+    return wrapOperandString(arm, true, indent);
   }
 
   protected TextBuffer wrapOperandString(Exprent expr, boolean eq, int indent) {

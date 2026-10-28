@@ -1583,6 +1583,14 @@ public class ExprProcessor implements CodeConstants {
       }
     }
 
+    // A ternary of in-range int constants narrowed to a byte, short or char target: the source's
+    // arms were constants of the target type (a constant cast folds to the same immediate), and
+    // the class file holds no i2b/i2c for the assignment. Printing the outer cast would add one.
+    if (doCast && exprent instanceof FunctionExprent narrowTernary
+      && narrowTernary.narrowConstantArms(leftType)) {
+      doCast = false;
+    }
+
     boolean cast = castAlways || doCast || doCastNull || doCastNarrowing || doCastGenerics || doubleCast
       || fieldBoundCast;
 
