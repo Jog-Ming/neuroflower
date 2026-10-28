@@ -426,7 +426,7 @@ public class IfStatement extends Statement {
    * Prints `} else ` and the nested if when the arm still qualifies as an else-if chain, leaving
    * the closing brace to the caller; false, printing nothing, otherwise.
    */
-  private static boolean printElseIfArm(TextBuffer buf, int indent, Statement arm) {
+  static boolean printElseIfArm(TextBuffer buf, int indent, Statement arm) {
     if (arm instanceof IfStatement
         && arm.varDefinitions.isEmpty() && (arm.getFirst().getExprents() != null && arm.getFirst().getExprents().isEmpty()) &&
         !arm.isLabeled() &&

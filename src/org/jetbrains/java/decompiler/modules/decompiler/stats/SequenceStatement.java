@@ -317,6 +317,121 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (A) { … } T …` where the condition's false branch lands on T and a jump inside the arm
+      // lands on the far side of T: the target's then arm jumps straight over the else content, so
+      // the source wrote `if (A) { … } else { T }`. A guard's arm can only fall through to T; a
+      // jump that skips T is what proves the else arm.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && !ifStatement.isPatternMatched() && !isLabeled()
+          && ifStatement.getIfstat() != null
+          && RoundTrip.selector("elseover")
+          && RoundTrip.lastBranchTarget(ifStatement.getHeadexprent()) >= 0
+          && RoundTrip.lastBranchTarget(ifStatement.getHeadexprent()) <= RoundTrip.statementStart(stats.get(i + 1))) {
+        Statement arm = ifStatement.getIfstat();
+        int from = i > 0 ? RoundTrip.lastEnd(stats.get(i - 1)) : RoundTrip.statementStart(ifStatement);
+        int elseStart = RoundTrip.lastBranchTarget(ifStatement.getHeadexprent());
+        int elseEnd = -1;
+        int previousEnd = -1;
+        for (int k = i + 1; k < stats.size(); k++) {
+          int end = RoundTrip.lastEnd(stats.get(k));
+          if (end < 0 || end <= previousEnd) {
+            break;
+          }
+          previousEnd = end;
+          if (from >= 0 && RoundTrip.jumpsOnto(from, elseStart, end)) {
+            elseEnd = k;
+            break;
+          }
+        }
+        int elseStop = elseEnd < 0 ? -1 : RoundTrip.lastEnd(stats.get(elseEnd));
+        // A sequence arm may carry the join it jumps to as its own last statement; the sequence
+        // holds the same statements after the if, so print those once and leave the arm's copy out.
+        int bodyEnd = arm.getStats().size();
+        if (elseStop > 0 && bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
+          while (bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
+            bodyEnd--;
+          }
+          if (bodyEnd == 0 || elseEnd + 1 >= stats.size()
+              || RoundTrip.firstOffset(stats.get(elseEnd + 1)) != elseStop) {
+            elseEnd = -1;
+          }
+        }
+        if (elseEnd > i && elseStart >= 0 && elseStop > elseStart && bodyEnd > 0
+            && !fallsInto(arm, elseStart, elseStop)
+            && !breaksOut(arm, elseStop)) {
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+          if (arm instanceof SequenceStatement armSeq) {
+            // Print the arm through its own statement so its printer rules still apply, without
+            // the join it absorbed: the sequence prints that once, after the else.
+            List<Statement> tail = new ArrayList<>(
+              armSeq.getStats().subList(Math.min(bodyEnd, armSeq.getStats().size()), armSeq.getStats().size()));
+            for (Statement dropped : tail) {
+              armSeq.getStats().removeWithKey(dropped.id);
+            }
+            try {
+              buf.append(ExprProcessor.jmpWrapper(armSeq, indent + 1, true));
+            } finally {
+              for (Statement dropped : tail) {
+                armSeq.getStats().addWithKey(dropped, dropped.id);
+              }
+            }
+          } else {
+            // The arm's trailing jump is the loop's own continue: the else arm's end carries it.
+            Statement previous = RoundTrip.suppressJump(arm);
+            try {
+              buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
+            } finally {
+              RoundTrip.restoreJump(previous);
+            }
+          }
+          if (!(elseEnd == i + 1 && IfStatement.printElseIfArm(buf, indent, stats.get(i + 1)))) {
+            buf.appendIndent(indent).append("} else {").appendLineSeparator();
+            for (int k = i + 1; k <= elseEnd; k++) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+            }
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+          }
+          notempty = true;
+          i = elseEnd;
+          continue;
+        }
+      }
+
+      // `if (A) { … return; } rest` where A declares an instanceof pattern variable and the first
+      // local declared after the if takes a fresh slot: javac keeps the pattern variable's slot
+      // alive through an else arm, so a local that does not reuse it proves the source wrote one.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && ifStatement.isPatternMatched() && ifStatement.getIfstat() != null
+          && ifStatement.getHeadexprent() != null
+          && !(ifStatement.getHeadexprent().getCondition() instanceof FunctionExprent negated
+               && negated.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT)
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled() && !isLabeled()
+          && !(stats.get(i + 1) instanceof IfStatement next && patternVar(next) != null)
+          && RoundTrip.selector("elsechain")
+          && exits(ifStatement.getIfstat())) {
+        int pattern = patternSlot(ifStatement);
+        int fresh = pattern < 0 ? -1 : firstDeclaredSlot(stats.get(i + 1));
+        if (fresh >= 0 && fresh != pattern) {
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          for (int k = i + 1; k < stats.size(); k++) {
+            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+          }
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          notempty = true;
+          i = stats.size();
+          continue;
+        }
+      }
+
       // `if (A) { … exit } if (B) { … exit }` with pattern variables in different slots, the first
       // no longer live where B tests, and B's variable not read afterwards: the source wrote an
       // else-if chain. Sequential ifs let javac reuse the first variable's slot.
@@ -698,7 +813,9 @@ public class SequenceStatement extends Statement {
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           Statement movedRest = new SequenceStatement(stats.subList(i + 1, stats.size()));
-          boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest);
+          boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest)
+            || RoundTrip.jumpsOnto(RoundTrip.firstOffset(movedRest),
+                 RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(movedRest, indent + 1, true));
           if (asElse) {
@@ -1135,6 +1252,69 @@ public class SequenceStatement extends Statement {
       return !exprents.isEmpty() && exprents.get(exprents.size() - 1) instanceof ExitExprent;
     }
     return endsWithExit(last.getStats());
+  }
+
+  /** The target's slot for the first local this statement declares, or -1. */
+  private static int firstDeclaredSlot(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents == null) {
+      return -1;
+    }
+    int start = -1;
+    int slot = -1;
+    for (Exprent exprent : exprents) {
+      for (Exprent part : exprent.getAllExprents(true, true)) {
+        if (part instanceof VarExprent variable && variable.isDefinition() && variable.getLVT() != null) {
+          int declared = variable.getLVT().getStartPC();
+          if (start < 0 || declared < start) {
+            start = declared;
+            slot = variable.getLVT().getIndex();
+          }
+        }
+      }
+    }
+    return slot;
+  }
+
+  /**
+   * Whether the arm leaves by a break to the join: a chain of guards that each break out of a
+   * shared block, or a loop arm that breaks out of the loop, which other rules already print.
+   */
+  private static boolean breaksOut(Statement arm, int join) {
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(arm);
+    while (!queue.isEmpty()) {
+      Statement stat = queue.poll();
+      for (StatEdge edge : stat.getAllDirectSuccessorEdges()) {
+        Statement destination = edge.getDestination();
+        if (edge.getType() == StatEdge.TYPE_BREAK && destination != null
+            && !arm.containsStatementStrict(destination) && destination != arm
+            && !(destination instanceof DummyExitStatement)
+            && RoundTrip.firstOffset(destination) >= join) {
+          return true;
+        }
+      }
+      queue.addAll(stat.getStats());
+    }
+    return false;
+  }
+
+  /**
+   * Whether any edge out of this arm lands inside that byte range: an arm that falls into the
+   * code after it never skipped it, so the code is not an else arm.
+   */
+  private static boolean fallsInto(Statement arm, int from, int to) {
+    for (StatEdge edge : arm.getAllDirectSuccessorEdges()) {
+      Statement destination = edge.getDestination();
+      if (destination == null || arm.containsStatementStrict(destination)) {
+        continue;
+      }
+      int start = RoundTrip.firstOffset(destination);
+      if (start >= from && start < to) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Whether the first if's pattern variable is still in scope where the second if tests. */

@@ -29,6 +29,8 @@ import java.util.List;
 
 /** Target-aware choices for byte-faithful output. Only active with {@code --round-trip=1}. */
 public final class RoundTrip {
+  /** A statement whose trailing jump an enclosing print has taken over (an else's implicit exit). */
+  private static final ThreadLocal<Statement> SUPPRESSED_JUMP = new ThreadLocal<>();
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instruction end offset by start offset; the live sequence is released before printing. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
@@ -1731,7 +1733,7 @@ public final class RoundTrip {
       .anyMatch(v -> v.getStart() >= start && v.getStart() <= end);
   }
 
-  private static int lastEnd(Statement stat) {
+  public static int lastEnd(Statement stat) {
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
     if (ends == null) {
@@ -2723,6 +2725,88 @@ public final class RoundTrip {
       return false;
     }
     return guards == null || !guards.containsKey(end);
+  }
+
+  /** Marks a statement whose trailing jump the caller prints as part of a wider shape. */
+  public static Statement suppressJump(Statement stat) {
+    Statement old = SUPPRESSED_JUMP.get();
+    SUPPRESSED_JUMP.set(stat);
+    return old;
+  }
+
+  public static void restoreJump(Statement old) {
+    if (old == null) {
+      SUPPRESSED_JUMP.remove();
+    } else {
+      SUPPRESSED_JUMP.set(old);
+    }
+  }
+
+  public static boolean isJumpSuppressed(Statement stat) {
+    return stat != null && SUPPRESSED_JUMP.get() == stat;
+  }
+
+  /** The first instruction offset of a statement, counting an if statement's head condition. */
+  public static int statementStart(Statement stat) {
+    int min = firstOffset(stat);
+    if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStat
+        && ifStat.getHeadexprent() != null) {
+      BitSet bits = ifStat.getHeadexprent().bytecode;
+      if (bits != null && !bits.isEmpty()) {
+        int offset = bits.nextSetBit(0);
+        if (offset >= 0 && (min < 0 || offset < min)) {
+          min = offset;
+        }
+      }
+    }
+    return min;
+  }
+
+  /** The jump target of a condition's last branch, the branch that skips the then arm, or -1. */
+  public static int lastBranchTarget(Exprent head) {
+    StructMethod method = currentMethod();
+    BitSet offsets = head == null ? null : head.bytecode;
+    if (method == null || offsets == null || offsets.isEmpty()) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    if (targets == null) {
+      return -1;
+    }
+    Integer target = targets.get(offsets.length());
+    return target == null ? -1 : target;
+  }
+
+  /**
+   * True when a forward jump starting in {@code [from, before)} lands on {@code target}: the code
+   * there leaves by skipping straight over the range, which no fall-through path does.
+   */
+  public static boolean jumpsOnto(int from, int before, int target) {
+    StructMethod method = currentMethod();
+    if (method == null || from < 0 || before < 0 || target < 0) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos != null) {
+      for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+        if (entry.getValue() == target && entry.getValue() > entry.getKey()
+            && entry.getKey() >= from && entry.getKey() < before) {
+          return true;
+        }
+      }
+    }
+    java.util.Map<Integer, Integer> branches = BRANCH_TARGETS.get(method);
+    if (branches != null) {
+      // A conditional branch is keyed by the offset just past it; the instruction starts before.
+      for (java.util.Map.Entry<Integer, Integer> entry : branches.entrySet()) {
+        int start = entry.getKey() - 1;
+        if (entry.getValue() == target && entry.getValue() > entry.getKey()
+            && start >= from && start < before) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
