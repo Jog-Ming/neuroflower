@@ -238,6 +238,14 @@ public class SwitchStatement extends Statement {
       List<Exprent> values = caseValues.get(i);
       Exprent guard = caseGuards.size() > i ? caseGuards.get(i) : null;
 
+      // An empty arm whose table entry is the join instruction itself: javac writes no code for
+      // a label with an empty body, so the source either wrote no group or an empty one at the
+      // very end — both compile to this table. Print nothing for it.
+      if (RoundTrip.selector("switchempty") && RoundTrip.firstOffset(stat) < 0
+          && armLandsOnJoinDirectly(i, switchEnd)) {
+        continue;
+      }
+
       boolean anyLabel = false;
       for (int j = 0; j < edges.size(); j++) {
         if (edges.get(j) == defaultEdge) {
@@ -451,6 +459,49 @@ public class SwitchStatement extends Statement {
       jump = target;
     }
     return jump;
+  }
+
+  /**
+   * True when this arm's case labels all land on the join instruction itself, and the labels sit
+   * inside the table's key span: dropping them leaves the same tableswitch, since javac writes
+   * the default's own offset for a key with no label. A label at the span's edge, or in a
+   * lookupswitch, does change the instruction and the source must have written it.
+   */
+  private boolean armLandsOnJoinDirectly(int index, int switchEnd) {
+    if (switchEnd < 0 || index < 0 || index >= caseEdges.size()) {
+      return false;
+    }
+    List<StatEdge> edges = caseEdges.get(index);
+    SwitchInstruction instruction = switchInstruction();
+    int[] targets = instruction == null ? null : RoundTrip.switchTargetsAt(instruction.startOffset);
+    if (targets == null || edges.isEmpty()
+        || instruction.opcode != org.jetbrains.java.decompiler.code.CodeConstants.opc_tableswitch) {
+      return false;
+    }
+    int[] keys = instruction.getValues();
+    if (keys.length == 0 || defaultTargetOffset() != switchEnd) {
+      return false;
+    }
+    List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    boolean any = false;
+    for (StatEdge edge : edges) {
+      if (edge == defaultEdge) {
+        continue;
+      }
+      int at = successors.indexOf(edge);
+      if (at < 0 || at >= targets.length || targets[at] != switchEnd
+          || RoundTrip.jumpTargetAt(targets[at]) >= 0) {
+        return false;
+      }
+      // The table's first and last keys come from a written label: a gap in the middle still
+      // has an entry, an endpoint without one would shrink the table.
+      int position = at - 1;
+      if (position <= 0 || position >= keys.length - 1) {
+        return false;
+      }
+      any = true;
+    }
+    return any;
   }
 
   private Statement joinArmForDefault() {

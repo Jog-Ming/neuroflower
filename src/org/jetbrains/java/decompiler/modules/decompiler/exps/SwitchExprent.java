@@ -240,8 +240,8 @@ public class SwitchExprent extends Exprent {
         continue;
       }
       for (int j = 0; j < edges.size(); j++) {
-        if (j >= values.size() || !(values.get(j) instanceof ConstExprent) && !(values.get(j) instanceof FieldExprent)) {
-          return order; // patterns and other labels have ordering rules of their own
+        if (j >= values.size() || !labelOrdersByBlock(values.get(j))) {
+          return order; // a label the layout does not place
         }
       }
       if (this.backing.getCaseGuards().size() > i && this.backing.getCaseGuards().get(i) != null) {
@@ -253,6 +253,19 @@ public class SwitchExprent extends Exprent {
     // restores the source's arm order.
     order.sort((a, b) -> Integer.compare(offset[a], offset[b]));
     return order;
+  }
+
+  /**
+   * Whether an arm carrying this label prints where its block sits. A constant or an enum field
+   * does; so does a pattern label and `case null` — javac lays those blocks out in source order
+   * like any other arm, the key table only reorders the labels.
+   */
+  private static boolean labelOrdersByBlock(Exprent value) {
+    if (value instanceof ConstExprent || value instanceof FieldExprent) {
+      return true;
+    }
+    return value instanceof FunctionExprent function
+      && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF;
   }
 
   /** The type the enclosing context expects from this value; consumed by the next {@link #toJava}. */
