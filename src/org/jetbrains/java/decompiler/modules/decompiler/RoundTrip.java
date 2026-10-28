@@ -74,6 +74,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Return instructions of a try-shaped `store S; goto M` / `M: load S; ret`, by the return's start. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> TRY_RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** First offsets of empty catch bodies, by offset, with the protected range's start. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> EMPTY_CATCHES = new java.util.concurrent.ConcurrentHashMap<>();
 
   private RoundTrip() {}
 
@@ -239,6 +241,30 @@ public final class RoundTrip {
       }
     }
     HANDLER_ENDS.put(method, handlerEnds);
+    // javac writes a catch parameter's table entry for every non-empty catch body. Its absence at
+    // the first instruction after the store marks a body the source left empty; the printer sees
+    // only the statement the decompiler folded in there, so remember where such a body starts.
+    java.util.Map<Integer, Integer> emptyCatches = new java.util.HashMap<>();
+    if (table != null && method.getLocalVariableAttr() != null) {
+      StructLocalVariableTableAttribute catches = method.getLocalVariableAttr();
+      for (org.jetbrains.java.decompiler.code.ExceptionHandler handler : table.getHandlers()) {
+        int handlerIndex = handler.handler();
+        if (handler.exceptionClass() == null || handlerIndex < 0 || handlerIndex >= seq.length()) {
+          continue;
+        }
+        Instruction store = seq.getInstr(handlerIndex);
+        if (store.opcode != CodeConstants.opc_astore) {
+          continue;
+        }
+        int body = store.startOffset + store.length;
+        if (catches.matchingVars(store.operand(0), body).findFirst().isPresent()) {
+          continue;
+        }
+        int from = handler.from() < seq.length() ? seq.getInstr(handler.from()).startOffset : -1;
+        emptyCatches.put(body, from);
+      }
+    }
+    EMPTY_CATCHES.put(method, emptyCatches);
     // A try body that ends `store S; goto M` with `M: load S; ret` keeps the value in a variable the
     // source declared outside the block: the target's table has two ranges for the slot, one ending
     // where the handler starts and one covering the load and the return. A single range is the
@@ -4454,6 +4480,20 @@ public final class RoundTrip {
     }
     out.sort(java.util.Comparator.comparingInt(a -> a[0]));
     return out;
+  }
+
+  /**
+   * The protected range's start when the target's table proves a catch body starting at this
+   * offset was empty (javac writes no parameter entry for an empty body), or -1.
+   */
+  public static int emptyCatchFrom(int bodyStart) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> empties = method == null ? null : EMPTY_CATCHES.get(method);
+    if (empties == null || bodyStart < 0) {
+      return -1;
+    }
+    Integer from = empties.get(bodyStart);
+    return from == null ? -1 : from;
   }
 
   public static StructMethod currentMethod() {

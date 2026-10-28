@@ -303,18 +303,37 @@ public class CatchStatement extends Statement {
           }
         }
       }
-      buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, false)).appendIndent(indent);
-      // javac attributes the instruction after a try's protected range to the last catch's
-      // closing brace. Map that offset to the brace so the aligner pads the arm to the line
-      // the table records instead of leaving the brace on its unaligned line.
-      if (i == stats.size() - 1 && handlerOffset != null) {
-        int exitOffset = RoundTrip.handlerExitOffset(handlerOffset);
-        if (exitOffset >= 0 && RoundTrip.lineAtOffset(exitOffset) > 0
-            && RoundTrip.lineAtOffset(exitOffset) != RoundTrip.lineAtOffset(exitOffset - 1)) {
-          buf.addBytecodeMapping(exitOffset);
+      // The handler's store block itself was dropped as dead code, so the statement the
+      // decompiler folded in is not the catch body: the table writes no entry for an empty
+      // catch body, and this statement starts exactly where such a body would. Print the brace
+      // empty and the folded statement after it, where the source wrote it.
+      int emptiedStart = -1;
+      if (i == stats.size() - 1 && (stat.getExprents() == null || stat.getExprents().isEmpty())
+          && getParent() != null
+          && (getParent().type == StatementType.SEQUENCE || getParent().type == StatementType.ROOT)) {
+        emptiedStart = emptiedHandlerStart(stat);
+      }
+      if (emptiedStart < 0) {
+        buf.append(ExprProcessor.jmpWrapper(stat, indent + 1, false)).appendIndent(indent);
+        // javac attributes the instruction after a try's protected range to the last catch's
+        // closing brace. Map that offset to the brace so the aligner pads the arm to the line
+        // the table records instead of leaving the brace on its unaligned line.
+        if (i == stats.size() - 1 && handlerOffset != null) {
+          int exitOffset = RoundTrip.handlerExitOffset(handlerOffset);
+          if (exitOffset >= 0 && RoundTrip.lineAtOffset(exitOffset) > 0
+              && RoundTrip.lineAtOffset(exitOffset) != RoundTrip.lineAtOffset(exitOffset - 1)) {
+            buf.addBytecodeMapping(exitOffset);
+          }
         }
       }
+      else {
+        buf.appendIndent(indent);
+      }
       buf.append("}");
+      if (emptiedStart >= 0) {
+        buf.appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(stat, indent, true));
+      }
       if (tail != null) {
         buf.appendLineSeparator();
         buf.append(ExprProcessor.listToJava(tail, indent));
@@ -427,6 +446,26 @@ public class CatchStatement extends Statement {
       }
     }
     return body;
+  }
+
+  /**
+   * The first offset of a statement the decompiler folded into a handler whose own store was
+   * dropped as dead code, or -1 when the table does not prove the catch body was empty. javac
+   * writes the parameter's entry for every non-empty body, and an empty body's protected range
+   * begins at or before this try's, so the absence of an entry where the folded statement starts
+   * marks the original empty catch.
+   */
+  private int emptiedHandlerStart(Statement handler) {
+    int start = RoundTrip.firstOffset(handler);
+    int from = RoundTrip.emptyCatchFrom(start);
+    if (start < 0 || from < 0) {
+      return -1;
+    }
+    int bodyStart = RoundTrip.firstOffset(first);
+    if (bodyStart < 0 || from > bodyStart) {
+      return -1;
+    }
+    return start;
   }
 
   private static boolean usesVar(Exprent exprent, int index) {
