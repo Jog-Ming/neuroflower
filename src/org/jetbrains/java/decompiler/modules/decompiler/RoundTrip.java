@@ -381,6 +381,41 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when the statement's first local lives in the enclosing block's scope rather than a block
+   * of its own. javac writes a local variable's table entry when its scope closes, so a local
+   * nested in a block is written before every local of the enclosing block; one written after them
+   * shares the enclosing block.
+   */
+  public static boolean sharesEnclosingScope(Statement stat, int enclosingStart) {
+    if (!selector("switchjoin")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null
+      : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null || enclosingStart < 0) {
+      return false;
+    }
+    LocalVariable local = firstDefinedLvt(stat);
+    if (local == null || local.getOrder() < 0) {
+      return false;
+    }
+    // Only a local of the block our own declaration lives in closes with it; parameters and
+    // method-scope locals are written after both and say nothing about the nesting.
+    boolean anyEnclosing = false;
+    for (LocalVariable var : table.getVariables().toList()) {
+      if (var.getEnd() == local.getEnd() && var.getOrder() != local.getOrder()
+          && var.getStart() <= enclosingStart) {
+        if (var.getOrder() > local.getOrder()) {
+          return false;
+        }
+        anyEnclosing = true;
+      }
+    }
+    return anyEnclosing;
+  }
+
   public static LocalVariable firstDefinedLvt(Statement stat) {
     if (stat.getExprents() != null) {
       for (Exprent exprent : stat.getExprents()) {

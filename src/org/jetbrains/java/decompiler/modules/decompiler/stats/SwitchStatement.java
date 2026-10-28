@@ -219,6 +219,12 @@ public class SwitchStatement extends Statement {
       && RoundTrip.selector("switchbreak") && RoundTrip.selector("switchdefault")
       && !yields && !isPattern() && caseGuards.stream().noneMatch(Objects::nonNull);
 
+    // The default arm can also be the block the source wrote after the switch: the default target
+    // opens the arm's block, and the local variable table says a declaration inside it shares the
+    // enclosing block's scope, where a block-scoped one would have closed first. The label was
+    // empty then, and the statements belong after the switch's closing brace.
+    Statement joinArm = defaultJoinArm(yields);
+
     boolean defaultPrinted = false;
     boolean lastJoins = false;
     for (int i : order) {
@@ -234,7 +240,7 @@ public class SwitchStatement extends Statement {
       boolean anyLabel = false;
       for (int j = 0; j < edges.size(); j++) {
         if (edges.get(j) == defaultEdge) {
-          if (defaultIsJoin) {
+          if (defaultIsJoin || stat == joinArm) {
             continue;
           }
           anyLabel = true;
@@ -365,11 +371,49 @@ public class SwitchStatement extends Statement {
 
     buf.appendIndent(indent).append("}").appendLineSeparator();
 
+    if (joinArm != null) {
+      buf.append(ExprProcessor.jmpWrapper(joinArm, indent, false));
+    }
+
     if (this.isPhantom()) {
       buf.append("*/");
     }
 
     return buf;
+  }
+
+  /**
+   * The default arm whose body the source wrote after the switch, or null. The arm's block has to
+   * start at the default target, carry no case labels of its own, and declare a local that the
+   * target's table puts in the enclosing block's scope.
+   */
+  private Statement defaultJoinArm(boolean yields) {
+    if (defaultEdge == null || yields || isPattern() || caseGuards.stream().anyMatch(Objects::nonNull)) {
+      return null;
+    }
+    Statement arm = defaultEdge.getDestination();
+    if (arm == null || !caseStatements.contains(arm)) {
+      return null;
+    }
+    int at = RoundTrip.firstOffset(arm);
+    if (at < 0 || at != defaultTargetOffset()) {
+      return null;
+    }
+    // The arm must be reachable only through the default label; one that also carries case labels
+    // is a real group the jump table enters.
+    for (List<StatEdge> edges : caseEdges) {
+      for (StatEdge edge : edges) {
+        if (edge != defaultEdge && edge.getDestination() == arm) {
+          return null;
+        }
+      }
+    }
+    // A local already in scope where the arm's block starts was declared outside the switch; the
+    // table's order says whether the arm's own declaration shares that scope.
+    if (!RoundTrip.sharesEnclosingScope(arm, at)) {
+      return null;
+    }
+    return arm;
   }
 
   /**
