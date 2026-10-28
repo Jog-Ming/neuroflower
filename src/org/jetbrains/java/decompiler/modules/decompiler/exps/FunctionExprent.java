@@ -526,6 +526,29 @@ public class FunctionExprent extends Exprent {
   }
 
   /**
+   * A recorded checkcast widening a concrete array to {@code Object[]}: javac emits a checkcast
+   * for an array conversion written in source even though no runtime test is needed, and it never
+   * inserts one itself between two concrete arrays, so the cast is the source's. Only a concrete
+   * element class qualifies: an erased or type-variable operand is a compiler adaptation.
+   */
+  private boolean recordedArrayWideningCast() {
+    if (!recordedCheckcast || lstOperands.size() < 2) {
+      return false;
+    }
+    VarType target = lstOperands.get(1).getExprType();
+    VarType value = lstOperands.get(0).getExprType();
+    if (target == null || value == null || target.arrayDim != 1 || value.arrayDim != 1
+      || target.type != org.jetbrains.java.decompiler.struct.gen.CodeType.OBJECT
+      || !"java/lang/Object".equals(target.value)
+      || value.type != org.jetbrains.java.decompiler.struct.gen.CodeType.OBJECT || value.value == null) {
+      return false;
+    }
+    org.jetbrains.java.decompiler.struct.StructClass element =
+      DecompilerContext.getStructContext().getClass(value.value);
+    return element != null && (element.getSignature() == null || element.getSignature().fparameters.isEmpty());
+  }
+
+  /**
    * A cast javac inserts on its own: a self-typed call (`<T extends ArgumentBuilder<S,T>> T
    * executes(...)`) erases to its bound, and the compiler casts the result back to the receiver's
    * class before the next link uses it. The source never wrote that cast, the type it names is an
@@ -712,7 +735,7 @@ public class FunctionExprent extends Exprent {
       case IMM:
         return buf.append(wrapOperandString(lstOperands.get(0), true, indent).append(funcType.operator));
       case CAST:
-        if (!needsCast && (compilerCast || !RoundTrip.forceCast(this))
+        if (!needsCast && (compilerCast || !(RoundTrip.forceCast(this) || recordedArrayWideningCast()))
             || selfTypedReceiverCast()) {
           return buf.append(lstOperands.get(0).toJava(indent));
         }

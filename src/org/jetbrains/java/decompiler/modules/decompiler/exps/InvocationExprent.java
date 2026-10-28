@@ -3046,13 +3046,28 @@ public class InvocationExprent extends Exprent {
           } else if (type.equals(pmd.params[i])) {
             ambiguous.set(i);
           } else if (type.type == CodeType.NULL) {
-            ambiguous.set(i);
+            // A null literal needs no cast when the recorded method is the most specific of the
+            // candidates: javac's overload choice among null arguments is the method whose
+            // parameter types are subtypes of every other candidate's, so printing the cast
+            // would only add the checkcast the source did not have.
+            if (!mostSpecificNullParameter(md.params[i], pmd.params[i])) {
+              ambiguous.set(i);
+            }
           }
         }
       }
     }
 
     return ambiguous;
+  }
+
+  /** Whether the recorded parameter type is a subtype of a rival candidate's for a null argument. */
+  private static boolean mostSpecificNullParameter(VarType recorded, VarType rival) {
+    if (recorded == null || rival == null || recorded.type != CodeType.OBJECT || rival.type != CodeType.OBJECT
+      || recorded.arrayDim != rival.arrayDim) {
+      return false;
+    }
+    return DecompilerContext.getStructContext().instanceOf(recorded.value, rival.value);
   }
 
   private boolean processGenericMapping(VarType from, VarType to, Map<VarType, List<VarType>> named, Map<VarType, List<VarType>> bounds) {
@@ -5435,7 +5450,8 @@ public class InvocationExprent extends Exprent {
     int count = Math.min(declaredParams.size(), lstParameters.size());
     for (int p = 0; p < count; p++) {
       if (!(lstParameters.get(p) instanceof NewExprent argument) || !argument.isLambda()
-        || argument.isMethodReference() || !(declaredParams.get(p) instanceof GenericType functional)) {
+        || argument.isMethodReference()
+        || !(declaredParams.get(p) instanceof GenericType functional)) {
         continue;
       }
       ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(argument.getNewType().value);
