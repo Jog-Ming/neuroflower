@@ -331,7 +331,6 @@ public class SequenceStatement extends Statement {
               || second.getFirst().getExprents().isEmpty())
           && exits(first.getIfstat()) && exits(second.getIfstat())
           && patternVar(first) != null && patternVar(second) != null
-          && !patternVar(first).getName().equals(patternVar(second).getName())
           && patternSlot(first) >= 0 && patternSlot(second) >= 0
           && patternSlot(first) != patternSlot(second)
           && !aliveAt(first, second)
@@ -1141,9 +1140,9 @@ public class SequenceStatement extends Statement {
   /** Whether the first if's pattern variable is still in scope where the second if tests. */
   private static boolean aliveAt(IfStatement first, IfStatement second) {
     var method = RoundTrip.currentMethod();
-    VarExprent variable = patternVar(first);
+    int slot = patternSlot(first);
     int at = RoundTrip.firstOffset(second);
-    if (method == null || variable == null || at < 0) {
+    if (method == null || slot < 0 || at < 0) {
       return false;
     }
     org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute table =
@@ -1151,7 +1150,7 @@ public class SequenceStatement extends Statement {
     if (table == null) {
       return false;
     }
-    return table.getVariables().anyMatch(entry -> entry.getIndex() == variable.getIndex()
+    return table.getVariables().anyMatch(entry -> entry.getIndex() == slot
       && entry.getStartPC() <= at && at < entry.getStartPC() + entry.getLength());
   }
 
@@ -1171,10 +1170,18 @@ public class SequenceStatement extends Statement {
     return null;
   }
 
-  /** The slot of the instanceof pattern variable this if declares, or -1. */
+  /** The target's slot for the instanceof pattern variable this if declares, or -1. */
   private static int patternSlot(IfStatement stat) {
     VarExprent variable = patternVar(stat);
-    return variable == null ? -1 : variable.getIndex();
+    if (variable == null) {
+      return -1;
+    }
+    // A pattern the tree rebuilt from a cast store carries a decompiler-assigned index; the
+    // target's local table names the slot javac actually used.
+    if (variable.getLVT() != null) {
+      return variable.getLVT().getIndex();
+    }
+    return variable.getIndex();
   }
 
   /** Whether this statement's own body ends with a return or a throw. */
