@@ -770,6 +770,18 @@ public class MergeHelper {
     if (lastData != null && !lastData.getExprents().isEmpty()) {
       lastExprent = lastData.getExprents().get(lastData.getExprents().size() - 1);
     }
+    if (!(lastExprent instanceof FunctionExprent)) {
+      // The switch body's default target can be the loop's own update: the table sends every
+      // unmatched value there, the block increments the index and jumps back to the head. The
+      // source wrote that update in the for header, so the arm holds the loop's update and not
+      // an arm statement of its own.
+      Statement arm = defaultUpdateArm(stat);
+      if (arm != null) {
+        lastData = arm;
+        lastExprent = arm.getExprents().get(arm.getExprents().size() - 1);
+        RoundTrip.recordLoopUpdateArm(arm);
+      }
+    }
 
     if (stat.getLooptype() == DoStatement.Type.WHILE && initExprents[0] != null && firstDoExprent != null) {
       if (isIteratorCall(initExprents[0].getRight())) {
@@ -976,6 +988,36 @@ public class MergeHelper {
     //cleanEmptyStatements(stat, firstData); //TODO: Look into this and see what it does...
 
     return false;
+  }
+
+  /**
+   * The default arm of the loop body's switch when it is the loop's update: its last exprent is
+   * an increment and it jumps back to the loop's head.
+   */
+  private static Statement defaultUpdateArm(DoStatement stat) {
+    Statement body = stat.getFirst();
+    if (!(body instanceof SwitchStatement sw)) {
+      return null;
+    }
+    StatEdge defaultEdge = sw.getDefaultEdge();
+    Statement arm = defaultEdge == null ? null : defaultEdge.getDestination();
+    if (arm == null || arm.getExprents() == null || arm.getExprents().isEmpty()) {
+      return null;
+    }
+    Exprent last = arm.getExprents().get(arm.getExprents().size() - 1);
+    if (!(last instanceof FunctionExprent function)) {
+      return null;
+    }
+    FunctionType type = function.getFuncType();
+    if (type != FunctionType.PPI && type != FunctionType.IPP) {
+      return null;
+    }
+    for (StatEdge edge : arm.getAllSuccessorEdges()) {
+      if (edge.getType() == StatEdge.TYPE_CONTINUE && edge.getDestination() == stat) {
+        return arm;
+      }
+    }
+    return null;
   }
 
   // Use DirectGraph traversal to see if a variable has been used before [TestForeachVardef]

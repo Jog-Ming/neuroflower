@@ -190,6 +190,14 @@ public class SwitchStatement extends Statement {
     // instruction can overshoot the join when its condition exprent records no offset of its own,
     // so an arm's own landing that sits before it names the join more precisely.
     int switchEnd = switchEndFromSibling();
+    // An arm that held the index loop's update is the join the for-each header absorbed: the
+    // table's default target is where every `break;` and the loop's update landed.
+    if (RoundTrip.isLoopUpdateArm(defaultEdge == null ? null : defaultEdge.getDestination())) {
+      int update = defaultTargetOffset();
+      if (update >= 0) {
+        switchEnd = update;
+      }
+    }
     int jumpEnd = switchEndFromJumps();
     int targetEnd = switchEndFromTargetJumps();
     if (targetEnd >= 0 && (jumpEnd < 0 || targetEnd < jumpEnd)) {
@@ -255,6 +263,10 @@ public class SwitchStatement extends Statement {
     // enclosing block's scope, where a block-scoped one would have closed first. The label was
     // empty then, and the statements belong after the switch's closing brace.
     Statement joinArm = defaultJoinArm(yields);
+    // The arm held the index loop's update, which the for-each header carries now: the table's
+    // default target is the loop's own back edge and the source wrote no group there.
+    Statement updateArm = defaultEdge != null && RoundTrip.isLoopUpdateArm(defaultEdge.getDestination())
+      ? defaultEdge.getDestination() : null;
     Statement caseJoinArm = caseJoinArm(yields, switchEnd);
 
     // An empty `default: break;` group compiles to a jump the table's default target points at.
@@ -315,7 +327,7 @@ public class SwitchStatement extends Statement {
       boolean anyLabel = false;
       for (int j = 0; j < edges.size(); j++) {
         if (edges.get(j) == defaultEdge) {
-          if (defaultIsJoin || stat == joinArm) {
+          if (defaultIsJoin || stat == joinArm || stat == updateArm) {
             continue;
           }
           anyLabel = true;
@@ -427,7 +439,11 @@ public class SwitchStatement extends Statement {
       // group is no exception: javac keeps a break's jump whenever another group follows it, and
       // the trailing `default:` below supplies that group.
       boolean armLeaves = leavesArm(armText);
-      boolean joins = breakJump >= 0;
+      // An arm whose closing if hangs the arm's jump to the join on its own branch: the source
+      // wrote the `break;` after the if, and javac merged it into the test.
+      Statement joinTarget = joinArm != null ? joinArm : updateArm;
+      boolean tailJumpsToJoin = joinTarget != null && tailIfJumpsToJoin(stat, joinTarget);
+      boolean joins = breakJump >= 0 || tailJumpsToJoin;
       if (i == lastPrinted) {
         lastJoins = joins;
       }
@@ -440,7 +456,7 @@ public class SwitchStatement extends Statement {
       // only its then-block, so the `break;` the source wrote after it is on no page. A break
       // that lives inside a nested block is printed by that block, and a guard's own break edge
       // hangs off a statement without a then-block, which prints it.
-      boolean breakPrinted = RoundTrip.printsExplicitJump(stat) && !tailIfCarriesBreak(stat);
+      boolean breakPrinted = RoundTrip.printsExplicitJump(stat) && !tailIfCarriesBreak(stat) && !tailJumpsToJoin;
       boolean breakInside = false;
       if (RoundTrip.selector("switchbreak") && joins && !yields && !orderUnknown
           && guard == null && !patternArm && !breakPrinted
@@ -845,6 +861,30 @@ public class SwitchStatement extends Statement {
       jump = target;
     }
     return jump;
+  }
+
+  /**
+   * True when the statement closing this arm is an if whose then-block exits and whose fall-out
+   * lands on the join: the arm's branch is the `break;` the source wrote after the if, which javac
+   * merged into the test.
+   */
+  private static boolean tailIfJumpsToJoin(Statement arm, Statement join) {
+    Statement last = arm;
+    while (last instanceof SequenceStatement && !last.getStats().isEmpty()) {
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
+    if (!(last instanceof IfStatement ifStat) || ifStat.getIfstat() == null) {
+      return false;
+    }
+    if (RoundTrip.canCompleteNormally(ifStat.getIfstat())) {
+      return false;
+    }
+    for (StatEdge edge : last.getAllSuccessorEdges()) {
+      if (edge.getDestination() == join) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

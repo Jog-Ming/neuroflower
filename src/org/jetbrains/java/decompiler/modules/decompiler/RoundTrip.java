@@ -104,6 +104,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Return instructions of a try-shaped `store S; goto M` / `M: load S; ret`, by the return's start. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> TRY_RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Switch arms that held a for-each's update: the label the source never wrote. */
+  private static final java.util.Set<Statement> LOOP_UPDATE_ARMS = java.util.concurrent.ConcurrentHashMap.newKeySet();
   /** First offsets of empty catch bodies, by offset, with the protected range's start. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> EMPTY_CATCHES = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -7269,6 +7271,15 @@ public final class RoundTrip {
     }
     Integer from = empties.get(bodyStart);
     return from == null ? -1 : from;
+  }
+
+  /** Reads the update a for-each's index loop carried, so the switch's default label is not printed. */
+  public static void recordLoopUpdateArm(Statement arm) {
+    LOOP_UPDATE_ARMS.add(arm);
+  }
+
+  public static boolean isLoopUpdateArm(Statement arm) {
+    return arm != null && LOOP_UPDATE_ARMS.contains(arm);
   }
 
   public static StructMethod currentMethod() {

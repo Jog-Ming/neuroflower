@@ -276,6 +276,11 @@ public class MethodProcessor implements Runnable {
           decompileRecord.incrementMergeLoop();
           decompileRecord.add("MergeLoopStart", root);
 
+          if (NestedLoopMerge.merge(root, mt, varProc)) {
+            decompileRecord.add("NestedLoopMerge", root);
+            continue;
+          }
+
           if (EliminateLoopsHelper.eliminateLoops(root, cl)) {
             decompileRecord.add("EliminateLoops", root);
             continue;
