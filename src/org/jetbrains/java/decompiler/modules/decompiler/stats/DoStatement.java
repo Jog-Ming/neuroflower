@@ -269,7 +269,12 @@ public class DoStatement extends Statement {
       case FOR:
         int incLine = RoundTrip.sourceLineDeep(incExprent.get(0));
         int condLine = RoundTrip.sourceLineDeep(conditionExprent.get(0));
-        if (incLine >= 0 && condLine >= 0 && incLine != condLine) {
+        // A guard statement the decompiler fused into the condition lands on a later line in the
+        // target than the loop's increment: that line difference is the guard's, not proof of a
+        // split `int i = 0; while (...) { ...; i++; }`. When the branch-then-goto pair proves the
+        // guard, the for form below prints it and its condition stays on the header's line.
+        if (incLine >= 0 && condLine >= 0 && incLine != condLine
+            && RoundTrip.foldedBreakGuard(conditionExprent.get(0), this, first) == null) {
           TextBuffer body = ExprProcessor.jmpWrapper(first, indent + 1, false);
           if (!endsWithTransfer(body)) {
             Exprent init = initExprent.get(0);
