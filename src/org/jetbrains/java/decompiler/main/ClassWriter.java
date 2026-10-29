@@ -234,6 +234,12 @@ public class ClassWriter implements StatementWriter {
             && writeLambdaMethodReference(node, cl, mt, method_object, buffer, indent, md_content, md_lambda)) {
           return;
         }
+        // A field-initializer method reference to a member class's constructor is lowered to an
+        // instance lambda whose body allocates the class; javac names that method after the
+        // field, while an explicit lambda in the same place is named after the synthetic block.
+        if (!lambdaToAnonymous && writeInnerConstructorReference(node, cl, mt, buffer, md_content, md_lambda)) {
+          return;
+        }
 
         boolean simpleLambda = false;
         boolean written = false;
@@ -915,6 +921,122 @@ public class ClassWriter implements StatementWriter {
       return false;
     }
     buffer.appendCastTypeName(new VarType(created, true)).append("::new");
+    return true;
+  }
+
+  /**
+   * A constructor reference to a non-static member class, lowered to an instance lambda:
+   * {@code new T; dup; aload_0; load the functional arguments; invokespecial T.<init>(cl, args);
+   * areturn}. javac names the synthetic method of a field-initializer method reference after the
+   * field ({@code lambda$field$0}); an explicit lambda in the same initializer is named after the
+   * synthetic block ({@code lambda$new$0}). The name therefore selects the {@code T::new} print
+   * for a body that is exactly the reference, and an explicit lambda keeps its lambda form. The
+   * simple name prints with no type arguments: the source reference names the class alone, and
+   * the target records no arguments for this allocation to reprint.
+   */
+  private boolean writeInnerConstructorReference(ClassNode node, StructClass cl, StructMethod mt,
+                                                 TextBuffer buffer, MethodDescriptor md_content,
+                                                 MethodDescriptor md_lambda) {
+    if (!RoundTrip.selector("innernewref") || mt == null
+        || node.lambdaInformation.content_method_invocation_type
+           != CodeConstants.CONSTANT_MethodHandle_REF_invokeVirtual
+        || (mt.getAccessFlags() & (CodeConstants.ACC_PRIVATE | CodeConstants.ACC_STATIC
+           | CodeConstants.ACC_SYNTHETIC))
+           != (CodeConstants.ACC_PRIVATE | CodeConstants.ACC_SYNTHETIC)) {
+      return false;
+    }
+    String name = mt.getName();
+    int fieldStart = "lambda$".length();
+    int separator = name.lastIndexOf('$');
+    if (!name.startsWith("lambda$") || separator <= fieldStart || separator == name.length() - 1) {
+      return false;
+    }
+    for (int i = separator + 1; i < name.length(); i++) {
+      if (!Character.isDigit(name.charAt(i))) {
+        return false;
+      }
+    }
+    String fieldName = name.substring(fieldStart, separator);
+    boolean field = false;
+    for (StructField structField : cl.getFields()) {
+      if (structField.getName().equals(fieldName)) {
+        field = true;
+        break;
+      }
+    }
+    if (!field || md_content.params.length != md_lambda.params.length) {
+      return false;
+    }
+    FullInstructionSequence seq;
+    try {
+      mt.expandData(cl);
+      seq = mt.getInstructionSequence();
+    } catch (IOException e) {
+      return false;
+    }
+    if (seq == null) {
+      return false;
+    }
+    // new T; dup; aload_0; one plain load per functional parameter, in slot order.
+    if (seq.length() < 4
+        || seq.getInstr(0).opcode != CodeConstants.opc_new
+        || seq.getInstr(1).opcode != CodeConstants.opc_dup) {
+      return false;
+    }
+    int index = 2;
+    Integer outer = loadSlot(seq.getInstr(index++));
+    if (outer == null || outer != 0) {
+      return false;
+    }
+    int slot = 1;
+    for (int i = 0; i < md_content.params.length; i++) {
+      if (index >= seq.length()) {
+        return false;
+      }
+      Integer load = loadSlot(seq.getInstr(index++));
+      if (load == null || load != slot) {
+        return false;
+      }
+      slot += md_content.params[i].stackSize;
+    }
+    if (index >= seq.length() || seq.getInstr(index).opcode != CodeConstants.opc_invokespecial) {
+      return false;
+    }
+    LinkConstant constructor = cl.getPool().getLinkConstant(seq.getInstr(index).operand(0));
+    index++;
+    if (constructor == null || !CodeConstants.INIT_NAME.equals(constructor.elementname)
+        || constructor.descriptor == null) {
+      return false;
+    }
+    String created = cl.getPool().getPrimitiveConstant(seq.getInstr(0).operand(0)).getString();
+    if (!created.equals(constructor.classname)
+        || index + 1 != seq.length() || seq.getInstr(index).opcode != CodeConstants.opc_areturn) {
+      return false;
+    }
+    MethodDescriptor md_constructor = MethodDescriptor.parseDescriptor(constructor.descriptor);
+    VarType ownerType = new VarType(CodeType.OBJECT, 0, cl.qualifiedName);
+    if (md_constructor.params.length != md_content.params.length + 1
+        || !md_constructor.params[0].equals(ownerType)) {
+      return false;
+    }
+    for (int i = 0; i < md_content.params.length; i++) {
+      if (!md_constructor.params[i + 1].equals(md_content.params[i])
+          || !md_lambda.params[i].equals(md_content.params[i])) {
+        return false;
+      }
+    }
+    ClassNode target = DecompilerContext.getClassProcessor().getMapRootClasses().get(created);
+    if (target == null || target.type != ClassNode.Type.MEMBER || target.parent == null
+        || target.parent.classStruct == null || target.simpleName == null
+        || !target.parent.classStruct.qualifiedName.equals(cl.qualifiedName)
+        || (target.access & CodeConstants.ACC_STATIC) != 0) {
+      return false;
+    }
+    VarType createdType = new VarType(CodeType.OBJECT, 0, created);
+    if (!passable(createdType, md_lambda.ret)) {
+      return false;
+    }
+    buffer.appendClass(target.simpleName, false, created).append("::new");
     return true;
   }
 
