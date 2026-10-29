@@ -208,6 +208,25 @@ public class IfStatement extends Statement {
     }
 
     Exprent condition = headexprent.get(0);
+    // NEUROFLOWER_GUARD_DEBUG=<method name> dumps every if head's guard evidence: the selector
+    // exists because a refused guard leaves no trace in the output, only a flattened mirror.
+    if (System.getenv("NEUROFLOWER_GUARD_DEBUG") != null && RoundTrip.currentMethod() != null
+        && System.getenv("NEUROFLOWER_GUARD_DEBUG").equals(RoundTrip.currentMethod().getName())) {
+      Exprent dbgCond = condition instanceof IfExprent h ? h.getCondition() : null;
+      IfExprent dbgHead = condition instanceof IfExprent h ? h : null;
+      System.err.println("guardshape ifstat=" + (ifstat != null) + " else=" + (elsestat != null)
+        + " patternMatched=" + isPatternMatched() + " labeled=" + isLabeled()
+        + " declaresPattern=" + (dbgCond != null && declaresPattern(dbgCond))
+        + " endsLoopBody=" + RoundTrip.endsLoopBody(this)
+        + " headLen=" + (dbgHead == null || dbgHead.bytecode == null ? -1 : dbgHead.bytecode.length())
+        + " headCard=" + (dbgHead == null || dbgHead.bytecode == null ? -1 : dbgHead.bytecode.cardinality())
+        + " condLen=" + (dbgCond == null || dbgCond.bytecode == null ? -1 : dbgCond.bytecode.length())
+        + " condCard=" + (dbgCond == null || dbgCond.bytecode == null ? -1 : dbgCond.bytecode.cardinality())
+        + " cond=" + (dbgCond == null ? "null" : dbgCond.toJava(0).toString().replace('\n', ' '))
+        + " continueGuard=" + (dbgHead != null && RoundTrip.printContinueGuard(dbgHead, this))
+        + (ifstat == null ? "" : " thenFirst=" + RoundTrip.firstOffset(ifstat) + " thenLast=" + RoundTrip.lastEnd(ifstat))
+        + (elsestat == null ? "" : " elseFirst=" + RoundTrip.firstOffset(elsestat) + " elseLast=" + RoundTrip.lastEnd(elsestat)));
+    }
     // An empty arm prints as `if (C) { ; } else { body }`; when the target returns between the
     // condition and the body, the source wrote the guard `if (C) { return; } body`.
     Statement guardBody;
@@ -272,8 +291,9 @@ public class IfStatement extends Statement {
     if (ifstat != null && elsestat == null && condition instanceof IfExprent ifHead
         && (getParent() instanceof DoStatement
             // The same mirror one level in: `if (!C) { rest }` printed as the loop body's tail.
-            // A pattern if's head also spans the nested condition, and its guard belongs to that
-            // inner test, so a condition that declares a pattern variable is refused outright.
+            // A pattern if's head can also span a nested condition of its own, and then its guard
+            // belongs to that inner test; a condition that declares a pattern variable is accepted
+            // only when its own bytes end flush with the head's, so the head is exactly this test.
             // Otherwise the head's length is a fallback: a condition the decompiler built itself
             // carries no offsets, and refusing those would lose every compound guard. A test that
             // is a boolean call or field access is simplified to the call itself, which drops the
@@ -285,12 +305,14 @@ public class IfStatement extends Statement {
             // `if (tickCount <= 600) continue;` as the else arm of the raider guard).
             || RoundTrip.endsLoopBody(this)
                && ifHead.bytecode != null
-               && !declaresPattern(ifHead.getCondition())
-               && (ifHead.getCondition().bytecode == null
-                   || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
-                   || loneBranch(ifHead)
-                      && !ifHead.getCondition().bytecode.isEmpty()
-                      && ifHead.getCondition().bytecode.length() == ifHead.bytecode.nextSetBit(0)))
+               && (declaresPattern(ifHead.getCondition())
+                   ? ifHead.getCondition().bytecode != null
+                      && ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
+                   : ifHead.getCondition().bytecode == null
+                      || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
+                      || loneBranch(ifHead)
+                         && !ifHead.getCondition().bytecode.isEmpty()
+                         && ifHead.getCondition().bytecode.length() == ifHead.bytecode.nextSetBit(0)))
         && RoundTrip.printContinueGuard(ifHead, this)) {
       Exprent printed = ifHead.getCondition();
       Exprent source = printed instanceof FunctionExprent not
@@ -763,68 +785,51 @@ public class IfStatement extends Statement {
    * Prints one `if` header per group and the arm the innermost guards, leaving the outermost brace
    * open: the caller closes it, and appends the else arm when there is one. A group the target
    * compiled as {@code if (C) continue;} prints as a closed guard and the groups after it return to
-   * the guard's own level; when that guard is the first group no brace is left open.
+   * the guard's own level; a run of written guards prints as a run of closed tests. When the first
+   * group is a guard no brace is left open.
    */
   static boolean printNestedIfs(TextBuffer buf, IfExprent head, Statement arm, List<Integer> groups, int indent,
                                 boolean allowContinueGuard) {
     List<Exprent> operands = booleanOperands(head.getCondition());
-    int guardGroup = allowContinueGuard && RoundTrip.endsLoopBody(arm) ? continueGuardGroup(head, operands, groups, arm) : -1;
-    int plain = guardGroup >= 0 ? guardGroup : groups.size();
-    for (int group = 0; group < plain; group++) {
-      int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
-      IfExprent nested = (IfExprent) head.copy();
-      nested.setCondition(andOf(operands, groups.get(group), to));
-      buf.appendIndent(indent + group).append(nested.toJava(indent + group))
-        .append(" {").appendLineSeparator();
-    }
-    if (guardGroup >= 0) {
-      int to = guardGroup + 1 < groups.size() ? groups.get(guardGroup + 1) : operands.size();
-      IfExprent guard = (IfExprent) head.copy();
-      Exprent printed = andOf(operands, groups.get(guardGroup), to);
-      guard.setCondition(printed instanceof FunctionExprent not
-          && not.getFuncType() == FunctionType.BOOL_NOT
-          && not.getLstOperands().size() == 1
-        ? not.getLstOperands().get(0)
-        : RoundTrip.negateCondition(printed));
-      buf.appendIndent(indent + guardGroup).append(guard.toJava(indent + guardGroup))
-        .append(" {").appendLineSeparator();
-      buf.appendIndent(indent + guardGroup + 1).append("continue;").appendLineSeparator();
-      buf.appendIndent(indent + guardGroup).append("}").appendLineSeparator();
-      // The groups the guard skips and the arm print at the guard's own level.
-      for (int rest = guardGroup + 1; rest < groups.size(); rest++) {
-        int restTo = rest + 1 < groups.size() ? groups.get(rest + 1) : operands.size();
-        IfExprent after = (IfExprent) head.copy();
-        after.setCondition(andOf(operands, groups.get(rest), restTo));
-        buf.appendIndent(indent + rest - 1).append(after.toJava(indent + rest - 1))
-          .append(" {").appendLineSeparator();
-      }
-      buf.append(ExprProcessor.jmpWrapper(arm, indent + groups.size() - 1, true));
-      for (int close = groups.size() - 1; close > guardGroup; close--) {
-        buf.appendIndent(indent + close - 1).append("}").appendLineSeparator();
-      }
-      for (int close = guardGroup - 1; close >= 1; close--) {
-        buf.appendIndent(indent + close).append("}").appendLineSeparator();
-      }
-      return guardGroup >= 1;
-    }
-    buf.append(ExprProcessor.jmpWrapper(arm, indent + groups.size(), true));
-    for (int group = groups.size() - 1; group >= 1; group--) {
-      buf.appendIndent(indent + group).append("}").appendLineSeparator();
-    }
-    return true;
-  }
-
-  /** The first group the target compiled as a whole {@code if (C) continue;} statement, or -1. */
-  private static int continueGuardGroup(IfExprent head, List<Exprent> operands, List<Integer> groups, Statement arm) {
+    boolean guards = allowContinueGuard && RoundTrip.endsLoopBody(arm);
+    int open = 0;
+    boolean firstGuard = false;
     for (int group = 0; group < groups.size(); group++) {
-      boolean guard = group == groups.size() - 1
-        ? RoundTrip.printContinueGuard(head, arm)
-        : RoundTrip.continuesBefore(operands.get(groups.get(group + 1)), arm);
+      int to = group + 1 < groups.size() ? groups.get(group + 1) : operands.size();
+      Exprent printed = andOf(operands, groups.get(group), to);
+      // A run of written `if (C) continue;` statements: each guard's jump ends where the next
+      // group's own test begins (the last one's at the head's end), so every group can be one.
+      boolean guard = guards && (group + 1 < groups.size()
+        ? RoundTrip.continuesBefore(operands.get(groups.get(group + 1)), arm)
+        : RoundTrip.printContinueGuard(head, arm));
+      IfExprent nested = (IfExprent) head.copy();
       if (guard) {
-        return group;
+        nested.setCondition(printed instanceof FunctionExprent not
+            && not.getFuncType() == FunctionType.BOOL_NOT
+            && not.getLstOperands().size() == 1
+          ? not.getLstOperands().get(0)
+          : RoundTrip.negateCondition(printed));
+        buf.appendIndent(indent + open).append(nested.toJava(indent + open))
+          .append(" {").appendLineSeparator();
+        buf.appendIndent(indent + open + 1).append("continue;").appendLineSeparator();
+        buf.appendIndent(indent + open).append("}").appendLineSeparator();
+        if (group == 0) {
+          firstGuard = true;
+        }
+      } else {
+        nested.setCondition(printed);
+        buf.appendIndent(indent + open).append(nested.toJava(indent + open))
+          .append(" {").appendLineSeparator();
+        open++;
       }
     }
-    return -1;
+    buf.append(ExprProcessor.jmpWrapper(arm, indent + open, true));
+    // The caller closes the outermost brace (and prints the else arm after it) unless the first
+    // group was a guard: then every test here is closed and the arm already returned to its level.
+    for (int level = open - 1; level >= (firstGuard ? 0 : 1); level--) {
+      buf.appendIndent(indent + level).append("}").appendLineSeparator();
+    }
+    return !firstGuard;
   }
 
   /**
