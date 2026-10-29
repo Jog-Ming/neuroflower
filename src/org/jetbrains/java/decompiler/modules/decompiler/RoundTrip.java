@@ -1732,7 +1732,6 @@ public final class RoundTrip {
     return DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP);
   }
 
-  /** For bisecting a suspect transform: {@code RT_OFF=name1,name2} turns these off. */
   /** The target's source line for the first instruction the exprent owns, or -1. */
   public static int sourceLine(Exprent exprent) {
     StructMethod method = currentMethod();
@@ -2546,11 +2545,19 @@ public final class RoundTrip {
     return here < 0 || before < 0 || here != before;
   }
 
+  /**
+   * Whether a named round-trip rule runs. {@code --rt-off=name1,name2}, or the RT_OFF environment
+   * variable when the option is unset, leaves the named rules off for bisecting a suspect
+   * transform.
+   */
   public static boolean selector(String name) {
     if (!enabled()) {
       return false;
     }
-    String disabled = System.getenv("RT_OFF");
+    String disabled = (String) DecompilerContext.getProperty(IFernflowerPreferences.ROUND_TRIP_OFF);
+    if (disabled == null || disabled.isEmpty()) {
+      disabled = System.getenv("RT_OFF");
+    }
     return disabled == null || !disabled.contains(name);
   }
 

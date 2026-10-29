@@ -404,7 +404,7 @@ public class InvocationExprent extends Exprent {
         // the builder calls do determine it, and javac's own resolution of the nested method
         // reference cannot reach it without the witness the source wrote.
         Map<VarType, VarType> builderInference = null;
-        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_BUILDER_INFERENCE)
+        if (!isNew && RoundTrip.selector("rt-builder-inference")
           && BUILDER_OWNER.equals(classname) && ("create".equals(name) || "mapCodec".equals(name))) {
           builderInference = BuilderInference.solve(this, fparams);
           if (builderInference != null) {
@@ -417,7 +417,7 @@ public class InvocationExprent extends Exprent {
         // variables default to their bounds and the reference is rejected. The reference's
         // implementation Signature and the interface's own Signature fix them.
         boolean referenceDemand = false;
-        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+        if (!isNew && RoundTrip.selector("rt-demand-witness")) {
           Map<VarType, VarType> referenceInference = BuilderInference.solveMethodReference(this, fparams);
           if (referenceInference != null) {
             referenceInference.forEach(genericsMap::putIfAbsent);
@@ -518,7 +518,7 @@ public class InvocationExprent extends Exprent {
         // class variable from the type arguments the call's own target already solved. javac
         // gives a receiver expression no target, so only an explicit witness on the receiver
         // could have carried that type.
-        if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+        if (!isNew && RoundTrip.selector("rt-demand-witness")) {
           BuilderInference.solveReceiverFromReference(this, fparams, upperBoundsMap, upperBoundsMap);
         }
 
@@ -771,7 +771,7 @@ public class InvocationExprent extends Exprent {
                 // argument's own type variables to nameable types, the source named them; a pure
                 // element factory passes the target one level in to its elements.
                 if (functype != Type.INIT
-                  && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+                  && RoundTrip.selector("rt-demand-witness")
                   && paramUB != null && paramUB.isGeneric()) {
                   if (parameter instanceof InvocationExprent topDown) {
                     topDown.applyTopDownTarget(paramUB);
@@ -903,7 +903,7 @@ public class InvocationExprent extends Exprent {
             }
 
             boolean receiverDemand = suppress && !isNew
-              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && RoundTrip.selector("rt-demand-witness")
               && receiverTargetDemand(fparams, upperBoundsMap, bounds);
 
             // A type variable no recorded parameter mentions can only default to its declared
@@ -911,7 +911,7 @@ public class InvocationExprent extends Exprent {
             // instantiation, so the source pinned it. Only the witness whose erasure reproduces
             // the pool's descriptor is used.
             boolean returnOnlyDemand = !isNew
-              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && RoundTrip.selector("rt-demand-witness")
               && returnOnlyTypeVariableDemand(fparams, ret, bounds, upperBound, isNew);
 
             // A receiver call whose own arguments leave a type variable to the target: javac
@@ -921,13 +921,13 @@ public class InvocationExprent extends Exprent {
             // something javac infers, so the printer's wildcard is the target's, and only an
             // explicit witness could have produced it.
             boolean receiverWildcardDemand = !suppress && !isNew
-              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && RoundTrip.selector("rt-demand-witness")
               && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds, false);
             // A method reference cannot name a wildcard return type, so where the target projection
             // carries one at an invariant position javac cannot infer it even when the printer's
             // own return type already fits the expected class.
             boolean receiverMethodRefDemand = suppress && !isNew
-              && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+              && RoundTrip.selector("rt-demand-witness")
               && receiverWildcardTargetDemand(fparams, ret, upperBound, bounds, true);
 
             if ((!suppress && !receiverWildcardDemand && !receiverMethodRefDemand)
@@ -954,7 +954,7 @@ public class InvocationExprent extends Exprent {
                 genericArgs.clear();
               }
               if (!rawWitness && genericArgs.isEmpty() && !isNew
-                && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+                && RoundTrip.selector("rt-demand-witness")) {
                 // The printer's inference has no value for some type variable; an argument's
                 // recorded metafactory type may still prove what the source passed.
                 tryDemandWitness(fparams, bounds);
@@ -968,37 +968,31 @@ public class InvocationExprent extends Exprent {
               // to the target; a receiver call had to name them.
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            else if (RoundTrip.selector("rt-demand-witness")
               && receiverRecordedValueDemand(fparams, ret, upperBound, bounds)) {
               // The printer has no value for some type variable of a call in receiver position.
               // The outer call's functional argument records the value it must return, and the
               // receiver's type argument is invariant in it: the recorded type pins the variable.
             }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            else if (RoundTrip.selector("rt-demand-witness")
               && targetProjectionDemand(fparams, ret, upperBound, bounds, LAMBDA_BODY.get() == this)) {
               // The recorded expected type names the arguments this call's own value must carry,
               // and the printer's own inference landed on a different one.
             }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            else if (RoundTrip.selector("rt-demand-witness")
               && passThroughReceiverDemand(fparams, ret, upperBound, bounds)) {
               // The outer call returns its receiver's own type variable unchanged and its own
               // result is the method's declared return type, so the receiver's argument must be
               // that recorded type; a method reference there is not pertinent to javac.
             }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GENVAR_ARGS)
+            else if (RoundTrip.selector("rt-genvar-args")
               && inPoly() && hasGenvarArgs(fparams, genericsMap)) {
               // A call inferred to an enclosing method's or class's type variable can need the
               // witness in source: javac does not propagate the target type into every poly
               // expression (a conditional arm, a diamond argument), and then cannot infer it.
               getGenericArgs(fparams, genericsMap, genericArgs);
             }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_WITNESS)
-              && inArgument() && hasWildcardArgs(fparams, genericsMap)) {
-              // A call whose inferred arguments carry wildcards can be beyond javac's inference
-              // from an argument position; the original wrote the witnesses it inferred itself.
-              getGenericArgs(fparams, genericsMap, genericArgs);
-            }
-            else if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            else if (RoundTrip.selector("rt-demand-witness")
               && constructorDelegationDemand(fparams, ret, targetSeeded, isNew)) {
               // this(...)/super(...) overload resolution cannot hand the target type to the
               // argument, so a type variable the arguments leave to the target must be pinned
@@ -1006,7 +1000,7 @@ public class InvocationExprent extends Exprent {
               getGenericArgs(fparams, genericsMap, genericArgs);
               narrowRecordedFunctionReturns(fparams, genericArgs);
             }
-            else if (!isNew && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            else if (!isNew && RoundTrip.selector("rt-demand-witness")
               && tryDemandWitness(fparams, bounds)) {
               // A functional argument's recorded instantiated type is wider than the method it
               // names, so the source constrained the call's type arguments explicitly. The witness
@@ -1022,7 +1016,7 @@ public class InvocationExprent extends Exprent {
           // so javac cannot infer this call's variable from the lambda to the argument's type.
           // The source pinned it to the recorded declaration, which is the only nameable witness.
           if (OPTIONAL_MAP_DEMAND.get() == this
-            && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+            && RoundTrip.selector("rt-demand-witness")
             && optionalMapWitness(OPTIONAL_MAP_DEMAND_TYPE.get(), fparams, bounds)) {
             genericArgs.clear();
             genericArgs.add(OPTIONAL_MAP_DEMAND_TYPE.get());
@@ -1033,7 +1027,7 @@ public class InvocationExprent extends Exprent {
           // type (the ground target's element type, erased) disagrees with what the printer
           // inferred for this call's return. The referenced method's recorded parameter type is
           // the only fully parameterised name that reproduces it.
-          if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+          if (RoundTrip.selector("rt-demand-witness")) {
             outerReferenceParameterWitness(fparams, ret);
           }
 
@@ -2465,10 +2459,10 @@ public class InvocationExprent extends Exprent {
         // from the enclosing statement's marker. javac attributes the invoke to the first
         // argument's line, so a later argument at the call's own line was written on that line:
         // the first argument merely inherited the declaration's line above it.
-        boolean callLineGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_CALL_LINE);
+        boolean callLineGate = RoundTrip.selector("rt-arg-call-line");
         // The target's line for the previous argument's last instruction is where that argument
         // ended; an argument that starts on it was written on the same source line.
-        boolean prevEndGate = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_ARG_PREV_END);
+        boolean prevEndGate = RoundTrip.selector("rt-arg-prev-end");
         int previous = prevEndGate ? previousEnd : previousLine;
         // A lambda's invokedynamic inherits the call's line, but its body is a method of its own:
         // a body line later than the call means the source wrote the lambda on that later line,
@@ -3503,32 +3497,6 @@ public class InvocationExprent extends Exprent {
     return POLY.get()[0] > 0;
   }
 
-  private boolean hasWildcardArgs(List<String> fparams, Map<VarType, VarType> genericsMap) {
-    List<VarType> probe = new java.util.ArrayList<>();
-    getGenericArgs(fparams, genericsMap, probe);
-    for (VarType arg : probe) {
-      if (containsWildcard(arg)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean containsWildcard(VarType type) {
-    if (!(type instanceof GenericType generic)) {
-      return false;
-    }
-    for (VarType argument : generic.getArguments()) {
-      if (argument == null) {
-        return true;
-      }
-      if (containsWildcard(argument)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private boolean hasGenvarArgs(List<String> fparams, Map<VarType, VarType> genericsMap) {
     List<VarType> probe = new java.util.ArrayList<>();
     getGenericArgs(fparams, genericsMap, probe);
@@ -3892,7 +3860,7 @@ public class InvocationExprent extends Exprent {
    * printed type argument otherwise falls back to the declared bound.
    */
   private void applyTopDownTarget(VarType target) {
-    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+    if (!RoundTrip.selector("rt-demand-witness")
       || target == null || !target.isGeneric() || desc == null || desc.getSignature() == null) {
       return;
     }
@@ -3949,7 +3917,7 @@ public class InvocationExprent extends Exprent {
 
   /** The same proof for a constructor whose value must fit the recorded target. */
   private void applyTopDownNewTarget(NewExprent created, VarType target) {
-    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+    if (!RoundTrip.selector("rt-demand-witness")
       || target == null || !target.isGeneric() || created.getNewType().arrayDim != 0) {
       return;
     }

@@ -5,7 +5,6 @@ import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
-import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
@@ -214,7 +213,7 @@ public class CatchStatement extends Statement {
 
       // javac gives a try-with-resources' synthetic close the closing brace's line, so the
       // target's table says whether the original put the brace on a line without the catch.
-      boolean newLine = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CATCH_LINE)
+      boolean newLine = RoundTrip.selector("rt-catch-line")
           && handlerOffset != null
           && RoundTrip.catchOnNewLine(i == 1 ? first : stats.get(i - 1), handlerOffset,
               i == 1 && !resources.isEmpty());

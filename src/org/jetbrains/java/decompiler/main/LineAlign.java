@@ -4,7 +4,7 @@ package org.jetbrains.java.decompiler.main;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
 import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.collectors.BytecodeMappingTracer;
-import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
@@ -50,7 +50,7 @@ public final class LineAlign {
   /** The aligned text, or null when the buffer cannot be aligned and must be left as printed. */
   public static String align(TextBuffer buffer, ClassesProcessor.ClassNode root) {
     String text = buffer.convertToStringAndAllowDataDiscard();
-    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CONSTANT_SITES)) {
+    if (RoundTrip.selector("rt-constant-sites")) {
       try {
         // Runs on the printed text before any line edit, so the bytecode positions the buffer
         // recorded still describe this string. The switch replaces the whole-file constant pass.
@@ -71,7 +71,7 @@ public final class LineAlign {
       return null;
     }
 
-    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SAME_LINE_JOIN)) {
+    if (RoundTrip.selector("rt-same-line-join")) {
       String joined = joinSameTargetLines(text, separator, lines, tracers);
       if (joined != null) {
         text = joined;
@@ -79,7 +79,7 @@ public final class LineAlign {
       }
     }
 
-    boolean gapAlign = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_GAP_ALIGN);
+    boolean gapAlign = RoundTrip.selector("rt-gap-align");
     TreeMap<Integer, Integer> shifts = new TreeMap<>();
     Set<Integer> conflicted = new HashSet<>();
     Set<Integer> entryLines = new HashSet<>();
@@ -134,8 +134,7 @@ public final class LineAlign {
     addImplicitConstructorConstraints(tracers, lines, shifts, conflicted, entryLines, root);
     resolveCandidates(candidates, shifts, conflicted);
 
-    if (DecompilerContext.getOption(IFernflowerPreferences.ML_BREAKS)
-        || System.getenv("NEUROFLOWER_ML_BREAKS") != null) {
+    if (System.getenv("NEUROFLOWER_ML_BREAKS") != null) {
       logModelAgreement(tracers);
     }
 

@@ -473,8 +473,7 @@ public class NewExprent extends Exprent {
       if (!lambda && constructor != null) {
         List<VarType> args = constructor.getGenericArgs();
         boolean diamond = args.size() == 1 && args.get(0) == GenericType.DUMMY_VAR;
-        if (args.isEmpty() && DecompilerContext.getOption(
-              org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+        if (args.isEmpty() && RoundTrip.selector("rt-diamond")
             && hasTypeParameters(newType)) {
           // No type arguments were recovered, but javac can infer them from the context; the
           // original wrote `new Foo<>()`, and the raw type would break the caller's inference.
@@ -632,7 +631,7 @@ public class NewExprent extends Exprent {
           // the chained receiver then loses the parameterization the caller needs. The original
           // wrote the raw type in that position, and erasure makes the two spellings identical.
           boolean receiverDiamond = args.isEmpty() && isQualifier;
-          if (args.isEmpty() && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+          if (args.isEmpty() && RoundTrip.selector("rt-diamond")
               && InvocationExprent.inArgument() && hasTypeParameters(newType) && !receiverDiamond) {
             // No recovered type arguments, but javac infers them from the context; the original
             // wrote the diamond, and a raw type would break the caller's inference.
@@ -1254,7 +1253,7 @@ public class NewExprent extends Exprent {
    */
   private void appendAnonymousSuperType(TextBuffer buf, VarType superType, ClassNode node) {
     if (superType instanceof GenericType && !((GenericType)superType).getArguments().isEmpty()
-        && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND)
+        && RoundTrip.selector("rt-diamond")
         && node.classStruct != null) {
       for (StructMethod method : node.classStruct.getMethods()) {
         if (CodeConstants.INIT_NAME.equals(method.getName()) && !method.getDescriptor().startsWith("()")) {
@@ -1429,7 +1428,7 @@ public class NewExprent extends Exprent {
    * own type variables: only a diamond lets javac infer the expected arguments from the target.
    */
   private boolean expectsWiderArguments(VarType upperBound) {
-    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DIAMOND) || constructor == null
+    if (!RoundTrip.selector("rt-diamond") || constructor == null
       || !(upperBound instanceof GenericType target) || target.type != CodeType.OBJECT
       || target.arrayDim != 0 || target.getWildcard() != GenericType.WILDCARD_NO
       || !target.value.equals(newType.value)) {
@@ -1579,7 +1578,7 @@ public class NewExprent extends Exprent {
    * instantiation names a type variable that is in scope and is not that bound.
    */
   private VarType methodReferenceQualifier() {
-    if (!DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)
+    if (!RoundTrip.selector("rt-demand-witness")
       || !lambda || !isMethodReference() || inferredLambdaType == null || !inferredLambdaType.isGeneric()) {
       return null;
     }

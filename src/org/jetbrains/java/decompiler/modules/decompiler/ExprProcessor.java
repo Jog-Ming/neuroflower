@@ -10,7 +10,6 @@ import org.jetbrains.java.decompiler.code.InstructionSequence;
 import org.jetbrains.java.decompiler.code.MethodProperties;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
-import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.plugins.PluginContext;
 import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
@@ -1399,13 +1398,12 @@ public class ExprProcessor implements CodeConstants {
     // merge. Our switch type came out as the bare erasure, so the outer cast is the printer's.
     boolean doCastNull = (castNull.cast && rightType.type == CodeType.NULL && !UNDEFINED_TYPE_STRING.equals(getTypeName(leftType)));
     boolean doCastNarrowing = (castNarrowing && isIntConstant(exprent) && isNarrowedIntType(leftType));
-    boolean doCastGenerics = !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
-      && doGenericTypesCast(exprent, leftType, rightType);
+    boolean doCastGenerics = doGenericTypesCast(exprent, leftType, rightType);
     // Inference substituted the upper bound into the call's type, so the wildcard the method
     // declared has vanished; the original source had to cast that capture away, and javac elides
     // the checkcast because the erasures match.
     if (!doCastGenerics
-        && DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_CAPTURE_CAST)
+        && RoundTrip.selector("rt-capture-cast")
         && exprent instanceof InvocationExprent invocation
         && needsCaptureCast(leftType, invocation.getDeclaredGenericReturnType())) {
       doCastGenerics = true;
@@ -1430,7 +1428,6 @@ public class ExprProcessor implements CodeConstants {
     // (X<T> is an X<?>), only a value whose type the class file fixes without context is cast,
     // and an out-of-scope variable cannot be named in the cast.
     if (!doCastGenerics
-      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
       && contextIndependentValue(exprent)
       && invariantWildcardTarget(exprent.getNamedGenerics(), leftType, rightType)) {
       doCastGenerics = true;
@@ -1442,7 +1439,6 @@ public class ExprProcessor implements CodeConstants {
     // invariant assignment, and the source cast the value to the target. The cast's erasure is
     // the supertype the value already implements, so javac emits no checkcast for it.
     if (!doCastGenerics
-      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
       && contextIndependentValue(exprent)
       && wildcardSubtypeTarget(exprent.getNamedGenerics(), leftType, rightType)) {
       doCastGenerics = true;
@@ -1454,7 +1450,6 @@ public class ExprProcessor implements CodeConstants {
     // that same array type. The call's recorded signature proves the target; the cast erases to
     // the variable's erasure, so javac either elides the checkcast or the target already has it.
     if (!doCastGenerics
-      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
       && typeVariableArrayTarget(exprent.getNamedGenerics(), leftType, rightType)) {
       doCastGenerics = true;
     }
@@ -1492,7 +1487,6 @@ public class ExprProcessor implements CodeConstants {
     // and a target with a concrete argument lets javac infer the variable from that target, so
     // neither needs a cast.
     if (!doCastGenerics
-      && !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_GENERIC_CAST)
       && exprent instanceof InvocationExprent
       && leftType instanceof GenericType && leftType.type == CodeType.OBJECT && leftType.arrayDim == 0
       && !hasWildcard(leftType) && !hasRawTypeArgument(leftType)

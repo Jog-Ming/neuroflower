@@ -4,7 +4,6 @@ package org.jetbrains.java.decompiler.main;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
 import org.jetbrains.java.decompiler.code.Instruction;
-import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -21,7 +20,7 @@ import java.util.Map;
  * current instruction, their pair, a position bucket and the length of the run of instructions
  * already on this printed line. The model does not replace the target's line table; it reports
  * which instructions should start a line, and LineAlign logs its agreement with the table when
- * {@code --ml-breaks=1} is set. Wiring it into a line-breaking decision waits for token-level
+ * {@code NEUROFLOWER_ML_BREAKS} is set. Wiring it into a line-breaking decision waits for token-level
  * offset maps, which the printer does not record yet.
  */
 public final class LineBreakModel {
@@ -43,8 +42,6 @@ public final class LineBreakModel {
       String path = System.getenv("NEUROFLOWER_LINEBREAK_WEIGHTS");
       if (path != null && !path.isEmpty()) {
         instance = load(Path.of(path));
-      } else if (DecompilerContext.getOption(IFernflowerPreferences.ML_BREAKS)) {
-        instance = load(Path.of("ml", "weights", "linebreak.tsv"));
       }
     }
     return instance;

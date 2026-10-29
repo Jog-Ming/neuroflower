@@ -183,137 +183,11 @@ public interface IFernflowerPreferences {
   @Type(DecompilerOption.Type.BOOLEAN)
   String ROUND_TRIP = "round-trip";
 
-  @Name("Round Trip: No Generic Casts")
-  @Description("Do not print casts that only reconcile inferred generic arguments.")
-  @ShortName("rtngc")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_NO_GENERIC_CAST = "rt-no-generic-cast";
-
-  @Name("Round Trip: No Variable Rename")
-  @Description("Do not suffix a clashing local variable's name; a variant for per-file selection.")
-  @ShortName("rtnvr")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_NO_VARIABLE_RENAME = "rt-no-variable-rename";
-
-  @Name("Round Trip: Genvar Arguments")
-  @Description("Print explicit type arguments when the inferred argument is an enclosing type variable.")
-  @ShortName("rtga")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_GENVAR_ARGS = "rt-genvar-args";
-
-  @Name("Round Trip: Shared Variable Names")
-  @Description("Give every version of a slot that carries the same name one printed name.")
-  @ShortName("rtsvn")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_SHARED_VAR_NAMES = "rt-shared-var-names";
-
-  @Name("Round Trip: Capture Casts")
-  @Description("Cast an invocation whose declared return type captures a wildcard to the expected type.")
-  @ShortName("rtcc")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_CAPTURE_CAST = "rt-capture-cast";
-
-  @Name("Round Trip: Constant Names")
-  @Description("Name a literal back to the constant the jar's pool shows the original used.")
-  @ShortName("rtcn")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_CONSTANT_NAMES = "rt-constant-names";
-
-  @Name("Round Trip: Constant Sites")
-  @Description("Attribute each nested class's code to its own pool and bound a constant's site to its pool order.")
-  @ShortName("rtcs")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_CONSTANT_SITES = "rt-constant-sites";
-
-  @Name("Round Trip: Member Order")
-  @Description("Print fields, methods and member classes in the original source's line order.")
-  @ShortName("rtmo")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_MEMBER_ORDER = "rt-member-order";
-
-  @Name("Round Trip: Member Tail")
-  @Description("Place a member class with no line table and no ranked sibling after every lined member.")
-  @ShortName("rtmt")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_MEMBER_TAIL = "rt-member-tail";
-
-  @Name("Round Trip: Argument Call Line")
-  @Description("Break between arguments only above the call's own line, where javac puts the invoke.")
-  @ShortName("rtacl")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_ARG_CALL_LINE = "rt-arg-call-line";
-
-  @Name("Round Trip: Argument Previous End")
-  @Description("Break between arguments only past the previous argument's last instruction line.")
-  @ShortName("rtape")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_ARG_PREV_END = "rt-arg-prev-end";
-
-  @Name("Round Trip: Catch Line")
-  @Description("Start a catch clause on its own line when the target proves the closing brace was.")
-  @ShortName("rtcl")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_CATCH_LINE = "rt-catch-line";
-
-  @Name("ML: Line Breaks")
-  @Description("Run the line-start model and log its agreement with the target's line table.")
-  @ShortName("mlb")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ML_BREAKS = "ml-breaks";
-
-  @Name("Round Trip: Argument Witnesses")
-  @Description("Print explicit type arguments when an inferred argument carries a wildcard in an argument position.")
-  @ShortName("rtaw")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_ARG_WITNESS = "rt-arg-witness";
-
-  @Name("Round Trip: Diamond")
-  @Description("Print the diamond when a generic constructor has no recovered arguments in a poly context.")
-  @ShortName("rtdi")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_DIAMOND = "rt-diamond";
-
-  @Name("Round Trip: Demand Witnesses")
-  @Description("Print a call's type arguments where an argument's recorded instantiated type proves the source fixed them, if the erasure matches the recorded call.")
-  @ShortName("rtdw")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_DEMAND_WITNESS = "rt-demand-witness";
-
-  @Name("Round Trip: Builder Inference")
-  @Description("Solve the type argument of a RecordCodecBuilder.create/mapCodec call from the declared builder signatures when no record proves it.")
-  @ShortName("rtbi")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_BUILDER_INFERENCE = "rt-builder-inference";
-
-  @Name("Round Trip: Same-Line Join")
-  @Description("Join two printed lines whose offsets the original's table puts on one source line.")
-  @ShortName("rtslj")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_SAME_LINE_JOIN = "rt-same-line-join";
-
-  @Name("Round Trip: Gap Alignment")
-  @Description("Lay line alignment out one anchor gap at a time and reclaim padding parked at earlier gaps.")
-  @ShortName("rtga")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_GAP_ALIGN = "rt-gap-align";
-
-  @Name("Round Trip: Switch Order")
-  @Description("Print case bodies in the original source's line order, not the switch's key order.")
-  @ShortName("rtswo")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_SWITCH_ORDER = "rt-switch-order";
-
-  @Name("Line Alignment")
-  @Description("Move the printed source onto the original LineNumberTable with padding and joins.")
-  @ShortName("la")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String LINE_ALIGN = "line-align";
-
-  @Name("Round Trip: Clashing Names by Slot")
-  @Description("Apply a clashing name to every version of the variable's slot.")
-  @ShortName("rtcbs")
-  @Type(DecompilerOption.Type.BOOLEAN)
-  String ROUND_TRIP_CLASHING_BY_SLOT = "rt-clashing-by-slot";
+  @Name("Round Trip: Disabled Rules")
+  @Description("Comma-separated rule selectors to leave off, for bisecting a suspect transform.")
+  @ShortName("rtoff")
+  @Type(DecompilerOption.Type.STRING)
+  String ROUND_TRIP_OFF = "rt-off";
 
   @Name("Pattern Matching")
   @Description("Decompile with if and switch pattern matching enabled.")
@@ -589,26 +463,6 @@ public interface IFernflowerPreferences {
     defaults.put(IGNORE_INVALID_BYTECODE, "0");
     defaults.put(VERIFY_ANONYMOUS_CLASSES, "0");
     defaults.put(ROUND_TRIP, "1");
-    defaults.put(ROUND_TRIP_NO_GENERIC_CAST, "0");
-    defaults.put(ROUND_TRIP_NO_VARIABLE_RENAME, "0");
-    defaults.put(ROUND_TRIP_DIAMOND, "1");
-    defaults.put(ROUND_TRIP_DEMAND_WITNESS, "1");
-    defaults.put(ROUND_TRIP_BUILDER_INFERENCE, "1");
-    defaults.put(ROUND_TRIP_SAME_LINE_JOIN, "1");
-    defaults.put(ROUND_TRIP_GAP_ALIGN, "1");
-    defaults.put(ROUND_TRIP_CLASHING_BY_SLOT, "0");
-    defaults.put(ROUND_TRIP_SHARED_VAR_NAMES, "0");
-    defaults.put(ROUND_TRIP_GENVAR_ARGS, "1");
-    defaults.put(LINE_ALIGN, "1");
-    defaults.put(ROUND_TRIP_SWITCH_ORDER, "1");
-    defaults.put(ROUND_TRIP_MEMBER_ORDER, "1");
-    defaults.put(ROUND_TRIP_MEMBER_TAIL, "1");
-    defaults.put(ROUND_TRIP_CATCH_LINE, "1");
-    defaults.put(ROUND_TRIP_ARG_CALL_LINE, "1");
-    defaults.put(ROUND_TRIP_ARG_PREV_END, "1");
-    defaults.put(ROUND_TRIP_CONSTANT_NAMES, "1");
-    defaults.put(ROUND_TRIP_CONSTANT_SITES, "1");
-    defaults.put(ROUND_TRIP_CAPTURE_CAST, "1");
     defaults.put(TERNARY_CONSTANT_SIMPLIFICATION, "0");
     defaults.put(OVERRIDE_ANNOTATION, "1");
     defaults.put(PATTERN_MATCHING, "1"); // Pattern matching is relatively stable

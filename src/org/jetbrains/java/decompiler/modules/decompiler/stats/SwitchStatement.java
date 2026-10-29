@@ -1160,9 +1160,9 @@ public class SwitchStatement extends Statement {
     boolean debugSwitch = System.getenv("NEUROFLOWER_SWITCH_DEBUG") != null;
     if (debugSwitch) {
       System.err.println("switch order called size=" + size + " option="
-        + DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SWITCH_ORDER));
+        + RoundTrip.selector("rt-switch-order"));
     }
-    if (size < 2 || !DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_SWITCH_ORDER)) {
+    if (size < 2 || !RoundTrip.selector("rt-switch-order")) {
       return order;
     }
     // The target's arm blocks record the source order directly when the switch instruction's keys

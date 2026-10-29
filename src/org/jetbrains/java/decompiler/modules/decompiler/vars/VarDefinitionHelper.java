@@ -2095,9 +2095,6 @@ public class VarDefinitionHelper {
 
   private @NotNull String rename(Map<VarInMethod, String> nameMap, String name, Set<VarInMethod> liveVarDefs,
                                  StructMethod mt, boolean selfParam, LocalVariable selfLvt) {
-    if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_NO_VARIABLE_RENAME)) {
-      return name;
-    }
     while (true) {
       final String candidate = name;
       if (liveVarDefs.stream().noneMatch(vim -> clashes(vim, candidate, nameMap, mt, selfParam, selfLvt))) {

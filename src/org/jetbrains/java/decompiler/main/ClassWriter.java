@@ -1053,7 +1053,7 @@ public class ClassWriter implements StatementWriter {
       // order is what lets javac reproduce the original line table and nesting order.
       List<int[]> plan = new ArrayList<>();
       java.util.Set<Integer> blockSequences = new java.util.HashSet<>();
-      boolean ordered = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_MEMBER_ORDER);
+      boolean ordered = RoundTrip.selector("rt-member-order");
       int sequence = 0;
       for (int i = 0; i < nonEnumFields.size(); i++) {
         plan.add(new int[]{0, i, ordered ? fieldLine(wrapper, cl, nonEnumFields.get(i)) : -1, sequence++});
@@ -1145,7 +1145,7 @@ public class ClassWriter implements StatementWriter {
             break;
           }
         }
-        boolean tailMembers = DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_MEMBER_TAIL);
+        boolean tailMembers = RoundTrip.selector("rt-member-tail");
         int maxFieldLine = -1;
         for (int[] member : plan) {
           if (member[0] == 0 && member[2] >= 0) {
