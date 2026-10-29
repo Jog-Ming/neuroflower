@@ -27,10 +27,10 @@ allowed to change as the work does.
   argument, however convincing, is evidence.
 - **Measure every change A/B.** Score the whole tree before and after, compare the `index.tsv` lines,
   and revert a change that lowers any attribute. Restore what a rewrite got wrong before trusting it.
-- **Decompiler options take a double dash.** Write `--line-align=0`, never `-line-align=0`: the
-  console parser reads a single-dash argument as a three-letter short name, so `-line-align=0`
-  silently becomes `--lin=-align=0` and the run measures the unchanged default. A single-dash A/B is
-  an empty measurement.
+- **Decompiler options take a double dash.** Write `--rt-off=elseflat`, never `-rt-off=elseflat`:
+  the console parser reads a single-dash argument as a three-letter short name, so `-rt-off=elseflat`
+  silently becomes `--rt-=ff=elseflat` and the run measures the unchanged default. A single-dash A/B
+  is an empty measurement.
 - **Never print an erased type.** A repair may print a type only when every type argument is recorded
   and nameable: no wildcard captures, no erased stand-ins, no unresolved type variables. If the only
   available type is an erasure, a capture, or an unknown, print nothing. A raw or erased type changes
