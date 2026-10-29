@@ -7685,6 +7685,29 @@ public final class RoundTrip {
   }
 
   /**
+   * The slots of the pattern variables a case label's values bind. A case pattern's variables are
+   * declared by the label and close with the switch's own block, so a local table row for one of
+   * them says nothing about where the arm's body block ended.
+   */
+  public static java.util.Set<Integer> patternVariableSlots(java.util.List<Exprent> values) {
+    java.util.Set<Integer> slots = new java.util.HashSet<>();
+    if (values == null) {
+      return slots;
+    }
+    for (Exprent value : values) {
+      if (value instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getAllExprents().size() > 2
+          && function.getAllExprents().get(2) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.Pattern pattern) {
+        for (VarExprent var : pattern.getPatternVars()) {
+          slots.add(var.getIndex());
+        }
+      }
+    }
+    return slots;
+  }
+
+  /**
    * True when the table proves this switch arm's body was a block of its own: a case pattern's
    * variables are declared by the label and close with the switch's block, so their rows are
    * written after every row of a body block that closed where the arm's code ends. When the
@@ -7707,17 +7730,7 @@ public final class RoundTrip {
     if (table == null) {
       return false;
     }
-    java.util.Set<Integer> patternSlots = new java.util.HashSet<>();
-    for (Exprent value : values) {
-      if (value instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent function
-          && function.getFuncType() == org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType.INSTANCEOF
-          && function.getAllExprents().size() > 2
-          && function.getAllExprents().get(2) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.Pattern pattern) {
-        for (org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent var : pattern.getPatternVars()) {
-          patternSlots.add(var.getIndex());
-        }
-      }
-    }
+    java.util.Set<Integer> patternSlots = patternVariableSlots(values);
     if (patternSlots.isEmpty()) {
       return false;
     }

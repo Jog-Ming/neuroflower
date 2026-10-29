@@ -420,12 +420,16 @@ public class SwitchStatement extends Statement {
         && RoundTrip.selector("switchbreak") && RoundTrip.jumpsOnto(breakJump);
       // A local the arm declares ends its row exactly at the break's jump, and another jump lands
       // on that jump: the source closed the arm's block before the break, so the break prints
-      // after the closing brace instead of inside whatever branch the tree hung it off.
+      // after the closing brace instead of inside whatever branch the tree hung it off. The row
+      // and the jump onto it say nothing about a guard: `case X x when g:` closes its block the
+      // same way, so a guard does not veto. A pattern variable's row runs to the switch's own
+      // block whatever the arm's brace did, so it is not the arm's own scope evidence.
       int deferredBreak = -1;
       if (armClose[i] > 0 && braced.contains(stat) && !breakOutside && !yields && !orderUnknown
-          && guard == null && RoundTrip.selector("switchbreak")
+          && RoundTrip.selector("switchbreak")
           && (breakJump < 0 || breakJump == armClose[i])
-          && !declaredScopePast(armRows.get(i), armClose[i])
+          && !declaredScopePast(armRows.get(i), armClose[i],
+            RoundTrip.patternVariableSlots(values))
           && RoundTrip.jumpsOnto(armClose[i]) && RoundTrip.breaksTo(stat, this)) {
         deferredBreak = armClose[i];
       }
@@ -518,9 +522,11 @@ public class SwitchStatement extends Statement {
         // The source wrote `} break;` for an arm braced to scope its locals; the same conditions
         // that decide a dropped `break` apply, since the brace does not change reachability. A
         // deferred break is the one the table proves: its jump is reachable from the jump onto it.
+        // A guarded arm prints its deferred break too: the proof is the table's, not the label's.
         if ((breakOutside || deferredBreak > 0
              || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
-            && (breakJump >= 0 || deferredBreak > 0) && !breakInside && guard == null
+            && (breakJump >= 0 || deferredBreak > 0) && !breakInside
+            && (guard == null || deferredBreak > 0)
             && (!patternArm || deferredBreak > 0)
             && (deferredBreak > 0 || RoundTrip.canCompleteNormally(stat))) {
           int at = buf.length();
@@ -737,8 +743,14 @@ public class SwitchStatement extends Statement {
     // The join block is no arm: its instructions lie after the switch, so they say nothing about
     // where its label stood in the source.
     int join = RoundTrip.selector("switchcasejoin") ? switchEndFromJumps() : -1;
+    // A synthesized throw arm is not a body the source wrote: javac places the no-match path where
+    // the jump layout wants it, and the printer drops the arm, so its block is no ordering evidence.
+    boolean skipMatch = !RoundTrip.switchYields(caseStatements);
     List<Integer> layout = new ArrayList<>(size);
     for (int i = 0; i < size; i++) {
+      if (skipMatch && RoundTrip.synthesizedMatchThrow(caseStatements.get(i))) {
+        continue;
+      }
       int first = RoundTrip.firstOffset(caseStatements.get(i));
       if (first < 0) {
         return false;
@@ -749,8 +761,15 @@ public class SwitchStatement extends Statement {
       layout.add(i);
     }
     layout.sort(Comparator.comparingInt(i -> RoundTrip.firstOffset(caseStatements.get(i))));
-    List<Integer> printed = new ArrayList<>(order);
-    printed.retainAll(layout);
+    List<Integer> printed = new ArrayList<>();
+    for (int i : order) {
+      if (skipMatch && RoundTrip.synthesizedMatchThrow(caseStatements.get(i))) {
+        continue;
+      }
+      if (layout.contains(i)) {
+        printed.add(i);
+      }
+    }
     return !layout.equals(printed);
   }
 
@@ -998,11 +1017,20 @@ public class SwitchStatement extends Statement {
 
   /** True when a local this arm declares at its own level is still in scope at {@code offset}. */
   private static boolean declaredScopePast(List<int[]> rows, int offset) {
+    return declaredScopePast(rows, offset, java.util.Set.of());
+  }
+
+  /**
+   * True when a local this arm declares at its own level is still in scope at {@code offset},
+   * ignoring the given pattern-variable slots: a case pattern's variables close with the switch's
+   * own block, so their rows run past an arm block that closed earlier and do not show its brace.
+   */
+  private static boolean declaredScopePast(List<int[]> rows, int offset, java.util.Set<Integer> patternSlots) {
     if (offset < 0) {
       return false;
     }
     for (int[] row : rows) {
-      if (row[2] > offset) {
+      if (row[2] > offset && !patternSlots.contains(row[0])) {
         return true;
       }
     }
