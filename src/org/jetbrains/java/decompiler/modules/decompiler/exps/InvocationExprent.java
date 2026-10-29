@@ -2276,9 +2276,11 @@ public class InvocationExprent extends Exprent {
     }
 
     // A cast to a wildcard type cannot be the target of a lambda, and a lambda cast to one does not
-    // satisfy the parameter it was meant to disambiguate. Leave those overloads as they were.
+    // satisfy the parameter it was meant to disambiguate. An erased generic type is worse: the cast
+    // erases the lambda's own parameter types (a raw BiFunction turns both into Object). Leave
+    // those overloads as they were.
     for (int i = lambdaAmbiguous.nextSetBit(0); i >= 0; i = lambdaAmbiguous.nextSetBit(i + 1)) {
-      if (i >= types.length || types[i] == null || !types[i].isGeneric()
+      if (i >= types.length || types[i] == null || isRawTarget(types[i])
           || ExprProcessor.getTypeName(types[i]).contains("?")) {
         setAmbiguousParameters.clear(i);
       }
@@ -2942,6 +2944,19 @@ public class InvocationExprent extends Exprent {
         if (md.params.length != lstParameters.size()) {
           continue;
         }
+        // An overload that differs from the called one at another position was already decided by
+        // that parameter — javac takes the more specific method there and never reaches the
+        // functional interfaces — so only an overload differing at the lambda alone is ambiguous.
+        boolean sameOther = true;
+        for (int j = 0; j < md.params.length; j++) {
+          if (j != i && (j >= descriptor.params.length || !md.params[j].equals(descriptor.params[j]))) {
+            sameOther = false;
+            break;
+          }
+        }
+        if (!sameOther) {
+          continue;
+        }
         // The erased descriptor hides a type-variable parameter behind Object; read the signature.
         org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor signature = mt.getSignature();
         VarType genericParam = signature != null && i < signature.parameterTypes.size()
@@ -2969,9 +2984,15 @@ public class InvocationExprent extends Exprent {
     return result;
   }
 
-  /** Same-name, same-arity methods from the receiver's class, or its first ancestor declaring any. */
+  /**
+   * The distinct same-name, same-arity signatures the receiver's type exposes: its own and every
+   * ancestor's. An override repeats its parent's descriptor and is one method; a second signature
+   * with a different parameter type — a functional interface in place of another, for one — is an
+   * overload javac weighs at the call site.
+   */
   private List<StructMethod> collectSameNameSameArity(StructClass cl) {
     List<StructMethod> found = new ArrayList<>();
+    Set<String> seen = new HashSet<>();
     Set<String> visited = new HashSet<>();
     Queue<StructClass> queue = new ArrayDeque<>();
     queue.add(cl);
@@ -2986,12 +3007,10 @@ public class InvocationExprent extends Exprent {
         if (mt.hasModifier(CodeConstants.ACC_SYNTHETIC) || mt.hasModifier(CodeConstants.ACC_BRIDGE)) {
           continue;
         }
-        if (name.equals(mt.getName()) && mt.methodDescriptor().params.length == lstParameters.size()) {
+        if (name.equals(mt.getName()) && mt.methodDescriptor().params.length == lstParameters.size()
+            && seen.add(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()))) {
           found.add(mt);
         }
-      }
-      if (cls == cl && !found.isEmpty()) {
-        return found;
       }
       visited.add(cls.qualifiedName);
       if (cls.superClass != null && !visited.contains(cls.superClass.value)) {
@@ -3010,6 +3029,15 @@ public class InvocationExprent extends Exprent {
       }
     }
     return found;
+  }
+
+  /** True when the type names an erased generic type: printing it would erase the lambda's own. */
+  private static boolean isRawTarget(VarType type) {
+    if (type.isGeneric() || type.type != CodeType.OBJECT) {
+      return false;
+    }
+    StructClass cls = DecompilerContext.getStructContext().getClass(type.value);
+    return cls != null && cls.getSignature() != null && !cls.getSignature().fparameters.isEmpty();
   }
 
   private BitSet getAmbiguousParameters(List<StructMethod> matches) {
