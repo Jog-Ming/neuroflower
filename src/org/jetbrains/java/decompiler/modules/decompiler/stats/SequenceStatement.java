@@ -1304,6 +1304,30 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { A } else { rest… }` where A does not leave the path itself: the target's branch
+      // lands on the first statement after the if and the instruction right after A is the join
+      // jump over the whole run, exactly where the run's own last instruction ends. A written
+      // `if (C) { A } rest…` has no such jump; the arm falls straight into rest.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && RoundTrip.guardElseJoin(ifStatement.getHeadexprent(), ifStatement.getIfstat(),
+               stats.subList(i + 1, stats.size()))) {
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent))
+          .append(" {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(
+          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) { A } return X;` where the target's then-arm ends with a jump over the returning
       // block: the source wrote `if (C) { A } else { return X; }`, and only the false path returns.
       // Without that jump the arm falls into the return and the trailing print is the faithful one.

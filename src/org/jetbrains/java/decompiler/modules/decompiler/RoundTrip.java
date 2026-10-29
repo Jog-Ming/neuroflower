@@ -1326,6 +1326,191 @@ public final class RoundTrip {
     return merge != null && merge >= thenStart ? exit : -1;
   }
 
+  /**
+   * True when the target proves the source wrote a negated pattern guard around the tree's then
+   * arm: {@code ifeq arm; <pattern bind>; goto body; arm: throw} — the branch lands on the abrupt
+   * arm, the bind in front of the arm ends in a goto to the body, and the body is the arm the tree
+   * kept as its else. The tree kept the source's polarity ({@code !(x instanceof T t)}) and its
+   * abrupt arm as the then. A real {@code if (!(x instanceof T t)) { arm } else { body }} sends
+   * the branch to the else with the bind at its start and has no goto in front of the arm, so the
+   * branch target and the bind's goto separate the two forms.
+   */
+  public static boolean guardArmFirst(Exprent head, Statement arm, Statement body) {
+    if (!selector("guardfirst") || head == null || arm == null || body == null
+        || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    Exprent condition = ifHead.getCondition();
+    if (condition == null || !declaresPatternVariable(condition)
+        || !(condition instanceof FunctionExprent not
+             && not.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT)) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    BitSet noFallThrough = NO_FALLTHROUGH.get(method);
+    if (ends == null || targets == null || gotos == null || byEnd == null || noFallThrough == null) {
+      return false;
+    }
+    int armStart = rangeStart(arm);
+    int bodyStart = rangeStart(body);
+    int headEnd = head.bytecode.length();
+    if (armStart <= headEnd || bodyStart < 0 || headEnd <= 0) {
+      return false;
+    }
+    // The condition's last branch is the one javac sends to the abrupt arm.
+    if (lastBranchTargetIn(head.bytecode, ends, targets) != armStart) {
+      return false;
+    }
+    // The gap in front of the arm is the pattern bind, and it ends in the goto that skips the
+    // arm to the body. A guard whose bind the printer folded into the test has no gap at all and
+    // is left to the ordinary arms.
+    int at = headEnd;
+    int steps = 0;
+    Integer skip = null;
+    while (at < armStart && steps < 8) {
+      Integer next = ends.get(at);
+      if (next == null) {
+        return false;
+      }
+      skip = gotos.get(at);
+      at = next;
+      steps++;
+    }
+    if (at != armStart || steps == 0 || skip == null || skip != bodyStart) {
+      return false;
+    }
+    // The arm leaves the path itself; an arm that falls through is an if/else's then.
+    int armEnd = lastEndWithin(arm, ends);
+    Integer lastArm = armEnd < 0 ? null : byEnd.get(armEnd);
+    return lastArm != null && noFallThrough.get(lastArm);
+  }
+
+  /** As {@link #guardElseJoin(Exprent, Statement, java.util.List, StructMethod)}, with the ambient method. */
+  public static boolean guardElseJoin(Exprent head, Statement arm, java.util.List<Statement> rest) {
+    return guardElseJoin(head, arm, rest, currentMethod());
+  }
+
+  /**
+   * The condition the target compiled as a conditional expression, or null. The tree folded
+   * {@code cmp ? false : rest} into {@code !(cmp) && rest}; javac compiles the two with opposite
+   * short-circuit branches, so only the conditional expression reproduces the target's bytes.
+   * The target's proof is the first operand's branch: it lands on the rest operand, and the goto
+   * immediately behind it lands where the whole test's final branch goes. A written {@code &&}
+   * sends that branch to the test's own false path instead and leaves no goto behind it.
+   */
+  public static Exprent ternaryCondition(IfExprent head) {
+    if (!selector("condselect") || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    Exprent condition = head.getCondition();
+    if (!(condition instanceof FunctionExprent and)
+        || and.getFuncType() != FunctionExprent.FunctionType.BOOLEAN_AND
+        || and.getLstOperands().size() != 2) {
+      return null;
+    }
+    Exprent lhs = and.getLstOperands().get(0);
+    Exprent rhs = and.getLstOperands().get(1);
+    if (!(lhs instanceof FunctionExprent not) || not.getFuncType() != FunctionExprent.FunctionType.BOOL_NOT
+        || not.getLstOperands().size() != 1) {
+      return null;
+    }
+    Exprent cmp = not.getLstOperands().get(0);
+    if (!(cmp instanceof FunctionExprent compare) || !isComparison(compare.getFuncType())
+        || cmp.bytecode == null || cmp.bytecode.isEmpty()) {
+      return null;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || targets == null || gotos == null) {
+      return null;
+    }
+    // The instruction right after the comparison is the short-circuit branch javac emits for the
+    // conditional expression; behind it sits the goto to the test's own false path.
+    Integer branchEnd = ends.get(cmp.bytecode.length());
+    if (branchEnd == null) {
+      return null;
+    }
+    Integer branchTo = targets.get(branchEnd);
+    Integer skipTo = gotos.get(branchEnd);
+    int finalTarget = lastBranchTarget(head.bytecode);
+    int rhsStart = firstOffsetOf(rhs);
+    if (branchTo == null || skipTo == null || rhsStart < 0 || branchTo != rhsStart
+        || finalTarget < 0 || skipTo != finalTarget) {
+      return null;
+    }
+    java.util.List<Exprent> operands = new java.util.ArrayList<>(3);
+    operands.add(cmp);
+    operands.add(new ConstExprent(VarType.VARTYPE_BOOLEAN, 0, null));
+    operands.add(rhs);
+    return new FunctionExprent(FunctionExprent.FunctionType.TERNARY, operands, condition.bytecode);
+  }
+
+  /** True for the comparison operators a conditional expression's test can hold. */
+  private static boolean isComparison(FunctionExprent.FunctionType type) {
+    return type == FunctionExprent.FunctionType.EQ || type == FunctionExprent.FunctionType.NE
+      || type == FunctionExprent.FunctionType.LT || type == FunctionExprent.FunctionType.GE
+      || type == FunctionExprent.FunctionType.GT || type == FunctionExprent.FunctionType.LE;
+  }
+
+  /**
+   * True when the target proves the statements after an else-less if are the source's else: the
+   * head's last branch lands on the first of them, the head falls through into the arm, and the
+   * instruction right after the arm is a join jump that lands exactly where the whole run ends.
+   * A written {@code if (C) { arm } rest…} has no such jump — the arm falls straight into rest —
+   * and an arm that ends in {@code break;}/{@code continue;} jumps away from the run's end, so
+   * the join jump is the fact that separates the two forms.
+   */
+  public static boolean guardElseJoin(Exprent head, Statement arm, java.util.List<Statement> rest,
+                                      StructMethod method) {
+    if (!selector("guardfirst") || head == null || arm == null || rest == null || rest.isEmpty()
+        || method == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (ends == null || targets == null || gotos == null) {
+      return false;
+    }
+    int armStart = statementOffset(arm);
+    int headEnd = head.bytecode.length();
+    if (armStart < 0 || armStart != headEnd) {
+      return false;
+    }
+    int runStart = statementOffset(rest.get(0));
+    int runEnd = -1;
+    for (Statement stat : rest) {
+      int end = lastEndWithin(stat, ends);
+      if (end > runEnd) {
+        runEnd = end;
+      }
+    }
+    if (runStart < 0 || runEnd < runStart) {
+      return false;
+    }
+    if (lastBranchTargetIn(head.bytecode, ends, targets) != runStart) {
+      return false;
+    }
+    int armEnd = lastEndWithin(arm, ends);
+    if (armEnd < 0) {
+      return false;
+    }
+    Integer after = gotos.get(armEnd);
+    return after != null && after == runEnd;
+  }
+
   /** Whether the instruction at this offset is a void return, which prints as {@code return;}. */
   public static boolean isVoidReturn(int offset) {
     StructMethod method = currentMethod();
@@ -5635,7 +5820,12 @@ public final class RoundTrip {
     if (table != null) {
       int continueLine = table.findLineNumber(site[0]);
       int bodyLine = table.findLineNumber(site[1]);
-      if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
+      // At the end of a try body the inlined close carries the block's closing-brace line, which
+      // sits after the body it guards; the guard's own test then has to be the line before the
+      // body instead. A written `if (C) continue;` above the body puts its branch there.
+      int guardLine = table.findLineNumber(Math.max(0, end - 1));
+      boolean guardAbove = guardLine >= 0 && bodyLine >= 0 && guardLine < bodyLine;
+      if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine && !guardAbove) {
         return false;
       }
     }
@@ -8716,7 +8906,15 @@ public final class RoundTrip {
   private static boolean isContinueTarget(org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
     // A continue jumps to the loop's head, which is built before the body's first statement. The
     // condition's own bytecode may not cover the receiver chain, so compare with the body start.
+    // The body's first statement can be one whose arms carry the offsets (an if whose head block
+    // is empty prints no exprent at all), so fall back to the statement's whole range: a head
+    // condition begins before the body's first instruction and the loop's head lies before it
+    // too. The whole range is only the fallback — a hoisted definition can carry an offset from
+    // outside the loop that would make the body seem to start before the loop's own head.
     int bodyStart = firstOffset(loop.getFirst());
+    if (bodyStart < 0) {
+      bodyStart = statementOffset(loop.getFirst());
+    }
     if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
       return true;
     }

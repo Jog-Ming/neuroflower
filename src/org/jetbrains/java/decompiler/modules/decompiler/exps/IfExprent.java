@@ -3,6 +3,7 @@
  */
 package org.jetbrains.java.decompiler.modules.decompiler.exps;
 
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SFormsConstructor;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.VarMapHolder;
@@ -92,7 +93,10 @@ public class IfExprent extends Exprent {
     // The general context of if conditions is that they must always return booleans
     condition.getInferredExprType(VarType.VARTYPE_BOOLEAN);
 
-    TextBuffer buf = condition.toJava(indent);
+    // A conditional expression the tree folded into `!(… ) && …`: only the `?:` form compiles to
+    // the target's short-circuit branch layout, so print it back as the source wrote it.
+    Exprent printed = RoundTrip.ternaryCondition(this);
+    TextBuffer buf = (printed == null ? condition : printed).toJava(indent);
     buf.pushNewlineGroup(indent, 1);
     buf.appendPossibleNewline();
     buf.enclose("if (", ")");

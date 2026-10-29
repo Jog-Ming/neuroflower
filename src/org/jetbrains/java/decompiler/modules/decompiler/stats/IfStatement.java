@@ -43,6 +43,15 @@ public class IfStatement extends Statement {
 
   private final List<Exprent> headexprent = new ArrayList<>(1); // contains IfExprent
 
+  /**
+   * The arm statements an enclosing print is putting behind `} else ` right now. A statement in
+   * this set has its own braces as the only ones around it, so a rewrite that must stay inside an
+   * else may print it as the chain's else; a sibling the enclosing print hoists after its brace
+   * is not in the set and keeps the hoisted reading.
+   */
+  private static final ThreadLocal<java.util.Set<Statement>> ELSE_IF_ARM =
+    ThreadLocal.withInitial(() -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+
   // *****************************************************************************
   // constructors
   // *****************************************************************************
@@ -249,6 +258,21 @@ public class IfStatement extends Statement {
       buf.appendIndent(indent + 1).append("return;").appendLineSeparator();
       buf.appendIndent(indent).append("}").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(guardBody, indent, false));
+      return buf;
+    }
+
+    // `if (!(x instanceof T t)) <abrupt arm>` followed by the body: the target's branch lands on
+    // the abrupt arm and the pattern bind in front of it ends in a goto to the body, where a real
+    // `if (!(x instanceof T t)) { arm } else { body }` branches to the else with the bind at its
+    // start and no such goto. The bind belongs to the test, so the guard prints with the tree's
+    // negated condition and the body follows the braces as the source's next statements.
+    if (ifstat != null && elsestat != null && !isLabeled()
+        && condition instanceof IfExprent ifHead
+        && RoundTrip.guardArmFirst(ifHead, ifstat, elsestat)) {
+      buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+      buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
       return buf;
     }
 
@@ -494,8 +518,20 @@ public class IfStatement extends Statement {
       buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
       appendContinueLine(buf, indent);
-      buf.appendIndent(indent).append("}").appendLineSeparator();
-      buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
+      if (printedAsElseIfArm()) {
+        // The enclosing if prints this statement as its `else if`, whose only braces are this
+        // statement's own: the rest hoisted after them would leave the enclosing else and join
+        // the flow the enclosing test branches past. Keep it as the chain's else — javac compiles
+        // both readings alike, and the else stays inside the enclosing arm.
+        if (!printElseIfArm(buf, indent, elsestat)) {
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
+      } else {
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
+      }
       return buf;
     }
 
@@ -757,6 +793,25 @@ public class IfStatement extends Statement {
     return true;
   }
 
+  /** Prints an `else if` arm's content, recording that the arm is being printed as one. */
+  private static TextBuffer printElseIfArmContent(Statement arm, int indent) {
+    ELSE_IF_ARM.get().add(arm);
+    try {
+      return ExprProcessor.jmpWrapper(arm, indent, false);
+    } finally {
+      ELSE_IF_ARM.get().remove(arm);
+    }
+  }
+
+  /**
+   * True when the enclosing if prints this statement as its `else if` arm: the arm's own braces
+   * are the only ones around its text, so anything this statement prints after them leaves the
+   * enclosing else and joins the flow the enclosing test branches past.
+   */
+  private boolean printedAsElseIfArm() {
+    return ELSE_IF_ARM.get().contains(this);
+  }
+
   /**
    * Prints `} else ` and the nested if when the arm still qualifies as an else-if chain, leaving
    * the closing brace to the caller; false, printing nothing, otherwise.
@@ -765,7 +820,7 @@ public class IfStatement extends Statement {
     if (arm instanceof SequenceStatement sequence && RoundTrip.selector("elseifchain")
         && sequence.printsAsChainArm()) {
       buf.appendIndent(indent).append("} else ");
-      TextBuffer content = ExprProcessor.jmpWrapper(arm, indent, false);
+      TextBuffer content = printElseIfArmContent(arm, indent);
       content.setStart(TextUtil.getIndentString(indent).length());
       buf.append(content);
       return true;
@@ -777,7 +832,7 @@ public class IfStatement extends Statement {
          || !arm.getSuccessorEdges(STATEDGE_DIRECT_ALL).get(0).explicit)) { // else if
       buf.appendIndent(indent).append("} else ");
 
-      TextBuffer content = ExprProcessor.jmpWrapper(arm, indent, false);
+      TextBuffer content = printElseIfArmContent(arm, indent);
       content.setStart(TextUtil.getIndentString(indent).length());
       buf.append(content);
       return true;
