@@ -347,6 +347,51 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // The same mirror inside a try-with-resources that ends the loop body: the target's branch
+    // skips the synthetic close() and the goto after it, so the branch-then-goto pair the path
+    // above needs is broken. The close's normal exit is where the source's continue compiled to;
+    // the guard and the body print inside the try, so the close still runs on the guard's path.
+    if (ifstat != null && elsestat == null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && ifHead.bytecode != null
+        && (declaresPattern(ifHead.getCondition())
+            ? ifHead.getCondition().bytecode != null
+               && ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
+            : ifHead.getCondition().bytecode == null
+               || ifHead.getCondition().bytecode.length() == ifHead.bytecode.length()
+               || loneBranch(ifHead)
+                  && !ifHead.getCondition().bytecode.isEmpty()
+                  && ifHead.getCondition().bytecode.length() == ifHead.bytecode.nextSetBit(0))
+        && RoundTrip.printContinueThroughClose(ifHead, this)) {
+      Exprent printed = ifHead.getCondition();
+      Exprent source = printed instanceof FunctionExprent not
+          && not.getFuncType() == FunctionType.BOOL_NOT
+          && not.getLstOperands().size() == 1
+        ? not.getLstOperands().get(0)
+        : RoundTrip.negateCondition(printed);
+      List<Exprent> ors = orOperands(source);
+      List<List<Exprent>> groups = RoundTrip.guardGroups(ifHead, ors, this);
+      if (groups == null) {
+        groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
+      }
+      int gotoOffset = groups.size() == 1 ? RoundTrip.continueCloseSite() : -1;
+      for (List<Exprent> group : groups) {
+        IfExprent guard = (IfExprent) ifHead.copy();
+        guard.setCondition(orOf(group));
+        buf.appendIndent(indent);
+        buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        if (gotoOffset >= 0) {
+          continueLine.addStartBytecodeMapping(gotoOffset);
+        }
+        buf.append(continueLine);
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
+      buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      return buf;
+    }
+
     // `if (!C) break; arm` where the tree kept the break as the if's trailing edge and the arm as
     // its then branch: javac branches into the arm and falls through to a jump to the break, which
     // only the written guard lays out that way. The plain `if (C) { arm } break;` branches past the

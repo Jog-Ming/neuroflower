@@ -98,7 +98,7 @@ public class MethodProcessor implements Runnable {
 
     mt.expandData(cl);
     FullInstructionSequence seq = mt.getInstructionSequence();
-    RoundTrip.recordMethod(mt, seq);
+    RoundTrip.recordMethod(cl, mt, seq);
     ControlFlowGraph graph = new ControlFlowGraph(seq);
     debugCurrentCFG.set(graph);
     DotExporter.toDotFile(graph, mt, "cfgConstructed", true);

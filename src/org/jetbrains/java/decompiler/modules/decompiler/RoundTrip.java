@@ -18,6 +18,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
+import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
@@ -53,6 +54,10 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> TRY_EXIT_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The goto behind the last printed continue-else, for the line alignment. */
   private static final ThreadLocal<int[]> CONTINUE_ELSE_SITE = ThreadLocal.withInitial(() -> new int[]{-1});
+  /** The goto behind the last printed continue that a try-with-resources close stands before. */
+  private static final ThreadLocal<int[]> CONTINUE_CLOSE_SITE = ThreadLocal.withInitial(() -> new int[]{-1});
+  /** Start offsets of {@code close:()V} invocations: the synthetic end of a try-with-resources. */
+  private static final java.util.Map<StructMethod, BitSet> CLOSE_CALLS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Returns already printed as guard exits; the same instruction must not print a second time. */
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> CONSUMED_GUARD_EXITS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
@@ -112,7 +117,7 @@ public final class RoundTrip {
   private RoundTrip() {}
 
   /** Remember where a method's void returns are; the instruction sequence is gone by print time. */
-  public static void recordMethod(StructMethod method, FullInstructionSequence seq) {
+  public static void recordMethod(StructClass cl, StructMethod method, FullInstructionSequence seq) {
     BitSet returns = new BitSet();
     BitSet sinks = new BitSet();
     java.util.Map<Integer, Integer> guards = new java.util.HashMap<>();
@@ -134,9 +139,19 @@ public final class RoundTrip {
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     BitSet noFallThrough = new BitSet();
     BitSet popSites = new BitSet();
+    BitSet closeCalls = new BitSet();
     for (int i = 0; i < seq.length(); i++) {
       Instruction instr = seq.getInstr(i);
       ends.put(instr.startOffset, instr.startOffset + instr.length);
+      if (instr.opcode >= CodeConstants.opc_invokevirtual && instr.opcode <= CodeConstants.opc_invokeinterface) {
+        // The synthetic close javac appends at the end of a try-with-resources body: the branch
+        // that skips it lands past the goto the close's normal path reaches.
+        org.jetbrains.java.decompiler.struct.consts.LinkConstant called =
+          cl.getPool().getLinkConstant(instr.operand(0));
+        if ("close".equals(called.elementname) && "()V".equals(called.descriptor)) {
+          closeCalls.set(instr.startOffset);
+        }
+      }
       if (instr.opcode == CodeConstants.opc_pop || instr.opcode == CodeConstants.opc_pop2) {
         popSites.set(instr.startOffset);
       }
@@ -261,6 +276,7 @@ public final class RoundTrip {
       }
     }
     TEMP_STORES.put(method, tempStores);
+    CLOSE_CALLS.put(method, closeCalls);
     VOID_RETURNS.put(method, returns);
     VALUE_SINKS.put(method, sinks);
     CONTINUE_GUARDS.put(method, guards);
@@ -5149,6 +5165,64 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target compiled this if as {@code if (C) continue;} inside a try-with-resources
+   * body that ends the loop body: the branch skips the synthetic {@code close()} and the goto
+   * right after it, so the branch-then-goto pair is broken by the close call. The jump the source's
+   * continue compiled to is the one at the close's normal exit; the table must put a line of its
+   * own there, before the body's first line. A written continue prints inside the try body, so the
+   * close still runs on its path.
+   */
+  public static boolean printContinueThroughClose(Exprent head, Statement sequence) {
+    CONTINUE_CLOSE_SITE.get()[0] = -1;
+    if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()
+        || !endsLoopBodyAcrossTry(sequence)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    int end = head.bytecode.length();
+    java.util.Map<Integer, Integer> guards = CONTINUE_ELSE_GUARDS.get(method);
+    Integer target = guards == null ? null : guards.get(end);
+    if (target == null || !targetContinues(target, sequence)) {
+      return false;
+    }
+    java.util.Map<Integer, int[]> sites = CONTINUE_ELSE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(end);
+    if (site == null) {
+      return false;
+    }
+    // The jump before the branch's target has to be the close's normal exit: the instruction right
+    // before that goto is the synthetic close() call, not the tail of an arm the branch skipped.
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    Integer close = byEnd == null ? null : byEnd.get(site[0]);
+    BitSet closes = CLOSE_CALLS.get(method);
+    if (close == null || closes == null || !closes.get(close)) {
+      return false;
+    }
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table != null) {
+      int continueLine = table.findLineNumber(site[0]);
+      int bodyLine = table.findLineNumber(site[1]);
+      if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
+        return false;
+      }
+    }
+    CONTINUE_CLOSE_SITE.get()[0] = site[0];
+    return true;
+  }
+
+  /**
+   * The goto the last {@link #printContinueThroughClose} proved, for the printer to pin the printed
+   * {@code continue;} to, exactly as {@link #continueElseSite} serves the else form.
+   */
+  public static int continueCloseSite() {
+    return CONTINUE_CLOSE_SITE.get()[0];
+  }
+
+  /**
    * The goto the guard's printed {@code continue;} compiles to: the jump the target's table puts on
    * the line the source wrote it on, which starts where the head's branch ends. Minus one when the
    * head does not end at a recorded guard.
@@ -5791,6 +5865,19 @@ public final class RoundTrip {
    * {@code continue} at its end jumps to the loop head having skipped nothing.
    */
   public static boolean endsLoopBody(Statement stat) {
+    return endsLoopBody(stat, false);
+  }
+
+  /**
+   * {@link #endsLoopBody} through a try: a statement at the end of a try body that ends the loop
+   * body still leaves for the loop's head, because the close or finally the fall-out runs is the
+   * same one a {@code continue} written there would run.
+   */
+  public static boolean endsLoopBodyAcrossTry(Statement stat) {
+    return endsLoopBody(stat, true);
+  }
+
+  private static boolean endsLoopBody(Statement stat, boolean acrossTry) {
     Statement cur = stat;
     for (Statement parent = cur.getParent(); parent != null; parent = cur.getParent()) {
       if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement) {
@@ -5812,8 +5899,13 @@ public final class RoundTrip {
         // the enclosing if itself reaches the loop's end (the sibling guard hoists it out).
         boolean thenTail = ifStatement.getIfstat() == cur
           && (ifStatement.getElsestat() == null || printsNothing(ifStatement.getElsestat()));
-        boolean elseTail = ifStatement.getElsestat() == cur && endsLoopBody(ifStatement);
+        boolean elseTail = ifStatement.getElsestat() == cur && endsLoopBody(ifStatement, acrossTry);
         if (!thenTail && !elseTail) {
+          return false;
+        }
+      } else if (acrossTry && (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement
+                               || parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement)) {
+        if (parent.getFirst() != cur) {
           return false;
         }
       } else {
