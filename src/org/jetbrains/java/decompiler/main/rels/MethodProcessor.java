@@ -282,6 +282,11 @@ public class MethodProcessor implements Runnable {
             continue;
           }
 
+          if (LoopWrapperMerge.restructure(root)) {
+            decompileRecord.add("LoopWrapperMerge", root);
+            continue;
+          }
+
           if (LoopExitLift.lift(root)) {
             decompileRecord.add("LoopExitLift", root);
             continue;
