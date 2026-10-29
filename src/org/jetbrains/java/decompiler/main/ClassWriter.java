@@ -507,8 +507,9 @@ public class ClassWriter implements StatementWriter {
       // A lambda that captures `this` is lowered to an instance body. A static bridge whose first
       // parameter is that captured instance and whose remaining parameters are forwarded
       // unchanged is javac's lowering of a bound method reference `this::name`, whose declared
-      // parameters coincide with the functional method's.
-      if (prefix != 1 || !(methodObject instanceof VarExprent receiver) || !"this".equals(receiver.getName())) {
+      // parameters coincide with the functional method's. A captured expression can only be an
+      // invocation after the receiver-temp fold: a lambda's capture is always a local.
+      if (prefix != 1 || !boundQualifier(methodObject)) {
         return false;
       }
     }
@@ -570,6 +571,17 @@ public class ClassWriter implements StatementWriter {
         break;
       }
     }
+    // A congruent bound reference to a varargs method packs an empty trailing array after the
+    // forwarded parameters (`iconst_0; anewarray A`, `expr::getPath` against
+    // `getPath(String, String...)`). Only a reference bridge whose qualifier is not a capture
+    // reaches this shape with `differs` clear; the same bytes under `differs` belong to a lambda
+    // that must keep printing as one, so the pack is accepted only here.
+    String packedType = null;
+    if (!differs && index + 1 < seq.length() && intConstant(seq.getInstr(index)) == 0
+        && seq.getInstr(index + 1).opcode == CodeConstants.opc_anewarray) {
+      packedType = cl.getPool().getPrimitiveConstant(seq.getInstr(index + 1).operand(0)).getString();
+      index += 2;
+    }
     if (paramIndex != md_content.params.length || index >= seq.length()) {
       return false;
     }
@@ -586,8 +598,16 @@ public class ClassWriter implements StatementWriter {
     }
     MethodDescriptor md_target = MethodDescriptor.parseDescriptor(target.descriptor);
     int passed = staticCall ? md_content.params.length : md_content.params.length - 1;
-    if (passed < 0 || md_target.params.length != passed) {
+    if (passed < 0 || md_target.params.length != passed + (packedType == null ? 0 : 1)) {
       return false;
+    }
+    if (packedType != null) {
+      // The packed array is the varargs method's last parameter, holding the forwarded value's
+      // element type.
+      VarType packedParam = md_target.params[passed];
+      if (packedParam == null || packedParam.arrayDim != 1 || !packedType.equals(packedParam.value)) {
+        return false;
+      }
     }
     // A static bridge with a capture that calls a static method forwards captured values into
     // arguments, which is a lambda body, not a reference.
@@ -741,6 +761,16 @@ public class ClassWriter implements StatementWriter {
 
   private static boolean staticNoCapture(int prefix) {
     return prefix == 0;
+  }
+
+  /**
+   * Whether a captured receiver can be printed as the qualifier of `expr::name`: the receiver
+   * `this`, or an invocation the receiver-temp fold put in the capture's place. A lambda
+   * expression's capture is always a local, so an invocation here is that fold's marker.
+   */
+  private static boolean boundQualifier(Exprent methodObject) {
+    return methodObject instanceof InvocationExprent
+      || methodObject instanceof VarExprent receiver && "this".equals(receiver.getName());
   }
 
   /**

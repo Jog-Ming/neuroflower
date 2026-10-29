@@ -10,6 +10,7 @@ import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.NewExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -17,7 +18,12 @@ import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
+import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
+import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
+import org.jetbrains.java.decompiler.struct.gen.VarType;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -38,13 +44,23 @@ import java.util.Set;
  * The source expression that produced the receiver therefore stands in for the temp: the capture
  * becomes that expression and the store disappears, so the printer's bridge reader sees
  * {@code recv::name} rather than a lambda over a declared local.
+ *
+ * <p>The stored value is either a non-stack local (the receiver {@code this}) or an invocation
+ * ({@code baseFolder.getFileSystem()::getPath}): javac evaluates the invocation once at the
+ * creation site and captures the result, and an invocation prints as a primary expression, so it
+ * can stand as the reference's qualifier without parentheses. An invocation fold is taken only
+ * when the bridge body is the forward shape the printer reads; otherwise the folded-away local
+ * would leave the bridge's printed body referring to a variable that no longer exists.
  */
 public final class ReferenceReceiverTemp {
   private ReferenceReceiverTemp() {
   }
 
   public static boolean fold(Statement root, StructMethod method) {
-    if (method == null || !RoundTrip.enabled() || !RoundTrip.selector("reftemp")) {
+    // The fold exists to feed the bridge printer: with that printer off, the marker would have
+    // no reader and the deleted store would leave the lambda's body dangling.
+    if (method == null || !RoundTrip.enabled() || !RoundTrip.selector("reftemp")
+        || !RoundTrip.selector("methodrefbridge")) {
       return false;
     }
 
@@ -86,7 +102,15 @@ public final class ReferenceReceiverTemp {
         if (!(assignment.getLeft() instanceof VarExprent temp) || temp.isStack() || temp.getLVT() != null) {
           continue;
         }
-        if (!(assignment.getRight() instanceof VarExprent value) || value.isStack()) {
+        Exprent value = assignment.getRight();
+        // Only a local (the receiver `this`) or an invocation is a primary the printer can put
+        // before `::` unchanged. New, field, function, array, assignment and constant values
+        // would need parentheses, so they stay as a declared temp.
+        if (value instanceof VarExprent variable) {
+          if (variable.isStack()) {
+            continue;
+          }
+        } else if (!(value instanceof InvocationExprent)) {
           continue;
         }
         if (stores.putIfAbsent(temp.getIndex(),
@@ -166,7 +190,8 @@ public final class ReferenceReceiverTemp {
     if (store == null || ambiguous.contains(slot)) {
       return null;
     }
-    if (!boundBridgeReference(site)) {
+    Bridge bridge = boundBridge(site);
+    if (bridge == null) {
       return null;
     }
     // The receiver temp must be untabled and appear exactly twice: its store and this capture.
@@ -185,6 +210,13 @@ public final class ReferenceReceiverTemp {
     if (!immediatelyBefore(method, store.assignment(), capture)) {
       return null;
     }
+    // An invocation only prints as the reference's qualifier when the bridge body is the single
+    // forward call the bridge printer reads; anything else would delete the temp and leave the
+    // printed lambda body referring to a local that no longer exists.
+    if (store.value() instanceof InvocationExprent invocation
+        && !printableForward(bridge, invocation)) {
+      return null;
+    }
     return new Fold(site, store);
   }
 
@@ -193,31 +225,144 @@ public final class ReferenceReceiverTemp {
    * static synthetic method whose first parameter, the captured receiver, is named {@code rec$} in
    * its local variable table.
    */
-  private static boolean boundBridgeReference(NewExprent site) {
+  private static Bridge boundBridge(NewExprent site) {
     ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(site.getNewType().value);
     if (node == null || node.lambdaInformation == null || !node.lambdaInformation.is_content_method_static) {
-      return false;
+      return null;
     }
     StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
     if (content == null) {
-      return false;
+      return null;
     }
     StructMethod bridge = content.getMethod(node.lambdaInformation.content_method_name,
       node.lambdaInformation.content_method_descriptor);
     if (bridge == null || !bridge.hasModifier(CodeConstants.ACC_STATIC)
       || !bridge.hasModifier(CodeConstants.ACC_SYNTHETIC)) {
-      return false;
+      return null;
     }
     StructLocalVariableTableAttribute table = bridge.getLocalVariableAttr();
     if (table == null) {
-      return false;
+      return null;
     }
     for (LocalVariable row : table.getVariables().toList()) {
       if (row.getIndex() == 0 && row.getStart() == 0 && "rec$".equals(row.getName())) {
-        return true;
+        return new Bridge(content, bridge, node.lambdaInformation.content_method_descriptor,
+          node.lambdaInformation.method_descriptor);
       }
     }
-    return false;
+    return null;
+  }
+
+  /**
+   * Whether the bridge's body is the forward shape the bridge printer reads for a bound
+   * reference whose qualifier is an invocation: the receiver and the forwarded parameters loaded
+   * in order, an empty varargs array packed when the target's last parameter is an array, then
+   * exactly one instance call and a plain return. The declared types must line up with the call,
+   * and the invocation's own type must satisfy the printer's receiver check; a body with any
+   * other instruction gives the printer no reference to write, so the store must stay.
+   */
+  private static boolean printableForward(Bridge bridge, InvocationExprent receiver) {
+    MethodDescriptor content = MethodDescriptor.parseDescriptor(bridge.contentDescriptor());
+    MethodDescriptor lambda = MethodDescriptor.parseDescriptor(bridge.lambdaDescriptor());
+    int prefix = content.params.length - lambda.params.length;
+    if (prefix != 1) {
+      return false;
+    }
+    // Only a congruent bridge prints here: every functional parameter already has the referenced
+    // method's own type, so the bridge's remaining parameters must be exactly the call's.
+    for (int i = 0; i < lambda.params.length; i++) {
+      if (!content.params[prefix + i].equals(lambda.params[i])) {
+        return false;
+      }
+    }
+    FullInstructionSequence seq;
+    try {
+      bridge.method().expandData(bridge.content());
+      seq = bridge.method().getInstructionSequence();
+    } catch (IOException e) {
+      return false;
+    }
+    if (seq == null || seq.isEmpty()) {
+      return false;
+    }
+    int index = 0;
+    int slot = 0;
+    for (VarType param : content.params) {
+      if (index >= seq.length()) {
+        return false;
+      }
+      Instruction load = seq.getInstr(index);
+      if (!isLoad(load.opcode) || slotOf(load) != slot) {
+        return false;
+      }
+      slot += param.stackSize;
+      index++;
+      while (index < seq.length() && seq.getInstr(index).opcode == CodeConstants.opc_checkcast) {
+        index++;
+      }
+    }
+    String packed = null;
+    if (index + 1 < seq.length() && intConstant(seq.getInstr(index)) == 0
+        && seq.getInstr(index + 1).opcode == CodeConstants.opc_anewarray) {
+      packed = bridge.content().getPool().getPrimitiveConstant(seq.getInstr(index + 1).operand(0)).getString();
+      index += 2;
+    }
+    if (index >= seq.length()) {
+      return false;
+    }
+    Instruction call = seq.getInstr(index);
+    if (call.opcode != CodeConstants.opc_invokevirtual
+        && call.opcode != CodeConstants.opc_invokeinterface
+        && call.opcode != CodeConstants.opc_invokespecial) {
+      return false;
+    }
+    LinkConstant target = bridge.content().getPool().getLinkConstant(call.operand(0));
+    if (target == null || target.classname == null || target.elementname == null
+        || target.descriptor == null) {
+      return false;
+    }
+    MethodDescriptor called = MethodDescriptor.parseDescriptor(target.descriptor);
+    int passed = content.params.length - 1;
+    if (called.params.length != passed + (packed == null ? 0 : 1)) {
+      return false;
+    }
+    for (int i = 0; i < passed; i++) {
+      if (!called.params[i].equals(content.params[i + 1])) {
+        return false;
+      }
+    }
+    if (packed != null) {
+      VarType last = called.params[passed];
+      if (last == null || last.arrayDim != 1 || !packed.equals(last.value)) {
+        return false;
+      }
+    }
+    // The printer types the qualifier and requires it to be an instance of the call's owner.
+    MethodDescriptor invocation = receiver.getDescriptor();
+    VarType receiverType = invocation == null ? null : invocation.ret;
+    if (receiverType == null || receiverType.type != CodeType.OBJECT
+        || receiverType.arrayDim != 0 || receiverType.value == null
+        || !DecompilerContext.getStructContext().instanceOf(receiverType.value, target.classname)) {
+      return false;
+    }
+    index++;
+    while (index < seq.length() && (seq.getInstr(index).opcode == CodeConstants.opc_checkcast
+        || seq.getInstr(index).opcode == CodeConstants.opc_pop)) {
+      index++;
+    }
+    return index + 1 == seq.length() && isReturn(seq.getInstr(index).opcode);
+  }
+
+  /** The value of a small integer constant instruction, or Integer.MIN_VALUE. */
+  private static int intConstant(Instruction instr) {
+    int opcode = instr.opcode;
+    if (opcode >= CodeConstants.opc_iconst_m1 && opcode <= CodeConstants.opc_iconst_5) {
+      return opcode - CodeConstants.opc_iconst_0;
+    }
+    if (opcode == CodeConstants.opc_bipush || opcode == CodeConstants.opc_sipush) {
+      return instr.operand(0);
+    }
+    return Integer.MIN_VALUE;
   }
 
   /**
@@ -253,6 +398,12 @@ public final class ReferenceReceiverTemp {
   private static boolean isLoad(int opcode) {
     return opcode >= CodeConstants.opc_iload && opcode <= CodeConstants.opc_aload
       || opcode >= CodeConstants.opc_iload_0 && opcode <= CodeConstants.opc_aload_3;
+  }
+
+  private static boolean isReturn(int opcode) {
+    return opcode == CodeConstants.opc_return || opcode == CodeConstants.opc_areturn
+      || opcode == CodeConstants.opc_ireturn || opcode == CodeConstants.opc_lreturn
+      || opcode == CodeConstants.opc_freturn || opcode == CodeConstants.opc_dreturn;
   }
 
   /** The slot an {@code iload}..{@code astore} instruction names, short form included. */
@@ -304,9 +455,14 @@ public final class ReferenceReceiverTemp {
   }
 
   private record Store(List<Exprent> list, AssignmentExprent assignment,
-                       VarExprent temp, VarExprent value) {
+                       VarExprent temp, Exprent value) {
   }
 
   private record Fold(NewExprent site, Store store) {
+  }
+
+  /** The bound reference's synthetic bridge and the two descriptors it was created with. */
+  private record Bridge(StructClass content, StructMethod method,
+                        String contentDescriptor, String lambdaDescriptor) {
   }
 }
