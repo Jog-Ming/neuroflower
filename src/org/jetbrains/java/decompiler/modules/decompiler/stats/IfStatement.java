@@ -793,7 +793,11 @@ public class IfStatement extends Statement {
           && (!starts
               || !RoundTrip.continuesBefore(operands.get(i), arm)
                  && !RoundTrip.patternSlotReused(operands.get(i)))) {
-        return java.util.Collections.emptyList();
+        // A pattern variable the flat condition declares stays where it is: nesting a later
+        // operand would move its declaration into a block of its own, and javac then numbers the
+        // slots differently. The later boundaries still split — a pattern variable in the prefix
+        // is in scope for the rest of the source's condition either way.
+        continue;
       }
       if (starts) {
         groups.add(i);
@@ -958,9 +962,10 @@ public class IfStatement extends Statement {
   private static void collectOrOperands(Exprent condition, List<Exprent> out) {
     if (condition instanceof FunctionExprent function
         && function.getFuncType() == FunctionType.BOOLEAN_OR
-        && function.getLstOperands().size() == 2) {
-      collectOrOperands(function.getLstOperands().get(0), out);
-      collectOrOperands(function.getLstOperands().get(1), out);
+        && function.getLstOperands().size() >= 2) {
+      for (Exprent operand : function.getLstOperands()) {
+        collectOrOperands(operand, out);
+      }
     } else {
       out.add(condition);
     }
@@ -976,11 +981,13 @@ public class IfStatement extends Statement {
   private static void collectOperands(Exprent condition, List<Exprent> out) {
     if (condition instanceof FunctionExprent function
         && function.getFuncType() == FunctionType.BOOLEAN_AND
-        && function.getLstOperands().size() == 2) {
-      // The fold nests to the right (the bytecode's three branches to one target), so both
-      // sides have to be flattened or a nested test stays hidden inside the right operand.
-      collectOperands(function.getLstOperands().get(0), out);
-      collectOperands(function.getLstOperands().get(1), out);
+        && function.getLstOperands().size() >= 2) {
+      // The fold nests to the right (the bytecode's three branches to one target), so every
+      // side has to be flattened or a nested test stays hidden inside a later operand. A
+      // merge may also fold into a single n-ary node.
+      for (Exprent operand : function.getLstOperands()) {
+        collectOperands(operand, out);
+      }
     } else {
       out.add(condition);
     }
