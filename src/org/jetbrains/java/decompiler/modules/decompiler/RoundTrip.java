@@ -49,6 +49,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_BY_END = new java.util.concurrent.ConcurrentHashMap<>();
   /** Per method: handler bytecode offset -> first offset after its protected range. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> HANDLER_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Per method: handler offset -> the skip-goto's destination, where code after the try starts. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> TRY_EXIT_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The goto behind the last printed continue-else, for the line alignment. */
   private static final ThreadLocal<int[]> CONTINUE_ELSE_SITE = ThreadLocal.withInitial(() -> new int[]{-1});
   /** Returns already printed as guard exits; the same instruction must not print a second time. */
@@ -268,6 +270,7 @@ public final class RoundTrip {
     INSTRUCTION_ENDS.put(method, ends);
     INSTRUCTION_BY_END.put(method, prevByEnd);
     java.util.Map<Integer, Integer> handlerEnds = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> tryExits = new java.util.HashMap<>();
     java.util.List<int[]> exceptionRanges = new java.util.ArrayList<>();
     org.jetbrains.java.decompiler.code.ExceptionTable table = seq.exceptionTable();
     if (table != null) {
@@ -295,6 +298,25 @@ public final class RoundTrip {
         if (exit.opcode == CodeConstants.opc_goto || exit.opcode == CodeConstants.opc_goto_w) {
           handlerEnds.put(seq.getInstr(handlerIndex).startOffset, exit.startOffset);
         }
+        // The skip-goto's destination is where the code after the try/catch begins. A protected
+        // range can stop just before its own trailing `return`, leaving the skip-goto one
+        // instruction further; it is the last goto before the handler that jumps past it.
+        int skipTarget = -1;
+        if (exit.opcode == CodeConstants.opc_goto || exit.opcode == CodeConstants.opc_goto_w) {
+          skipTarget = exit.startOffset + exit.operand(0);
+        } else {
+          int handlerStart = seq.getInstr(handlerIndex).startOffset;
+          for (int i = toIndex; i < handlerIndex; i++) {
+            Instruction candidate = seq.getInstr(i);
+            if ((candidate.opcode == CodeConstants.opc_goto || candidate.opcode == CodeConstants.opc_goto_w)
+                && candidate.startOffset + candidate.operand(0) > handlerStart) {
+              skipTarget = candidate.startOffset + candidate.operand(0);
+            }
+          }
+        }
+        if (skipTarget >= 0) {
+          tryExits.put(seq.getInstr(handlerIndex).startOffset, skipTarget);
+        }
         // A finally handler's body ends with athrow; javac copies that body to every path that
         // leaves the protected range, so the same instruction run appears several times.
         int start = seq.getInstr(handlerIndex).startOffset;
@@ -315,6 +337,7 @@ public final class RoundTrip {
       }
     }
     HANDLER_ENDS.put(method, handlerEnds);
+    TRY_EXIT_TARGETS.put(method, tryExits);
     // javac writes a catch parameter's table entry for every non-empty catch body. Its absence at
     // the first instruction after the store marks a body the source left empty; the printer sees
     // only the statement the decompiler folded in there, so remember where such a body starts.
@@ -1698,7 +1721,10 @@ public final class RoundTrip {
     if (exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
       return false;
     }
-    int skip = handlerExitOffset(handlerOffset);
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> exits = method == null ? null : TRY_EXIT_TARGETS.get(method);
+    Integer target = exits == null ? null : exits.get(handlerOffset);
+    int skip = target != null ? target : handlerExitOffset(handlerOffset);
     if (skip < 0 || exit.bytecode.nextSetBit(0) < skip) {
       return false;
     }
