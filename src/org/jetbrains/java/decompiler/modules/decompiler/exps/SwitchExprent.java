@@ -118,7 +118,15 @@ public class SwitchExprent extends Exprent {
             var.setWritingPattern();
           }
 
-          buf.append(value.getAllExprents().get(2).toJava(indent));
+          // Java 25's unnamed pattern: the class file has no binding for the label — no slot, no
+          // table row, no load — so the source wrote `_`, not a name.
+          String unnamed = pattern instanceof VarExprent var && RoundTrip.unnamedPatternVariable(stat, var)
+            ? var.getDefinitionType() : null;
+          if (unnamed != null && !unnamed.equals("var")) {
+            buf.append(unnamed).append(" _");
+          } else {
+            buf.append(value.getAllExprents().get(2).toJava(indent));
+          }
         } else {
           buf.append(value.toJava(indent));
         }

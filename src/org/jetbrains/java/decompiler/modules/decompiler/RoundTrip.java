@@ -1192,6 +1192,34 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when the class file proves a switch case's type pattern wrote Java 25's unnamed pattern
+   * {@code _} instead of a name. javac allocates a slot and writes a local table row for a written
+   * name even when the arm never reads it; {@code _} binds nothing, so its slot carries no row and
+   * the arm's own code never loads it. A name the arm reads must stay: the load names the slot.
+   */
+  public static boolean unnamedPatternVariable(Statement arm, VarExprent variable) {
+    if (!selector("unusedpattern") || arm == null || variable == null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    // The pattern's slot has no row: the table names every written binding, whether or not the
+    // arm reads it, and writes nothing at all for `_`.
+    if (table.matchingVars(originalSlot(variable)).findFirst().isPresent()) {
+      return false;
+    }
+    // The arm's own code never reads the slot: a binding the body uses cannot become `_`.
+    return !variable.isVarReferenced(arm);
+  }
+
   /** The first offset a statement covers, its head exprents included, or -1. */
   private static int rangeStart(Statement statement) {
     BitSet bits = new BitSet();
