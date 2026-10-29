@@ -8102,6 +8102,48 @@ public final class RoundTrip {
   }
 
   /**
+   * True when this explicit jump is a switch arm's {@code break;} and not the enclosing loop's
+   * {@code continue;}: the jump lands on the loop's own latch, a bare {@code goto} to the continue
+   * target that the switch's join falls into. A written continue jumps to that target directly,
+   * with no trampoline instruction in between, so the goto on the landing separates the two forms
+   * and printing continue would merge the switch's join with the loop's back edge.
+   */
+  public static boolean armBreakAtLoopLatch(Statement stat, int jumpOffset) {
+    if (!selector("switchbreak") || stat == null) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = gotosHere();
+    // The printer keeps the jump's offset only for a basic block whose last instruction it
+    // dropped; a compound arm's jump starts where its last recorded instruction ends.
+    int jump = jumpOffset >= 0 ? jumpOffset : tailJumpOffset(stat);
+    Integer landing = gotos == null || jump < 0 ? null : gotos.get(jump);
+    if (landing == null || landing <= 0) {
+      return false;
+    }
+    org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement sw = enclosingArm(stat);
+    if (sw == null) {
+      return false;
+    }
+    // The landing has to lie past the whole switch: an instruction inside an arm is that arm's
+    // own flow, and a continue of the loop then has a real instruction to land on.
+    int end = blockEnd(sw);
+    return end >= 0 && landing > end && loopBackEdge(stat, landing);
+  }
+
+  /** The nearest switch this statement is directly a case arm of, or null. */
+  private static org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement enclosingArm(Statement stat) {
+    Statement child = stat;
+    for (Statement cur = stat.getParent(); cur != null; cur = cur.getParent()) {
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement sw
+          && sw.getCaseStatements().contains(child)) {
+        return sw;
+      }
+      child = cur;
+    }
+    return null;
+  }
+
+  /**
    * True when a forward goto other than the one at {@code known} lands on {@code target}: two
    * distinct jumps onto one instruction prove both were written exits, where a group the source
    * left to fall through has no jump of its own.

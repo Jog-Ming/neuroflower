@@ -1247,11 +1247,15 @@ public class ExprProcessor implements CodeConstants {
               // A break out of the loop body's last switch and a continue compile to different
               // jumps; the target's jump at this offset says which one the source wrote.
               boolean continues = !edge.labeled
-                && (RoundTrip.breakJumpsToContinue(jumpOffset) || RoundTrip.emptyArmContinues(stat));
+                && (RoundTrip.breakJumpsToContinue(jumpOffset) || RoundTrip.emptyArmContinues(stat))
+                && !RoundTrip.armBreakAtLoopLatch(stat, jumpOffset);
               buf.append(continues ? "continue" : "break");
               break;
             case StatEdge.TYPE_CONTINUE:
-              buf.append("continue");
+              // An arm's jump that lands on the loop's bare back-edge goto is the switch's break:
+              // a written continue would reach the loop's continue target with no goto between.
+              boolean latchBreak = !edge.labeled && RoundTrip.armBreakAtLoopLatch(stat, jumpOffset);
+              buf.append(latchBreak ? "break" : "continue");
           }
 
           boolean needsName = edge.labeled || RoundTrip.leavesClosure(edge);
