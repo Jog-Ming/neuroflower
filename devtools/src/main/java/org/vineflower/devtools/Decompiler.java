@@ -95,7 +95,10 @@ public final class Decompiler {
     Files.createDirectories(staging);
     List<String> command = new ArrayList<>();
     command.add(javaCommand());
-    command.add("-Xmx4g");
+    // A cap, not a reservation: the JVM commits lazily and the page file backs the rest, so a
+    // bigger budget only gives the collector room under pressure. 4 GB made a full-tree run
+    // under external load fail methods it decompiles cleanly on its own.
+    command.add("-Xmx8g");
     command.add("-jar");
     command.add(devJar.toString());
     command.add("--thread-count=" + threads);
