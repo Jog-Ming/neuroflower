@@ -95,6 +95,19 @@ public class ExitExprent extends Exprent {
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
+    if (exitType == Type.RETURN && value != null) {
+      int jump = RoundTrip.valuedBreakJump(this);
+      if (jump >= 0) {
+        String label = RoundTrip.labelledBreakLabel(this);
+        if (label != null) {
+          // A copy of the method's final return that a jump out of an enclosing loop lands on:
+          // the source wrote that break, and the return itself prints once after the loop.
+          buf.append("break ").append(label);
+          buf.addStartBytecodeMapping(jump);
+          return buf;
+        }
+      }
+    }
     buf.addBytecodeMapping(bytecode);
 
     if (exitType == Type.RETURN) {

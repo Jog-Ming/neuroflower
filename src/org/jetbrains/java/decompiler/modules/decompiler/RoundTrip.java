@@ -5438,12 +5438,38 @@ public final class RoundTrip {
    * that the jump cannot reach without a name, or null when it prints as `return;`/plain `break;`.
    */
   public static String labelledBreakLabel(Exprent exit) {
+    int[] site = outwardBreak(exit);
+    return site == null ? null : "label" + site[1];
+  }
+
+  /**
+   * The jump a value return prints as, when the expression is a copy of the method's own final
+   * return and a jump out of an enclosing loop lands on it: the source wrote {@code break label;}
+   * there, which compiles to exactly that jump. Returns the jump's offset, or -1.
+   */
+  public static int valuedBreakJump(Exprent exit) {
+    if (exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
+    if (last == null || exit.bytecode.previousSetBit(Integer.MAX_VALUE) != last) {
+      return -1;
+    }
+    int[] site = outwardBreak(exit);
+    return site == null ? -1 : site[0];
+  }
+
+  /** The jump offset and the enclosing loop's id for a return a loop's outward break lands on. */
+  private static int[] outwardBreak(Exprent exit) {
     if (!selector("breaklabel") || exit == null || exit.bytecode == null || exit.bytecode.isEmpty()) {
       return null;
     }
     StructMethod method = currentMethod();
     java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
-    int exitStart = exit.bytecode.nextSetBit(0);
+    // A valued return starts at its expression's first instruction; the exit's own offsets begin
+    // at the return instruction, which the jump does not land on.
+    int exitStart = exitStart(exit);
     if (gotos == null || exitStart < 0) {
       return null;
     }
@@ -5459,11 +5485,18 @@ public final class RoundTrip {
       }
       for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
         if (edge.getValue() == exitStart && edge.getKey() >= start && edge.getKey() < exitStart) {
-          return "label" + loop.id;
+          return new int[]{edge.getKey(), loop.id};
         }
       }
     }
     return null;
+  }
+
+  /** The first instruction the whole exit covers, its value's operands included. */
+  private static int exitStart(Exprent exit) {
+    BitSet range = new BitSet();
+    exit.getBytecodeRange(range);
+    return range.isEmpty() ? -1 : range.nextSetBit(0);
   }
 
   /** Where this loop's own body ends: the instruction after its back edge to the head. */
@@ -5481,23 +5514,61 @@ public final class RoundTrip {
     // A condition the decompiler composed carries no offsets of its own.
     int headStart = head.bytecode != null && !head.bytecode.isEmpty()
       ? head.bytecode.nextSetBit(0) : firstOffsetOf(head);
-    if (headStart < 0) {
-      return -1;
-    }
     int end = -1;
-    for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
-      if (edge.getValue() == headStart) {
-        Integer instructionEnd = ends.get(edge.getKey());
-        if (instructionEnd != null && instructionEnd > end) {
-          end = instructionEnd;
+    if (headStart >= 0) {
+      for (java.util.Map.Entry<Integer, Integer> edge : gotos.entrySet()) {
+        if (edge.getValue() == headStart) {
+          Integer instructionEnd = ends.get(edge.getKey());
+          if (instructionEnd != null && instructionEnd > end) {
+            end = instructionEnd;
+          }
         }
       }
     }
-    return end;
+    if (end >= 0) {
+      return end;
+    }
+    // A composed condition names no head to jump back to. Cut the copies of the method's final
+    // return out of the loop, and the instruction that then ends its body is the back edge: a
+    // jump backwards to the head. A nested loop's back edge does not end where the last exprent
+    // does, so it cannot be mistaken for this one.
+    BitSet skip = new BitSet();
+    Integer last = LAST_INSTRUCTION.get(method);
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(loop);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent e : exprents) {
+          for (Exprent part : e.getAllExprents(true, true)) {
+            if (part instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+                && exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+                && exit.bytecode != null && !exit.bytecode.isEmpty()
+                && last != null && exit.bytecode.previousSetBit(Integer.MAX_VALUE) == last) {
+              exit.getBytecodeRange(skip);
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    int bodyEnd = lastEndExcept(loop, skip);
+    Integer backEnd = bodyEnd < 0 ? null : ends.get(bodyEnd);
+    if (backEnd == null) {
+      return -1;
+    }
+    Integer target = gotos.get(bodyEnd);
+    if (target == null) {
+      target = BRANCH_STARTS.getOrDefault(method, java.util.Map.of()).get(bodyEnd);
+    }
+    return target != null && target <= bodyEnd ? backEnd : -1;
   }
 
   /** Offsets where a bare void return sits anywhere inside this statement. */
   private static java.util.Set<Integer> copiedExitOffsets(Statement stat) {
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
     java.util.Set<Integer> offsets = new java.util.HashSet<>();
     java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
     queue.add(stat);
@@ -5509,9 +5580,15 @@ public final class RoundTrip {
           for (Exprent part : exprent.getAllExprents(true, true)) {
             if (part instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
                 && exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
-                && exit.getValue() == null
-                && exit.bytecode != null && !exit.bytecode.isEmpty()) {
-              offsets.add(exit.bytecode.nextSetBit(0));
+                && exit.bytecode != null && !exit.bytecode.isEmpty()
+                // A bare return is the loop's break outright; a valued one is a copy of the
+                // method's final return the break jumps to.
+                && (exit.getValue() == null
+                    || last != null && exit.bytecode.previousSetBit(Integer.MAX_VALUE) == last)) {
+              int start = exitStart(exit);
+              if (start >= 0) {
+                offsets.add(start);
+              }
             }
           }
         }
