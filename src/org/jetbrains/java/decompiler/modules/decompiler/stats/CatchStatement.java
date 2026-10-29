@@ -186,13 +186,12 @@ public class CatchStatement extends Statement {
           hoistedReturn = lastBody;
           hoistOwner = owner;
           bodyExprents.remove(bodyExprents.size() - 1);
-        } else if (lastBody instanceof ExitExprent copy && copy.getExitType() == ExitExprent.Type.RETURN
-            && copy.getValue() == null && RoundTrip.isMethodFinalReturn(copy)) {
-          // The method's own final return, which the fall-through after the try prints; the body
-          // must not print the copy again — the source ended the try there.
-          bodyExprents.remove(bodyExprents.size() - 1);
         }
       }
+      // The method's own final return can also be folded into the body anywhere on its last
+      // printed path (a finite check's arm, say). The fall-through after the try ends at that
+      // same instruction, so the body must not print the copy.
+      removeFinalReturn(first);
     }
 
     buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
@@ -358,6 +357,24 @@ public class CatchStatement extends Statement {
     return buf;
   }
 
+  /** Removes a bare void return at the method's last instruction from the try body. */
+  private static void removeFinalReturn(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (int i = exprents.size() - 1; i >= 0; i--) {
+        Exprent exprent = exprents.get(i);
+        if (exprent instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+            && exit.getValue() == null && RoundTrip.isMethodFinalReturn(exit)) {
+          exprents.remove(i);
+          return;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      removeFinalReturn(child);
+    }
+  }
+
   /** The bytecode offset of the first catch handler's exception store, or -1. */
   /**
    * The sequence statement whose own exprents end with the try body's trailing return, or null.
@@ -373,6 +390,11 @@ public class CatchStatement extends Statement {
       Statement child = children.get(i);
       if (RoundTrip.printsNothing(child)) {
         continue;
+      }
+      // A trailing sequence's last child is still the body's own fall-through exit; an arm of
+      // an if or loop is not.
+      if (child instanceof SequenceStatement) {
+        return trailingReturnOwner(child);
       }
       List<Exprent> exprents = child.getExprents();
       if (exprents == null || exprents.isEmpty()) {
