@@ -565,6 +565,74 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (A) { …exit } if (B b) { … } rest` where B's pattern variable took a slot below a
+      // local the first arm declares and the second arm ends in a copy of the method's final
+      // return that the arm jumps over the rest to: javac hoists an else-if chain's binding
+      // above the first arm (the target's table proves it by the slot order), and a jump that
+      // skips the rest to the return the tail prints is the else the source wrote around it.
+      if (i + 2 < stats.size() && st instanceof IfStatement first
+          && first.iftype == IfStatement.IFTYPE_IF && first.getElsestat() == null
+          && !first.isLabeled() && first.getIfstat() != null
+          && first.getIfstat().getExprents() != null
+          && stats.get(i + 1) instanceof IfStatement second
+          && second.iftype == IfStatement.IFTYPE_IF && second.getElsestat() == null
+          && !second.isLabeled() && !stats.get(i + 1).isLabeled() && !isLabeled()
+          && second.getIfstat() != null && second.getFirst() != null
+          && RoundTrip.selector("elseifelse")
+          && exits(first.getIfstat())
+          && patternSlot(second) >= 0 && firstDeclaredSlot(first.getIfstat()) > patternSlot(second)) {
+        Statement arm = second.getIfstat();
+        Statement copy = arm instanceof SequenceStatement seq && !seq.getStats().isEmpty()
+          ? seq.getStats().getLast() : arm;
+        int target = RoundTrip.firstOffset(copy);
+        int elseStart = RoundTrip.lastBranchTarget(second.getHeadexprent());
+        int from = RoundTrip.lastEnd(first.getIfstat());
+        int tailEnd = RoundTrip.lastEnd(stats.get(stats.size() - 1));
+        if (target > 0 && elseStart > 0 && from >= 0 && from <= elseStart
+            && RoundTrip.isTailReturnCopy(copy)
+            && RoundTrip.statementStart(stats.get(i + 2)) >= elseStart
+            && tailEnd > 0 && tailEnd < target
+            && RoundTrip.jumpsOnto(from, elseStart, target)
+            && exits(stats.get(stats.size() - 1))) {
+          // The copy stands for the jump the arm's own closing brace carries; printing it here
+          // would emit a second return.
+          List<Statement> dropped = List.of();
+          if (copy != arm) {
+            dropped = List.of(copy);
+            ((SequenceStatement) arm).getStats().removeWithKey(copy.id);
+          }
+          try {
+            buf.append(ExprProcessor.listToJava(first.varDefinitions, indent));
+            buf.append(first.getFirst().toJava(indent));
+            buf.appendIndent(indent).append(first.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(first.getIfstat(), indent + 1, true));
+            buf.appendIndent(indent).append("} else ");
+            buf.append(second.getFirst().toJava(indent));
+            buf.append(second.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+            buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
+            // The target's table puts the else's first statement on the closing brace's line:
+            // the jump over the else takes that line, and a statement line of its own would add
+            // an entry the target does not have.
+            buf.appendIndent(indent).append("} else { ");
+            TextBuffer lead = ExprProcessor.jmpWrapper(stats.get(i + 2), indent + 1, true);
+            lead.setStart(TextUtil.getIndentString(indent + 1).length());
+            buf.append(lead);
+            for (int k = i + 3; k < stats.size(); k++) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 3));
+            }
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+          }
+          finally {
+            for (Statement stat : dropped) {
+              arm.getStats().addWithKey(stat, stat.id);
+            }
+          }
+          notempty = true;
+          i = stats.size() - 1;
+          continue;
+        }
+      }
+
       // `if (A) { … } T …` where the condition's false branch lands on T and a jump inside the arm
       // lands on the far side of T: the target's then arm jumps straight over the else content, so
       // the source wrote `if (A) { … } else { T }`. A guard's arm can only fall through to T; a
