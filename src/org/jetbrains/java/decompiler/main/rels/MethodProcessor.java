@@ -22,6 +22,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectGraph;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.FlattenStatementsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.LoopExitLift;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
@@ -278,6 +279,11 @@ public class MethodProcessor implements Runnable {
 
           if (NestedLoopMerge.merge(root, mt, varProc)) {
             decompileRecord.add("NestedLoopMerge", root);
+            continue;
+          }
+
+          if (LoopExitLift.lift(root)) {
+            decompileRecord.add("LoopExitLift", root);
             continue;
           }
 

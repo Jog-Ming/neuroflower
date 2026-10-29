@@ -1243,7 +1243,8 @@ public class ExprProcessor implements CodeConstants {
             buf.append("continue");
         }
 
-        if (edge.labeled) {
+        boolean needsName = edge.labeled || RoundTrip.leavesClosure(edge);
+        if (needsName) {
           buf.append(" label").append(edge.closure.id);
         }
         buf.append(";").appendLineSeparator();

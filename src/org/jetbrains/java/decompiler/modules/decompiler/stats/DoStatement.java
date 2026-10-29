@@ -116,10 +116,19 @@ public class DoStatement extends Statement {
       }
     }
 
+    // A block the target laid out past the back edge is the loop's exit: the arms print the
+    // break that reached it, and it prints again after the closing brace. Deciding it here lets a
+    // local the block reads but the body only stores be declared above the loop first.
+    List<Statement> deferredExits = null;
+    if (looptype == Type.INFINITE) {
+      deferredExits = RoundTrip.deferExitsAfter(this);
+      RoundTrip.hoistDeferredDeclarations(this, deferredExits);
+    }
+
     int varDefsStart = buf.length();
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
-    if (isLabeled() || RoundTrip.carriesOutwardBreak(this)) {
+    if (isLabeled() || RoundTrip.carriesOutwardBreak(this) || RoundTrip.carriesBreakOut(this)) {
       buf.appendIndent(indent).append("label").append(this.id).append(":").appendLineSeparator();
     }
 
@@ -130,12 +139,11 @@ public class DoStatement extends Statement {
         // An exit copied out of this loop prints as the break the target jumped with.
         RoundTrip.enterLoop(this);
         try {
+          List<Statement> deferred = deferredExits == null ? List.of() : deferredExits;
           if (printBreakGuard(buf, indent)) {
+            RoundTrip.releaseDeferredExits(deferred);
             break;
           }
-          // A block the target laid out past the back edge is the loop's exit: the arms print the
-          // break that reached it, and it prints again after the closing brace.
-          List<Statement> deferred = RoundTrip.deferExitsAfter(this);
           buf.appendIndent(indent).append("while (true) {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(first, indent + 1, false));
           buf.appendIndent(indent).append("}").appendLineSeparator();

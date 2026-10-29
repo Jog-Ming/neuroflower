@@ -2834,9 +2834,14 @@ public final class RoundTrip {
     }
     int bodyStart = firstOffset(body);
     int exitStart = firstOffset(exit);
+    int exitEnd = lastEnd(exit);
     // A written `while (C)` branches to the exit block itself; the guard's test branches past it
-    // into the body, and the exit block sits before the body in the target's layout.
-    return bodyStart >= 0 && exitStart >= 0 && exitStart < bodyStart && branchTarget > exitStart;
+    // into the body, and the exit block sits wholly before the body in the target's layout. A
+    // statement that only reaches low offsets through a descendant's exprents (a merged head or a
+    // nested loop's own test) is not a block before the body.
+    boolean beforeBody = bodyStart >= 0 && exitStart >= 0 && exitStart < bodyStart
+      && branchTarget > exitStart;
+    return beforeBody && (!selector("wgibexit") || exitEnd >= 0 && exitEnd < bodyStart);
   }
 
   /**
@@ -3249,39 +3254,20 @@ public final class RoundTrip {
     if (method == null || !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
       return out;
     }
-    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
     java.util.Map<Integer, Integer> branches = BRANCH_TARGETS.get(method);
-    int head = firstOffset(loop);
-    int loopEnd = lastOffset(loop);
-    if (gotos == null || head < 0 || loopEnd < 0) {
+    int[] exit = loopExitOffsets(loop);
+    if (exit == null) {
       return out;
     }
-    int backEdge = -1;
-    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
-      if (entry.getValue() != null && entry.getValue() == head && entry.getKey() > backEdge) {
-        backEdge = entry.getKey();
-      }
-    }
-    if (backEdge < 0) {
-      return out;
-    }
-    // The first instruction after the back edge that an unconditional jump reaches is the block's
-    // start; the source's break is that jump.
-    int tail = -1;
-    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
-      int from = entry.getKey();
-      Integer to = entry.getValue();
-      if (to != null && from > head && from < to && to > backEdge && to <= loopEnd && (tail < 0 || to < tail)) {
-        tail = to;
-      }
-    }
-    if (tail < 0) {
-      return out;
-    }
+    int head = exit[0];
+    int loopEnd = exit[1];
+    int backEdge = exit[2];
+    int tail = exit[3];
     if (branches != null) {
       for (java.util.Map.Entry<Integer, Integer> entry : branches.entrySet()) {
         Integer to = entry.getValue();
-        if (to != null && to >= tail && entry.getKey() > head && entry.getKey() <= backEdge) {
+        if (to != null && to >= tail && entry.getKey() > head && entry.getKey() <= backEdge
+            && !(selector("looptest") && isLeadingTestOffset(loop, entry.getKey()))) {
           // A test in the body reaches the block without jumping out of the loop: it is body.
           return out;
         }
@@ -3329,12 +3315,120 @@ public final class RoundTrip {
     if (defined.isEmpty()) {
       return false;
     }
+    boolean reads = false;
     for (Statement stat : deferred) {
       if (readsAny(stat, defined)) {
-        return true;
+        reads = true;
+        break;
       }
     }
-    return false;
+    if (!reads) {
+      return false;
+    }
+    // A local the moved block reads can still be in scope: the target's table keeps its row open
+    // past the loop's last instruction, which a declaration inside the body cannot do. The source
+    // wrote the declaration above the loop and only the store inside; the declaration is hoisted
+    // when the loop prints, so the moved block reads a local that is still in scope.
+    return !(selector("deferlvt") && deferredReadsDeclaredAbove(loop, deferred, defined));
+  }
+
+  /** True when every loop-defined local the moved block reads is proven declared above the loop. */
+  private static boolean deferredReadsDeclaredAbove(Statement loop, java.util.List<Statement> deferred,
+      java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined) {
+    int loopEnd = lastOffset(loop);
+    if (loopEnd < 0) {
+      return false;
+    }
+    for (Statement stat : deferred) {
+      for (org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair : readPairs(stat)) {
+        if (!defined.contains(pair)) {
+          continue;
+        }
+        VarExprent definition = definitionInLoop(loop, deferred, pair);
+        if (definition == null || definition.getLVT() == null) {
+          return false;
+        }
+        org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable lvt = definition.getLVT();
+        if (lvt.getStartPC() + lvt.getLength() <= loopEnd) {
+          // The row closes inside the loop: the body declared the local.
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /** The definition the loop body holds for this pair, skipping the statements that move. */
+  private static VarExprent definitionInLoop(Statement stat, java.util.List<Statement> deferred,
+      org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair) {
+    for (Exprent exprent : ownExprents(stat)) {
+      if (exprent instanceof VarExprent var && var.isDefinition() && pair.equals(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var))) {
+        return var;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (deferred.contains(child)) {
+        continue;
+      }
+      VarExprent found = definitionInLoop(child, deferred, pair);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Prints the declarations of the locals the moved block reads above the loop: the target's table
+   * proves the source declared them there, and the store stays where it is. A declaration inside
+   * the loop would close the row at the loop's end; a bare declaration above it keeps the row open.
+   */
+  public static void hoistDeferredDeclarations(Statement loop, java.util.List<Statement> deferred) {
+    if (deferred.isEmpty() || !selector("deferlvt")) {
+      return;
+    }
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> defined = new java.util.HashSet<>();
+    collectDefinitions(loop, deferred, defined);
+    if (defined.isEmpty()) {
+      return;
+    }
+    int loopEnd = lastOffset(loop);
+    for (Statement stat : deferred) {
+      for (org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair : readPairs(stat)) {
+        if (!defined.contains(pair)) {
+          continue;
+        }
+        VarExprent definition = definitionInLoop(loop, deferred, pair);
+        if (definition == null || definition.getLVT() == null
+            || definition.getLVT().getStartPC() + definition.getLVT().getLength() <= loopEnd) {
+          continue;
+        }
+        Statement owner = directOwner(loop, definition);
+        Exprent declaration;
+        if (owner != null && owner.getExprents() != null && owner.getExprents().contains(definition)) {
+          // A bare declaration the tree kept where it stood: it moves itself.
+          removeIdentity(owner.getExprents(), definition);
+          definition.bytecode = null;
+          declaration = definition;
+        }
+        else {
+          declaration = definition.copy();
+          ((VarExprent) declaration).bytecode = null;
+          definition.setDefinition(false);
+        }
+        java.util.List<Exprent> defs = loop.getVarDefinitions();
+        int slot = definition.getLVT().getIndex();
+        int at = defs.size();
+        for (int i = 0; i < defs.size(); i++) {
+          if (defs.get(i) instanceof VarExprent other && other.getLVT() != null
+              && other.getLVT().getIndex() > slot) {
+            at = i;
+            break;
+          }
+        }
+        defs.add(at, declaration);
+      }
+    }
   }
 
   private static void collectDefinitions(Statement stat, java.util.List<Statement> deferred,
@@ -3386,6 +3480,115 @@ public final class RoundTrip {
       }
     }
     return out;
+  }
+
+  /** The first offset any exprent in the statement carries, head exprents included. */
+  private static int headOffsetDeep(Statement stat) {
+    int min = -1;
+    List<Exprent> exprents = stat.getExprents();
+    List<Exprent> own = exprents;
+    if (own == null) {
+      // Only the condition/head exprent carries a real offset; a switch's case values keep the
+      // offsets of the code that produced them, which are not this statement's position.
+      if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat) {
+        own = ifstat.getHeadexprent() == null ? List.of() : List.of(ifstat.getHeadexprent());
+      }
+      else if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement sw) {
+        own = sw.getHeadexprent() == null ? List.of() : List.of(sw.getHeadexprent());
+      }
+      else {
+        own = List.of();
+      }
+    }
+    for (Exprent exprent : own) {
+      if (exprent == null) {
+        continue;
+      }
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        BitSet bits = inner.bytecode;
+        if (bits != null && !bits.isEmpty()) {
+          int offset = bits.nextSetBit(0);
+          if (min < 0 || offset < min) {
+            min = offset;
+          }
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      int offset = headOffsetDeep(child);
+      if (offset >= 0 && (min < 0 || offset < min)) {
+        min = offset;
+      }
+    }
+    return min;
+  }
+
+  /** True when the offset belongs to the condition of the test at the loop's head. */
+  private static boolean isLeadingTestOffset(Statement loop, int offset) {
+    Statement first = loop.getFirst();
+    while (first instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement
+        && !first.getStats().isEmpty()) {
+      first = first.getFirst();
+    }
+    if (!(first instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat)
+        || ifstat.getHeadexprent() == null) {
+      return false;
+    }
+    Exprent condition = ifstat.getHeadexprent().getCondition();
+    if (condition == null) {
+      return false;
+    }
+    // Branch entries are keyed by the instruction's end offset; the condition's last bit is its
+    // final byte.
+    for (Exprent inner : condition.getAllExprents(true, true)) {
+      BitSet bits = inner.bytecode;
+      if (bits != null && offset > 0 && bits.get(offset - 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The layout of a loop's exit block when the target laid it out past the back edge:
+   * {@code {head, loopEnd, backEdge, tail}}, or null when the loop has no such block. The head is
+   * the first instruction of the loop's test (its back edge's target), and the tail is the first
+   * instruction after the back edge that a jump reaches.
+   */
+  public static int[] loopExitOffsets(Statement loop) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return null;
+    }
+    int head = selector("loophead") ? headOffsetDeep(loop) : firstOffset(loop);
+    int loopEnd = lastOffset(loop);
+    if (head < 0 || loopEnd < 0) {
+      return null;
+    }
+    int backEdge = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() != null && entry.getValue() == head && entry.getKey() > backEdge) {
+        backEdge = entry.getKey();
+      }
+    }
+    if (backEdge < 0) {
+      return null;
+    }
+    // The first instruction after the back edge that an unconditional jump reaches is the block's
+    // start; the source's break is that jump.
+    int tail = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      int from = entry.getKey();
+      Integer to = entry.getValue();
+      if (to != null && from > head && from < to && to > backEdge && to <= loopEnd && (tail < 0 || to < tail)) {
+        tail = to;
+      }
+    }
+    if (tail < 0) {
+      return null;
+    }
+    return new int[]{head, loopEnd, backEdge, tail};
   }
 
   /** Collects the outermost statements that start at or after the tail, without descending into them. */
@@ -4190,6 +4393,70 @@ public final class RoundTrip {
     }
     java.util.Set<Statement> set = AFTER_IF.get().get(method);
     return set != null && set.contains(stat);
+  }
+
+  /**
+   * A break that leaves its closure has to name it: the same {@code break;} inside a switch would
+   * only leave the switch. The tree's labelled flag is recomputed by the label passes and a break
+   * to a block hoisted out of a loop can lose it; the jump itself proves the name is needed.
+   */
+  public static boolean leavesClosure(StatEdge edge) {
+    if (edge == null || edge.getType() != StatEdge.TYPE_BREAK || edge.closure == null
+        || edge.getDestination() == null || edge.getDestination() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement) {
+      return false;
+    }
+    Statement destination = edge.getDestination();
+    Statement closure = edge.closure;
+    // Only a loop prints its label purely because a break names it ({@link #carriesBreakOut}); a
+    // switch's or block's label is owned by its own print rule, and naming it here could leave the
+    // label undefined.
+    if (!selector("breakout")
+        || !(closure instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      return false;
+    }
+    // The jump has to start inside the loop: a break printed after the loop's closing brace can no
+    // longer name its label. And something between the two has to swallow an unnamed break first —
+    // a switch or another loop — or a plain `break;` would already leave the loop.
+    return destination != closure && !closure.containsStatementStrict(destination)
+      && closure.containsStatementStrict(edge.getSource()) && shielded(edge.getSource(), closure);
+  }
+
+  /**
+   * True when a plain {@code break;} at the source would leave some statement inside the closure
+   * rather than the closure itself: a switch or another loop stands between the two.
+   */
+  private static boolean shielded(Statement source, Statement closure) {
+    if ((source instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement
+        || source instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)
+        && source != closure) {
+      return true;
+    }
+    for (Statement parent = source.getParent(); parent != null && parent != closure; parent = parent.getParent()) {
+      if (parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement
+          || parent instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** True when a break inside this statement names it as its closure: its print needs a label. */
+  public static boolean carriesBreakOut(Statement stat) {
+    return carriesBreakOut(stat, stat);
+  }
+
+  private static boolean carriesBreakOut(Statement stat, Statement closure) {
+    for (StatEdge edge : stat.getAllSuccessorEdges()) {
+      if (edge.closure == closure && leavesClosure(edge)) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (carriesBreakOut(child, closure)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** True when this statement's position prints as the break that jumps to the moved block. */
