@@ -1054,8 +1054,11 @@ public class InvocationExprent extends Exprent {
           // The recorded functional instantiations arbitrate the witness: a witness whose
           // substitution would instantiate a functional argument's SAM differently from the
           // metafactory's instantiated method type was the printer's own target-derived value,
-          // not the source's, and the original let javac infer the variable again.
-          if (!genericArgs.isEmpty() && witnessContradictsFunctionalRecord(fparams)) {
+          // not the source's, and the original let javac infer the variable again. A method
+          // reference's witness cannot simply be dropped — javac would infer the variable from
+          // the reference alone — so it is corrected to the recorded types instead.
+          if (!genericArgs.isEmpty() && !correctMethodReferenceWitness(fparams)
+            && witnessContradictsFunctionalRecord(fparams)) {
             genericArgs.clear();
             lambdaBodyWitness = null;
           }
@@ -5563,6 +5566,121 @@ public class InvocationExprent extends Exprent {
       }
     }
     return false;
+  }
+
+  /**
+   * Corrects a method reference's witness to the types the metafactory recorded. The instantiated
+   * method type is the functional method's type after javac substituted the call's type arguments,
+   * so an interface type argument that stands unmodified at a functional method parameter or
+   * return position is recorded there as its value. Where the declared parameter spells that
+   * argument as one of the call's own type variables, possibly under a wildcard, the witness entry
+   * is that recorded type. Only fully printable records are used, so an erasure is never printed.
+   * Returns true when every witness entry was rewritten this way.
+   */
+  private boolean correctMethodReferenceWitness(List<String> fparams) {
+    // Only a receiver's type arguments are beyond javac's inference: an argument or assignment
+    // position hands the call a target, and the source could leave the variable to it.
+    if (!RoundTrip.selector("witnessrecord") || !isInvocationInstance || genericArgs.size() != fparams.size()
+      || desc == null || desc.getSignature() == null || lstParameters.isEmpty()
+      || genericArgs.contains(null) || genericArgs.contains(GenericType.DUMMY_VAR)) {
+      return false;
+    }
+    List<VarType> declaredParams = desc.getSignature().parameterTypes;
+    VarType[] solved = new VarType[fparams.size()];
+    boolean sawMethodReference = false;
+    int count = Math.min(declaredParams.size(), lstParameters.size());
+    for (int p = 0; p < count; p++) {
+      if (!(lstParameters.get(p) instanceof NewExprent argument) || !argument.isLambda()
+        || !argument.isMethodReference() || !(declaredParams.get(p) instanceof GenericType functional)) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(argument.getNewType().value);
+      if (node == null || node.lambdaInformation == null || node.lambdaInformation.method_descriptor == null) {
+        continue;
+      }
+      MethodDescriptor recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
+      StructClass samClass = DecompilerContext.getStructContext().getClass(functional.value);
+      if (samClass == null || samClass.getSignature() == null) {
+        continue;
+      }
+      List<String> interfaceParams = samClass.getSignature().fparameters;
+      List<VarType> interfaceArgs = functional.getArguments();
+      if (interfaceArgs.size() != interfaceParams.size()) {
+        continue;
+      }
+      StructMethod sam = functionalMethod(samClass, node.lambdaInformation.method_name, recorded.params.length);
+      if (sam == null || sam.getSignature() == null) {
+        continue;
+      }
+      sawMethodReference = true;
+      List<VarType> samParams = sam.getSignature().parameterTypes;
+      for (int k = 0; k < samParams.size() && k < recorded.params.length; k++) {
+        if (!solveWitnessEntry(interfaceParams, interfaceArgs, samParams.get(k), recorded.params[k], fparams, solved)) {
+          return false;
+        }
+      }
+      if (!solveWitnessEntry(interfaceParams, interfaceArgs, sam.getSignature().returnType, recorded.ret, fparams, solved)) {
+        return false;
+      }
+    }
+    if (!sawMethodReference) {
+      return false;
+    }
+    List<VarType> corrected = new ArrayList<>(fparams.size());
+    boolean changed = false;
+    for (int i = 0; i < fparams.size(); i++) {
+      VarType value = solved[i];
+      if (value == null || !isPrintableWitness(value)) {
+        return false;
+      }
+      VarType current = genericArgs.get(i);
+      if (current != null && current.type == CodeType.GENVAR) {
+        // A witness that names a type variable is the source's own; the metafactory record is an
+        // erasure and cannot contradict a name the source could write.
+        corrected.add(current);
+        continue;
+      }
+      changed |= !value.equals(current);
+      corrected.add(value);
+    }
+    if (!changed) {
+      return false;
+    }
+    genericArgs.clear();
+    genericArgs.addAll(corrected);
+    return true;
+  }
+
+  /**
+   * Solves one recorded functional method position: when the position's declared type is exactly
+   * one of the interface's type variables, the recorded instantiated type is that variable's
+   * value. The interface argument standing there must name one of the call's type variables;
+   * anything else leaves the witness unsolved. Returns false when two arguments disagree.
+   */
+  private static boolean solveWitnessEntry(List<String> interfaceParams, List<VarType> interfaceArgs,
+                                           VarType samType, VarType recordedType,
+                                           List<String> fparams, VarType[] solved) {
+    if (samType == null || recordedType == null || samType.type != CodeType.GENVAR || samType.arrayDim != 0
+      || recordedType.equals(GenericType.DUMMY_VAR) || recordedType.type == CodeType.GENVAR) {
+      return true; // a position this rule does not read, or a record that names no concrete type
+    }
+    int position = interfaceParams.indexOf(samType.value);
+    if (position < 0 || position >= interfaceArgs.size()) {
+      return true;
+    }
+    VarType declared = stripWitnessWildcard(interfaceArgs.get(position));
+    if (declared == null || declared.type != CodeType.GENVAR || declared.arrayDim != 0) {
+      return true; // a concrete argument: nothing of the call's is settled here
+    }
+    int index = fparams.indexOf(declared.value);
+    if (index < 0) {
+      return true;
+    }
+    if (solved[index] != null && !solved[index].equals(recordedType)) {
+      return false; // two recorded positions disagree about the same type variable
+    }
+    solved[index] = recordedType;
+    return true;
   }
 
   /** The unique abstract instance method of the functional interface with this name and arity. */
