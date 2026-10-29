@@ -221,7 +221,17 @@ public class SequenceStatement extends Statement {
             buf.append(returnLine);
           }
           buf.appendIndent(indent).append("}").appendLineSeparator();
-          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          // The arm prints last here; its trailing return may be the method's own final return,
+          // which the source did not write and the closing brace stands for.
+          Runnable restoreReturn = RoundTrip.hideImplicitFinalReturn(ifStatement.getIfstat());
+          try {
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          }
+          finally {
+            if (restoreReturn != null) {
+              restoreReturn.run();
+            }
+          }
           notempty = true;
           break;
         }
@@ -1383,7 +1393,10 @@ public class SequenceStatement extends Statement {
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
           && ifStatement.getIfstat() != null
-          && !ifStatement.isPatternMatched()
+          // A pattern-matched if joins on the arm's goto over the rest to the method's return;
+          // otherwise the pattern printers own the shape.
+          && (!ifStatement.isPatternMatched()
+              || RoundTrip.armJumpsOverRestToFinalReturn(ifStatement.getIfstat(), stats.get(i + 1)))
           && RoundTrip.returnsPastRest(ifStatement.getIfstat(), stats.get(i + 1),
                stats.get(stats.size() - 1))) {
         List<Exprent> armExprents = ifStatement.getIfstat().getExprents();

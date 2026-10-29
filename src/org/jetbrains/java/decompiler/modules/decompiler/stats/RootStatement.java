@@ -3,6 +3,7 @@ package org.jetbrains.java.decompiler.modules.decompiler.stats;
 
 import org.jetbrains.java.decompiler.code.cfg.ControlFlowGraph;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.util.StartEndPair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
@@ -33,7 +34,15 @@ public final class RootStatement extends Statement {
 
   @Override
   public TextBuffer toJava(int indent) {
-    return ExprProcessor.listToJava(varDefinitions, indent).append(first.toJava(indent));
+    Runnable restoreReturn = RoundTrip.hideImplicitFinalReturn(first);
+    try {
+      return ExprProcessor.listToJava(varDefinitions, indent).append(first.toJava(indent));
+    }
+    finally {
+      if (restoreReturn != null) {
+        restoreReturn.run();
+      }
+    }
   }
 
   public DummyExitStatement getDummyExit() {

@@ -4038,7 +4038,15 @@ public final class RoundTrip {
     }
     int exitStart = exit.bytecode.nextSetBit(0);
     Integer last = LAST_INSTRUCTION.get(method);
-    if (exitStart < 0 || last == null || exitStart != last || lastEnd(restLast) != exitStart) {
+    if (exitStart < 0 || last == null || exitStart != last) {
+      return false;
+    }
+    int restEnd = lastEnd(restLast);
+    // Synthetic code may sit between the else block and the method's return — a record pattern's
+    // match handler is laid out right there — so the rest need not end on the return. The arm's
+    // own goto over the rest to it is the same proof in that case.
+    if (restEnd != exitStart
+        && !(restEnd >= 0 && restEnd < exitStart && armJumpsOverRestToFinalReturn(arm, restFirst))) {
       return false;
     }
     int armStart = firstOffset(arm);
@@ -4054,6 +4062,101 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /**
+   * True when the arm's code ends in a goto laid out immediately before the statements after the
+   * if, and that goto jumps to the method's own final return. The source wrote
+   * {@code if (C) { A } else { rest }}: javac lays the else block right after the arm's code and
+   * the arm's completion jumps over it to the method's end. Synthetic code (a record pattern's
+   * match handler) may sit between the else block and that return, so the rest need not end on it.
+   */
+  public static boolean armJumpsOverRestToFinalReturn(Statement arm, Statement restFirst) {
+    if (!selector("elseblock")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (last == null || gotos == null || arm == null || restFirst == null) {
+      return false;
+    }
+    int restStart = firstOffset(restFirst);
+    int armStart = firstOffset(arm);
+    if (restStart < 3 || armStart < 0 || restStart - 3 < armStart) {
+      return false;
+    }
+    Integer target = gotos.get(restStart - 3);
+    return target != null && target == last;
+  }
+
+  /**
+   * Hides the method's own final void return from the last block the body prints when the target
+   * reaches that return with a goto laid out after the block's own code. The source did not write
+   * the return: its flow fell out of the body and javac laid the method's one return past the
+   * synthetic code — a record pattern's match handler sits there — so the closing brace compiles
+   * to the same instruction. Returns an action that puts the exprent back, or null.
+   */
+  public static Runnable hideImplicitFinalReturn(Statement body) {
+    if (!selector("silentreturn") || body == null) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (last == null || gotos == null) {
+      return null;
+    }
+    Statement tail = body;
+    while (true) {
+      List<Exprent> exprents = tail.getExprents();
+      if (exprents != null) {
+        if (exprents.size() < 2) {
+          return null;
+        }
+        Exprent candidate = exprents.get(exprents.size() - 1);
+        if (!(candidate instanceof ExitExprent exit)
+            || exit.getExitType() != ExitExprent.Type.RETURN || exit.getValue() != null
+            || exit.bytecode == null || exit.bytecode.isEmpty()) {
+          return null;
+        }
+        int exitStart = exit.bytecode.nextSetBit(0);
+        int start = firstOffset(tail);
+        if (exitStart != last || start < 0) {
+          return null;
+        }
+        for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+          int from = entry.getKey();
+          if (from >= start && from < exitStart
+              && entry.getValue() != null && entry.getValue() == exitStart) {
+            int index = exprents.size() - 1;
+            exprents.remove(index);
+            return () -> exprents.add(index, candidate);
+          }
+        }
+        return null;
+      }
+      // Only the statements whose completion falls out of the method are followed: a block printed
+      // last inside a loop, a switch or a handler continues after its brace, and a return hidden
+      // there would let control run on.
+      if (!(tail instanceof SequenceStatement) && !(tail instanceof IfStatement)) {
+        return null;
+      }
+      Statement next = null;
+      if (tail instanceof IfStatement branching) {
+        next = branching.getElsestat() != null ? branching.getElsestat() : branching.getIfstat();
+      }
+      else {
+        List<Statement> children = tail.getStats();
+        if (!children.isEmpty()) {
+          next = children.get(children.size() - 1);
+        }
+      }
+      if (next == null || next == tail) {
+        return null;
+      }
+      tail = next;
+    }
   }
 
   /** Records the statements an if prints after its closing brace, so the arm prints nothing there. */
