@@ -571,11 +571,19 @@ public class MergeHelper {
 
       for (Exprent move : moved) {
         for (Exprent e : move.getAllExprents(true, true)) {
-          if (!(e instanceof VarExprent)) {
+          if (!(e instanceof VarExprent var)) {
             continue;
           }
 
-          if (!isVarUsedBefore((VarExprent) e, stat)) {
+          // A slot the loop's own condition reads holds a value by the first evaluation of the
+          // header, which runs before the update either way. A parameter the loop updates — the
+          // source's `for (…; n > 0; …, n--)` — is only ever read there, so the predecessor scan
+          // below finds no use of it outside the loop and would refuse the header the target
+          // proves by its continue.
+          if (readsSlot(stat.getConditionExprent(), var.getIndex())) {
+            continue;
+          }
+          if (!isVarUsedBefore(var, stat)) {
             return;
           }
         }
@@ -1012,6 +1020,19 @@ public class MergeHelper {
     }
 
     // Found nothing
+    return false;
+  }
+
+  /** Whether the expression reads a variable of this slot, whatever its version. */
+  private static boolean readsSlot(Exprent exprent, int index) {
+    if (exprent == null) {
+      return false;
+    }
+    for (Exprent e : exprent.getAllExprents(true, true)) {
+      if (e instanceof VarExprent var && var.getIndex() == index) {
+        return true;
+      }
+    }
     return false;
   }
 
