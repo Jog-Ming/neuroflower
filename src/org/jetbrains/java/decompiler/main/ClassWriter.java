@@ -2275,6 +2275,10 @@ public class ClassWriter implements StatementWriter {
               LocalDeclarationOrder.reorder(root);
               TextBuffer code = root.toJava(indent + 1);
               appendUndeclaredLocals(buffer, mt, md, cl, indent + 1);
+              ClassNode orphan = node.orphanLambdas.get(InterpreterUtil.makeUniqueKey(mt.getName(), mt.getDescriptor()));
+              if (orphan != null) {
+                writeOrphanLambda(wrapper, methodWrapper, orphan, buffer, indent + 1);
+              }
               if (!clInit || !endsWithLiftedInitializer(methodWrapper, wrapper)) {
                 code.addBytecodeMapping(root.getDummyExit().bytecode);
               }
@@ -2314,6 +2318,69 @@ public class ClassWriter implements StatementWriter {
     //tracer.setCurrentSourceLine(buffer.countLines(start_index_method));
 
     return !hideMethod;
+  }
+
+  /**
+   * Prints a lambda whose content method the class file keeps but whose creation site Lower
+   * removed — javac desugars every lambda before it prunes a branch whose condition is constant
+   * false, so the method survives with nothing referring to it. The dead block is printed at the
+   * head of the owning method under that same constant condition, which emits no bytecode; the
+   * lambda in it is lowered back into the method the class file records.
+   *
+   * <p>The body goes through the ordinary lambda path, so its instructions carry the orphan's own
+   * method key and LineAlign places them on the orphan's line table. The functional parameter's
+   * name is the one the method's local table records, because that name is written into the
+   * recompiled method's table. The declared local and the interface name are not recorded
+   * anywhere in the class file: the block is dead, so its shape is what a compiler checks and
+   * never emits.
+   */
+  private void writeOrphanLambda(ClassWrapper wrapper, MethodWrapper owner, ClassNode orphan,
+                                 TextBuffer buffer, int indent) {
+    StructClass cl = wrapper.getClassStruct();
+    StructMethod mt = cl.getMethod(orphan.lambdaInformation.content_method_key);
+    if (mt == null) {
+      return;
+    }
+    MethodWrapper methodWrapper = wrapper.getMethodWrapper(mt.getName(), mt.getDescriptor());
+    if (methodWrapper == null || methodWrapper.root == null || methodWrapper.decompileError != null) {
+      return;
+    }
+
+    MethodDescriptor mdContent = MethodDescriptor.parseDescriptor(orphan.lambdaInformation.content_method_descriptor);
+    int samIndex = mdContent.params.length - 1;
+    VarType samType = mdContent.params[samIndex];
+    int slot = 0;
+    for (int i = 0; i < samIndex; i++) {
+      slot += mdContent.params[i].stackSize;
+    }
+    String parameter = methodWrapper.varproc.getVarName(new VarVersionPair(slot, 0));
+    if (parameter == null || parameter.isEmpty()) {
+      return;
+    }
+
+    VarType sam = new GenericType(CodeType.OBJECT, 0, "java/util/function/Consumer", null,
+      List.of(samType), GenericType.WILDCARD_NO);
+
+    buffer.appendIndent(indent).append("if (false) {").appendLineSeparator();
+    buffer.appendIndent(indent + 1).appendCastTypeName(sam).append(' ')
+      .append(orphanLocalName(owner, methodWrapper, parameter)).append(" = ")
+      .append(parameter).append(" -> {").appendLineSeparator();
+    methodLambdaToJava(orphan, wrapper, mt, buffer, indent + 2, true);
+    buffer.appendIndent(indent + 1).append("};").appendLineSeparator();
+    buffer.appendIndent(indent).append("}").appendLineSeparator();
+  }
+
+  /** A local name for the dead block that no name in either method can collide with. */
+  private static String orphanLocalName(MethodWrapper owner, MethodWrapper orphan, String parameter) {
+    Set<String> used = new HashSet<>();
+    used.add(parameter);
+    used.addAll(owner.varproc.getVarNames());
+    used.addAll(orphan.varproc.getVarNames());
+    String name = "visitor";
+    while (used.contains(name)) {
+      name += "_";
+    }
+    return name;
   }
 
   /**

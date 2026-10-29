@@ -53,6 +53,14 @@ public class NestedClassProcessor {
       }
     }
 
+    // An orphan lambda's content method is a method of this class too: the writer prints it at the
+    // head of its owner as a dead block, so it must not also be written as a member.
+    if (node.getWrapper() != null) {
+      for (ClassNode orphan : node.orphanLambdas.values()) {
+        node.getWrapper().getHiddenMembers().add(orphan.lambdaInformation.content_method_key);
+      }
+    }
+
     if (node.nested.isEmpty()) {
       return;
     }

@@ -638,6 +638,12 @@ public class ClassesProcessor implements CodeConstants {
     public final Set<String> enclosingClasses = new HashSet<>();
     public @Nullable ClassNode parent;
     public LambdaInformation lambdaInformation;
+    /**
+     * Lambda content methods no call site binds, by the owning method's key. javac lowers a lambda
+     * before Lower prunes the dead branch it sat in, so the method survives with nothing referring
+     * to it; the writer prints it again as a dead block. See {@code LambdaProcessor}.
+     */
+    public final Map<String, ClassNode> orphanLambdas = new HashMap<>();
 
     public ClassNode(String content_class_name,
                      String content_method_name,
