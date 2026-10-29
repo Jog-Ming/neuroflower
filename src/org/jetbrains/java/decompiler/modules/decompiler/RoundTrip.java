@@ -516,19 +516,12 @@ public final class RoundTrip {
     }
     List<LocalVariable> rows = table.getVariables().toList();
     for (LocalVariable first : rows) {
-      int s1 = first.getStart();
-      int e1 = first.getEnd();
-      if (e1 <= s1) {
+      if (first.getEnd() <= first.getStart()) {
         continue;
       }
       for (LocalVariable second : rows) {
-        if (second.getIndex() != first.getIndex() || second.getStart() <= e1
-          || second.getEnd() <= second.getStart()) {
-          continue;
-        }
-        int s2 = second.getStart();
-        if (storesInto(method, first.getIndex(), s2) && dominates(method, s1, s2)) {
-          starts.set(s2);
+        if (handoverPair(method, first, second)) {
+          starts.set(second.getStart());
         }
       }
     }
@@ -6833,10 +6826,17 @@ public final class RoundTrip {
         continue;
       }
       for (LocalVariable row : rows) {
-        if (row.getStart() != s1 || row.getEnd() <= s1 || row.getEnd() >= blockEnd) {
+        if (row.getStart() != s1 || row.getEnd() <= s1 || row.getEnd() > blockEnd) {
           continue;
         }
         int e1 = row.getEnd();
+        // A row that ends exactly where the enclosing block does leaves its closing brace to the
+        // construct that prints its own; only the table's entry order can prove a nested block
+        // closed on that same brace, so the run is printed only when it does.
+        boolean atBlockEnd = e1 == blockEnd;
+        if (atBlockEnd && !closedInNestedBlock(row, rows, firstOffset(stats.get(0)))) {
+          continue;
+        }
         Integer openEnd = HANDOVER_END.get();
         if (openEnd != null && openEnd == e1) {
           // The block this run would print is the one already open: one brace, not two.
@@ -6855,8 +6855,10 @@ public final class RoundTrip {
         for (int j = from; j < stats.size(); j++) {
           int end = printEnd(stats.get(j));
           if (end == e1) {
-            // The run ends with this statement; the rest of the sequence prints outside.
-            if (j == stats.size() - 1) {
+            // The run ends with this statement; the rest of the sequence prints outside. A run that
+            // reaches the sequence's end closes on the same brace as the enclosing construct, so it
+            // is only printed when the row ends there and the table proved a nested block.
+            if ((j == stats.size() - 1) != atBlockEnd) {
               break;
             }
             return new int[]{from, a, j, -1, row.getIndex(), s1, e1, next.getStart(), next.getEnd()};
@@ -6889,6 +6891,30 @@ public final class RoundTrip {
       }
     }
     return null;
+  }
+
+  /**
+   * True when the table's entry order proves this row's scope closed in a block of its own that
+   * ended where the enclosing block does. javac writes a block's entries when the block closes, so
+   * a row written before a local the same enclosing block declared earlier was written after the
+   * enclosing block's own locals — only a nested block closing at the same offset puts one before
+   * the other. The enclosing block's own locals are the rows that open after its first instruction;
+   * a loop's variable opens before it, and a parameter at offset zero, so neither is evidence.
+   */
+  private static boolean closedInNestedBlock(LocalVariable row, List<LocalVariable> rows, int blockStart) {
+    if (row.getOrder() < 0 || blockStart < 0) {
+      return false;
+    }
+    for (LocalVariable other : rows) {
+      if (other.getOrder() < 0 || other.getEnd() != row.getEnd()
+          || other.getStart() <= blockStart || other.getStart() >= row.getStart()) {
+        continue;
+      }
+      if (other.getOrder() > row.getOrder()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -7007,8 +7033,12 @@ public final class RoundTrip {
           if (printedEnd(exprents.get(b)) == e1 && closesCleanly(s1, e1)) {
             // The list's own end is the closing brace of whatever prints it — a try, a loop, an
             // arm — unless nothing does, and then the block the source closed is ours.
-            if (b == to - 1 && !closeAtEnd) {
-              continue;
+            if (b == to - 1) {
+              // Nothing after this run proves the boundary: the next row's store has to sit behind
+              // the declaration on every path, which a row that merely reuses the slot does not.
+              if (!closeAtEnd || slotHandoverAcrossPaths(row.getIndex(), s1, e1) == null) {
+                continue;
+              }
             }
             return new int[]{a, b, s1, e1};
           }
@@ -7190,9 +7220,10 @@ public final class RoundTrip {
 
   /**
    * The later local that takes over this slot after {@code e1}, or null. The table must hold a
-   * second row that opens after {@code e1} with a store to the slot right before it, and every path
-   * from the method's entry to that store must pass {@code s1} — else the two rows are one variable
-   * whose scope the branches cut, and closing a block between them would be wrong.
+   * second row that opens after {@code e1} with a store to the slot right before it, and either it
+   * names a different local or every path from the method's entry to that store passes {@code s1} —
+   * else the two rows are one variable whose scope the branches cut, and closing a block between
+   * them would be wrong.
    */
   public static LocalVariable slotHandover(int slot, int s1, int e1) {
     StructMethod method = currentMethod();
@@ -7204,17 +7235,78 @@ public final class RoundTrip {
     if (table == null) {
       return null;
     }
-    for (LocalVariable second : table.getVariables().toList()) {
+    return slotHandover(method, table, slot, s1, e1);
+  }
+
+  /**
+   * The handover only when every path to the next row's store passes this row's start: the proof
+   * a run that ends at its own block's boundary needs, where nothing after the run stands between.
+   */
+  private static LocalVariable slotHandoverAcrossPaths(int slot, int s1, int e1) {
+    StructMethod method = currentMethod();
+    if (method == null || slot < 0 || s1 < 0 || e1 <= s1) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    return slotHandover(method, table, slot, s1, e1, true);
+  }
+
+  /** The same handover over a known method and table, for callers that already hold both. */
+  private static LocalVariable slotHandover(StructMethod method, StructLocalVariableTableAttribute table,
+                                            int slot, int s1, int e1) {
+    return slotHandover(method, table, slot, s1, e1, false);
+  }
+
+  private static LocalVariable slotHandover(StructMethod method, StructLocalVariableTableAttribute table,
+                                            int slot, int s1, int e1, boolean acrossPathsRequired) {
+    List<LocalVariable> rows = table.getVariables().toList();
+    LocalVariable first = null;
+    for (LocalVariable row : rows) {
+      if (row.getIndex() == slot && row.getStart() == s1 && row.getEnd() == e1) {
+        first = row;
+        break;
+      }
+    }
+    for (LocalVariable second : rows) {
       if (second.getIndex() != slot || second.getStart() <= e1 || second.getEnd() <= second.getStart()) {
         continue;
       }
       int s2 = second.getStart();
-      if (!storesInto(method, slot, s2) || !dominates(method, s1, s2)) {
+      if (!storesInto(method, slot, s2)) {
         continue;
       }
-      return second;
+      if (acrossPathsRequired ? dominates(method, s1, s2)
+                              : (!sameVariable(first, second) || dominates(method, s1, s2))) {
+        return second;
+      }
     }
     return null;
+  }
+
+  /**
+   * True when the second row provably takes the first row's slot over: it opens after the first
+   * row ends, at a store. A second row that names a different local is a different variable, so it
+   * needs no dominance proof; that proof only separates one variable's scope a branch cut, and one
+   * variable cannot change name or type. Two rows spelled alike stay unproven without it.
+   */
+  private static boolean handoverPair(StructMethod method, LocalVariable first, LocalVariable second) {
+    if (second.getIndex() != first.getIndex() || second.getStart() <= first.getEnd()
+        || second.getEnd() <= second.getStart()) {
+      return false;
+    }
+    int s2 = second.getStart();
+    return storesInto(method, first.getIndex(), s2)
+      && (!sameVariable(first, second) || dominates(method, first.getStart(), s2));
+  }
+
+  /** True when the second row may be a second scope of one variable: it keeps the name and type. */
+  private static boolean sameVariable(LocalVariable first, LocalVariable second) {
+    return first == null
+      || (first.getName().equals(second.getName()) && first.getDescriptor().equals(second.getDescriptor()));
   }
 
   /**
