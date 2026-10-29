@@ -103,6 +103,8 @@ public final class RoundTrip {
     ThreadLocal.withInitial(java.util.concurrent.ConcurrentHashMap::new);
   /** Slot stored immediately before the load a value return reads, by the return's start offset. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The source local a try-with-resources return value was assigned to, by the return's start. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> TWR_RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instructions that store or discard the stack's value: a call's result ends its statement here. */
   private static final java.util.Map<StructMethod, BitSet> VALUE_SINKS = new java.util.concurrent.ConcurrentHashMap<>();
   /** `dup; store N`: the duplicated value is the one the local N receives, keyed by the dup's start. */
@@ -135,6 +137,8 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> branchTargets = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> ends = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> returnStores = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> twrReturnStores = new java.util.HashMap<>();
+    StructLocalVariableTableAttribute returnRows = method.getLocalVariableAttr();
     java.util.Map<Integer, Integer> gotos = new java.util.HashMap<>();
     java.util.Map<Integer, int[]> switches = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> branchStarts = new java.util.HashMap<>();
@@ -225,6 +229,34 @@ public final class RoundTrip {
           && store.opcode >= CodeConstants.opc_istore && store.opcode <= CodeConstants.opc_astore
           && load.operand(0) == store.operand(0)) {
           returnStores.put(instr.startOffset, load.operand(0));
+        }
+        // A try-with-resources body's return value is copied into a hidden slot across the close:
+        // `store S; load S; store T; load R; close; load T; areturn`. S is the source's own local,
+        // which the table names and whose row covers both instructions; T is the hidden copy,
+        // which it does not. The source wrote `S = expr; return S;`, and copy propagation folded
+        // the read away. The rival `return S = expr;` keeps the value on the stack instead of
+        // reloading S (`store S; store T`), so the reload between the two stores is the proof.
+        if (instr.opcode == CodeConstants.opc_areturn && i >= 6
+          && isLoad(seq.getInstr(i - 1).opcode) && isLoad(seq.getInstr(i - 3).opcode)
+          && isLoad(seq.getInstr(i - 5).opcode) && isStore(seq.getInstr(i - 4).opcode)
+          && isStore(seq.getInstr(i - 6).opcode)) {
+          Instruction loadT = seq.getInstr(i - 1);
+          Instruction close = seq.getInstr(i - 2);
+          Instruction storeT = seq.getInstr(i - 4);
+          Instruction loadS = seq.getInstr(i - 5);
+          Instruction storeS = seq.getInstr(i - 6);
+          int temp = variableIndex(loadT);
+          int slot = variableIndex(storeS);
+          if (variableIndex(storeT) == temp && variableIndex(loadS) == slot && slot != temp
+            && close.opcode >= CodeConstants.opc_invokevirtual
+            && close.opcode <= CodeConstants.opc_invokeinterface
+            && closeCalls.get(close.startOffset)
+            && tableCovers(returnRows, slot, storeS.startOffset)
+            && tableCovers(returnRows, slot, loadS.startOffset)
+            && !tableCovers(returnRows, temp, storeT.startOffset)
+            && !tableCovers(returnRows, temp, loadT.startOffset)) {
+            twrReturnStores.put(instr.startOffset, slot);
+          }
         }
       }
       // The catch javac synthesizes for a record-pattern extraction stores the thrown value in a
@@ -510,6 +542,7 @@ public final class RoundTrip {
     SWITCH_TARGETS.put(method, switches);
     BRANCH_STARTS.put(method, branchStarts);
     RETURN_STORES.put(method, returnStores);
+    TWR_RETURN_STORES.put(method, twrReturnStores);
     DUP_STORES.put(method, dupStores);
     STORE_SITES.put(method, storeSites);
     LOAD_SITES.put(method, loadSites);
@@ -588,6 +621,42 @@ public final class RoundTrip {
       }
     }
     return -1;
+  }
+
+  /**
+   * The source local a try-with-resources return value was assigned to: the S of
+   * {@code store S; load S; store T; ... close ... load T; return}. -1 unless the target's
+   * instructions carry exactly that shape and the table names S across both of its accesses.
+   */
+  public static int twrStoredBeforeReturn(BitSet offsets) {
+    StructMethod method = currentMethod();
+    if (method == null || offsets == null || !selector("twrreturn")) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> stores = TWR_RETURN_STORES.get(method);
+    if (stores == null) {
+      return -1;
+    }
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      Integer slot = stores.get(offset);
+      if (slot != null) {
+        return slot;
+      }
+    }
+    return -1;
+  }
+
+  /** Whether a local table row for {@code slot} covers the instruction that starts at {@code offset}. */
+  private static boolean tableCovers(StructLocalVariableTableAttribute table, int slot, int offset) {
+    if (table == null) {
+      return false;
+    }
+    for (LocalVariable row : table.getVariables().toList()) {
+      if (row.getIndex() == slot && row.getStart() <= offset && row.getEnd() > offset) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

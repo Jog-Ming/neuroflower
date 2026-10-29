@@ -54,6 +54,12 @@ public final class ReturnedVariable {
         }
         int slot = RoundTrip.storedBeforeReturn(exit.bytecode);
         if (slot < 0) {
+          // Inside a try-with-resources javac copies the return value into a hidden slot across the
+          // close, so the store/load pair is not adjacent to the return; the recorded shape proves
+          // the same source assignment.
+          slot = RoundTrip.twrStoredBeforeReturn(exit.bytecode);
+        }
+        if (slot < 0) {
           continue;
         }
         VarExprent variable = findVariable(exit.getValue(), slot);

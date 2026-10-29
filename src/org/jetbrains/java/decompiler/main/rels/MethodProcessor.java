@@ -470,6 +470,11 @@ public class MethodProcessor implements Runnable {
     if (TempReceiverCompound.fold(root, mt)) {
       decompileRecord.add("TempReceiverCompound", root);
     }
+    // A bound method reference's captured receiver is parked in a hidden slot at the creation
+    // site; print the source expression in its place, which javac re-lowers to the same store.
+    if (ReferenceReceiverTemp.fold(root, mt)) {
+      decompileRecord.add("ReferenceReceiverTemp", root);
+    }
     // A value the printer dropped may still be a store the target made into a source-named local
     // it never reads; dropping the store would recompile as `pop`.
     if (NamedDeadStore.restore(root, mt, varProc)) {
