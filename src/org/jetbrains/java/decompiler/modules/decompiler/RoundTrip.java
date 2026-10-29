@@ -648,7 +648,25 @@ public final class RoundTrip {
       return false;
     }
     LocalVariable first = firstDefinedLvt(stat);
-    return first != null && first.getStart() > 0 && first.getOrder() > paramsEnd;
+    if (first == null || first.getStart() <= 0 || first.getOrder() < 0) {
+      return false;
+    }
+    if (first.getOrder() > paramsEnd) {
+      return true;
+    }
+    // A local declared in a nested block closes when that block does, so every one of its rows is
+    // written before the parameter group. A local declared in the method body closes with it, and
+    // its last alive range is written after the parameters. The declaration exprent carries only
+    // one row — the first store's — and a local assigned in both arms of an if has an early row
+    // there even when the declaration stood outside the branch: the row the table writes last is
+    // the one that proves the method scope.
+    for (LocalVariable v : vars) {
+      if (v.getOrder() > paramsEnd && v.getIndex() == first.getIndex()
+          && v.getName().equals(first.getName()) && v.getDescriptor().equals(first.getDescriptor())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static boolean spansMethod(List<LocalVariable> vars, int maxEnd) {
