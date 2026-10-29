@@ -2248,6 +2248,20 @@ public final class RoundTrip {
     return sites != null && !sites.isEmpty();
   }
 
+  /** Start offsets of every store to a slot in the method, as a fresh set. */
+  public static BitSet storeSites(StructMethod method, int slot) {
+    java.util.Map<Integer, BitSet> map = method == null ? null : STORE_SITES.get(method);
+    BitSet sites = map == null ? null : map.get(slot);
+    return sites == null ? new BitSet() : (BitSet) sites.clone();
+  }
+
+  /** Start offsets of every load of a slot in the method, as a fresh set. */
+  public static BitSet loadSites(StructMethod method, int slot) {
+    java.util.Map<Integer, BitSet> map = method == null ? null : LOAD_SITES.get(method);
+    BitSet sites = map == null ? null : map.get(slot);
+    return sites == null ? new BitSet() : (BitSet) sites.clone();
+  }
+
   /** Whether some store to {@code slot} starts after {@code from} and no later than {@code to}. */
   public static boolean storedIn(StructMethod method, int slot, int from, int to) {
     java.util.Map<Integer, BitSet> map = method == null ? null : STORE_SITES.get(method);

@@ -23,6 +23,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SynchronizedStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
@@ -62,8 +63,272 @@ public final class LocalDeclarationOrder {
 
     NameTable names = NameTable.build(root);
     hoistAcrossStatements(root, varproc, names, method);
+    hoistReserved(root, varproc, names, method);
     reorderWithinList(root, varproc);
     hoistToPrintedOrder(root, varproc, names, method);
+  }
+
+  /** Per method: true when some slot the code uses has no local-table row. */
+  private static final java.util.Map<StructMethod, Boolean> HIDDEN_LOCALS = new java.util.concurrent.ConcurrentHashMap<>();
+
+  /**
+   * javac hands a local the next slot of the block it is declared in. A declaration inside a
+   * nested block therefore records how many locals the enclosing block had declared when the
+   * block was entered: a witness whose slot lies above a later declaration's slot proves that
+   * later local's slot was already reserved -- the source declared it above the block. The
+   * declaration moves to the list printed just before the statement holding the block, the shared
+   * sequence level; landing inside the block would end its scope where the block ends.
+   *
+   * <p>The slot arithmetic only holds for slots javac allocated to named locals. A hidden
+   * temporary -- a for-each iterator, a try-with-resources exception, a switch map -- takes a
+   * slot no table row names, and that slot can explain the witness's number instead, so a method
+   * with any such slot is refused.
+   */
+  private static void hoistReserved(Statement root, VarProcessor varproc, NameTable names, String method) {
+    if (!RoundTrip.selector("declreserved")) {
+      return;
+    }
+    hoistReservedRec(root, varproc, names, method);
+  }
+
+  private static void hoistReservedRec(Statement stat, VarProcessor varproc, NameTable names, String method) {
+    if (stat.type == Statement.StatementType.SEQUENCE
+        || (stat.type == Statement.StatementType.ROOT && onlyBasicBlocks(stat))) {
+      hoistReservedInSequence(stat, varproc, names, method);
+    }
+    for (Statement child : stat.getStats()) {
+      hoistReservedRec(child, varproc, names, method);
+    }
+  }
+
+  private static void hoistReservedInSequence(Statement seq, VarProcessor varproc, NameTable names, String method) {
+    StructMethod structMethod = RoundTrip.currentMethod();
+    if (structMethod == null || hiddenLocals(structMethod)) {
+      return;
+    }
+    java.util.Map<Integer, List<LocalVariable>> rows = rowTable(structMethod);
+    // Each move changes the printed order, so the landing point is re-derived after every one;
+    // the moves are few and each declaration can only be hoisted once (its own list then holds
+    // the landing too).
+    while (true) {
+      List<Position> order = declarationOrder(seq, varproc);
+      if (!hoistReservedOne(seq, order, rows, names, method)) {
+        return;
+      }
+    }
+  }
+
+  private static boolean hoistReservedOne(Statement seq, List<Position> order,
+                                          java.util.Map<Integer, List<LocalVariable>> rows,
+                                          NameTable names, String method) {
+    List<Statement> children = seq.getStats();
+    for (int i = 1; i < order.size(); i++) {
+      Position position = order.get(i);
+      VarExprent var = definedVar(position.exprent);
+      if (var == null || !isRealDefinition(var) || position.slot < 0 || var.getLVT() == null
+          || position.list == null) {
+        continue;
+      }
+      // A bare declaration has no instruction of its own; the table's row opens at the first
+      // store, which is where the source's declaration took effect.
+      int store = var.getLVT().getStart();
+      Statement holder = directChild(children, position.owner);
+      if (holder == null || store < 0) {
+        continue;
+      }
+      boolean witnessed = false;
+      for (Statement sibling : siblingsBefore(children, holder)) {
+        if (reservedWitness(sibling, position.slot, store, rows) != null) {
+          witnessed = true;
+          break;
+        }
+      }
+      if (!witnessed) {
+        continue;
+      }
+      Position landing = order.get(i - 1);
+      if (landing.list == null || landing.list == position.list || landing.owner == null) {
+        continue;
+      }
+      int deadEnd = slotReuseEnd(var);
+      if (!afterDeadScope(landing, deadEnd)) {
+        debug(method, var, "rejected: reserved-slot landing inside the dead scope " + deadEnd);
+        continue;
+      }
+      if (!names.uniqueName(var) && !names.sameSlotName(var)) {
+        debug(method, var, "rejected: another local prints as " + var.getName());
+        continue;
+      }
+      if (RoundTrip.isCatchParameter(new VarVersionPair(var))) {
+        debug(method, var, "rejected: the catch header declares it");
+        continue;
+      }
+      if (mentionsField(seq, var.getName()) || mentionsField(landing.owner, var.getName())) {
+        debug(method, var, "rejected: the landing block names a field " + var.getName());
+        continue;
+      }
+      if (!new Da(var).check(seq)) {
+        debug(method, var, "rejected: not definitely assigned at a use");
+        continue;
+      }
+      debug(method, var, "hoisted above a nested block that reserved slot-" + position.slot);
+      Exprent declaration;
+      if (position.exprent == var) {
+        removeIdentity(position.list, position.exprent);
+        declaration = position.exprent;
+      } else {
+        declaration = var.copy();
+        var.setDefinition(false);
+      }
+      insertByTargetSlot(landing.list, declaration);
+      return true;
+    }
+    return false;
+  }
+
+  /** The direct child of the sequence that holds this statement, or null when it is the sequence. */
+  private static Statement directChild(List<Statement> children, Statement stat) {
+    for (Statement child : children) {
+      if (child == stat || child.containsStatementStrict(stat)) {
+        return child;
+      }
+    }
+    return null;
+  }
+
+  /** The method's local-table rows grouped by slot. */
+  private static java.util.Map<Integer, List<LocalVariable>> rowTable(StructMethod method) {
+    java.util.Map<Integer, List<LocalVariable>> slots = new java.util.HashMap<>();
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table != null) {
+      for (LocalVariable local : table.getVariables().toList()) {
+        if (local.getIndex() >= 0) {
+          slots.computeIfAbsent(local.getIndex(), key -> new ArrayList<>()).add(local);
+        }
+      }
+    }
+    return slots;
+  }
+
+  /** The slots whose every row opens after the witness's store: named but not yet stored there. */
+  private static java.util.BitSet rowSlots(java.util.Map<Integer, List<LocalVariable>> rows) {
+    java.util.BitSet slots = new java.util.BitSet();
+    for (java.util.Map.Entry<Integer, List<LocalVariable>> entry : rows.entrySet()) {
+      slots.set(entry.getKey());
+    }
+    return slots;
+  }
+
+  /**
+   * True when the code uses a slot outside every table row that names it: a compiler temporary,
+   * which advances the slot allocator without the table recording a declaration. A row opens at
+   * its first store's end, so the store that opens it lies in the few bytes just before the row's
+   * start; a later row for the same slot continues the same variable's scope.
+   */
+  private static boolean hiddenLocals(StructMethod method) {
+    return HIDDEN_LOCALS.computeIfAbsent(method, key -> {
+      java.util.Map<Integer, List<LocalVariable>> rows = rowTable(key);
+      for (int slot = 0; slot < 256; slot++) {
+        List<LocalVariable> atSlot = rows.get(slot);
+        java.util.BitSet stores = RoundTrip.storeSites(key, slot);
+        java.util.BitSet loads = RoundTrip.loadSites(key, slot);
+        if (stores.isEmpty() && loads.isEmpty()) {
+          continue;
+        }
+        if (atSlot == null || atSlot.isEmpty()) {
+          return true;
+        }
+        for (int store = stores.nextSetBit(0); store >= 0; store = stores.nextSetBit(store + 1)) {
+          if (!insideRow(atSlot, store) && !nextToRow(atSlot, store)) {
+            return true;
+          }
+        }
+        for (int load = loads.nextSetBit(0); load >= 0; load = loads.nextSetBit(load + 1)) {
+          if (!insideRow(atSlot, load)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+  }
+
+  /** True when a store at this offset opens one of the slot's rows (its end is the row's start). */
+  private static boolean nextToRow(List<LocalVariable> rows, int store) {
+    for (LocalVariable row : rows) {
+      if (store < row.getStart() && row.getStart() - store <= 4) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean insideRow(List<LocalVariable> rows, int offset) {
+    for (LocalVariable row : rows) {
+      if (offset >= row.getStart() && offset < row.getEnd()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * A declaration inside the block whose slot lies above the candidate's and whose store runs
+   * before the candidate's own, with every slot between the two named by a table row: the
+   * witness whose number proves the candidate's slot was still reserved.
+   */
+  private static VarExprent reservedWitness(Statement stat, int slot, int store,
+                                            java.util.Map<Integer, List<LocalVariable>> rows) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        for (Exprent inner : exprent.getAllExprents(true, true)) {
+          if (!(inner instanceof VarExprent var) || !isRealDefinition(var) || var.getLVT() == null) {
+            continue;
+          }
+          int witnessSlot = var.getLVT().getIndex();
+          if (witnessSlot <= slot) {
+            continue;
+          }
+          int witnessStore = printedOffset(inner);
+          if (witnessStore < 0 || witnessStore >= store) {
+            continue;
+          }
+          // Every slot between the two must belong to a local whose table row opens only after
+          // the witness's store: at the witness those locals were declared but not yet stored,
+          // and that is exactly what reserved the candidate's slot. A row opening earlier means a
+          // different, already live local explains the witness's number.
+          if (!reservedGap(rows, slot, witnessSlot, witnessStore)) {
+            continue;
+          }
+          return var;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      VarExprent found = reservedWitness(child, slot, store, rows);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  private static boolean reservedGap(java.util.Map<Integer, List<LocalVariable>> rows, int from, int to,
+                                     int witnessStore) {
+    for (int slot = from; slot < to; slot++) {
+      List<LocalVariable> atSlot = rows.get(slot);
+      if (atSlot == null || atSlot.isEmpty()) {
+        return false;
+      }
+      for (LocalVariable local : atSlot) {
+        if (local.getStart() <= witnessStore) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /**
