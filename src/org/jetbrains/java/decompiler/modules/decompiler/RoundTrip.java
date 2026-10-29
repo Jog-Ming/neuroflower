@@ -15,6 +15,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
@@ -4895,6 +4897,46 @@ public final class RoundTrip {
   }
 
   /**
+   * The target's local-table rows a statement's own straight-line chain declares, as
+   * {@code {slot, start, end}}: the statement itself and the head blocks of the ifs it contains.
+   * `if (C) { …; } break;` keeps its statements in the head, and the source wrote them in the same
+   * block. A local declared in a loop (its init included), in an if arm or a nested block keeps
+   * that construct's scope instead, and a pattern variable is declared by the label, not here.
+   */
+  public static java.util.List<int[]> declarationRows(Statement stat) {
+    java.util.List<int[]> rows = new java.util.ArrayList<>();
+    collectDeclarationRows(stat, rows);
+    return rows;
+  }
+
+  private static void collectDeclarationRows(Statement stat, java.util.List<int[]> rows) {
+    addDeclarationRows(stat.getVarDefinitions(), rows);
+    if (stat.getExprents() != null) {
+      addDeclarationRows(stat.getExprents(), rows);
+    }
+    if (stat instanceof SequenceStatement) {
+      for (Statement child : stat.getStats()) {
+        collectDeclarationRows(child, rows);
+      }
+    } else if (stat instanceof IfStatement ifStat) {
+      collectDeclarationRows(ifStat.getFirst(), rows);
+    }
+  }
+
+  private static void addDeclarationRows(java.util.List<? extends Exprent> exprents, java.util.List<int[]> rows) {
+    for (Exprent exprent : exprents) {
+      if (exprent == null) {
+        continue;
+      }
+      for (Exprent part : exprent.getAllExprents(true, true)) {
+        if (part instanceof VarExprent var && var.isDefinition() && var.getLVT() != null) {
+          rows.add(new int[]{var.getLVT().getIndex(), var.getLVT().getStart(), var.getLVT().getEnd()});
+        }
+      }
+    }
+  }
+
+  /**
    * Whether a local declared in this statement runs to its end. Such a statement's scope closes at
    * the jump that follows it; a {@code continue} printed after the local's last use would close the
    * scope after that jump instead of before it, and the local's table range would grow. A local
@@ -5557,13 +5599,17 @@ public final class RoundTrip {
   }
 
   /**
-   * The slots the target's table declares inside this switch arm's own instruction range. A slot
-   * that two arms declare is proof the source braced them: unbraced arms share the switch's block,
-   * so javac would have to give the second one a fresh slot instead of reusing a dead one.
+   * The locals the target's table declares inside this switch arm's own instruction range and that
+   * the arm declares itself, keyed by slot. A slot that two arms declare is proof the earlier arm
+   * was braced: unbraced arms share the switch's block, so javac would have to give the later local
+   * a fresh slot instead of reusing a dead one. {@code own} holds the table rows the arm's own
+   * declaration exprents own, as {@code {slot, start, end}}; a row of the table belongs to one of
+   * them only when both the slot and the start agree, so a pattern variable or a reassignment the
+   * table records inside the arm is not counted as the arm's declaration.
    */
-  public static java.util.Map<Integer, int[]> targetSlotsDeclaredIn(Statement arm, java.util.Set<Integer> own) {
+  public static java.util.Map<Integer, int[]> targetSlotsDeclaredIn(Statement arm, java.util.List<int[]> own) {
     java.util.Map<Integer, int[]> slots = new java.util.HashMap<>();
-    if (!selector("armbraces") || arm == null) {
+    if (!selector("armbraces") || arm == null || own == null || own.isEmpty()) {
       return slots;
     }
     StructMethod method = currentMethod();
@@ -5584,33 +5630,18 @@ public final class RoundTrip {
     }
     table.getRange(start, Integer.MAX_VALUE)
       .filter(v -> v.getStart() >= start && v.getStart() <= end)
-      .filter(v -> own.isEmpty() || own.contains(v.getIndex()))
+      .filter(v -> ownedRow(own, v))
       .forEach(v -> slots.put(v.getIndex(), new int[]{v.getStart(), v.getEnd()}));
     return slots;
   }
 
-  /**
-   * True when a local this arm declares is still in the target's table at {@code offset}: its
-   * entry closes after the jump, so the arm's block was still open there — the source wrote the
-   * {@code break;} inside the brace rather than after it.
-   */
-  public static boolean declaredScopePast(Statement arm, int offset) {
-    if (arm == null || offset < 0) {
-      return false;
+  private static boolean ownedRow(java.util.List<int[]> own, StructLocalVariableTableAttribute.LocalVariable row) {
+    for (int[] candidate : own) {
+      if (candidate[0] == row.getIndex() && candidate[1] == row.getStart()) {
+        return true;
+      }
     }
-    StructMethod method = currentMethod();
-    StructLocalVariableTableAttribute table =
-      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
-    if (table == null) {
-      return false;
-    }
-    int start = firstOffset(arm);
-    int end = lastOffset(arm);
-    if (start < 0 || end < 0) {
-      return false;
-    }
-    return table.getRange(start, Integer.MAX_VALUE)
-      .anyMatch(v -> v.getStart() >= start && v.getStart() <= end && v.getEnd() > offset);
+    return false;
   }
 
   /** Last instruction end covered by a statement, or -1. */

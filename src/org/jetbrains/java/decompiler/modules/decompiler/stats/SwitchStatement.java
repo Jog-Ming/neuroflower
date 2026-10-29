@@ -144,7 +144,7 @@ public class SwitchStatement extends Statement {
     Map<String, List<Statement>> definitions = new HashMap<>();
     for (Statement caseStat : caseStatements) {
       Set<String> names = new HashSet<>();
-      collectCaseNames(caseStat, names, null);
+      collectCaseNames(caseStat, names);
       for (String name : names) {
         definitions.computeIfAbsent(name, key -> new ArrayList<>()).add(caseStat);
       }
@@ -155,12 +155,17 @@ public class SwitchStatement extends Statement {
       }
     }
 
-    // A slot two arms declare in the target's table: the first arm's local died at its closing
-    // brace and javac handed the slot to the next arm, which only a braced arm can do.
+    // A slot two arms declare in the target's table: the earlier arm's local died at its closing
+    // brace and javac handed the slot to a later arm, which only a braced arm can do. Only the
+    // earlier arm is braced: the later local's start says nothing about where its own arm closed,
+    // since the slot it reuses is simply free by then.
     Set<Statement> bracedEarly = new HashSet<>();
     List<Map<Integer, int[]>> armSlots = new ArrayList<>();
+    List<List<int[]>> armRows = new ArrayList<>();
     for (Statement arm : caseStatements) {
-      armSlots.add(RoundTrip.targetSlotsDeclaredIn(arm, ownSlots(arm)));
+      List<int[]> rows = RoundTrip.declarationRows(arm);
+      armRows.add(rows);
+      armSlots.add(RoundTrip.targetSlotsDeclaredIn(arm, rows));
     }
     for (int a = 0; a < armSlots.size(); a++) {
       for (int b = a + 1; b < armSlots.size(); b++) {
@@ -168,11 +173,10 @@ public class SwitchStatement extends Statement {
         for (Map.Entry<Integer, int[]> first : armSlots.get(a).entrySet()) {
           int[] second = armSlots.get(b).get(first.getKey());
           // The earlier local has to die at its arm's closing brace and the later one to start
-          // with its arm: a local declared in a nested block dies inside the arm instead.
+          // after it: a local declared in a nested block dies inside the arm instead.
           if (second != null && first.getValue()[1] <= second[0]
               && armEnd >= 0 && first.getValue()[1] >= armEnd - 1) {
             bracedEarly.add(caseStatements.get(a));
-            bracedEarly.add(caseStatements.get(b));
           }
         }
       }
@@ -386,16 +390,16 @@ public class SwitchStatement extends Statement {
         && function.getFuncType() == FunctionType.INSTANCEOF);
       boolean breakOutside = braced.contains(stat) && bracedEarly.contains(stat) && breakJump >= 0
         && !yields && !orderUnknown && guard == null && !patternArm
-        && RoundTrip.canCompleteNormally(stat) && !RoundTrip.declaredScopePast(stat, breakJump)
+        && RoundTrip.canCompleteNormally(stat) && !declaredScopePast(armRows.get(i), breakJump)
         && RoundTrip.selector("switchbreak") && RoundTrip.jumpsOnto(breakJump);
       // A local the arm declares ends its row exactly at the break's jump, and another jump lands
       // on that jump: the source closed the arm's block before the break, so the break prints
       // after the closing brace instead of inside whatever branch the tree hung it off.
       int deferredBreak = -1;
       if (armClose[i] > 0 && braced.contains(stat) && !breakOutside && !yields && !orderUnknown
-          && guard == null && !patternArm && RoundTrip.selector("switchbreak")
+          && guard == null && RoundTrip.selector("switchbreak")
           && (breakJump < 0 || breakJump == armClose[i])
-          && !RoundTrip.declaredScopePast(stat, armClose[i])
+          && !declaredScopePast(armRows.get(i), armClose[i])
           && RoundTrip.jumpsOnto(armClose[i]) && RoundTrip.breaksTo(stat, this)) {
         deferredBreak = armClose[i];
       }
@@ -439,7 +443,7 @@ public class SwitchStatement extends Statement {
           && RoundTrip.canCompleteNormally(stat) && !armLeaves) {
         // A braced arm holds the break inside the brace when the target's table still has a local
         // the arm declared alive past the jump: the block was open there.
-        breakInside = braced.contains(stat) && RoundTrip.declaredScopePast(stat, breakJump);
+        breakInside = braced.contains(stat) && declaredScopePast(armRows.get(i), breakJump);
         if (!braced.contains(stat) || breakInside) {
           buf.append(breakLine(indent + 2, breakJump));
         }
@@ -453,7 +457,8 @@ public class SwitchStatement extends Statement {
         // deferred break is the one the table proves: its jump is reachable from the jump onto it.
         if ((breakOutside || deferredBreak > 0
              || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
-            && (breakJump >= 0 || deferredBreak > 0) && !breakInside && guard == null && !patternArm
+            && (breakJump >= 0 || deferredBreak > 0) && !breakInside && guard == null
+            && (!patternArm || deferredBreak > 0)
             && (deferredBreak > 0 || RoundTrip.canCompleteNormally(stat))) {
           int at = buf.length();
           buf.append(" break;");
@@ -838,43 +843,51 @@ public class SwitchStatement extends Statement {
     return jump;
   }
 
-  /** The slot indices this arm declares at its own level, not inside a nested statement. */
-  private static Set<Integer> ownSlots(Statement arm) {
-    Set<Integer> slots = new HashSet<>();
-    for (Exprent definition : arm.getVarDefinitions()) {
-      for (Exprent part : definition.getAllExprents(true, true)) {
-        if (part instanceof VarExprent var && var.isDefinition()) {
-          slots.add(var.getIndex());
-        }
-      }
-      if (definition instanceof VarExprent var && var.isDefinition()) {
-        slots.add(var.getIndex());
+  /** True when a local this arm declares at its own level is still in scope at {@code offset}. */
+  private static boolean declaredScopePast(List<int[]> rows, int offset) {
+    if (offset < 0) {
+      return false;
+    }
+    for (int[] row : rows) {
+      if (row[2] > offset) {
+        return true;
       }
     }
-    return slots;
+    return false;
   }
 
-  /** Collects the local names this arm declares at its own level, looking through nested statements. */
-  private static void collectCaseNames(Statement stat, Set<String> names, SwitchStatement inner) {
-    if (stat instanceof SwitchStatement) {
-      inner = (SwitchStatement) stat; // an inner switch scopes its own arms
+  /**
+   * Collects the local names this arm declares at its own level. A name declared inside a loop or
+   * a nested block lives in that construct's scope whether or not the arm is braced, so it can
+   * share a name with another arm and says nothing about the switch's block.
+   */
+  private static void collectCaseNames(Statement stat, Set<String> names) {
+    addDefinitionNames(stat.getVarDefinitions(), names);
+    if (stat.getExprents() != null) {
+      addDefinitionNames(stat.getExprents(), names);
     }
-    if (inner == null) {
-      if (stat.getExprents() != null) {
-        for (Exprent exprent : stat.getExprents()) {
-          for (Exprent nested : exprent.getAllExprents(true, true)) {
-            if (nested instanceof VarExprent var && var.isDefinition()) {
-              String name = var.getName();
-              if (name != null) {
-                names.add(name);
-              }
-            }
+    if (stat instanceof SequenceStatement) {
+      for (Statement child : stat.getStats()) {
+        collectCaseNames(child, names);
+      }
+    } else if (stat instanceof IfStatement ifStat) {
+      collectCaseNames(ifStat.getFirst(), names);
+    }
+  }
+
+  private static void addDefinitionNames(List<? extends Exprent> exprents, Set<String> names) {
+    for (Exprent exprent : exprents) {
+      if (exprent == null) {
+        continue;
+      }
+      for (Exprent nested : exprent.getAllExprents(true, true)) {
+        if (nested instanceof VarExprent var && var.isDefinition()) {
+          String name = var.getName();
+          if (name != null) {
+            names.add(name);
           }
         }
       }
-    }
-    for (Statement child : stat.getStats()) {
-      collectCaseNames(child, names, inner);
     }
   }
 
