@@ -578,6 +578,9 @@ public class SequenceStatement extends Statement {
         // holds the same statements after the if, so print those once and leave the arm's copy out.
         int bodyEnd = arm.getStats().size();
         boolean finalReturnTail = false;
+        // The dropped tail that this print itself has to print after the else: the arm ended on
+        // the join, and nothing here or in the enclosing flow would print it otherwise.
+        List<Statement> joinTail = List.of();
         if (elseStop > 0 && bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
           while (bodyEnd > 0 && RoundTrip.firstOffset(arm.getStats().get(bodyEnd - 1)) >= elseStop) {
             bodyEnd--;
@@ -586,17 +589,47 @@ public class SequenceStatement extends Statement {
             }
           }
           // The join has to be printed exactly once after the else: by the next statement here,
-          // or — when the else runs to the end of this sequence — by the enclosing flow. The arm
-          // may only lean on the enclosing flow when the copy it absorbed is the method's own
-          // final return, which that flow does print after the whole if.
+          // by the enclosing flow when the copy is the method's own final return, or by this
+          // print when the dropped tail itself begins at the join.
           int join;
           if (elseEnd + 1 < stats.size()) {
             join = RoundTrip.firstOffset(stats.get(elseEnd + 1));
+          } else if (finalReturnTail) {
+            join = RoundTrip.printedAfter(this);
+          } else if (bodyEnd < arm.getStats().size()
+              && RoundTrip.firstOffset(arm.getStats().get(bodyEnd)) == elseStop) {
+            join = elseStop;
+            joinTail = new ArrayList<>(arm.getStats().subList(bodyEnd, arm.getStats().size()));
           } else {
-            join = finalReturnTail ? RoundTrip.printedAfter(this) : -1;
+            join = -1;
           }
           if (bodyEnd == 0 || join != elseStop) {
             elseEnd = -1;
+          }
+        }
+        // The arm's last basic block may hold the join as trailing exprents instead: the block
+        // starts before the else and ends on the join's own instruction, which only code after
+        // the if/else can own. Split them off so the arm prints without them.
+        List<Exprent> joinExprents = null;
+        Statement joinExprentHost = null;
+        if (elseEnd > i && elseStop > 0 && bodyEnd > 0 && joinTail.isEmpty()
+            && elseEnd + 1 >= stats.size()) {
+          Statement lastArm = arm.getStats().get(bodyEnd - 1);
+          List<Exprent> exprents = lastArm.getExprents();
+          if (exprents != null && exprents.size() > 1) {
+            int split = -1;
+            for (int k = 0; k < exprents.size(); k++) {
+              Exprent e = exprents.get(k);
+              int start = e.bytecode == null || e.bytecode.isEmpty() ? -1 : e.bytecode.nextSetBit(0);
+              if (start >= elseStop) {
+                split = k;
+                break;
+              }
+            }
+            if (split > 0) {
+              joinExprents = new ArrayList<>(exprents.subList(split, exprents.size()));
+              joinExprentHost = lastArm;
+            }
           }
         }
         if (elseEnd > i && elseStart >= 0 && elseStop > elseStart && bodyEnd > 0
@@ -613,11 +646,20 @@ public class SequenceStatement extends Statement {
             for (Statement dropped : tail) {
               armSeq.getStats().removeWithKey(dropped.id);
             }
+            List<Exprent> savedExprents = null;
+            if (joinExprentHost != null) {
+              savedExprents = joinExprentHost.getExprents();
+              joinExprentHost.setExprents(new ArrayList<>(
+                savedExprents.subList(0, savedExprents.size() - joinExprents.size())));
+            }
             try {
               RoundTrip.pushJoinOffset(elseStop);
               buf.append(ExprProcessor.jmpWrapper(armSeq, indent + 1, true));
             } finally {
               RoundTrip.popJoinOffset();
+              if (savedExprents != null) {
+                joinExprentHost.setExprents(savedExprents);
+              }
               for (Statement dropped : tail) {
                 armSeq.getStats().addWithKey(dropped, dropped.id);
               }
@@ -625,12 +667,21 @@ public class SequenceStatement extends Statement {
           } else {
             // The arm's trailing jump is the loop's own continue: the else arm's end carries it.
             Statement previous = RoundTrip.suppressJump(arm);
+            List<Exprent> savedExprents = null;
+            if (joinExprentHost != null) {
+              savedExprents = joinExprentHost.getExprents();
+              joinExprentHost.setExprents(new ArrayList<>(
+                savedExprents.subList(0, savedExprents.size() - joinExprents.size())));
+            }
             try {
               RoundTrip.pushJoinOffset(elseStop);
               buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
             } finally {
               RoundTrip.popJoinOffset();
               RoundTrip.restoreJump(previous);
+              if (savedExprents != null) {
+                joinExprentHost.setExprents(savedExprents);
+              }
             }
           }
           if (!(elseEnd == i + 1 && IfStatement.printElseIfArm(buf, indent, stats.get(i + 1)))) {
@@ -639,6 +690,13 @@ public class SequenceStatement extends Statement {
               buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
             }
             buf.appendIndent(indent).append("}").appendLineSeparator();
+          }
+          // The join the arm absorbed prints here, once, where the source wrote it.
+          for (Statement dropped : joinTail) {
+            buf.append(ExprProcessor.jmpWrapper(dropped, indent, false));
+          }
+          if (joinExprents != null) {
+            buf.append(ExprProcessor.listToJava(joinExprents, indent));
           }
           notempty = true;
           i = elseEnd;
