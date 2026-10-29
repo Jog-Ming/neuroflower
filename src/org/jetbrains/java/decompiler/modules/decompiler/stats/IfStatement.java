@@ -490,7 +490,7 @@ public class IfStatement extends Statement {
         // (TripWireHookBlock's tripwire test). Let the swap below print it as the if/else it is.
         && !RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat)
         && endsLoopBody(this)
-        && RoundTrip.printContinueElse(ifHead, this)) {
+        && RoundTrip.printContinueElse(ifHead, this, ifstat)) {
       buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
       appendContinueLine(buf, indent);
@@ -509,7 +509,7 @@ public class IfStatement extends Statement {
         && !RoundTrip.declaresLocalToEnd(elsestat)
         && RoundTrip.swapIfArmsByLastTarget(ifHead, ifstat)
         && endsLoopBody(this)
-        && RoundTrip.printContinueElse(ifHead, this)) {
+        && RoundTrip.printContinueElse(ifHead, this, elsestat)) {
       IfExprent source = (IfExprent) ifHead.copy();
       source.setCondition(RoundTrip.negateCondition(source.getCondition()));
       buf.appendIndent(indent).append(source.toJava(indent)).append(" {").appendLineSeparator();

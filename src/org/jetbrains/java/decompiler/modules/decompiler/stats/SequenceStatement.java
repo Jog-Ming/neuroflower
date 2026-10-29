@@ -500,7 +500,7 @@ public class SequenceStatement extends Statement {
           // the wrong way round: the jump between them is the join, not a written continue.
           && !RoundTrip.swapIfArmsByLastTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat())
           && i == stats.size() - 1 && endsLoopBody()
-          && RoundTrip.printContinueElse(ifStatement.getHeadexprent(), this)) {
+          && RoundTrip.printContinueElse(ifStatement.getHeadexprent(), this, ifStatement.getIfstat())) {
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
         buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();

@@ -6151,10 +6151,50 @@ public final class RoundTrip {
   }
 
   /**
-   * Whether a local declared in this statement runs to its end. Such a statement's scope closes at
-   * the jump that follows it; a {@code continue} printed after the local's last use would close the
-   * scope after that jump instead of before it, and the local's table range would grow. A local
-   * declared in a nested block ends earlier and is unaffected.
+   * Whether a local the arm declares closes exactly at the end of the goto that starts at the
+   * arm's own end. The source wrote its {@code continue} inside the arm's block, and the block
+   * closed after that jump: this row is the evidence that the jump at the arm's end is the
+   * written statement, not the if/else join.
+   */
+  public static boolean continueInsideBlock(Statement arm) {
+    StructMethod method = currentMethod();
+    if (method == null || arm == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    int start = firstOffset(arm);
+    int end = lastEnd(arm);
+    if (start < 0 || end < 0) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = gotosHere();
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    Integer jumpEnd = ends == null ? null : ends.get(end);
+    if (gotos == null || !gotos.containsKey(end) || jumpEnd == null) {
+      return false;
+    }
+    for (LocalVariable row : table.getRange(start, Integer.MAX_VALUE).toList()) {
+      if (row.getStart() > end || row.getEnd() < end) {
+        continue;
+      }
+      if (row.getEnd() == jumpEnd) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether a local declared in this statement closes at or past its end, so that a {@code continue}
+   * printed after its last use would close the scope after the jump the hoist adds instead of
+   * before it and grow the local's table range. One row is not such a local: one that closes
+   * exactly at the end of the single goto sitting at the statement's end is the source's own
+   * written continue — the hoist prints the same jump there, and closing after it is what the
+   * table recorded. A local declared in a nested block ends earlier and is unaffected.
    */
   public static boolean declaresLocalToEnd(Statement statement) {
     StructMethod method = currentMethod();
@@ -6173,8 +6213,22 @@ public final class RoundTrip {
     }
     // The table's own range filter wants both ends, but the scope ends at the jump past the last
     // instruction, so bound the start here and compare the end directly.
-    return table.getRange(start, Integer.MAX_VALUE)
-      .anyMatch(v -> v.getStart() <= end && v.getEnd() >= end);
+    java.util.Map<Integer, Integer> gotos = gotosHere();
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    Integer jumpEnd = ends == null ? null : ends.get(end);
+    for (LocalVariable row : table.getRange(start, Integer.MAX_VALUE).toList()) {
+      if (row.getStart() > end || row.getEnd() < end) {
+        continue;
+      }
+      if (row.getEnd() == end) {
+        return true;
+      }
+      if (gotos != null && gotos.containsKey(end) && jumpEnd != null && row.getEnd() == jumpEnd) {
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -6234,7 +6288,7 @@ public final class RoundTrip {
    * the goto ending that arm is the continue. The caller proves the arm is the rest of the loop
    * body, so hoisting it keeps every scope's end where it was and no local can change slot.
    */
-  public static boolean printContinueElse(Exprent head, Statement sequence) {
+  public static boolean printContinueElse(Exprent head, Statement sequence, Statement arm) {
     CONTINUE_ELSE_SITE.get()[0] = -1;
     if (!selector("continueguard")) {
       return false;
@@ -6279,13 +6333,19 @@ public final class RoundTrip {
     // A jump the table marks as starting a line is a statement of the source. A jump to the loop's
     // own head — everything the loop builds before its body — is one too: the loop's back edge is
     // a jump instruction at the body's end, so nothing else in the middle of the body left one
-    // there. A jump to the update or to a join cannot be told apart from an if/else's closing jump
-    // without the table, and javac only anchors that jump when the source wrote a statement there.
+    // there. A for loop's increment is a landing point only when the printer keeps it in the for
+    // header; when its line differs from the condition's the printer moves it into the body, and a
+    // written continue skips it, so a goto there is an if/else's join instead. Otherwise javac
+    // anchors the goto when the source wrote a statement at it.
     int bodyStart = firstOffset(doStatement.getFirst());
     boolean headTarget = target >= 0 && bodyStart >= 0 && target < bodyStart;
+    // A for increment is a landing point only when a local the arm declares proves the jump stood
+    // inside the arm's block: without that row the target may be an if/else's join that happens to
+    // sit on the increment because the else arm ends the loop body.
+    boolean headerInc = isHeaderIncrement(doStatement, target) && continueInsideBlock(arm);
     StructLineNumberTableAttribute table =
       method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
-    if (table == null || !headTarget && !startsLine(table, site[0])) {
+    if (table == null || !headTarget && !headerInc && !startsLine(table, site[0])) {
       return false;
     }
     if (!isLoopHeadTarget(doStatement, target)) {
@@ -8538,6 +8598,27 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether {@code target} is a for loop's increment bytecode that the printer keeps in the for
+   * header. When the increment's line differs from the condition's the printer moves it into the
+   * body as a trailing statement, so a written {@code continue} skips it and the increment cannot
+   * be a continue's landing point there.
+   */
+  private static boolean isHeaderIncrement(
+      org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    if (loop.getLooptype() != org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.FOR
+        || target < 0) {
+      return false;
+    }
+    Exprent inc = loop.getIncExprent();
+    if (inc == null || inc.bytecode == null || !inc.bytecode.get(target)) {
+      return false;
+    }
+    int incLine = sourceLineDeep(inc);
+    int condLine = sourceLineDeep(loop.getConditionExprent());
+    return incLine < 0 || condLine < 0 || incLine == condLine;
   }
 
   /** The instruction a {@code continue} in this loop jumps to. */
