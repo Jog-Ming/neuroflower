@@ -61,11 +61,93 @@ public final class LocalDeclarationOrder {
     String method = wrapper == null ? "?" : wrapper.classStruct.qualifiedName + "." + wrapper.methodStruct.getName()
       + wrapper.methodStruct.getDescriptor();
 
+    collapseAssignedWrappers(root, method);
     NameTable names = NameTable.build(root);
     hoistAcrossStatements(root, varproc, names, method);
     hoistReserved(root, varproc, names, method);
     reorderWithinList(root, varproc);
     hoistToPrintedOrder(root, varproc, names, method);
+  }
+
+  /**
+   * `T v = (w = expr);` where the target's table never names v and nothing reads it: the value of
+   * an assignment to the already-declared local w survived the decompiler as a second local. The
+   * source wrote the assignment to w alone, and printing it alone reproduces the target's store.
+   */
+  private static void collapseAssignedWrappers(Statement root, String method) {
+    if (!RoundTrip.selector("assigntemp")) {
+      return;
+    }
+    Map<VarVersionPair, Integer> occurrences = new HashMap<>();
+    countOccurrences(root, occurrences);
+    collapseAssignedWrappersRec(root, occurrences, method);
+  }
+
+  private static void countOccurrences(Statement stat, Map<VarVersionPair, Integer> out) {
+    countOccurrences(stat.getVarDefinitions(), out);
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      countOccurrences(exprents, out);
+    }
+    for (Statement child : stat.getStats()) {
+      countOccurrences(child, out);
+    }
+  }
+
+  private static void countOccurrences(List<Exprent> exprents, Map<VarVersionPair, Integer> out) {
+    for (Exprent exprent : exprents) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var) {
+          out.merge(var.getVarVersionPair(), 1, Integer::sum);
+        }
+      }
+    }
+  }
+
+  private static void collapseAssignedWrappersRec(Statement stat, Map<VarVersionPair, Integer> occurrences,
+                                                  String method) {
+    collapseAssignedWrappersIn(stat.getVarDefinitions(), List.of(), occurrences, method);
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      collapseAssignedWrappersIn(exprents, stat.getVarDefinitions(), occurrences, method);
+    }
+    for (Statement child : stat.getStats()) {
+      collapseAssignedWrappersRec(child, occurrences, method);
+    }
+  }
+
+  private static void collapseAssignedWrappersIn(List<Exprent> exprents, List<Exprent> declarations,
+                                                 Map<VarVersionPair, Integer> occurrences, String method) {
+    for (int i = 0; i < exprents.size(); i++) {
+      if (!(exprents.get(i) instanceof AssignmentExprent outer)
+          || !(outer.getLeft() instanceof VarExprent wrapper)
+          || !wrapper.isDefinition() || wrapper.getLVT() != null
+          || !(outer.getRight() instanceof AssignmentExprent inner)
+          || !(inner.getLeft() instanceof VarExprent target) || target.isStack() || target.isDefinition()) {
+        continue;
+      }
+      // The target's table is the evidence the wrapper is not a source variable; a read anywhere
+      // means the value it holds is still needed.
+      if (occurrences.getOrDefault(wrapper.getVarVersionPair(), 0) != 1) {
+        continue;
+      }
+      if (!declaredAbove(declarations, target.getVarVersionPair())
+          && !declaredAbove(exprents.subList(0, i), target.getVarVersionPair())) {
+        continue;
+      }
+      debug(method, wrapper, "collapsed a wrapper that only stored into " + target.getName());
+      exprents.set(i, inner);
+    }
+  }
+
+  /** True when one of these exprents is a bare declaration of the variable. */
+  private static boolean declaredAbove(List<Exprent> exprents, VarVersionPair pair) {
+    for (Exprent exprent : exprents) {
+      if (exprent instanceof VarExprent var && isRealDefinition(var) && var.getVarVersionPair().equals(pair)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Per method: true when the code uses a slot outside every table row that names it. */
