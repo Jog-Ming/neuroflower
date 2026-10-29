@@ -440,6 +440,31 @@ public class IfStatement extends Statement {
     if (ifstat != null && elsestat == null && !isLabeled() && !isPatternMatched()
         && condition instanceof IfExprent ifHead
         && RoundTrip.emptyThenArm(ifHead, ifstat)) {
+      // The jump after the branch lands on the loop's head: the empty arm the source wrote was a
+      // `continue;` and the tree's arm is the statement after it, not an else. The arm keeps the
+      // block its own table rows close with, or prints in the open when they run on.
+      if (RoundTrip.printContinueGuardAtHead(ifHead, this)) {
+        IfExprent head = (IfExprent) ifHead.copy();
+        head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        int gotoOffset = RoundTrip.continueGoto(ifHead);
+        if (gotoOffset >= 0) {
+          continueLine.addStartBytecodeMapping(gotoOffset);
+        }
+        buf.append(continueLine);
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        boolean braces = RoundTrip.closesAtOwnEnd(ifstat);
+        if (braces) {
+          buf.appendIndent(indent).append("{").appendLineSeparator();
+        }
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent + (braces ? 1 : 0), false));
+        if (braces) {
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
+        return buf;
+      }
       IfExprent head = (IfExprent) ifHead.copy();
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();

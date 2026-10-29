@@ -5203,6 +5203,51 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target compiled this if as {@code if (!C) { continue; } <arm>}: the branch's
+   * fall-through goto lands on the head of the loop that directly encloses the test — the narrow
+   * landing test, where the join of a written {@code if (!C) { } else <arm>} could not — and the
+   * line table puts the goto on a line of its own before the arm. The arm the tree hung off the
+   * test is the source's next statement, not an else. Only the innermost loop is asked: a
+   * {@code break} out of it lands on the enclosing loop's increment, which is no continue of this
+   * test's loop.
+   */
+  public static boolean printContinueGuardAtHead(Exprent head, Statement around) {
+    if (!selector("continueguard") || !(head instanceof IfExprent) || around == null
+        || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    Statement loop = around.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    if (!(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement)) {
+      return false;
+    }
+    int end = head.bytecode.length();
+    java.util.Map<Integer, Integer> guards = CONTINUE_GUARDS.get(method);
+    Integer target = guards == null ? null : guards.get(end);
+    if (target == null || !isLoopHeadTarget(doStatement, target)) {
+      return false;
+    }
+    java.util.Map<Integer, int[]> sites = CONTINUE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(end);
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (site != null && table != null) {
+      int continueLine = table.findLineNumber(site[0]);
+      int bodyLine = table.findLineNumber(site[1]);
+      if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * True when the target compiled this if as {@code if (C) continue;} inside a try-with-resources
    * body that ends the loop body: the branch skips the synthetic {@code close()} and the goto
    * right after it, so the branch-then-goto pair is broken by the close call. The jump the source's
@@ -5827,6 +5872,25 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /**
+   * True when the table proves the source braced this block: the first local the block declares
+   * itself has a row that ends exactly where the block's last instruction does. javac closes an
+   * alive range at the scope it lives in or at a merge it does not survive; a row ending on the
+   * block's own last instruction is the source's closing brace around the block. An unbraced
+   * block's local would keep its range open until the enclosing construct closed.
+   */
+  public static boolean closesAtOwnEnd(Statement statement) {
+    if (!selector("bareblock") || statement == null) {
+      return false;
+    }
+    int end = lastEnd(statement);
+    if (end < 0) {
+      return false;
+    }
+    java.util.List<int[]> rows = declarationRows(statement);
+    return !rows.isEmpty() && rows.get(0)[2] == end;
   }
 
   /**
