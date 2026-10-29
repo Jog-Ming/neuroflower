@@ -296,6 +296,11 @@ public class MethodProcessor implements Runnable {
             decompileRecord.add("EnhanceLoops", root);
           }
 
+          if (LoopJoinSink.sink(root)) {
+            decompileRecord.add("LoopJoinSink", root);
+            continue;
+          }
+
           if (LoopExtractHelper.extractLoops(root)) {
             decompileRecord.add("ExtractLoops", root);
             continue;
