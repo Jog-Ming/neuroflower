@@ -1562,6 +1562,26 @@ public final class RoundTrip {
     return lineAt(method, exprent.bytecode.nextSetBit(0));
   }
 
+  /**
+   * The target's source line for the first instruction the exprent covers, or the line of the
+   * first operand that carries one. A merged condition (two tests joined into one {@code &&}) is a
+   * FunctionExprent the rewrite passes built without its own instruction range, but its operands
+   * still carry the lines the source gave them, and a condition's first operand begins it.
+   */
+  public static int sourceLineDeep(Exprent exprent) {
+    int line = sourceLine(exprent);
+    if (line >= 0 || exprent == null) {
+      return line;
+    }
+    for (Exprent child : exprent.getAllExprents(true)) {
+      line = sourceLine(child);
+      if (line >= 0) {
+        return line;
+      }
+    }
+    return -1;
+  }
+
   /** The target's source line for the instruction at the exprent's last offset, or -1. */
   public static int sourceLineEnd(Exprent exprent) {
     StructMethod method = currentMethod();

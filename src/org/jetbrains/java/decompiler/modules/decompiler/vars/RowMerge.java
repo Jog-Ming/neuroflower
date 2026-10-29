@@ -7,6 +7,8 @@ import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
 import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
+import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
@@ -130,6 +132,7 @@ public final class RowMerge {
 
     Map<Integer, Integer> victims = new TreeMap<>();
     Map<Integer, LocalVariable> survivorRows = new TreeMap<>();
+    List<VarInfo> survivors = new ArrayList<>();
     for (Map.Entry<LocalVariable, List<VarInfo>> entry : groups.entrySet()) {
       LocalVariable row = entry.getKey();
       List<VarInfo> group = entry.getValue();
@@ -174,26 +177,250 @@ public final class RowMerge {
       }
       victims.putAll(planned);
       survivorRows.put(survivor.index, row);
+      survivors.add(survivor);
     }
 
     if (victims.isEmpty()) {
       return;
     }
 
-    Order order = new Order(victims.keySet());
+    // A survivor declared in a loop initialiser prints inside the loop's header, and the stores
+    // the table merges into it may lie in other loops. Where the target's line table proves the
+    // source printed the initialiser as a statement before a while, and its slot is lower than a
+    // declaration still live at the first store, the source declared the variable bare above that
+    // declaration. Move the bare declaration there; the slot simulation below decides whether the
+    // moved order is the printed one, and a rejected merge puts it back.
+    List<Runnable> undoHoists = hoistLoopInitialisers(root, varproc, mt, seq, bySlot, survivors, survivorRows);
+    Order order = new Order(victims.keySet(), mt);
     order.walk(root);
     if (!inScope(order, vars, victims)) {
       debug(mt, "merge reverted: a merged store prints outside the declaration's block");
+      revertHoists(undoHoists);
       return;
     }
     if (!slotsMatch(order, paramSlots(mt), varproc, mt)) {
       debug(mt, "merge reverted: the printed slots would not match the table");
+      revertHoists(undoHoists);
       return;
     }
 
     apply(root, victims);
     nameFromRow(varproc, survivorRows);
     debug(mt, "merged " + victims);
+  }
+
+  /**
+   * Moves a survivor's bare declaration out of a loop initialiser and up to the declaration the
+   * target's slot order puts after it.
+   *
+   * <p>javac allocates a local's slot at its declaration. When the source wrote {@code int x;}
+   * above a declaration that got the next slot and assigned {@code x} at a loop, the table gives
+   * {@code x} the lower slot while its only store sits in the initialiser. The declaration must be
+   * moved bare — the store stays where it prints — to just above the first declaration printed
+   * before it whose slot is higher and whose scope is still open at the first store. Only a loop
+   * initialiser is moved here: the merge itself then has to prove the printed order by the slot
+   * simulation, and a rejected merge puts the declaration back.
+   */
+  private static List<Runnable> hoistLoopInitialisers(RootStatement root, VarProcessor varproc, StructMethod mt,
+                                                      FullInstructionSequence seq,
+                                                      Map<Integer, List<LocalVariable>> bySlot,
+                                                      List<VarInfo> survivors,
+                                                      Map<Integer, LocalVariable> survivorRows) {
+    List<Runnable> undo = new ArrayList<>();
+    if (survivors.isEmpty()) {
+      return undo;
+    }
+    Order printed = new Order(Set.of(), mt);
+    printed.walk(root);
+    for (VarInfo survivor : survivors) {
+      VarExprent definition = survivor.definition;
+      LocalVariable row = survivorRows.get(survivor.index);
+      if (definition == null || row == null) {
+        continue;
+      }
+      DoStatement loop = initialiserLoop(root, definition);
+      if (loop == null || !printsBeforeLoop(loop, mt)) {
+        continue;
+      }
+      int at = indexOfEvent(printed, definition);
+      if (at < 0) {
+        continue;
+      }
+      Event anchor = null;
+      for (int i = 0; i < at; i++) {
+        Event event = printed.events.get(i);
+        if (event.var == null || event.var.getIndex() == survivor.index) {
+          continue;
+        }
+        Integer slot = varproc.getVarOriginalIndex(event.var.getIndex());
+        if (slot == null || slot <= survivor.slot) {
+          continue;
+        }
+        int end = storeEnd(event.var, mt, slot, seq);
+        LocalVariable anchorRow = end < 0 ? null : rowAt(bySlot.get(slot), end);
+        // A declaration whose scope closed before the store proves nothing: its slot was free
+        // when the survivor was declared, so the lower slot does not order the declarations.
+        if (anchorRow != null && anchorRow.getEnd() > row.getStart()) {
+          anchor = event;
+          break;
+        }
+      }
+      if (anchor == null) {
+        continue;
+      }
+      List<Exprent> list = anchor.list != null ? anchor.list : anchor.owner.getVarDefinitions();
+      Exprent before = anchor.list != null ? anchor.top : null;
+      VarExprent bare = (VarExprent)definition.copy();
+      bare.setDefinition(true);
+      bare.bytecode = null;
+      int index = before == null ? list.size() : indexOfIdentity(list, before);
+      list.add(index < 0 ? list.size() : index, bare);
+      definition.setDefinition(false);
+      survivor.definition = bare;
+      debug(mt, "hoisted slot " + survivor.slot + " above a declaration printed before slot-"
+        + varproc.getVarOriginalIndex(anchor.var.getIndex()));
+      undo.add(() -> {
+        list.remove(bare);
+        definition.setDefinition(true);
+        survivor.definition = definition;
+      });
+    }
+    return undo;
+  }
+
+  private static void revertHoists(List<Runnable> undo) {
+    for (Runnable action : undo) {
+      action.run();
+    }
+  }
+
+  private static int indexOfIdentity(List<Exprent> list, Exprent exprent) {
+    for (int i = 0; i < list.size(); i++) {
+      if (list.get(i) == exprent) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private static int indexOfEvent(Order order, VarExprent definition) {
+    for (int i = 0; i < order.events.size(); i++) {
+      if (order.events.get(i).var == definition) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** The loop whose initialiser defines this variable, or null. */
+  private static DoStatement initialiserLoop(Statement stat, VarExprent definition) {
+    if (stat instanceof DoStatement loop && loop.getInitExprent() != null) {
+      List<Exprent> all = loop.getInitExprent().getAllExprents(true);
+      all.add(loop.getInitExprent());
+      for (Exprent exprent : all) {
+        if (exprent == definition) {
+          return loop;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      DoStatement found = initialiserLoop(child, definition);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * True when the printer will emit the loop's initialiser as a statement before a while rather
+   * than in a for header. Only the target's line table separates the two shapes: javac gives a
+   * for header's init, condition and update the header's line, while an initialiser statement and
+   * the loop's condition carry their own. The printer keeps the header when the rendered body ends
+   * with a jump, so a body that carries any explicit break or continue — or an exit anywhere — is
+   * left as a header here: the simulation must never assume a wider scope than the printed one.
+   */
+  private static boolean printsBeforeLoop(DoStatement loop, StructMethod mt) {
+    if (loop.getLooptype() != DoStatement.Type.FOR || loop.getInitExprent() == null) {
+      return false;
+    }
+    int incLine = firstLine(mt, loop.getIncExprent());
+    int condLine = firstLine(mt, loop.getConditionExprent());
+    return incLine >= 0 && condLine >= 0 && incLine != condLine && !endsWithTransfer(loop.getFirst());
+  }
+
+  /** The target's line for the first instruction this exprent covers, descending into operands. */
+  private static int firstLine(StructMethod mt, Exprent exprent) {
+    if (exprent == null) {
+      return -1;
+    }
+    int line = lineOf(mt, exprent);
+    if (line >= 0) {
+      return line;
+    }
+    for (Exprent child : exprent.getAllExprents(true)) {
+      line = lineOf(mt, child);
+      if (line >= 0) {
+        return line;
+      }
+    }
+    return -1;
+  }
+
+  private static int lineOf(StructMethod mt, Exprent exprent) {
+    if (exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return -1;
+    }
+    return RoundTrip.lineAt(mt, exprent.bytecode.nextSetBit(0));
+  }
+
+  /** True when the body carries a jump that could print as the last line of the loop's body. */
+  private static boolean endsWithTransfer(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    for (StatEdge edge : stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.explicit
+          && (edge.getType() == StatEdge.TYPE_BREAK || edge.getType() == StatEdge.TYPE_CONTINUE)) {
+        return true;
+      }
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (containsExit(exprent)) {
+          return true;
+        }
+      }
+    }
+    else {
+      for (Exprent exprent : stat.getStatExprents()) {
+        if (containsExit(exprent)) {
+          return true;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (endsWithTransfer(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean containsExit(Exprent exprent) {
+    if (exprent == null) {
+      return false;
+    }
+    List<Exprent> all = exprent.getAllExprents(true);
+    all.add(exprent);
+    for (Exprent inner : all) {
+      if (inner instanceof ExitExprent exit
+          && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -433,12 +660,24 @@ public final class RowMerge {
 
   /** A declaration in printed order, or the closing of the scope that holds one. */
   private static final class Event {
-    final int variable;
+    final VarExprent var;
     final int scope;
+    /** The printed exprent the declaration lives in, and the list that prints it. */
+    final Exprent top;
+    final List<Exprent> list;
+    final Statement owner;
 
-    Event(int variable, int scope) {
-      this.variable = variable;
+    Event(VarExprent var, int scope, Exprent top, List<Exprent> list, Statement owner) {
+      this.var = var;
       this.scope = scope;
+      this.top = top;
+      this.list = list;
+      this.owner = owner;
+    }
+
+    /** The declared variable, or -1 for a scope close. */
+    int variable() {
+      return var == null ? -1 : var.getIndex();
     }
   }
 
@@ -451,10 +690,12 @@ public final class RowMerge {
     final Map<VarExprent, Statement> owners = new IdentityHashMap<>();
     final Map<VarExprent, Statement> declarationScopes = new IdentityHashMap<>();
     final Set<VarExprent> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+    final StructMethod mt;
     Statement root;
 
-    Order(Set<Integer> victims) {
+    Order(Set<Integer> victims, StructMethod mt) {
       this.victims = victims;
+      this.mt = mt;
     }
 
     void walk(Statement stat) {
@@ -463,7 +704,7 @@ public final class RowMerge {
       }
       int scope = scopeOf(stat);
       for (Exprent exprent : stat.getVarDefinitions()) {
-        declaration(exprent, stat, scope);
+        declaration(exprent, exprent, stat.getVarDefinitions(), stat, scope);
       }
       switch (stat.type) {
         case ROOT: {
@@ -482,7 +723,7 @@ public final class RowMerge {
           List<Exprent> exprents = stat.getExprents();
           if (exprents != null) {
             for (Exprent exprent : exprents) {
-              declaration(exprent, stat, scope);
+              declaration(exprent, exprent, exprents, stat, scope);
             }
           }
           for (Statement child : stat.getStats()) {
@@ -495,7 +736,7 @@ public final class RowMerge {
           if (ifstat.getFirst() != null) {
             walk(ifstat.getFirst());
           }
-          declaration(ifstat.getHeadexprent(), stat, scope);
+          declaration(ifstat.getHeadexprent(), ifstat.getHeadexprent(), null, stat, scope);
           if (ifstat.getIfstat() != null) {
             walk(ifstat.getIfstat());
           }
@@ -508,8 +749,11 @@ public final class RowMerge {
           DoStatement loop = (DoStatement)stat;
           Exprent init = loop.getInitExprent();
           if (init != null) {
-            // A for header's declaration is scoped to the loop itself.
-            declaration(init, loop, scope(loop));
+            // A for header's declaration is scoped to the loop itself. When the target's line
+            // table proves the initialiser printed as a statement before a while, the source
+            // declared it in the enclosing block, and its slot stays allocated until that block
+            // closes.
+            declaration(init, init, null, loop, printsBeforeLoop(loop, mt) ? scopeOf(stat) : scope(loop));
           }
           if (loop.getFirst() != null) {
             walk(loop.getFirst());
@@ -521,7 +765,7 @@ public final class RowMerge {
           if (sw.getFirst() != null) {
             walk(sw.getFirst());
           }
-          declaration(sw.getHeadexprent(), stat, scope);
+          declaration(sw.getHeadexprent(), sw.getHeadexprent(), null, stat, scope);
           for (Statement arm : sw.getCaseStatements()) {
             walk(arm);
           }
@@ -535,7 +779,8 @@ public final class RowMerge {
           for (int i = 1; i < tryCatch.getStats().size(); i++) {
             Statement handler = tryCatch.getStats().get(i);
             if (i - 1 < tryCatch.getVars().size()) {
-              declaration(tryCatch.getVars().get(i - 1), handler, scope(handler));
+              VarExprent var = tryCatch.getVars().get(i - 1);
+              declaration(var, var, null, handler, scope(handler));
             }
             walk(handler);
           }
@@ -589,7 +834,7 @@ public final class RowMerge {
     }
 
     /** Records the locals this exprent mentions and the declarations it prints, in order. */
-    void declaration(Exprent exprent, Statement owner, int scope) {
+    void declaration(Exprent exprent, Exprent top, List<Exprent> list, Statement owner, int scope) {
       if (exprent == null) {
         return;
       }
@@ -600,7 +845,7 @@ public final class RowMerge {
           owners.putIfAbsent(var, owner);
           if (var.isDefinition() && seen.add(var) && !victims.contains(var.getIndex())) {
             declarationScopes.put(var, scopeStatements.get(scope));
-            events.add(new Event(var.getIndex(), scope));
+            events.add(new Event(var, scope, top, list, owner));
           }
         }
       }
@@ -609,7 +854,7 @@ public final class RowMerge {
     void close(Statement stat) {
       Integer id = scopes.get(stat);
       if (id != null) {
-        events.add(new Event(-1, id));
+        events.add(new Event(null, id, null, null, null));
       }
     }
 
@@ -674,7 +919,7 @@ public final class RowMerge {
     Map<Integer, Integer> closeAt = new HashMap<>();
     for (int i = 0; i < order.events.size(); i++) {
       Event event = order.events.get(i);
-      if (event.variable < 0) {
+      if (event.var == null) {
         closeAt.put(event.scope, i);
       }
     }
@@ -686,7 +931,7 @@ public final class RowMerge {
     List<int[]> live = new ArrayList<>();
     for (int i = 0; i < order.events.size(); i++) {
       Event event = order.events.get(i);
-      if (event.variable < 0) {
+      if (event.var == null) {
         continue;
       }
       for (Iterator<int[]> it = live.iterator(); it.hasNext(); ) {
@@ -699,19 +944,19 @@ public final class RowMerge {
         }
       }
 
-      Integer expected = varproc.getVarOriginalIndex(event.variable);
+      Integer expected = varproc.getVarOriginalIndex(event.variable());
       if (expected == null) {
-        debug(mt, "local " + event.variable + " has no slot in the table");
+        debug(mt, "local " + event.variable() + " has no slot in the table");
         return false;
       }
-      VarType type = varproc.getVarType(new VarVersionPair(event.variable, 0));
+      VarType type = varproc.getVarType(new VarVersionPair(event.variable(), 0));
       int width = type == null || type.stackSize <= 0 ? 1 : type.stackSize;
       int slot = firstFree(used, paramSlots, width);
       if (slot < 0) {
         return false;
       }
       if (slot != expected) {
-        debug(mt, "local " + event.variable + " would take slot " + slot + ", table says " + expected);
+        debug(mt, "local " + event.variable() + " would take slot " + slot + ", table says " + expected);
         return false;
       }
       for (int at = slot; at < slot + width; at++) {

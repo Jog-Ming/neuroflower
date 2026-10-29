@@ -258,8 +258,8 @@ public class DoStatement extends Statement {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         break;
       case FOR:
-        int incLine = incExprent.get(0) == null ? -1 : RoundTrip.sourceLine(incExprent.get(0));
-        int condLine = conditionExprent.get(0) == null ? -1 : RoundTrip.sourceLine(conditionExprent.get(0));
+        int incLine = RoundTrip.sourceLineDeep(incExprent.get(0));
+        int condLine = RoundTrip.sourceLineDeep(conditionExprent.get(0));
         if (incLine >= 0 && condLine >= 0 && incLine != condLine) {
           TextBuffer body = ExprProcessor.jmpWrapper(first, indent + 1, false);
           if (!endsWithTransfer(body)) {
