@@ -337,7 +337,7 @@ public class IfStatement extends Statement {
     if (ifstat != null && elsestat == null && !isLabeled() && !isPatternMatched()
         && condition instanceof IfExprent ifHead
         && breakEdge
-        && endsWithExit(ifstat) && !RoundTrip.declaresLocal(ifstat)
+        && endsWithExit(ifstat) && !RoundTrip.declaresBlockLocal(ifstat)
         && RoundTrip.breakGuardEntersArm(ifHead, ifstat, breakSuccs.get(0).getDestination())) {
       Exprent printed = ifHead.getCondition();
       Exprent source = printed instanceof FunctionExprent not

@@ -4937,6 +4937,27 @@ public final class RoundTrip {
   }
 
   /**
+   * Whether a local this statement's block declares ends inside the block, so that a brace around
+   * the block would scope it. A row that starts in the block but ends past the block's last
+   * instruction belongs to a local declared outside it, which the block only re-assigns.
+   */
+  public static boolean declaresBlockLocal(Statement statement) {
+    if (statement == null) {
+      return false;
+    }
+    int end = lastEnd(statement);
+    if (end < 0) {
+      return false;
+    }
+    for (int[] row : declarationRows(statement)) {
+      if (row[2] <= end) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Whether a local declared in this statement runs to its end. Such a statement's scope closes at
    * the jump that follows it; a {@code continue} printed after the local's last use would close the
    * scope after that jump instead of before it, and the local's table range would grow. A local

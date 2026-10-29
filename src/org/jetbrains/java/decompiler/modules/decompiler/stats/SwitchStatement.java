@@ -436,7 +436,11 @@ public class SwitchStatement extends Statement {
       // the other path, and the explicit jump edge hanging off that branch is what the printer
       // already rendered. Only an arm whose tail path carries no explicit jump owes a break at its
       // end for the target's tail goto.
-      boolean breakPrinted = RoundTrip.printsExplicitJump(stat);
+      // An if that closes the arm hangs the arm's fall-through break on itself: the if prints
+      // only its then-block, so the `break;` the source wrote after it is on no page. A break
+      // that lives inside a nested block is printed by that block, and a guard's own break edge
+      // hangs off a statement without a then-block, which prints it.
+      boolean breakPrinted = RoundTrip.printsExplicitJump(stat) && !tailIfCarriesBreak(stat);
       boolean breakInside = false;
       if (RoundTrip.selector("switchbreak") && joins && !yields && !orderUnknown
           && guard == null && !patternArm && !breakPrinted
@@ -841,6 +845,27 @@ public class SwitchStatement extends Statement {
       jump = target;
     }
     return jump;
+  }
+
+  /**
+   * True when the statement closing this arm is an if with a then-block that carries the arm's
+   * explicit break as its own edge. The if renders the break as nothing: its fall-through is the
+   * flow the source continued with, and the `break;` after it was written by hand.
+   */
+  private static boolean tailIfCarriesBreak(Statement arm) {
+    Statement last = arm;
+    while (last instanceof SequenceStatement && !last.getStats().isEmpty()) {
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
+    if (!(last instanceof IfStatement ifStat) || ifStat.getIfstat() == null) {
+      return false;
+    }
+    for (StatEdge edge : last.getAllSuccessorEdges()) {
+      if (edge.explicit && edge.getType() == StatEdge.TYPE_BREAK) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** True when a local this arm declares at its own level is still in scope at {@code offset}. */
