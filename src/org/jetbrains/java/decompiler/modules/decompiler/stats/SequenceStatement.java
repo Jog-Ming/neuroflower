@@ -485,7 +485,12 @@ public class SequenceStatement extends Statement {
         buf.append(ifStatement.getFirst().toJava(indent));
         buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
-        buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        if (RoundTrip.continueElseSite() >= 0) {
+          continueLine.addStartBytecodeMapping(RoundTrip.continueElseSite());
+        }
+        buf.append(continueLine);
         buf.appendIndent(indent).append("}").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifStatement.getElsestat(), indent, false));
         notempty = true;

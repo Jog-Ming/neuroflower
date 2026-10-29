@@ -372,7 +372,7 @@ public class IfStatement extends Statement {
         && RoundTrip.printContinueElse(ifHead, this)) {
       buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
-      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      appendContinueLine(buf, indent);
       buf.appendIndent(indent).append("}").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent, false));
       return buf;
@@ -393,7 +393,7 @@ public class IfStatement extends Statement {
       source.setCondition(RoundTrip.negateCondition(source.getCondition()));
       buf.appendIndent(indent).append(source.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
-      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+      appendContinueLine(buf, indent);
       buf.appendIndent(indent).append("}").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
       return buf;
@@ -551,6 +551,17 @@ public class IfStatement extends Statement {
       return endsWithVoidReturn(stat.getStats().get(stat.getStats().size() - 1));
     }
     return false;
+  }
+
+  /** Prints the continue that ends a hoisted arm, pinned to the jump the target records. */
+  private static void appendContinueLine(TextBuffer buf, int indent) {
+    TextBuffer line = new TextBuffer();
+    line.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+    int site = RoundTrip.continueElseSite();
+    if (site >= 0) {
+      line.addStartBytecodeMapping(site);
+    }
+    buf.append(line);
   }
 
   /** Prints the closing brace of the then arm and the else arm, if any, at this indent. */

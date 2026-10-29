@@ -45,6 +45,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_BY_END = new java.util.concurrent.ConcurrentHashMap<>();
   /** Per method: handler bytecode offset -> first offset after its protected range. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> HANDLER_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The goto behind the last printed continue-else, for the line alignment. */
+  private static final ThreadLocal<int[]> CONTINUE_ELSE_SITE = ThreadLocal.withInitial(() -> new int[]{-1});
   /** Returns already printed as guard exits; the same instruction must not print a second time. */
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> CONSUMED_GUARD_EXITS = new java.util.concurrent.ConcurrentHashMap<>();
   /** For each continue guard, the end offset of its condition branch maps to the loop-head offset. */
@@ -4882,11 +4884,16 @@ public final class RoundTrip {
     if (armEnd == null || armEnd <= armStart) {
       return null;
     }
+    java.util.Map<Integer, Integer> branchEnds = BRANCHES.get(method);
     int best = -1;
     for (java.util.Map.Entry<Integer, Integer> goto_ : gotos.entrySet()) {
       int offset = goto_.getKey();
       int dest = goto_.getValue();
       if (offset < armStart || offset >= armEnd) {
+        continue;
+      }
+      if (branchEnds != null && branchEnds.containsKey(offset)) {
+        // The jump half of an `if (C) continue;` guard, not a statement ending the arm.
         continue;
       }
       if (dest >= armStart && dest < armEnd) {
@@ -4908,6 +4915,7 @@ public final class RoundTrip {
    * body, so hoisting it keeps every scope's end where it was and no local can change slot.
    */
   public static boolean printContinueElse(Exprent head, Statement sequence) {
+    CONTINUE_ELSE_SITE.get()[0] = -1;
     if (!selector("continueguard")) {
       return false;
     }
@@ -4948,28 +4956,44 @@ public final class RoundTrip {
       target = found[0];
       site = new int[]{found[1], found[2]};
     }
-    // Only a jump to the loop head counts. An ordinary if/else joins after its else arm, which
-    // is still inside the loop, so the loop's extent alone cannot tell the two apart.
+    // A jump the table marks as starting a line is a statement of the source. A jump to the loop's
+    // own head — everything the loop builds before its body — is one too: the loop's back edge is
+    // a jump instruction at the body's end, so nothing else in the middle of the body left one
+    // there. A jump to the update or to a join cannot be told apart from an if/else's closing jump
+    // without the table, and javac only anchors that jump when the source wrote a statement there.
+    int bodyStart = firstOffset(doStatement.getFirst());
+    boolean headTarget = target >= 0 && bodyStart >= 0 && target < bodyStart;
+    StructLineNumberTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (table == null || !headTarget && !startsLine(table, site[0])) {
+      return false;
+    }
     if (!isLoopHeadTarget(doStatement, target)) {
       return false;
     }
-    // The source wrote `continue;` on a line of its own, so the table starts an entry at its goto
-    // and puts it before the else arm's first line. An if/else's closing jump inherits the line of
-    // the arm before it and starts nothing; when the table has no entry at the goto, the extra
-    // `continue` line would change the table and the arm is an ordinary else. A continue that
-    // closes a statement run inside the arm gets no entry of its own; there the arm's own edge and
-    // the jump to the loop head are the proof.
-    StructLineNumberTableAttribute table =
-      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
-    if (table == null || adjacent && !startsLine(table, site[0])) {
+    // The jump half of an `if (C) continue;` follows its branch; it is that guard's, not a
+    // statement of its own at the arm's end.
+    java.util.Map<Integer, Integer> branches = BRANCHES.get(method);
+    if (branches != null && branches.containsKey(site[0])) {
       return false;
     }
+    // The printed continue keeps the line the target's table gives its jump when that line starts
+    // there; otherwise the arm's own last line is the only line the jump can belong to.
     int continueLine = table.findLineNumber(site[0]);
     int bodyLine = table.findLineNumber(site[1]);
     if (continueLine >= 0 && bodyLine >= 0 && continueLine >= bodyLine) {
       return false;
     }
+    CONTINUE_ELSE_SITE.get()[0] = site[0];
     return true;
+  }
+
+  /**
+   * The goto the last {@link #printContinueElse} proved, for the printer to pin the printed
+   * {@code continue;} to: the line alignment has to see the jump to place it on the source's line.
+   */
+  public static int continueElseSite() {
+    return CONTINUE_ELSE_SITE.get()[0];
   }
 
   /** True when the statement's own last edge is a continue to this loop. */
