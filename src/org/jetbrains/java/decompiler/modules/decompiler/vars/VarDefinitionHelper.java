@@ -257,6 +257,9 @@ public class VarDefinitionHelper {
     }
 
     mergeVars(root);
+    // Versions the table records as one variable (one row per slot) are one declaration, but the
+    // merge shifts later slots; it is kept only where the printed order's slots still match.
+    RowMerge.merge(varproc, root, mt, implDefVars);
     propagateLVTs(root);
     setNonFinal(root, new HashSet<>());
     remapClashingNames(root, mt);
