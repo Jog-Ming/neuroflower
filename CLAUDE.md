@@ -127,8 +127,9 @@ devtools/cli clean     [--trees] [--compile] [--downloads] [--all]
 devtools/cli cache     [--measure]                    show cache usage; --measure sizes old trees once
 ```
 
-Several versions in one `score` run, `--jobs` at a time (default 1: each decompile claims a 4 GB
-heap and two beside the verifier's javac exhausts the machine's page file), with the thread count
+Several versions in one `score` run, `--jobs` at a time (default 1: two decompiles beside the
+verifier's javac exhaust the machine's page file — measured, the second JVM died at startup with
+`os::commit_memory ... the paging file is too small`), with the thread count
 split across them; logs go to `.dev/tmp/score-<version>.out`. A single version is the normal
 iteration loop; score the whole goal set only after a batch of large gains.
 
