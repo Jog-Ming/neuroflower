@@ -39,6 +39,8 @@ public final class RoundTrip {
   private static final ThreadLocal<Statement> OPEN_ARM = new ThreadLocal<>();
   private static final ThreadLocal<Boolean> ARM_CLOSED = new ThreadLocal<>();
   private static final java.util.Map<StructMethod, BitSet> VOID_RETURNS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Per slot, the stores the local table gives no row to: a temporary's, and a pattern's own. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, java.util.List<int[]>>> TEMP_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Instruction end offset by start offset; the live sequence is released before printing. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> INSTRUCTION_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The instruction that ends at an offset, keyed by that end: an arm's last instruction. */
@@ -229,6 +231,30 @@ public final class RoundTrip {
         elseSites.put(branch.getKey(), new int[]{prev, branch.getValue()});
       }
     }
+    java.util.Map<Integer, java.util.List<int[]>> tempStores = new java.util.HashMap<>();
+    org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute storeRows =
+      method.getLocalVariableAttr();
+    if (storeRows != null && !storeSites.isEmpty()) {
+      for (java.util.Map.Entry<Integer, BitSet> entry : storeSites.entrySet()) {
+        for (int offset = entry.getValue().nextSetBit(0); offset >= 0;
+             offset = entry.getValue().nextSetBit(offset + 1)) {
+          boolean named = false;
+          for (org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable row
+              : storeRows.getVariables().toList()) {
+            if (row.getIndex() == entry.getKey() && row.getStart() <= offset && row.getEnd() > offset) {
+              named = true;
+              break;
+            }
+          }
+          if (!named) {
+            Integer instructionEnd = ends.get(offset);
+            tempStores.computeIfAbsent(entry.getKey(), k -> new java.util.ArrayList<>())
+              .add(new int[]{offset, instructionEnd == null ? offset + 1 : instructionEnd});
+          }
+        }
+      }
+    }
+    TEMP_STORES.put(method, tempStores);
     VOID_RETURNS.put(method, returns);
     VALUE_SINKS.put(method, sinks);
     CONTINUE_GUARDS.put(method, guards);
@@ -2384,6 +2410,44 @@ public final class RoundTrip {
   /** As {@link #declaresLocal} but over the statement's own exprent offsets, not its block's end. */
   public static boolean declaresLocalIn(Statement stat) {
     return declaresLocalBetween(stat, true);
+  }
+
+  /**
+   * True when a pattern variable this operand declares takes a slot the target already stored a
+   * temporary into. A nested if starts after the enclosing condition, so javac can hand the
+   * variable a slot a temporary of that condition has since freed; in one flat condition the
+   * earlier operand's temporaries are still held, and the variable gets a fresh slot.
+   */
+  public static boolean patternSlotReused(Exprent operand) {
+    if (!selector("ifnest")) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, java.util.List<int[]>> tempStores = method == null ? null : TEMP_STORES.get(method);
+    if (tempStores == null || tempStores.isEmpty() || operand == null) {
+      return false;
+    }
+    for (Exprent part : operand.getAllExprents(true, true)) {
+      if (!(part instanceof FunctionExprent function)
+          || function.getFuncType() != FunctionExprent.FunctionType.INSTANCEOF
+          || function.getLstOperands().size() < 3
+          || !(function.getLstOperands().get(2) instanceof VarExprent var)
+          || var.getLVT() == null) {
+        continue;
+      }
+      java.util.List<int[]> stores = tempStores.get(var.getLVT().getIndex());
+      if (stores == null) {
+        continue;
+      }
+      // The pattern's own store is the row-less store that ends where its row begins; a temporary
+      // is one that ended earlier.
+      for (int[] store : stores) {
+        if (store[1] < var.getLVT().getStart()) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**

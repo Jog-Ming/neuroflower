@@ -691,15 +691,17 @@ public class IfStatement extends Statement {
     if (operands.size() < 2) {
       return java.util.Collections.emptyList();
     }
-    for (int i = 1; i < operands.size(); i++) {
-      if (declaresPattern(operands.get(i)) && !RoundTrip.continuesBefore(operands.get(i), arm)) {
-        return java.util.Collections.emptyList();
-      }
-    }
     List<Integer> groups = new ArrayList<>();
     groups.add(0);
     for (int i = 1; i < operands.size(); i++) {
-      if (RoundTrip.operandStartsStatement(andOf(operands, 0, i), operands.get(i))) {
+      boolean starts = RoundTrip.operandStartsStatement(andOf(operands, 0, i), operands.get(i));
+      if (declaresPattern(operands.get(i))
+          && (!starts
+              || !RoundTrip.continuesBefore(operands.get(i), arm)
+                 && !RoundTrip.patternSlotReused(operands.get(i)))) {
+        return java.util.Collections.emptyList();
+      }
+      if (starts) {
         groups.add(i);
       }
     }
