@@ -1800,6 +1800,62 @@ public final class RoundTrip {
     return end == null ? -1 : end;
   }
 
+  /** The first handler offset of the try/catch whose body is being printed right now, or -1. */
+  private static final ThreadLocal<Integer> TRY_BODY_HANDLER = new ThreadLocal<>();
+  /** Returns a try body's print hands to the try, to print after its catch, in print order. */
+  private static final ThreadLocal<java.util.List<Exprent>> DEFERRED_TRY_RETURNS = new ThreadLocal<>();
+
+  /** Marks the try/catch whose body is about to print; returns the previous handler offset. */
+  public static Integer pushTryBody(int handlerOffset) {
+    Integer previous = TRY_BODY_HANDLER.get();
+    if (handlerOffset >= 0) {
+      TRY_BODY_HANDLER.set(handlerOffset);
+    }
+    return previous;
+  }
+
+  public static void popTryBody(Integer previous) {
+    if (previous == null) {
+      TRY_BODY_HANDLER.remove();
+    }
+    else {
+      TRY_BODY_HANDLER.set(previous);
+    }
+  }
+
+  /**
+   * A body's trailing exit the source wrote after the try/catch: javac's skip-goto lands on it,
+   * so its instruction sits past the protected range. A rule that would print it inside the body
+   * hands it here instead, and the try prints it after its catch.
+   */
+  public static Exprent deferTryReturn(Statement stat) {
+    Integer handler = TRY_BODY_HANDLER.get();
+    if (!selector("tryreturntail") || handler == null || stat == null
+        || stat.getExprents() == null || stat.getExprents().size() != 1) {
+      return null;
+    }
+    Exprent only = stat.getExprents().get(0);
+    if (!(only instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit)
+        || exit.getExitType() != org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+        || !returnPastTry(only, handler)) {
+      return null;
+    }
+    java.util.List<Exprent> deferred = DEFERRED_TRY_RETURNS.get();
+    if (deferred == null) {
+      deferred = new java.util.ArrayList<>();
+      DEFERRED_TRY_RETURNS.set(deferred);
+    }
+    deferred.add(only);
+    return only;
+  }
+
+  /** The exits a try body handed over while printing; the caller prints them after the catch. */
+  public static java.util.List<Exprent> takeDeferredTryReturns() {
+    java.util.List<Exprent> deferred = DEFERRED_TRY_RETURNS.get();
+    DEFERRED_TRY_RETURNS.remove();
+    return deferred == null ? java.util.List.of() : deferred;
+  }
+
   /**
    * True when the target's return sits past the try's protected range. javac ends the range at a
    * skip-goto, so a return written after the try/catch starts at or after that goto's destination,

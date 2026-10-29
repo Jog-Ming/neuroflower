@@ -1515,7 +1515,11 @@ public class SequenceStatement extends Statement {
             buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
           }
           buf.appendIndent(indent).append("}").appendLineSeparator();
-          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          // As a try body's print, the trailing return's own instruction may sit past the
+          // protected range: the source wrote it after the try/catch, and the try prints it.
+          if (RoundTrip.deferTryReturn(ifStatement.getIfstat()) == null) {
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+          }
           notempty = true;
           break;
         }
@@ -2077,7 +2081,11 @@ public class SequenceStatement extends Statement {
       buf.appendIndent(indent + 1).append("break label").append(exit.closure.id).append(";").appendLineSeparator();
     }
     buf.appendIndent(indent).append("}").appendLineSeparator();
-    buf.append(ExprProcessor.jmpWrapper(arm.getIfstat(), indent, false));
+    // As a try body's print, the trailing arm's return may sit past the protected range: the
+    // source wrote it after the try/catch, and the try prints it there.
+    if (RoundTrip.deferTryReturn(arm.getIfstat()) == null) {
+      buf.append(ExprProcessor.jmpWrapper(arm.getIfstat(), indent, false));
+    }
     return true;
   }
 

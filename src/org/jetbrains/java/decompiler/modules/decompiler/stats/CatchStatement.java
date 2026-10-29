@@ -194,7 +194,13 @@ public class CatchStatement extends Statement {
       removeFinalReturn(first);
     }
 
-    buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
+    Integer outerTry = RoundTrip.pushTryBody(firstHandler);
+    try {
+      buf.append(ExprProcessor.jmpWrapper(first, indent + 1, true));
+    }
+    finally {
+      RoundTrip.popTryBody(outerTry);
+    }
     buf.appendIndent(indent).append("}");
 
     for (int i = 1; i < stats.size(); i++) {
@@ -352,6 +358,12 @@ public class CatchStatement extends Statement {
     if (hoistedReturn != null) {
       hoistOwner.getExprents().add(hoistedReturn);
       buf.appendIndent(indent).append(hoistedReturn.toJava(indent)).append(";").appendLineSeparator();
+    }
+
+    // An exit the body handed over: its instruction sits past the skip-goto, so the source wrote
+    // it after the try/catch. The body's own rules print it here, once, in the source's order.
+    for (Exprent deferred : RoundTrip.takeDeferredTryReturns()) {
+      buf.appendIndent(indent).append(deferred.toJava(indent)).append(";").appendLineSeparator();
     }
 
     return buf;
