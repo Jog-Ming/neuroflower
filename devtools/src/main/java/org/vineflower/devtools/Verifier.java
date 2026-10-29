@@ -563,6 +563,17 @@ public final class Verifier {
     System.out.printf(Locale.ROOT,
       "sources %d (%d cached)  classes %d  compiled %d  missing %d  fully %d  extra %d  in %.1fs%n",
       files, cached, classes, compiled, Math.max(0, missing), fully, extras, elapsed / 1000.0);
+    // A method Vineflower failed on is printed as a stub, so its class cannot compile and shows
+    // up as missing. Say it here: the tree is cached and every later score would inherit it.
+    Path treeMeta = target.getParent() == null ? null : target.getParent().resolve("meta.json");
+    if (treeMeta != null && Files.exists(treeMeta)) {
+      JsonObject meta = Workspace.readJson(treeMeta);
+      JsonElement failedMethods = meta.get("failedMethods");
+      if (failedMethods != null && failedMethods.getAsInt() > 0) {
+        System.out.println("decompile failed on " + failedMethods.getAsInt()
+          + " method(s) when this tree was built; rerun with --no-cache on a quiet machine");
+      }
+    }
     System.out.printf(Locale.ROOT, "%-12s %8s %8s%n", "attribute", "match", "rate");
     for (String attribute : ClassDiff.ATTRIBUTES) {
       int count = matches.get(attribute);

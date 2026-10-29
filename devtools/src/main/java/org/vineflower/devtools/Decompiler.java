@@ -116,6 +116,13 @@ public final class Decompiler {
       Files.createDirectories(retry);
       List<String> retryCommand = new ArrayList<>(command);
       retryCommand.set(retryCommand.size() - 1, retry.toString());
+      // Peak memory scales with the classes in flight: half the threads halves what the run
+      // claims while an unrelated score is verifying beside it -- the pressure that produces
+      // these failures in the first place.
+      int threadArg = retryCommand.indexOf("--thread-count=" + threads);
+      if (threadArg >= 0) {
+        retryCommand.set(threadArg, "--thread-count=" + Math.max(1, threads / 2));
+      }
       runDecompiler(retryCommand, retry, timeoutMinutes);
       int retried = countFailedMethods(retry);
       if (retried < failed) {
@@ -166,6 +173,9 @@ public final class Decompiler {
     meta.addProperty("createdAt", System.currentTimeMillis());
     meta.addProperty("lastUsed", System.currentTimeMillis());
     meta.addProperty("decompileMillis", elapsed);
+    // A tree that still holds failed methods cannot compile those classes, and the score would
+    // report them as a source problem. Record it so every later score of this tree says so.
+    meta.addProperty("failedMethods", failed);
     long[] stats = treeStats(src);
     meta.addProperty("sourceFiles", stats[0]);
     meta.addProperty("bytes", stats[1]);
