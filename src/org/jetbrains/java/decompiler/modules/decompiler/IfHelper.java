@@ -644,7 +644,14 @@ public final class IfHelper {
     if ((ifdirect || ifdirectpath) && (elsedirect || elsedirectpath) && !noifstat && !noelsestat) {  // if - then - else
 
       // The target ends the then-arm with a return: keep the guard and let the rest follow it.
-      if (RoundTrip.selector("guardmerge") && ifstat.getIfstat() != null && endsWithReturn(ifstat.getIfstat())
+      // A return that only closes a nested branch — the arm can still leave by falling out of
+      // it, and the return is not the arm's last instruction because the loop it sits in runs
+      // on — is not the arm's tail. There javac wrote the else the rest stands for, and the
+      // tree-level else is what lets the printer drop the label the guard form would need.
+      boolean guardRefuse = ifstat.getIfstat() != null && endsWithReturn(ifstat.getIfstat())
+        && !(tailReturnEndsArm(ifstat.getIfstat())
+             && RoundTrip.canCompleteNormally(ifstat.getIfstat()));
+      if (RoundTrip.selector("guardmerge") && ifstat.getIfstat() != null && guardRefuse
           && !mentionsAssertionsDisabled(ifstat)) {
         return false;
       }
@@ -960,16 +967,30 @@ public final class IfHelper {
   }
 
   private static boolean endsWithReturn(Statement stat) {
+    Exprent last = tailExprent(stat);
+    return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+  }
+
+  /** The exprent the last-child chain ends on, or null. */
+  private static Exprent tailExprent(Statement stat) {
     List<Exprent> exprents = stat.getExprents();
     if (exprents != null) {
-      if (exprents.isEmpty()) {
-        return false;
-      }
-      Exprent last = exprents.get(exprents.size() - 1);
-      return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN;
+      return exprents.isEmpty() ? null : exprents.get(exprents.size() - 1);
     }
     List<Statement> children = stat.getStats();
-    return !children.isEmpty() && endsWithReturn(children.get(children.size() - 1));
+    return children.isEmpty() ? null : tailExprent(children.get(children.size() - 1));
+  }
+
+  /**
+   * True when the tail return is the arm's final instruction. A return the chain reaches through
+   * a loop's last branch is followed by the loop's back edge: the arm ends at the loop, not at
+   * that return, and the source wrote the return inside it.
+   */
+  private static boolean tailReturnEndsArm(Statement stat) {
+    Exprent last = tailExprent(stat);
+    int armEnd = RoundTrip.lastEnd(stat);
+    return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+      && armEnd > 0 && RoundTrip.lastEndOf(last) == armEnd;
   }
 
   private static int firstOffset(Statement stat) {
