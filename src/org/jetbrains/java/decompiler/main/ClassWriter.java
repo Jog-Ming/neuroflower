@@ -633,6 +633,14 @@ public class ClassWriter implements StatementWriter {
         || seq.getInstr(index).opcode == CodeConstants.opc_pop)) {
       index++;
     }
+    // javac adapts a primitive/wrapper return mismatch inside the bridge (`isFocused()Z` against
+    // a Supplier): the reference itself performs that adaptation at the call site, so the boxing
+    // or unboxing conversion is the compiler's, not a statement the source wrote.
+    index = skipReturnConversion(cl, seq, index, call);
+    while (index < seq.length() && (seq.getInstr(index).opcode == CodeConstants.opc_checkcast
+        || seq.getInstr(index).opcode == CodeConstants.opc_pop)) {
+      index++;
+    }
     if (index + 1 != seq.length() || !isReturn(seq.getInstr(index).opcode)) {
       return false;
     }
@@ -656,6 +664,66 @@ public class ClassWriter implements StatementWriter {
     buffer.append("::").appendMethod(target.elementname, false, target.classname,
       target.elementname, target.descriptor);
     return true;
+  }
+
+  /**
+   * The index after a primitive/wrapper conversion javac inserts between a method reference's
+   * bridge call and its return: {@code Boolean.valueOf(Z)Boolean} when the referenced method
+   * returns a primitive and the functional method returns the wrapper, or {@code intValue()I}
+   * for the reverse. Anything else leaves the index where it was.
+   */
+  private static int skipReturnConversion(StructClass cl, FullInstructionSequence seq, int index,
+                                          Instruction call) {
+    if (index >= seq.length()) {
+      return index;
+    }
+    Instruction conversion = seq.getInstr(index);
+    boolean boxing = conversion.opcode == CodeConstants.opc_invokestatic;
+    if (!boxing && conversion.opcode != CodeConstants.opc_invokevirtual) {
+      return index;
+    }
+    LinkConstant callTarget = cl.getPool().getLinkConstant(call.operand(0));
+    LinkConstant conversionTarget = cl.getPool().getLinkConstant(conversion.operand(0));
+    if (callTarget == null || callTarget.descriptor == null || conversionTarget == null
+        || conversionTarget.descriptor == null || conversionTarget.elementname == null) {
+      return index;
+    }
+    MethodDescriptor callDescriptor = MethodDescriptor.parseDescriptor(callTarget.descriptor);
+    MethodDescriptor md = MethodDescriptor.parseDescriptor(conversionTarget.descriptor);
+    if (callDescriptor.ret == null || callDescriptor.ret.arrayDim != 0 || md.ret == null
+        || md.ret.arrayDim != 0) {
+      return index;
+    }
+    if (boxing) {
+      // The wrapper's valueOf takes exactly the referenced method's primitive return.
+      if (!"valueOf".equals(conversionTarget.elementname) || md.params.length != 1
+          || md.params[0] == null || md.params[0].arrayDim != 0
+          || wrapperPrimitive(md.ret.value) != callDescriptor.ret.type) {
+        return index;
+      }
+      return index + 1;
+    }
+    // Unboxing: the referenced method returned the wrapper the functional method narrows.
+    if (md.params.length != 0 || wrapperPrimitive(callDescriptor.ret.value) != md.ret.type
+        || !conversionTarget.elementname.endsWith("Value")) {
+      return index;
+    }
+    return index + 1;
+  }
+
+  /** The primitive a wrapper class boxes, or null when the class is not a wrapper. */
+  private static CodeType wrapperPrimitive(String className) {
+    return switch (className) {
+      case "java/lang/Boolean" -> CodeType.BOOLEAN;
+      case "java/lang/Byte" -> CodeType.BYTE;
+      case "java/lang/Character" -> CodeType.CHAR;
+      case "java/lang/Short" -> CodeType.SHORT;
+      case "java/lang/Integer" -> CodeType.INT;
+      case "java/lang/Long" -> CodeType.LONG;
+      case "java/lang/Float" -> CodeType.FLOAT;
+      case "java/lang/Double" -> CodeType.DOUBLE;
+      default -> null;
+    };
   }
 
   /** The value of a small integer constant instruction, or Integer.MIN_VALUE. */
