@@ -80,6 +80,12 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> SWITCH_TARGETS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Offsets just past an inlined copy of a finally body, per method. */
   private static final java.util.Map<StructMethod, java.util.Set<Integer>> FINALLY_COPY_ENDS = new java.util.concurrent.ConcurrentHashMap<>();
+  /**
+   * Slots of the catch parameters javac synthesizes for record-pattern extraction, per method:
+   * the {@code astore N} that opens {@code new MatchException}. javac emits this catch after the
+   * body's scopes close, so N records which local slots were still held when they did.
+   */
+  private static final java.util.Map<StructMethod, BitSet> MATCH_CATCH_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** The method's last instruction start offset. */
   private static final java.util.Map<StructMethod, Integer> LAST_INSTRUCTION = new java.util.concurrent.ConcurrentHashMap<>();
   /** The method's first instruction start offset: the entry a dominance check starts from. */
@@ -137,6 +143,7 @@ public final class RoundTrip {
     java.util.Map<Integer, BitSet> loadSites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> storeSlots = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
+    BitSet matchCatchSlots = new BitSet();
     BitSet noFallThrough = new BitSet();
     BitSet popSites = new BitSet();
     BitSet closeCalls = new BitSet();
@@ -218,6 +225,16 @@ public final class RoundTrip {
           && store.opcode >= CodeConstants.opc_istore && store.opcode <= CodeConstants.opc_astore
           && load.operand(0) == store.operand(0)) {
           returnStores.put(instr.startOffset, load.operand(0));
+        }
+      }
+      // The catch javac synthesizes for a record-pattern extraction stores the thrown value in a
+      // hidden parameter right before building the MatchException, and its code is emitted after
+      // the body's scopes close: the slot records which locals were still held at that point.
+      if (instr.opcode == CodeConstants.opc_new
+        && "java/lang/MatchException".equals(cl.getPool().getPrimitiveConstant(instr.operand(0)).getString())) {
+        int slot = i > 0 ? astoreSlot(seq.getInstr(i - 1)) : -1;
+        if (slot >= 0) {
+          matchCatchSlots.set(slot);
         }
       }
       if (isConditional(instr.opcode)) {
@@ -497,6 +514,7 @@ public final class RoundTrip {
     STORE_SITES.put(method, storeSites);
     LOAD_SITES.put(method, loadSites);
     STORE_SLOTS.put(method, storeSlots);
+    MATCH_CATCH_SLOTS.put(method, matchCatchSlots);
     HANDOVER_STARTS.put(method, handoverStarts(method));
   }
 
@@ -6908,6 +6926,168 @@ public final class RoundTrip {
     }
     int start = firstOffset(stat);
     return start >= 0 && !startsLine(table, start);
+  }
+
+  /** True when the target's local table proves this if's else statement was written flat. */
+  public static boolean flatElseWitness(IfStatement ifSt, StructMethod method) {
+    return ifSt != null && armWasFlat(ifSt.getElsestat(), method);
+  }
+
+  /** As {@link #armWasFlat(Statement, StructMethod)}, with the printing pass's own method. */
+  public static boolean armWasFlat(Statement arm) {
+    return armWasFlat(arm, currentMethod());
+  }
+
+  /**
+   * True when the target's local table proves the source wrote this arm flat: its statements
+   * followed the exiting then arm in the enclosing block, and no {@code else} block wrapped them.
+   * javac writes a local's row when its scope closes and closes a block's slots in one rising-slot
+   * pass ({@code Code.endScopes(first)} resets the register counter to the block's first slot and
+   * ends every slot up to the previous top), so the table's row order records which locals closed
+   * together.
+   *
+   * <p>Rule L reads row order. A row that opens before the arm and ends where an arm-declared
+   * local's row ends is an enclosing local whose scope closes at the same pc. Flat, both close in
+   * the same pass, which walks rising slots: the enclosing row (allocated earlier, hence lower)
+   * precedes the arm's. A real else closes its own block first and writes the arm's rows ahead of
+   * every enclosing row.
+   *
+   * <p>Rule C reads the synthetic record-pattern catch. javac emits the {@code astore N} that
+   * opens {@code new MatchException} after the body's scopes close, so N names the locals still
+   * held at the method's end: flat, every arm local is live there and the parameter takes a slot
+   * above them all; after a real else the arm's slots were released and the parameter reuses one.
+   *
+   * <p>Refuses on absent or conflicting evidence: no arm-declared local with a row, no enclosing
+   * row ending with it, no synthetic catch, or rows and catch that disagree. {@code method} is
+   * the target's method: the caller supplies it because prettify runs outside the printing pass,
+   * where the ambient method is the class's last one.
+   */
+  public static boolean armWasFlat(Statement arm, StructMethod method) {
+    if (!selector("elseflat") || arm == null || method == null) {
+      return false;
+    }
+    int armStart = firstOffset(arm);
+    if (armStart < 0) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    List<LocalVariable> armRows = new java.util.ArrayList<>();
+    collectArmRows(arm, armRows);
+    if (armRows.isEmpty()) {
+      return false;
+    }
+
+    int flat = 0;
+    int realElse = 0;
+    for (LocalVariable armRow : armRows) {
+      if (armRow.getOrder() < 0) {
+        continue;
+      }
+      for (LocalVariable row : table.getVariables().toList()) {
+        // Rows opened inside the arm (its own locals and nested blocks' locals) end with the
+        // arm's scope and say nothing about the enclosing block; a row opened before it does.
+        if (row.getOrder() < 0 || row.getStart() >= armStart || row.getEnd() != armRow.getEnd()) {
+          continue;
+        }
+        if (row.getOrder() < armRow.getOrder()) {
+          flat++;
+        } else {
+          realElse++;
+        }
+      }
+    }
+
+    int armMax = -1;
+    for (LocalVariable armRow : armRows) {
+      armMax = Math.max(armMax, armRow.getIndex());
+    }
+    BitSet catchSlots = MATCH_CATCH_SLOTS.get(method);
+    if (catchSlots != null && !catchSlots.isEmpty()) {
+      // Several syntheses reuse rising slots after a real else, so the lowest is the one the
+      // first allocation took; flat, even the lowest lies above every arm local.
+      if (catchSlots.nextSetBit(0) > armMax) {
+        flat++;
+      } else {
+        realElse++;
+      }
+    }
+
+    return flat > 0 && realElse == 0;
+  }
+
+  /**
+   * The table rows of the locals this arm declares at its own level, not in a nested block. An
+   * if the arm starts with keeps the statements before its test in its head block; those run in
+   * the arm's own scope, so they count here too.
+   */
+  private static void collectArmRows(Statement arm, List<LocalVariable> rows) {
+    addDeclaredRows(arm.getVarDefinitions(), rows);
+    addDeclaredRows(arm.getExprents(), rows);
+    for (Statement child : arm.getStats()) {
+      if (child.type == Statement.StatementType.BASIC_BLOCK) {
+        addDeclaredRows(child.getVarDefinitions(), rows);
+        addDeclaredRows(child.getExprents(), rows);
+      } else if (child instanceof IfStatement childIf) {
+        Statement head = childIf.getFirst();
+        if (head != null && head.type == Statement.StatementType.BASIC_BLOCK) {
+          addDeclaredRows(head.getVarDefinitions(), rows);
+          addDeclaredRows(head.getExprents(), rows);
+        }
+      }
+    }
+  }
+
+  private static void addDeclaredRows(List<Exprent> exprents, List<LocalVariable> rows) {
+    if (exprents == null) {
+      return;
+    }
+    for (Exprent exprent : exprents) {
+      VarExprent defined = declarationVar(exprent);
+      if (defined == null || !defined.isDefinition() || defined.isStack() || defined.getLVT() == null) {
+        continue;
+      }
+      LocalVariable row = defined.getLVT();
+      boolean known = false;
+      for (LocalVariable other : rows) {
+        if (other == row) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) {
+        rows.add(row);
+      }
+    }
+  }
+
+  /** The variable a declaration exprent defines: a bare declaration or an initialized one. */
+  private static VarExprent declarationVar(Exprent exprent) {
+    if (exprent instanceof VarExprent var) {
+      return var;
+    }
+    if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assignment
+      && assignment.getLeft() instanceof VarExprent left) {
+      return left;
+    }
+    return null;
+  }
+
+  /** The slot an astore-family instruction stores, or -1. */
+  private static int astoreSlot(Instruction instr) {
+    if (instr == null) {
+      return -1;
+    }
+    if (instr.opcode == CodeConstants.opc_astore) {
+      return instr.operand(0);
+    }
+    if (instr.opcode >= CodeConstants.opc_astore_0 && instr.opcode <= CodeConstants.opc_astore_3) {
+      return instr.opcode - CodeConstants.opc_astore_0;
+    }
+    return -1;
   }
 
   /**

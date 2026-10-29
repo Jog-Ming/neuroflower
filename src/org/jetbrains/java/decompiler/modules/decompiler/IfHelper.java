@@ -10,6 +10,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.struct.StructField;
+import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.util.DotExporter;
 
 import java.util.*;
@@ -874,6 +875,17 @@ public final class IfHelper {
   // Try to make if/else statements that unconditionally return more pleasing to read.
   // TODO: swap branches with negated float ops
   public static boolean prettifyIfs(Statement stat) {
+    // No method: the class-file witness cannot run without the tree's own class file, and the
+    // ambient one belongs to whichever method the context saw last.
+    return prettifyIfs(stat, null);
+  }
+
+  /**
+   * {@code method} is the method this tree was built from. The class-file witness cannot ask the
+   * ambient context for it: this pass runs after every class's methods were built, so the context
+   * still names whatever method was processed last.
+   */
+  public static boolean prettifyIfs(Statement stat, StructMethod method) {
     boolean changed = false;
     for (Statement st : new ArrayList<>(stat.getStats())) {
       // Don't bother inside switches
@@ -881,17 +893,17 @@ public final class IfHelper {
         continue;
       }
 
-      prettifyIfs(st);
+      prettifyIfs(st, method);
 
       if (st instanceof IfStatement ifSt) {
-        changed |= prettifyIf(ifSt);
+        changed |= prettifyIf(ifSt, method);
       }
     }
 
     return changed;
   }
 
-  private static boolean prettifyIf(IfStatement ifSt) {
+  private static boolean prettifyIf(IfStatement ifSt, StructMethod method) {
     if (ifSt.iftype == IfStatement.IFTYPE_IFELSE && !ifSt.isPatternMatched()) {
       Statement ifStat = ifSt.getIfstat();
       Statement elseStat = ifSt.getElsestat();
@@ -921,7 +933,9 @@ public final class IfHelper {
         // If the inside of the if is only one return/throw, be more aggressive in reordering
         boolean force = ifStat.getExprents().size() == 1 && elseStat.getExprents() != null && elseStat.getExprents().size() > 1;
         if (!force) {
-          if (isExit(elseStat)) {
+          // An else that exits is usually a real else, but the target's local table can prove the
+          // source wrote the arm flat, after the then arm: then the else keyword was never there.
+          if (isExit(elseStat) && !RoundTrip.flatElseWitness(ifSt, method)) {
             return false;
           }
 

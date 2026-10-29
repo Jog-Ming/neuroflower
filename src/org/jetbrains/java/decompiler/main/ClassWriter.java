@@ -103,7 +103,7 @@ public class ClassWriter implements StatementWriter {
 
           // This is awful and really doesn't belong here, but this breaks simplify switches (for some reason...) so it needs to go after
           if (DecompilerContext.getOption(IFernflowerPreferences.PRETTIFY_IFS)) {
-            if (IfHelper.prettifyIfs(method.root)) {
+            if (IfHelper.prettifyIfs(method.root, method.methodStruct)) {
               rec.add("FinalPrettifyIfs", method.root);
             }
           }

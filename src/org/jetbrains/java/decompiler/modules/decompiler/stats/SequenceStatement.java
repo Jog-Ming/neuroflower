@@ -1294,20 +1294,26 @@ public class SequenceStatement extends Statement {
             straddle.setExprents(savedExprents);
           }
         }
-        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        // The target's local table can prove the source wrote this arm flat, as statements the
+        // enclosing block ran after the then arm, and never as an else block: its declarations
+        // then live in the enclosing block, and a brace here would move their scope.
+        boolean flatArm = RoundTrip.armWasFlat(elseArm);
+        buf.appendIndent(indent).append(flatArm ? "}" : "} else {").appendLineSeparator();
         if (elseCopy != null && joinAfterArms && RoundTrip.isTailReturnCopy(elseCopy)) {
           ((SequenceStatement) elseArm).getStats().removeWithKey(elseCopy.id);
         }
         try {
           RoundTrip.pushJoinOffset(exitStart);
-          buf.append(ExprProcessor.jmpWrapper(elseArm, indent + 1, true));
+          buf.append(ExprProcessor.jmpWrapper(elseArm, flatArm ? indent : indent + 1, true));
         } finally {
           RoundTrip.popJoinOffset();
           if (elseCopy != null && joinAfterArms && RoundTrip.isTailReturnCopy(elseCopy)) {
             ((SequenceStatement) elseArm).getStats().addWithKey(elseCopy, elseCopy.id);
           }
         }
-        buf.appendIndent(indent).append("}").appendLineSeparator();
+        if (!flatArm) {
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+        }
         if (!shellTail.isEmpty()) {
           buf.append(ExprProcessor.listToJava(shellTail, indent));
         }
