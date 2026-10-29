@@ -1327,14 +1327,16 @@ public final class LocalDeclarationOrder {
             }
           }
           Statement body = catchAll.getFirst();
-          if (body != null) {
-            stat(body, assigned);
-          }
+          boolean afterBody = body == null ? assigned : stat(body, assigned);
           Statement handler = catchAll.getHandler();
-          if (handler != null) {
-            stat(handler, assigned);
+          if (handler == null) {
+            return assigned;
           }
-          return assigned;
+          // A use inside the handler can also be reached from an exception at any point of the
+          // body, so it is checked against the entry state. The code after the statement, in
+          // contrast, is reached only when the body completed normally and the handler did too.
+          stat(handler, assigned);
+          return stat(handler, afterBody);
         }
         default: {
           for (Statement child : stat.getStats()) {
