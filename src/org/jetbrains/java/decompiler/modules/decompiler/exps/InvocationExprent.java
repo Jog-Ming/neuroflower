@@ -101,6 +101,9 @@ public class InvocationExprent extends Exprent {
   private boolean isInvocationInstance = false;
   /** The invocation whose receiver is currently being typed; set only for the duration. */
   private static final ThreadLocal<InvocationExprent> OUTER_INVOCATION = new ThreadLocal<>();
+  /** The receiver chain being printed, outermost first: each link pushes itself around its receiver. */
+  private static final ThreadLocal<java.util.ArrayDeque<InvocationExprent>> PRINT_CHAIN =
+    ThreadLocal.withInitial(java.util.ArrayDeque::new);
   /** Whether the outer call's own target is the enclosing method's declared return type. */
   private static final ThreadLocal<Boolean> OUTER_SOURCE_TARGET = new ThreadLocal<>();
   /** This call's own expected result was the enclosing method's declared return type. */
@@ -1321,7 +1324,13 @@ public class InvocationExprent extends Exprent {
           try {
             // The receiver subtree is inferred again while it prints, so the demand must be
             // visible for the whole print, not just for the type computation above.
-            res = instance.toJava(indent);
+            PRINT_CHAIN.get().push(this);
+            try {
+              res = instance.toJava(indent);
+            }
+            finally {
+              PRINT_CHAIN.get().pop();
+            }
           }
           finally {
             OPTIONAL_MAP_DEMAND.set(priorPrintedMap);
@@ -1391,6 +1400,9 @@ public class InvocationExprent extends Exprent {
           // Adds generic arguments to the invocation, so .m() becomes .<T>m()
           List<VarType> printedArgs = genericArgs.isEmpty() && recordedGenericArgs != null
             ? recordedGenericArgs : genericArgs;
+          if (printedArgs == genericArgs && !genericArgs.isEmpty()) {
+            printedArgs = chainRecordedWitness(genericArgs);
+          }
           this.appendParameters(buf, witnessContradictsRecordedMethodReference() || witnessContradictsLambdaValue()
             ? Collections.emptyList() : printedArgs);
         }
@@ -4709,6 +4721,165 @@ public class InvocationExprent extends Exprent {
       }
     }
     return type.type != CodeType.OBJECT || !isGenericClass(type.value);
+  }
+
+  /**
+   * A witness whose wildcard a recorded functional argument inside the receiver chain contradicts.
+   * A generic invocation in one of the chain arguments was inferred against a target this witness
+   * supplies (a {@code ? super X} inside the element type), and its functional argument metafactory
+   * record settles the variable that target bound: the instantiated type records the source's X.
+   * The printer's X came from the first element the chain saw, not from the source's witness. Only
+   * a plain class is used, because the record is erased, and the witness type must be a supertype
+   * of the call recorded return type, which is what ties the two together.
+   */
+  private static List<VarType> chainRecordedWitness(List<VarType> witness) {
+    if (!RoundTrip.selector("chainwitness")) {
+      return witness;
+    }
+    java.util.ArrayDeque<InvocationExprent> chain = PRINT_CHAIN.get();
+    if (chain.isEmpty()) {
+      return witness;
+    }
+    List<VarType> result = witness;
+    for (InvocationExprent ancestor : chain) {
+      for (Exprent parameter : ancestor.lstParameters) {
+        result = correctWitnessFromExpression(parameter, result);
+      }
+    }
+    return result;
+  }
+
+  /** Walks an expression tree for calls whose functional argument record fixes a witness entry. */
+  private static List<VarType> correctWitnessFromExpression(Exprent expr, List<VarType> witness) {
+    if (!(expr instanceof InvocationExprent call)) {
+      return witness;
+    }
+    List<VarType> result = correctWitnessFromCall(call, witness);
+    if (call.instance != null) {
+      result = correctWitnessFromExpression(call.instance, result);
+    }
+    for (Exprent parameter : call.lstParameters) {
+      if (parameter instanceof NewExprent created && created.isLambda()) {
+        continue; // a lambda body is another method
+      }
+      result = correctWitnessFromExpression(parameter, result);
+    }
+    return result;
+  }
+
+  private static List<VarType> correctWitnessFromCall(InvocationExprent call, List<VarType> witness) {
+    if (call.desc == null || call.desc.getSignature() == null || call.lstParameters.isEmpty()) {
+      return witness;
+    }
+    List<VarType> declared = call.desc.getSignature().parameterTypes;
+    int count = Math.min(declared.size(), call.lstParameters.size());
+    for (int p = 0; p < count; p++) {
+      if (!(call.lstParameters.get(p) instanceof NewExprent lambda) || !lambda.isLambda()
+        || !(declared.get(p) instanceof GenericType functional)) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(lambda.getNewType().value);
+      if (node == null || node.lambdaInformation == null || node.lambdaInformation.method_descriptor == null) {
+        continue;
+      }
+      MethodDescriptor recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
+      StructClass samClass = DecompilerContext.getStructContext().getClass(functional.value);
+      if (samClass == null || samClass.getSignature() == null) {
+        continue;
+      }
+      List<String> interfaceParams = samClass.getSignature().fparameters;
+      List<VarType> interfaceArgs = functional.getArguments();
+      if (interfaceArgs.isEmpty() || interfaceArgs.size() != interfaceParams.size()) {
+        continue;
+      }
+      StructMethod sam = functionalMethod(samClass, node.lambdaInformation.method_name, recorded.params.length);
+      if (sam == null || sam.getSignature() == null) {
+        continue;
+      }
+      List<VarType> samParams = sam.getSignature().parameterTypes;
+      for (int i = 0; i < interfaceArgs.size(); i++) {
+        VarType declaredArg = interfaceArgs.get(i);
+        if (declaredArg == null || declaredArg.type != CodeType.GENVAR
+          || !call.desc.getSignature().typeParameters.contains(declaredArg.value)) {
+          continue;
+        }
+        if (!(call.genericsMap.get(declaredArg) instanceof GenericType wildcard)
+          || wildcard.getWildcard() == GenericType.WILDCARD_NO || !wildcard.getArguments().isEmpty()
+          || wildcard.value == null) {
+          continue;
+        }
+        int position = -1;
+        for (int k = 0; k < samParams.size(); k++) {
+          VarType parameter = samParams.get(k);
+          if (parameter != null && parameter.type == CodeType.GENVAR
+            && interfaceParams.get(i).equals(parameter.value)) {
+            position = k;
+            break;
+          }
+        }
+        if (position < 0 || position >= recorded.params.length) {
+          continue;
+        }
+        VarType recordedValue = recorded.params[position];
+        if (recordedValue == null || recordedValue.type != CodeType.OBJECT || recordedValue.arrayDim != 0
+          || recordedValue.value == null || recordedValue.isGeneric() || isGenericClass(recordedValue.value)
+          || recordedValue.value.equals(wildcard.value)) {
+          continue; // only a plain class is nameable from an erased record
+        }
+        VarType callReturn = call.desc.getSignature().returnType == null
+          ? null : call.desc.getSignature().returnType.remap(call.genericsMap);
+        if (!(callReturn instanceof GenericType)) {
+          continue;
+        }
+        VarType replacement = new GenericType(CodeType.OBJECT, 0, recordedValue.value,
+          wildcard.getParent(), Collections.emptyList(), wildcard.getWildcard());
+        List<VarType> corrected = new ArrayList<>(witness.size());
+        boolean changed = false;
+        for (VarType entry : witness) {
+          VarType updated = replaceLinkedWildcard(entry, ((GenericType) callReturn).value, wildcard, replacement);
+          changed |= updated != entry;
+          corrected.add(updated);
+        }
+        if (changed) {
+          witness = corrected;
+        }
+      }
+    }
+    return witness;
+  }
+
+  /**
+   * Replaces the wildcard wherever it stands inside a type the call recorded return inhabits: the
+   * position is the one the call own target filled, so what the record says there is the source's
+   * value for that very wildcard.
+   */
+  private static VarType replaceLinkedWildcard(VarType type, String returnClass, VarType target, VarType replacement) {
+    if (!(type instanceof GenericType generic)) {
+      return type;
+    }
+    List<VarType> arguments = generic.getArguments();
+    List<VarType> updated = new ArrayList<>(arguments);
+    boolean changed = false;
+    if (!arguments.isEmpty() && returnClass != null && generic.value != null
+      && !generic.value.equals(returnClass)
+      && DecompilerContext.getStructContext().instanceOf(returnClass, generic.value)) {
+      for (int i = 0; i < arguments.size(); i++) {
+        if (sameType(arguments.get(i), target)) {
+          updated.set(i, replacement);
+          changed = true;
+        }
+      }
+    }
+    for (int i = 0; i < updated.size(); i++) {
+      VarType replaced = replaceLinkedWildcard(updated.get(i), returnClass, target, replacement);
+      if (replaced != updated.get(i)) {
+        updated.set(i, replaced);
+        changed = true;
+      }
+    }
+    return changed
+      ? new GenericType(generic.type, generic.arrayDim, generic.value, generic.getParent(), updated, generic.getWildcard())
+      : type;
   }
 
   /**
