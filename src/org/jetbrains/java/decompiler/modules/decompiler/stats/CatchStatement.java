@@ -186,6 +186,11 @@ public class CatchStatement extends Statement {
           hoistedReturn = lastBody;
           hoistOwner = owner;
           bodyExprents.remove(bodyExprents.size() - 1);
+        } else if (lastBody instanceof ExitExprent copy && copy.getExitType() == ExitExprent.Type.RETURN
+            && copy.getValue() == null && RoundTrip.isMethodFinalReturn(copy)) {
+          // The method's own final return, which the fall-through after the try prints; the body
+          // must not print the copy again — the source ended the try there.
+          bodyExprents.remove(bodyExprents.size() - 1);
         }
       }
     }
@@ -375,7 +380,7 @@ public class CatchStatement extends Statement {
       }
       Exprent last = exprents.get(exprents.size() - 1);
       return last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
-        && exit.getValue() != null ? child : null;
+        ? child : null;
     }
     return null;
   }

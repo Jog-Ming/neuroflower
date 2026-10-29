@@ -753,6 +753,18 @@ public final class RoundTrip {
     return tailReturnCopyOffset(stat) >= 0;
   }
 
+  /** True when this exprent is a return at the method's last instruction. */
+  public static boolean isMethodFinalReturn(Exprent exprent) {
+    StructMethod method = currentMethod();
+    if (method == null || !(exprent instanceof ExitExprent exit)
+        || exit.getExitType() != ExitExprent.Type.RETURN || exprent.bytecode == null
+        || exprent.bytecode.isEmpty()) {
+      return false;
+    }
+    Integer last = LAST_INSTRUCTION.get(method);
+    return last != null && exprent.bytecode.previousSetBit(Integer.MAX_VALUE) == last;
+  }
+
   /** The return offset when this block is a copy of the method's final return, or -1. */
   public static int tailReturnCopyOffset(Statement stat) {
     StructMethod method = currentMethod();

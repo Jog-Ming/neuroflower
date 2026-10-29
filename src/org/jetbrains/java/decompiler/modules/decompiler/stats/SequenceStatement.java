@@ -157,6 +157,16 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (!C) { return; } B` where B's leading exprents run before the return's own
+      // instruction: a guard clause only reaches its following statements after the return, so
+      // code laid out before it was the source's then arm. The source wrote `if (C) { B-leading }
+      // else { return; } B-rest`, as javac lays a finally block's unlock out.
+      if (printInvertedGuard(buf, indent, i)) {
+        notempty = true;
+        i++;
+        continue;
+      }
+
       // The if this run was folded into prints this block after its closing brace: the target
       // laid it out past the branch shell, so the arm ends where the source's brace was.
       if (RoundTrip.isAfterIf(st)) {
@@ -2332,6 +2342,74 @@ public class SequenceStatement extends Statement {
       }
     }
     return slot;
+  }
+
+  /**
+   * Prints `if (!C) { return; } B` back as the source's `if (C) { B-leading } else { return; }
+   * B-rest` when B's leading exprents are laid out before the return's own instruction. A guard
+   * clause reaches its following statements only after the return, so code before that
+   * instruction was the then arm, as javac lays out a finally block's unlock.
+   */
+  private boolean printInvertedGuard(TextBuffer buf, int indent, int i) {
+    if (i + 1 >= stats.size() || !(stats.get(i) instanceof IfStatement ifs)
+        || ifs.iftype != IfStatement.IFTYPE_IF || ifs.getElsestat() != null
+        || ifs.isLabeled() || ifs.isPatternMatched() || ifs.getIfstat() == null
+        || ifs.getHeadexprent() == null
+        || !(ifs.getHeadexprent().getCondition() instanceof FunctionExprent not)
+        || not.getFuncType() != FunctionExprent.FunctionType.BOOL_NOT
+        || not.getLstOperands().size() != 1) {
+      return false;
+    }
+    Statement block = stats.get(i + 1);
+    if (!(block instanceof BasicBlockStatement) || block.isLabeled()
+        || !block.getVarDefinitions().isEmpty() || !block.getStats().isEmpty()
+        || block.getExprents() == null || block.getExprents().size() < 2) {
+      return false;
+    }
+    List<Exprent> armExprents = ifs.getIfstat().getExprents();
+    if (armExprents == null || armExprents.size() != 1
+        || !(armExprents.get(0) instanceof ExitExprent exit)
+        || exit.getExitType() != ExitExprent.Type.RETURN || exit.getValue() != null) {
+      return false;
+    }
+    int exitOffset = RoundTrip.exprentStart(exit);
+    List<Exprent> exprents = block.getExprents();
+    int split = 0;
+    while (split < exprents.size()) {
+      int start = RoundTrip.exprentStart(exprents.get(split));
+      if (start < 0 || start >= exitOffset) {
+        break;
+      }
+      if (definesLocal(exprents.get(split)) || RoundTrip.printedEnd(exprents.get(split)) > exitOffset) {
+        // A declaration would leave its scope with the brace, and code straddling the return
+        // cannot move to either side.
+        return false;
+      }
+      split++;
+    }
+    if (split == 0) {
+      return false;
+    }
+    IfExprent head = (IfExprent) ifs.getHeadexprent().copy();
+    head.setCondition(not.getLstOperands().get(0));
+    buf.append(ExprProcessor.listToJava(ifs.getVarDefinitions(), indent));
+    buf.append(ifs.getFirst().toJava(indent));
+    buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+    buf.append(ExprProcessor.listToJava(exprents.subList(0, split), indent + 1));
+    buf.appendIndent(indent).append("} else {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(ifs.getIfstat(), indent + 1, true));
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    buf.append(ExprProcessor.listToJava(exprents.subList(split, exprents.size()), indent));
+    return true;
+  }
+
+  /** Whether this exprent declares a local, which cannot move into a brace. */
+  private static boolean definesLocal(Exprent exprent) {
+    if (exprent instanceof VarExprent var && var.isDefinition()) {
+      return true;
+    }
+    return exprent instanceof AssignmentExprent assignment
+      && assignment.getLeft() instanceof VarExprent left && left.isDefinition();
   }
 
   /**
