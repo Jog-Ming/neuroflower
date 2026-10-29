@@ -210,6 +210,10 @@ public class SwitchStatement extends Statement {
     }
     int jumpEnd = switchEndFromJumps();
     int targetEnd = switchEndFromTargetJumps();
+    int defaultEnd = switchEndFromDefault();
+    if (defaultEnd >= 0 && (targetEnd < 0 || defaultEnd < targetEnd)) {
+      targetEnd = defaultEnd;
+    }
     if (targetEnd >= 0 && (jumpEnd < 0 || targetEnd < jumpEnd)) {
       jumpEnd = targetEnd;
     }
@@ -479,6 +483,23 @@ public class SwitchStatement extends Statement {
       // that lives inside a nested block is printed by that block, and a guard's own break edge
       // hangs off a statement without a then-block, which prints it.
       boolean breakPrinted = RoundTrip.printsExplicitJump(stat) && !tailIfCarriesBreak(stat) && !tailJumpsToJoin;
+      // The switch ends the loop body and this group leaves by the enclosing loop's own back
+      // edge: the tree kept the group's jump as that continue, so the arm printed nothing of it,
+      // but the switch's join is the same block and the source's `break;` (a written `continue;`
+      // compiles to the same jump) stands after the arm.
+      int loopJoinJump = -1;
+      if (breakJump < 0 && !breakPrinted && !yields && guard == null && !patternArm
+          && switchEnd >= 0 && RoundTrip.selector("switchjump") && !braced.contains(stat)
+          && RoundTrip.canCompleteNormally(stat) && !armLeaves
+          && RoundTrip.loopBackEdge(this, switchEnd) && continuesToEnclosingLoop(stat)) {
+        int candidate = RoundTrip.jumpOffsetTo(RoundTrip.blockEnd(stat), RoundTrip.blockEnd(this), switchEnd);
+        if (candidate >= 0) {
+          loopJoinJump = candidate;
+        }
+      }
+      if (loopJoinJump >= 0) {
+        buf.append(breakLine(indent + 2, loopJoinJump));
+      }
       boolean breakInside = false;
       if (RoundTrip.selector("switchbreak") && joins && !yields && !orderUnknown
           && guard == null && !patternArm && !breakPrinted
@@ -832,6 +853,34 @@ public class SwitchStatement extends Statement {
     return join;
   }
 
+  /**
+   * The join a switch that wrote no `default:` sends unmatched values to: the table's default
+   * target, when it lies past every arm's entry and past every arm's last instruction. A written
+   * `default:` label opens arm code at its target, so it can never sit past all of it. A switch
+   * that ends a loop body falls into the loop's update block, where a group's `break;` and the
+   * loop's `continue;` are the same jump, and the landing is that block.
+   */
+  private int switchEndFromDefault() {
+    if (!RoundTrip.selector("switchjump")) {
+      return -1;
+    }
+    int target = defaultTargetOffset();
+    if (target < 0) {
+      return -1;
+    }
+    for (int i = 0; i < caseStatements.size(); i++) {
+      int entry = entryOffset(i);
+      if (entry >= 0 && target <= entry) {
+        return -1;
+      }
+      int end = RoundTrip.blockEnd(caseStatements.get(i));
+      if (end >= 0 && target < end) {
+        return -1;
+      }
+    }
+    return target;
+  }
+
   /** The switch instruction starting this statement, or null when the head holds none. */
   private SwitchInstruction switchInstruction() {
     if (first instanceof BasicBlockStatement head
@@ -883,6 +932,23 @@ public class SwitchStatement extends Statement {
       jump = target;
     }
     return jump;
+  }
+
+  /** True when the arm's tail leaves by the enclosing loop's own, unprinted back edge. */
+  private static boolean continuesToEnclosingLoop(Statement stat) {
+    Statement walk = stat;
+    while (true) {
+      for (StatEdge edge : walk.getAllSuccessorEdges()) {
+        if (edge.getType() == StatEdge.TYPE_CONTINUE && !edge.explicit
+            && edge.getDestination() instanceof DoStatement) {
+          return true;
+        }
+      }
+      if (walk.getExprents() != null || walk.getStats().isEmpty()) {
+        return false;
+      }
+      walk = walk.getStats().get(walk.getStats().size() - 1);
+    }
   }
 
   /**

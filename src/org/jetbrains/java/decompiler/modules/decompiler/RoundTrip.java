@@ -5129,6 +5129,27 @@ public final class RoundTrip {
     return target == null ? -1 : target;
   }
 
+  /** The start offset of the first forward goto in [from, before) landing on target, or -1. */
+  public static int jumpOffsetTo(int from, int before, int target) {
+    StructMethod method = currentMethod();
+    if (method == null || from < 0 || before < 0 || target < 0) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return -1;
+    }
+    int best = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getValue() == target && entry.getValue() > entry.getKey()
+          && entry.getKey() >= from && entry.getKey() < before
+          && (best < 0 || entry.getKey() < best)) {
+        best = entry.getKey();
+      }
+    }
+    return best;
+  }
+
   /** True when any forward jump lands exactly on that offset: a jump to a jump, not a fall-in. */
   public static boolean jumpsOnto(int target) {
     return target > 0 && jumpsOnto(0, target, target);
@@ -7947,6 +7968,28 @@ public final class RoundTrip {
     for (Statement cur = statement == null ? null : statement.getParent(); cur != null; cur = cur.getParent()) {
       if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
           && atLoopContinueTarget(loop, target)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when the instruction at the offset is an enclosing loop's back edge: a jump to the head
+   * its {@code continue} goes to. The code a switch that ends the loop body falls into is exactly
+   * that block, so a group's {@code break;} there and the loop's {@code continue;} are the same
+   * jump; a landing anywhere else in the loop is not the switch's join.
+   */
+  public static boolean loopBackEdge(Statement statement, int target) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    Integer dest = gotos == null ? null : gotos.get(target);
+    if (dest == null || dest == target) {
+      return false;
+    }
+    for (Statement cur = statement == null ? null : statement.getParent(); cur != null; cur = cur.getParent()) {
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
+          && atLoopContinueTarget(loop, dest)) {
         return true;
       }
     }
