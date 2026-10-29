@@ -26,6 +26,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
+import org.jetbrains.java.decompiler.struct.gen.VarType;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -94,22 +96,33 @@ public final class LocalDeclarationOrder {
         if (body.getExprents() != null) {
           candidates.addAll(body.getExprents());
         }
+        // A catch parameter is declared after the try body, and javac hands it the lowest slot
+        // free at the handler; one above the local's whole slot range proves the local was still
+        // in scope there, so the source declared it before the try.
+        java.util.List<Integer> handlerSlots = child instanceof CatchStatement catchStatement
+          ? catchParameterSlots(catchStatement) : java.util.Collections.emptyList();
         for (Exprent exprent : candidates) {
           VarExprent var = definedVar(exprent);
           if (var == null || !isRealDefinition(var) || var.getLVT() == null) {
             continue;
           }
+          int slot = var.getLVT().getIndex();
           // The target gave this local a slot below one that prints before the block: the source
-          // declared it further up the sequence, bare, and assigned it here.
-          if (var.getLVT().getIndex() < 0 || var.getLVT().getIndex() >= maxSlot) {
+          // declared it further up the sequence, bare, and assigned it here. A try body is not
+          // taken by this rule: the slots the sequence saw before it may come from a sibling
+          // try's own body, which is not declared at this level.
+          boolean belowPrinted = slot >= 0 && slot < maxSlot && !(child instanceof CatchStatement);
+          boolean reservedAtHandler = slot >= 0 && belowHandlerSlot(handlerSlots, var);
+          if (!belowPrinted && !reservedAtHandler) {
             continue;
           }
           if (!names.uniqueName(var) || mentionsField(seq, var.getName())) {
             debug(method, var, "rejected: nested declaration would capture a name");
             continue;
           }
-          debug(method, var, "hoisted out of a nested block: slot " + var.getLVT().getIndex()
-            + " below " + maxSlot);
+          debug(method, var, (belowPrinted
+            ? "hoisted out of a nested block: slot " + slot + " below " + maxSlot
+            : "hoisted out of a try: slot " + slot + " still reserved at a handler"));
           Exprent declaration;
           if (exprent == var) {
             removeIdentity(body.getVarDefinitions(), exprent);
@@ -533,7 +546,41 @@ public final class LocalDeclarationOrder {
       // sequence and keep their place relative to the switch.
       return switchStatement.getFirst();
     }
+    if (child instanceof CatchStatement catchStatement) {
+      // A try body's locals can be declared above the whole try: the catch parameter, allocated
+      // after the body, then sits above their slots instead of reusing them. The body may be a
+      // single block, so any statement type is taken here.
+      return catchStatement.getFirst();
+    }
     return null;
+  }
+
+  /** The slots the target gives a catch statement's exception parameters. */
+  private static List<Integer> catchParameterSlots(CatchStatement catchStatement) {
+    List<Integer> slots = new ArrayList<>();
+    for (Exprent exprent : catchStatement.getStatExprents()) {
+      if (exprent == null) {
+        continue;
+      }
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && var.getLVT() != null && var.getLVT().getIndex() >= 0) {
+          slots.add(var.getLVT().getIndex());
+        }
+      }
+    }
+    return slots;
+  }
+
+  /** True when a handler slot lies above the local's whole slot range, so it was still reserved. */
+  private static boolean belowHandlerSlot(List<Integer> handlerSlots, VarExprent var) {
+    VarType type = var.getVarType();
+    int width = type != null && (type.type == CodeType.LONG || type.type == CodeType.DOUBLE) ? 2 : 1;
+    for (int slot : handlerSlots) {
+      if (slot >= var.getLVT().getIndex() + width) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Inserts the declaration before the first definition the target gives a higher slot. */
