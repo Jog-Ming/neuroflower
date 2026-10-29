@@ -14,6 +14,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -28,6 +29,7 @@ import org.jetbrains.java.decompiler.util.StatementIterator;
 
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -43,9 +45,14 @@ import java.util.TreeMap;
  *
  * <p>The table is authoritative for identity in one direction only: javac writes one row per
  * variable per lexical range, and two rows of one slot never overlap in the corpus, so two stores
- * the same row covers are one source variable. The reverse direction — separate rows meaning
- * separate variables — is not proven, and no split is attempted here; a variable whose stores span
- * more than one row keeps the versions the data flow gave it.
+ * the same row covers are one source variable. A variable whose recorded range is split into two
+ * rows is still one variable when the second row continues the first: javac opens a row where its
+ * {@code LocalVar} records a definition at a point the register was already live at, which is the
+ * first instruction of a statement and never the end of a store. A sibling declaration starts its
+ * row at the end of its initialising store instead, so the two shapes are separable from the class
+ * file alone. Rows that do not meet every condition are left alone, and no split is ever
+ * attempted: a variable whose stores span rows of different names or descriptors keeps the
+ * versions the data flow gave it.
  *
  * <p>Merging removes a local, which shifts every later local's slot, and that shift is what broke
  * the earlier unguarded attempts. The merge is therefore kept only when simulating the printed
@@ -114,24 +121,40 @@ public final class RowMerge {
       bySlot.computeIfAbsent(row.getIndex(), k -> new ArrayList<>()).add(row);
     }
 
+    Map<Integer, List<Integer>> rawStores = rawStores(seq);
+    Map<LocalVariable, LocalVariable> continuation = Map.of();
+    Set<LocalVariable> continuationRoots = Set.of();
+    if (hasMultiRowSlot(bySlot)) {
+      Set<Integer> starts = statementStarts(root);
+      continuation = continuationRows(bySlot, rawStores, starts);
+      continuationRoots = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+      continuationRoots.addAll(continuation.values());
+      if (System.getenv("NEUROFLOWER_ROWMERGE") != null) {
+        dumpEvidence(mt, rows, rawStores, starts, continuation);
+      }
+    }
+
     // Every local gets the one row its stores all fall in, if such a row exists. Locals declared
     // implicitly (parameters, catch variables) belong to the row that opens at the method entry.
+    // A row that continues an earlier row of the same variable is keyed by that earlier row, so
+    // the versions on either side of the block edge are planned as one merge.
     Map<LocalVariable, List<VarInfo>> groups = new IdentityHashMap<>();
     for (VarInfo info : vars.values()) {
       info.type = varproc.getVarType(new VarVersionPair(info.index, 0));
       info.row = info.stores.isEmpty()
         ? entryRow(bySlot.get(info.slot), implicit.contains(info.index))
         : coveringRow(bySlot.get(info.slot), info.stores);
-      if (info.row != null) {
-        groups.computeIfAbsent(info.row, k -> new ArrayList<>()).add(info);
+      LocalVariable key = info.row == null ? null : continuation.getOrDefault(info.row, info.row);
+      if (key != null) {
+        groups.computeIfAbsent(key, k -> new ArrayList<>()).add(info);
       }
     }
 
-    Map<Integer, List<Integer>> rawStores = rawStores(seq);
     Set<VarExprent> loopInits = loopInits(root);
 
     Map<Integer, Integer> victims = new TreeMap<>();
-    Map<Integer, LocalVariable> survivorRows = new TreeMap<>();
+    Map<Integer, LocalVariable> nameRows = new TreeMap<>();
+    Set<Integer> continuedVictims = new HashSet<>();
     List<VarInfo> survivors = new ArrayList<>();
     for (Map.Entry<LocalVariable, List<VarInfo>> entry : groups.entrySet()) {
       LocalVariable row = entry.getKey();
@@ -176,7 +199,16 @@ public final class RowMerge {
         continue;
       }
       victims.putAll(planned);
-      survivorRows.put(survivor.index, row);
+      // A continuation group's survivor already names itself from the row it keeps. Rebasing its
+      // original pair onto the group's first row would reproduce the table's ambiguous version
+      // number for the slot — every row after the first is numbered alike — and rename it after
+      // whatever variable of the slot was recorded last. Only the victim's index is rewritten.
+      if (continuationRoots.contains(row)) {
+        continuedVictims.addAll(planned.keySet());
+      }
+      else {
+        nameRows.put(survivor.index, row);
+      }
       survivors.add(survivor);
     }
 
@@ -190,10 +222,10 @@ public final class RowMerge {
     // declaration still live at the first store, the source declared the variable bare above that
     // declaration. Move the bare declaration there; the slot simulation below decides whether the
     // moved order is the printed one, and a rejected merge puts it back.
-    List<Runnable> undoHoists = hoistLoopInitialisers(root, varproc, mt, seq, bySlot, survivors, survivorRows);
+    List<Runnable> undoHoists = hoistLoopInitialisers(root, varproc, mt, seq, bySlot, survivors);
     Order order = new Order(victims.keySet(), mt);
     order.walk(root);
-    if (!inScope(order, vars, victims)) {
+    if (!inScope(order, vars, victims, continuedVictims)) {
       debug(mt, "merge reverted: a merged store prints outside the declaration's block");
       revertHoists(undoHoists);
       return;
@@ -205,7 +237,7 @@ public final class RowMerge {
     }
 
     apply(root, victims);
-    nameFromRow(varproc, survivorRows);
+    nameFromRow(varproc, nameRows);
     debug(mt, "merged " + victims);
   }
 
@@ -224,8 +256,7 @@ public final class RowMerge {
   private static List<Runnable> hoistLoopInitialisers(RootStatement root, VarProcessor varproc, StructMethod mt,
                                                       FullInstructionSequence seq,
                                                       Map<Integer, List<LocalVariable>> bySlot,
-                                                      List<VarInfo> survivors,
-                                                      Map<Integer, LocalVariable> survivorRows) {
+                                                      List<VarInfo> survivors) {
     List<Runnable> undo = new ArrayList<>();
     if (survivors.isEmpty()) {
       return undo;
@@ -234,7 +265,7 @@ public final class RowMerge {
     printed.walk(root);
     for (VarInfo survivor : survivors) {
       VarExprent definition = survivor.definition;
-      LocalVariable row = survivorRows.get(survivor.index);
+      LocalVariable row = survivor.row;
       if (definition == null || row == null) {
         continue;
       }
@@ -428,14 +459,23 @@ public final class RowMerge {
    * absorbed version lies inside the block that declares the survivor; otherwise the source would
    * name a local outside its scope. The table proves identity, not that our block structure
    * already contains both halves.
+   *
+   * <p>A version joined across a continuation row is declared in the sequence that holds both
+   * rows: the table proves the source declared it there, and the printer's declaration-order pass
+   * moves it out of the nested block its first assignment landed in. The scope is therefore the
+   * nearest sequence around the declaration, not the block that currently prints it.
    */
-  private static boolean inScope(Order order, Map<Integer, VarInfo> vars, Map<Integer, Integer> victims) {
+  private static boolean inScope(Order order, Map<Integer, VarInfo> vars, Map<Integer, Integer> victims,
+                                 Set<Integer> continued) {
     Map<Integer, Statement> scopes = new HashMap<>();
     for (Map.Entry<Integer, Integer> entry : victims.entrySet()) {
       VarInfo survivor = vars.get(entry.getValue());
-      Statement scope = survivor != null && survivor.definition != null
-        ? order.declarationScopes.get(survivor.definition)
-        : null;
+      Statement scope = null;
+      if (survivor != null && survivor.definition != null) {
+        scope = continued.contains(entry.getKey())
+          ? enclosingSequence(order.owners.get(survivor.definition))
+          : order.declarationScopes.get(survivor.definition);
+      }
       // An implicit declaration (a parameter or catch variable) is scoped to the whole method.
       scopes.put(entry.getKey(), scope == null ? order.root : scope);
     }
@@ -451,6 +491,16 @@ public final class RowMerge {
       return 0;
     });
     return ok[0];
+  }
+
+  /** The nearest statement that prints as a block of sequential statements, or null. */
+  private static Statement enclosingSequence(Statement stat) {
+    for (Statement current = stat; current != null; current = current.getParent()) {
+      if (current.type == Statement.StatementType.SEQUENCE || current.type == Statement.StatementType.ROOT) {
+        return current;
+      }
+    }
+    return null;
   }
 
   private static boolean isAncestorOrSelf(Statement ancestor, Statement stat) {
@@ -553,6 +603,98 @@ public final class RowMerge {
       row = found;
     }
     return row;
+  }
+
+  /**
+   * The rows of one slot that one source variable continues into a later statement, mapped to the
+   * first row of the group the row belongs to.
+   *
+   * <p>javac opens a local's row where its {@code LocalVar} records a definition at a point the
+   * register was already live at — the first instruction of a statement, which is a block entry or
+   * a jump target. A fresh declaration of a sibling block cannot open a row there: its row starts
+   * at the end of the initialising store, so the two shapes are told apart by the class file
+   * alone. Rows that only share a slot are never taken as one variable.
+   */
+  private static Map<LocalVariable, LocalVariable> continuationRows(Map<Integer, List<LocalVariable>> bySlot,
+                                                                   Map<Integer, List<Integer>> rawStores,
+                                                                   Set<Integer> statementStarts) {
+    Map<LocalVariable, LocalVariable> representatives = new IdentityHashMap<>();
+    for (Map.Entry<Integer, List<LocalVariable>> entry : bySlot.entrySet()) {
+      List<LocalVariable> slotRows = new ArrayList<>(entry.getValue());
+      slotRows.sort(Comparator.comparingInt(LocalVariable::getStart).thenComparingInt(LocalVariable::getEnd));
+      List<Integer> stores = rawStores.getOrDefault(entry.getKey(), List.of());
+      for (int i = 0; i < slotRows.size(); i++) {
+        for (int j = i + 1; j < slotRows.size(); j++) {
+          LocalVariable next = slotRows.get(j);
+          if (!representatives.containsKey(next)
+              && continues(slotRows.get(i), next, stores, statementStarts)) {
+            representatives.put(next, representatives.getOrDefault(slotRows.get(i), slotRows.get(i)));
+          }
+        }
+      }
+    }
+    return representatives;
+  }
+
+  /**
+   * True when {@code next} is a later recorded range of the variable {@code first} records: the
+   * same slot, name and descriptor, opening after the first range ends at a statement's first
+   * instruction that no store of the slot ends at.
+   */
+  private static boolean continues(LocalVariable first, LocalVariable next, List<Integer> stores,
+                                   Set<Integer> statementStarts) {
+    return first.getEnd() <= next.getStart()
+      && first.getName().equals(next.getName())
+      && first.getDescriptor().equals(next.getDescriptor())
+      && !stores.contains(next.getStart())
+      && statementStarts.contains(next.getStart());
+  }
+
+  private static boolean hasMultiRowSlot(Map<Integer, List<LocalVariable>> bySlot) {
+    for (List<LocalVariable> slotRows : bySlot.values()) {
+      if (slotRows.size() > 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The first instruction offset of every statement in the method's tree. */
+  private static Set<Integer> statementStarts(Statement root) {
+    Set<Integer> starts = new java.util.TreeSet<>();
+    collectStatementStarts(root, starts);
+    return starts;
+  }
+
+  private static void dumpEvidence(StructMethod mt, List<LocalVariable> rows,
+                                   Map<Integer, List<Integer>> rawStores, Set<Integer> statementStarts,
+                                   Map<LocalVariable, LocalVariable> continuation) {
+    System.err.println("rowmerge rows " + mt.getName() + mt.getDescriptor());
+    for (LocalVariable row : rows) {
+      System.err.println("  row " + row);
+    }
+    for (Map.Entry<Integer, List<Integer>> entry : rawStores.entrySet()) {
+      System.err.println("  store slot " + entry.getKey() + " ends " + entry.getValue());
+    }
+    System.err.println("  statement starts " + statementStarts);
+    for (Map.Entry<LocalVariable, LocalVariable> entry : continuation.entrySet()) {
+      System.err.println("  continues " + entry.getValue() + " -> " + entry.getKey());
+    }
+  }
+
+  private static void collectStatementStarts(Statement stat, Set<Integer> starts) {
+    if (stat == null || stat instanceof DummyExitStatement) {
+      return;
+    }
+    BitSet bits = new BitSet();
+    stat.getOffset(bits);
+    int first = bits.nextSetBit(0);
+    if (first >= 0) {
+      starts.add(first);
+    }
+    for (Statement child : stat.getStats()) {
+      collectStatementStarts(child, starts);
+    }
   }
 
   /** The row of this slot that opens at the method entry, for an implicitly declared local. */
@@ -944,7 +1086,12 @@ public final class RowMerge {
         }
       }
 
-      Integer expected = varproc.getVarOriginalIndex(event.variable());
+      // The row the variable was built from records its slot directly. The map can instead carry
+      // a synthetic index for a variable created after SSA renumbering — a catch variable gets a
+      // fresh counter as its index — and that number is not a slot.
+      Integer expected = event.var.getLVT() != null
+        ? event.var.getLVT().getIndex()
+        : varproc.getVarOriginalIndex(event.variable());
       if (expected == null) {
         debug(mt, "local " + event.variable() + " has no slot in the table");
         return false;
