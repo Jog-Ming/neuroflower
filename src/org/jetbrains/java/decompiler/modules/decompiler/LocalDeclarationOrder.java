@@ -116,7 +116,9 @@ public final class LocalDeclarationOrder {
           if (!belowPrinted && !reservedAtHandler) {
             continue;
           }
-          if (!names.uniqueName(var) || mentionsField(seq, var.getName())) {
+          // A discontinuous table row of the same name and slot is the same source variable, so
+          // its later range's declaration is not a second name the hoist could capture.
+          if ((!names.uniqueName(var) && !names.sameSlotName(var)) || mentionsField(seq, var.getName())) {
             debug(method, var, "rejected: nested declaration would capture a name");
             continue;
           }
@@ -143,6 +145,9 @@ public final class LocalDeclarationOrder {
             ? insertionList(seq, child)
             : seq.getVarDefinitions();
           insertByTargetSlot(target, declaration);
+          // The variable's other alive ranges no longer print their own declaration: one `T v;`
+          // stands above and each range's store is a plain assignment.
+          absorbSplitRanges(seq, (VarExprent) declaration);
         }
       }
       for (Exprent definition : child.getVarDefinitions()) {
@@ -200,7 +205,7 @@ public final class LocalDeclarationOrder {
       if (anchor == null) {
         continue;
       }
-      if (!names.uniqueName(var)) {
+      if (!names.uniqueName(var) && !names.sameSlotName(var)) {
         debug(method, var, "rejected: another local prints as " + var.getName());
         continue;
       }
@@ -264,6 +269,10 @@ public final class LocalDeclarationOrder {
           candidate.slot);
         order.add(anchorIndex, inserted);
         debug(method, var, "hoisted to the printed order before slot-" + anchor.slot);
+      }
+      // The other alive ranges of the same source variable lose their own declarations.
+      if (declaration instanceof VarExprent keptVar) {
+        absorbSplitRanges(root, keptVar);
       }
     }
   }
@@ -699,7 +708,7 @@ public final class LocalDeclarationOrder {
         // Nothing earlier to precede, or the plain within-list pass owns this move.
         continue;
       }
-      if (!names.uniqueName(var)) {
+      if (!names.uniqueName(var) && !names.sameSlotName(var)) {
         debug(method, var, "rejected: another local prints as " + var.getName());
         continue;
       }
@@ -1280,9 +1289,49 @@ public final class LocalDeclarationOrder {
   // names
   // *****************************************************************************
 
+  /**
+   * Prints one declaration for a variable the target's table splits into several alive ranges:
+   * the other ranges' own declarations become plain assignments, and a bare declaration that is
+   * only the same variable's next row is dropped. The kept declaration is the one hoisted above.
+   */
+  private static void absorbSplitRanges(Statement stat, VarExprent kept) {
+    absorbSplitRanges(stat.getVarDefinitions(), kept);
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      absorbSplitRanges(exprents, kept);
+    }
+    for (Statement child : stat.getStats()) {
+      absorbSplitRanges(child, kept);
+    }
+  }
+
+  private static void absorbSplitRanges(List<Exprent> exprents, VarExprent kept) {
+    for (int i = exprents.size() - 1; i >= 0; i--) {
+      Exprent exprent = exprents.get(i);
+      if (exprent instanceof VarExprent var && var != kept && var.isDefinition() && sameRange(var, kept)) {
+        // A bare declaration of the same variable's next range: the hoisted one announces it.
+        exprents.remove(i);
+        continue;
+      }
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && var != kept && var.isDefinition() && sameRange(var, kept)) {
+          var.setDefinition(false);
+        }
+      }
+    }
+  }
+
+  /** Whether two printed variables are one source variable's table ranges: same slot and name. */
+  private static boolean sameRange(VarExprent a, VarExprent b) {
+    return a.getLVT() != null && b.getLVT() != null && a.getLVT().getIndex() >= 0
+      && a.getLVT().getIndex() == b.getLVT().getIndex()
+      && a.getName().equals(b.getName());
+  }
+
   /** Every printed local name in the method, to detect a hoist that would capture another one. */
   private static final class NameTable {
     private final Map<String, Set<VarVersionPair>> byName = new HashMap<>();
+    private final Map<String, Set<Integer>> slotsByName = new HashMap<>();
 
     static NameTable build(Statement root) {
       NameTable table = new NameTable();
@@ -1310,6 +1359,8 @@ public final class LocalDeclarationOrder {
         for (Exprent inner : exprent.getAllExprents(true, true)) {
           if (inner instanceof VarExprent var && !var.isStack()) {
             byName.computeIfAbsent(var.getName(), name -> new HashSet<>()).add(var.getVarVersionPair());
+            slotsByName.computeIfAbsent(var.getName(), name -> new HashSet<>())
+              .add(var.getLVT() == null ? -1 : var.getLVT().getIndex());
           }
         }
       }
@@ -1318,6 +1369,18 @@ public final class LocalDeclarationOrder {
     boolean uniqueName(VarExprent var) {
       Set<VarVersionPair> pairs = byName.get(var.getName());
       return pairs != null && pairs.size() == 1 && pairs.contains(var.getVarVersionPair());
+    }
+
+    /**
+     * True when every printed variable of this name holds the same slot: the target's table
+     * writes one row per alive range, so a discontinuous scope is one source variable, not two.
+     */
+    boolean sameSlotName(VarExprent var) {
+      if (var.getLVT() == null || var.getLVT().getIndex() < 0) {
+        return false;
+      }
+      Set<Integer> slots = slotsByName.get(var.getName());
+      return slots != null && slots.size() == 1 && slots.contains(var.getLVT().getIndex());
     }
   }
 

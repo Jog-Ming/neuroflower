@@ -1231,21 +1231,34 @@ public class ExprProcessor implements CodeConstants {
           buf.appendIndent(indent);
         }
 
-        switch (edge.getType()) {
-          case StatEdge.TYPE_BREAK:
-            // A break out of the loop body's last switch and a continue compile to different
-            // jumps; the target's jump at this offset says which one the source wrote.
-            boolean continues = !edge.labeled
-              && (RoundTrip.breakJumpsToContinue(jumpOffset) || RoundTrip.emptyArmContinues(stat));
-            buf.append(continues ? "continue" : "break");
-            break;
-          case StatEdge.TYPE_CONTINUE:
-            buf.append("continue");
+        // A labelled continue whose jump lands on an enclosing loop's own end through another
+        // goto is the source's `break label;` of that loop: the named outer continue compiles to
+        // the head jump directly, with no trampoline in between.
+        Statement trampolineBreak = edge.getType() == StatEdge.TYPE_CONTINUE
+          ? RoundTrip.trampolineBreakLoop(edge, stat, jumpOffset) : null;
+        if (trampolineBreak != null && !RoundTrip.printsLabel(trampolineBreak)) {
+          // The loop would print no label of its own; the plain continue is the safe form.
+          trampolineBreak = null;
         }
+        if (trampolineBreak != null) {
+          buf.append("break label").append(trampolineBreak.id);
+        } else {
+          switch (edge.getType()) {
+            case StatEdge.TYPE_BREAK:
+              // A break out of the loop body's last switch and a continue compile to different
+              // jumps; the target's jump at this offset says which one the source wrote.
+              boolean continues = !edge.labeled
+                && (RoundTrip.breakJumpsToContinue(jumpOffset) || RoundTrip.emptyArmContinues(stat));
+              buf.append(continues ? "continue" : "break");
+              break;
+            case StatEdge.TYPE_CONTINUE:
+              buf.append("continue");
+          }
 
-        boolean needsName = edge.labeled || RoundTrip.leavesClosure(edge);
-        if (needsName) {
-          buf.append(" label").append(edge.closure.id);
+          boolean needsName = edge.labeled || RoundTrip.leavesClosure(edge);
+          if (needsName) {
+            buf.append(" label").append(edge.closure.id);
+          }
         }
         buf.append(";").appendLineSeparator();
       }

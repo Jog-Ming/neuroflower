@@ -128,7 +128,8 @@ public class DoStatement extends Statement {
     int varDefsStart = buf.length();
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
-    if (isLabeled() || RoundTrip.carriesOutwardBreak(this) || RoundTrip.carriesBreakOut(this)) {
+    if (isLabeled() || RoundTrip.carriesOutwardBreak(this) || RoundTrip.carriesBreakOut(this)
+        || RoundTrip.carriesTrampolineBreak(this)) {
       buf.appendIndent(indent).append("label").append(this.id).append(":").appendLineSeparator();
     }
 

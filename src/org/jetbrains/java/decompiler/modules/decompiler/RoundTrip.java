@@ -585,6 +585,14 @@ public final class RoundTrip {
    * The block must also end at the method's close for the tail to be the guard's else arm.
    */
   public static boolean opensTrailingBlock(Statement firstTail) {
+    return opensTrailingBlock(firstTail, -1);
+  }
+
+  /**
+   * The same, for a trailing block that ends where the enclosing statement does instead of at
+   * the method's close: a guard's else arm inside an enclosing else ends at that arm's brace.
+   */
+  public static boolean opensTrailingBlock(Statement firstTail, int boundaryEnd) {
     StructMethod method = currentMethod();
     StructLocalVariableTableAttribute lvt = method == null ? null : method.getLocalVariableAttr();
     if (lvt == null) {
@@ -603,8 +611,27 @@ public final class RoundTrip {
       return false;
     }
     LocalVariable first = firstDefinedLvt(firstTail);
-    return first != null && first.getStart() > 0 && first.getOrder() >= 0
-        && first.getOrder() < paramsStart && first.getEnd() == maxEnd;
+    if (first == null) {
+      return false;
+    }
+    boolean boundary = first.getEnd() == boundaryEnd && boundaryEnd >= 0;
+    if (boundary) {
+      // The tail's block closed before an enclosing block local that was written later and lives
+      // longer: only then did the source brace the tail inside the arm. A block-scoped local is
+      // written before the parameters; the method body's own locals are written after them and
+      // outlive every arm, so they are not evidence about the arm's braces.
+      boundary = false;
+      for (LocalVariable other : vars) {
+        if (other.getStart() > 0 && other.getOrder() > first.getOrder()
+            && other.getOrder() < paramsStart && other.getEnd() >= first.getEnd()) {
+          boundary = true;
+          break;
+        }
+      }
+    }
+    return first.getStart() > 0 && first.getOrder() >= 0
+        && first.getOrder() < paramsStart
+        && (first.getEnd() == maxEnd || boundary);
   }
 
   /**
@@ -5364,6 +5391,120 @@ public final class RoundTrip {
   }
 
   /**
+   * The operand groups of a condition that folded a run of {@code if (G) continue;} statements
+   * whose continues run through a try-with-resources close. A written guard's branch jumps past
+   * the close and the goto behind it, so the target records it as an else guard: the statement
+   * after the guard begins at the branch's target, not right after the branch. Groups at those
+   * targets, or null when the target records fewer than two such guards.
+   */
+  public static java.util.List<java.util.List<Exprent>> closeGuardGroups(Exprent head,
+                                                                         java.util.List<Exprent> operands,
+                                                                         Statement around) {
+    if (!selector("continueguard") || !(head instanceof IfExprent ifHead) || operands.size() < 2) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> guards = CONTINUE_ELSE_GUARDS.get(method);
+    java.util.Map<Integer, int[]> sites = CONTINUE_ELSE_SITES.get(method);
+    int[] range = byteRange(ifHead.getCondition());
+    if (guards == null || guards.isEmpty() || sites == null || range == null) {
+      return null;
+    }
+    java.util.List<int[]> boundaries = new java.util.ArrayList<>();
+    for (Integer end : guards.keySet()) {
+      if (end <= range[0] || end > range[1]) {
+        continue;
+      }
+      Integer target = guards.get(end);
+      int[] site = sites.get(end);
+      if (target == null || site == null || !targetContinues(target, around)) {
+        continue;
+      }
+      boundaries.add(new int[]{end, site[1]});
+    }
+    if (boundaries.isEmpty()) {
+      return null;
+    }
+    boundaries.sort(java.util.Comparator.comparingInt(b -> b[1]));
+    // The branches of one written guard's `&&` chain share its continue block, so they record
+    // the same next statement; only the last branch of such a run ends the statement.
+    java.util.List<int[]> distinct = new java.util.ArrayList<>();
+    for (int[] boundary : boundaries) {
+      if (distinct.isEmpty() || distinct.get(distinct.size() - 1)[1] != boundary[1]) {
+        distinct.add(boundary);
+      } else {
+        distinct.set(distinct.size() - 1, boundary);
+      }
+    }
+    boundaries = distinct;
+    int[] starts = new int[operands.size()];
+    for (int i = 0; i < starts.length; i++) {
+      starts[i] = firstOffsetOf(operands.get(i));
+      if (starts[i] < 0) {
+        return null;
+      }
+    }
+    java.util.List<java.util.List<Exprent>> groups = new java.util.ArrayList<>();
+    int from = 0;
+    for (int[] boundary : boundaries) {
+      int next = from;
+      while (next < starts.length && starts[next] < boundary[1]) {
+        next++;
+      }
+      if (next == from) {
+        return null;
+      }
+      groups.add(new java.util.ArrayList<>(operands.subList(from, next)));
+      from = next;
+      if (from >= operands.size()) {
+        break;
+      }
+    }
+    if (from < operands.size()) {
+      groups.add(new java.util.ArrayList<>(operands.subList(from, operands.size())));
+    }
+    return groups.size() > 1 ? groups : null;
+  }
+
+  /**
+   * The goto the head's own last guard compiles to when its continue runs through a
+   * try-with-resources close: the jump the target records behind the close for the branch that
+   * ends the head, or -1.
+   */
+  public static int continueCloseSiteForHead(Exprent head) {
+    if (!selector("continueguard") || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, int[]> sites = method == null ? null : CONTINUE_ELSE_SITES.get(method);
+    int[] site = sites == null ? null : sites.get(head.bytecode.length());
+    return site == null ? -1 : site[0];
+  }
+
+  /**
+   * The goto a written guard before this next test compiles to when its continue runs through a
+   * try-with-resources close: the jump the target records behind the close, so the printed
+   * {@code continue;} takes its line from it.
+   */
+  public static int continueCloseSiteBefore(Exprent next, Statement around) {
+    if (!selector("continueguard")) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, int[]> sites = method == null ? null : CONTINUE_ELSE_SITES.get(method);
+    int start = firstOffsetOf(next);
+    if (sites == null || start < 0) {
+      return -1;
+    }
+    for (java.util.Map.Entry<Integer, int[]> entry : sites.entrySet()) {
+      if (entry.getValue() != null && entry.getValue()[1] == start) {
+        return entry.getValue()[0];
+      }
+    }
+    return -1;
+  }
+
+  /**
    * The operand groups a condition that folded a run of {@code if (G) continue;} statements splits
    * into at the target's recorded guards, or null when it holds fewer than two. The key filter is
    * the condition's own byte range, not the head's bits: the merge drops the comparison wrapper of
@@ -6115,6 +6256,165 @@ public final class RoundTrip {
     }
   }
 
+  /** The jump offset a statement's print drops, where its block's old instruction list ends. */
+  public static int droppedJumpOffset(Statement stat) {
+    if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.BasicBlockStatement basic) {
+      java.util.List<Integer> offsets = basic.getBlock().getInstrOldOffsets();
+      if (!offsets.isEmpty() && offsets.size() > basic.getBlock().getSeq().length()) {
+        return offsets.get(offsets.size() - 1);
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The enclosing loop whose own end a labelled continue's jump lands on through a trampoline
+   * goto: {@code goto L; L: goto head} is the target's record of a {@code break} out of the loop
+   * that ends at L, not of a {@code continue} of the named outer loop, which compiles to the head
+   * jump directly. Null when the edge is not that shape.
+   */
+  public static Statement trampolineBreakLoop(
+      org.jetbrains.java.decompiler.modules.decompiler.StatEdge edge, Statement source, int jumpOffset) {
+    if (!selector("trampolinebreak") || edge == null || source == null) {
+      return null;
+    }
+    if (edge.getType() != org.jetbrains.java.decompiler.modules.decompiler.StatEdge.TYPE_CONTINUE
+        || !edge.labeled || edge.closure == null) {
+      return null;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (gotos == null) {
+      return null;
+    }
+    if (jumpOffset < 0) {
+      // The edge's jump may hang off a nested block the printer does not expose: take the last
+      // recorded goto inside the source that itself lands on a goto, which is the trampoline.
+      int start = firstOffset(source);
+      int end = lastEnd(source);
+      if (start < 0 || end <= start) {
+        return null;
+      }
+      for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+        if (entry.getKey() >= start && entry.getKey() <= end && gotos.containsKey(entry.getValue())) {
+          jumpOffset = Math.max(jumpOffset, entry.getKey());
+        }
+      }
+      if (jumpOffset < 0) {
+        return null;
+      }
+    }
+    Integer trampoline = gotos.get(jumpOffset);
+    if (trampoline == null || !gotos.containsKey(trampoline)) {
+      return null;
+    }
+    Integer onward = gotos.get(trampoline);
+    if (onward == null
+        || !(edge.closure instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement outer)
+        || !atLoopContinueTarget(outer, onward)) {
+      return null;
+    }
+    for (Statement cur = source; cur != null && cur != edge.closure; cur = cur.getParent()) {
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
+          && loopOwnEnd(loop) == trampoline) {
+        return loop;
+      }
+    }
+    // The loop that ends where the trampoline stands: its own back edge is the instruction just
+    // before it, jumping back into the loop. `break label;` leaves the loop right there.
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    Integer backEdge = byEnd == null ? null : byEnd.get(trampoline);
+    Integer backTarget = backEdge == null ? null : gotos.get(backEdge);
+    if (backEdge != null && backTarget != null && backTarget < backEdge) {
+      // The loop whose own head the back edge jumps to: the nearest head above its target. The
+      // back edge sits immediately before the break's destination, so this loop is the one the
+      // source left; the named outer loop is not it (its head is farther up).
+      org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement best = null;
+      int bestDistance = Integer.MAX_VALUE;
+      for (Statement cur = source; cur != null && cur != edge.closure; cur = cur.getParent()) {
+        if (!(cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop)) {
+          continue;
+        }
+        int head = loopHeadStartAfter(loop, backTarget);
+        if (head < 0) {
+          continue;
+        }
+        int distance = head - backTarget;
+        if (distance < bestDistance) {
+          best = loop;
+          bestDistance = distance;
+        }
+      }
+      if (best != null) {
+        return best;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The nearest offset of a loop's head at or after the given target: its condition, increment, or
+   * body, whichever the back edge can have jumped to. A for-each keeps the iterator increment
+   * before the hasNext test, so the increment may sit below the continue target.
+   */
+  private static int loopHeadStartAfter(org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    int head = -1;
+    for (Exprent exprent : java.util.Arrays.asList(loop.getConditionExprent(), loop.getIncExprent())) {
+      if (exprent != null && exprent.bytecode != null && !exprent.bytecode.isEmpty()) {
+        int start = exprent.bytecode.nextSetBit(0);
+        if (start >= target && (head < 0 || start < head)) {
+          head = start;
+        }
+      }
+    }
+    int body = firstOffset(loop.getFirst());
+    if (body >= target && (head < 0 || body < head)) {
+      head = body;
+    }
+    return head;
+  }
+
+  /**
+   * True when a labelled continue nested in this loop is really a {@code break label;} of it: its
+   * jump lands on the loop's own end, where another goto continues the enclosing loop.
+   */
+  /** True when the loop's print emits a label a `break label;` can name. */
+  public static boolean printsLabel(Statement loop) {
+    return loop != null && (loop.isLabeled() || carriesOutwardBreak(loop) || carriesBreakOut(loop)
+      || carriesTrampolineBreak(loop));
+  }
+
+  public static boolean carriesTrampolineBreak(Statement loop) {
+    if (!selector("trampolinebreak") || loop == null) {
+      return false;
+    }
+    return carriesTrampolineBreak(loop, loop);
+  }
+
+  private static boolean carriesTrampolineBreak(Statement stat, Statement loop) {
+    // Only an edge the jump printer will actually emit as this statement's single exit can become
+    // the printed `break label;`; any other edge is printed by its own rule, which would leave
+    // the label this decision adds dangling.
+    java.util.List<org.jetbrains.java.decompiler.modules.decompiler.StatEdge> successors =
+      stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (successors.size() == 1) {
+      org.jetbrains.java.decompiler.modules.decompiler.StatEdge edge = successors.get(0);
+      if (edge.getType() == org.jetbrains.java.decompiler.modules.decompiler.StatEdge.TYPE_CONTINUE
+          && edge.labeled && edge.explicit && !isClosureHidden(edge) && !isJumpSuppressed(stat)
+          && !printedBreak(stat) && !isDeferredBreak(edge)
+          && !(edge.getDestination() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement)
+          && trampolineBreakLoop(edge, stat, droppedJumpOffset(stat)) == loop) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (carriesTrampolineBreak(child, loop)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * True when code nested in a loop inside this one jumps to a return the decompiler copied here:
    * no unlabelled `break` can reach that far, so the source named this loop with a label.
@@ -6406,7 +6706,17 @@ public final class RoundTrip {
       return false;
     }
     Integer landing = targets.get(lastEnd);
-    if (landing == null || !isContinueTarget(loop, landing)) {
+    if (landing == null) {
+      return false;
+    }
+    // A head whose last branch is one of the target's written `continue;` guards, recorded as an
+    // else guard behind a try-with-resources close, is a run of guard statements rather than an
+    // if/else: its branch lands on the next written test, and the source's rest follows the run.
+    java.util.Map<Integer, Integer> elseGuards = CONTINUE_ELSE_GUARDS.get(method);
+    if (selector("continueguard") && elseGuards != null && elseGuards.containsKey(lastEnd)) {
+      return false;
+    }
+    if (!isContinueTarget(loop, landing)) {
       return false;
     }
     return guards == null || !guards.containsKey(lastEnd);
@@ -7349,23 +7659,34 @@ public final class RoundTrip {
    */
   public static boolean continuesAtLoopHead(Statement statement, int target) {
     for (Statement cur = statement == null ? null : statement.getParent(); cur != null; cur = cur.getParent()) {
-      if (!(cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop)) {
-        continue;
-      }
-      int bodyStart = firstOffset(loop.getFirst());
-      if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
+      if (cur instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop
+          && atLoopContinueTarget(loop, target)) {
         return true;
       }
-      Exprent head = switch (loop.getLooptype()) {
-        case WHILE, DO_WHILE -> loop.getConditionExprent();
-        case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
-        default -> null;
-      };
-      if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
-        int start = head.bytecode.nextSetBit(0);
-        if (target <= start && target >= start - 3) {
-          return true;
-        }
+    }
+    return false;
+  }
+
+  /**
+   * Whether the offset is where a {@code continue} of this loop actually goes: its head, the
+   * increment/condition before the body, or the loop top a load sits up to three bytes before.
+   * An offset merely inside the loop is not one — a merged guard's last branch lands on the body.
+   */
+  private static boolean atLoopContinueTarget(
+      org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop, int target) {
+    int bodyStart = firstOffset(loop.getFirst());
+    if (bodyStart >= 0 && target >= 0 && target < bodyStart) {
+      return true;
+    }
+    Exprent head = switch (loop.getLooptype()) {
+      case WHILE, DO_WHILE -> loop.getConditionExprent();
+      case FOR, FOR_EACH -> loop.getIncExprent() != null ? loop.getIncExprent() : loop.getConditionExprent();
+      default -> null;
+    };
+    if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
+      int start = head.bytecode.nextSetBit(0);
+      if (target <= start && target >= start - 3) {
+        return true;
       }
     }
     return false;

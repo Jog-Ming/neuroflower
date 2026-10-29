@@ -372,16 +372,26 @@ public class IfStatement extends Statement {
       List<Exprent> ors = orOperands(source);
       List<List<Exprent>> groups = RoundTrip.guardGroups(ifHead, ors, this);
       if (groups == null) {
+        // A run of guards whose continues each run through the close: the target records every
+        // branch as an else guard, and the next statement starts at the branch's target.
+        groups = RoundTrip.closeGuardGroups(ifHead, ors, this);
+      }
+      if (groups == null) {
         groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
       }
-      int gotoOffset = groups.size() == 1 ? RoundTrip.continueCloseSite() : -1;
-      for (List<Exprent> group : groups) {
+      for (int groupIndex = 0; groupIndex < groups.size(); groupIndex++) {
+        List<Exprent> group = groups.get(groupIndex);
         IfExprent guard = (IfExprent) ifHead.copy();
         guard.setCondition(orOf(group));
         buf.appendIndent(indent);
         buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
         TextBuffer continueLine = new TextBuffer();
         continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        // Each guard compiles its `continue;` to the jump the target records for it: the next
+        // group's site for an earlier guard, the head's own last branch for the last group.
+        int gotoOffset = groupIndex + 1 < groups.size()
+          ? RoundTrip.continueCloseSiteBefore(groups.get(groupIndex + 1).get(0), this)
+          : RoundTrip.continueCloseSite();
         if (gotoOffset >= 0) {
           continueLine.addStartBytecodeMapping(gotoOffset);
         }
@@ -559,17 +569,28 @@ public class IfStatement extends Statement {
       boolean semicolon = false;
       if (ifedge.explicit && !RoundTrip.isClosureHidden(ifedge)) {
         semicolon = true;
-        if (ifedge.getType() == StatEdge.TYPE_BREAK) {
-          // break
-          buf.appendIndent(indent + 1).append("break");
+        // A labelled continue whose jump lands on an enclosing loop's own end through another
+        // goto is the source's `break label;` of that loop.
+        Statement trampolineBreak = ifedge.getType() == StatEdge.TYPE_CONTINUE
+          ? RoundTrip.trampolineBreakLoop(ifedge, this, RoundTrip.droppedJumpOffset(this)) : null;
+        if (trampolineBreak != null && !RoundTrip.printsLabel(trampolineBreak)) {
+          trampolineBreak = null;
         }
-        else {
-          // continue
-          buf.appendIndent(indent + 1).append("continue");
-        }
+        if (trampolineBreak != null) {
+          buf.appendIndent(indent + 1).append("break label").append(trampolineBreak.id);
+        } else {
+          if (ifedge.getType() == StatEdge.TYPE_BREAK) {
+            // break
+            buf.appendIndent(indent + 1).append("break");
+          }
+          else {
+            // continue
+            buf.appendIndent(indent + 1).append("continue");
+          }
 
-        if (ifedge.labeled) {
-          buf.append(" label").append(ifedge.closure == null ? "<unknownclosure>" : Integer.toString(ifedge.closure.id));
+          if (ifedge.labeled) {
+            buf.append(" label").append(ifedge.closure == null ? "<unknownclosure>" : Integer.toString(ifedge.closure.id));
+          }
         }
       }
       if(semicolon) {
@@ -904,7 +925,31 @@ public class IfStatement extends Statement {
     List<Exprent> operands = written ? orOperands(head.getCondition()) : booleanOperands(head.getCondition());
     RoundTrip.GuardSplit split = RoundTrip.mergedGuards(head, operands, this, breaks);
     if (split == null) {
-      return false;
+      // A run of guards whose continues each run through a try-with-resources close: the target
+      // records every branch as an else guard at the close's goto, and the next statement begins
+      // at the branch's target. Split the run there and print one guard per group.
+      List<List<Exprent>> closeGroups = written && !breaks
+        ? RoundTrip.closeGuardGroups(head, operands, this) : null;
+      if (closeGroups == null) {
+        return false;
+      }
+      for (int i = 0; i < closeGroups.size(); i++) {
+        IfExprent guard = (IfExprent) head.copy();
+        guard.setCondition(orOf(closeGroups.get(i)));
+        buf.appendIndent(indent);
+        buf.append(guard.toJava(indent)).append(" {").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+        int site = i + 1 < closeGroups.size()
+          ? RoundTrip.continueCloseSiteBefore(closeGroups.get(i + 1).get(0), this)
+          : RoundTrip.continueCloseSiteForHead(head);
+        if (site >= 0) {
+          continueLine.addStartBytecodeMapping(site);
+        }
+        buf.append(continueLine);
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
+      return true;
     }
     // With the continue as the fall-through the head's branch is the last guard's whole test, so a
     // head group that branch does not send to the loop would print a guard the target lacks.

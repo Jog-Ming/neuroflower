@@ -1349,7 +1349,7 @@ public class SequenceStatement extends Statement {
           && ifStatement.getIfstat() != null && !ifStatement.isLabeled()
           && !ifStatement.isPatternMatched()
           && endsWithReturn(ifStatement.getIfstat())
-          && RoundTrip.opensTrailingBlock(stats.get(i + 1))) {
+          && RoundTrip.opensTrailingBlock(stats.get(i + 1), elseArmEnd())) {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
@@ -1788,6 +1788,15 @@ public class SequenceStatement extends Statement {
       buf.append(content);
     }
     return open;
+  }
+
+  /**
+   * The closing offset of this sequence when it is an if's else arm: a guard's own else inside
+   * it ends at the same brace, and the table records that scope end. -1 otherwise.
+   */
+  private int elseArmEnd() {
+    return getParent() instanceof IfStatement parent && parent.getElsestat() == this
+      ? RoundTrip.lastEnd(this) : -1;
   }
 
   /**
