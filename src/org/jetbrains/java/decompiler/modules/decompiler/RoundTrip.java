@@ -115,6 +115,8 @@ public final class RoundTrip {
   private static final java.util.Map<StructMethod, java.util.Map<Integer, BitSet>> LOAD_SITES = new java.util.concurrent.ConcurrentHashMap<>();
   /** The slot a store at this start offset writes. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
+  /** The slot of every store at its start offset, the compact operand-less forms included. */
+  private static final java.util.Map<StructMethod, java.util.Map<Integer, Integer>> ALL_STORE_SLOTS = new java.util.concurrent.ConcurrentHashMap<>();
   /** Return instructions of a try-shaped `store S; goto M` / `M: load S; ret`, by the return's start. */
   private static final java.util.Map<StructMethod, java.util.Map<Integer, int[]>> TRY_RETURN_STORES = new java.util.concurrent.ConcurrentHashMap<>();
   /** Switch arms that held a for-each's update: the label the source never wrote. */
@@ -146,6 +148,7 @@ public final class RoundTrip {
     java.util.Map<Integer, BitSet> storeSites = new java.util.HashMap<>();
     java.util.Map<Integer, BitSet> loadSites = new java.util.HashMap<>();
     java.util.Map<Integer, Integer> storeSlots = new java.util.HashMap<>();
+    java.util.Map<Integer, Integer> allStoreSlots = new java.util.HashMap<>();
     java.util.List<int[]> finallyCopies = new java.util.ArrayList<>();
     BitSet matchCatchSlots = new BitSet();
     BitSet noFallThrough = new BitSet();
@@ -185,6 +188,11 @@ public final class RoundTrip {
           }
         }
 
+      }
+      // Every store, the compact _0.._3 forms included: a caller walking the stream for the
+      // next store cannot see the opcode itself once the sequence is released.
+      if (isStore(instr.opcode)) {
+        allStoreSlots.put(instr.startOffset, variableIndex(instr));
       }
       if (instr.opcode >= CodeConstants.opc_istore && instr.opcode <= CodeConstants.opc_astore
         || instr.opcode == CodeConstants.opc_putfield || instr.opcode == CodeConstants.opc_putstatic
@@ -547,6 +555,7 @@ public final class RoundTrip {
     STORE_SITES.put(method, storeSites);
     LOAD_SITES.put(method, loadSites);
     STORE_SLOTS.put(method, storeSlots);
+    ALL_STORE_SLOTS.put(method, allStoreSlots);
     MATCH_CATCH_SLOTS.put(method, matchCatchSlots);
     HANDOVER_STARTS.put(method, handoverStarts(method));
   }
@@ -2433,6 +2442,27 @@ public final class RoundTrip {
     java.util.Map<Integer, Integer> map = method == null ? null : STORE_SLOTS.get(method);
     Integer slot = map == null ? null : map.get(offset);
     return slot == null ? -1 : slot;
+  }
+
+  /**
+   * The first store instruction starting after this offset and the slot it writes, as
+   * {@code {start offset, slot}}, or null. Both operand forms are covered; the instruction
+   * sequence itself is gone by print time.
+   */
+  public static int[] firstStoreAfter(StructMethod method, int offset) {
+    java.util.Map<Integer, Integer> map = method == null ? null : ALL_STORE_SLOTS.get(method);
+    if (map == null || offset < 0) {
+      return null;
+    }
+    int best = -1;
+    int slot = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : map.entrySet()) {
+      if (entry.getKey() > offset && (best < 0 || entry.getKey() < best)) {
+        best = entry.getKey();
+        slot = entry.getValue();
+      }
+    }
+    return best < 0 ? null : new int[]{best, slot};
   }
 
   /** Whether the method loads this slot anywhere. */

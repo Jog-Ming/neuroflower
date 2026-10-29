@@ -240,12 +240,20 @@ public class CatchStatement extends Statement {
 
       VarExprent var = vars.get(i - 1);
 
+      // A catch parameter with no table row and a folded statement whose stores prove the body
+      // was not empty: the source wrote Java 25's unnamed pattern `_`, and the statement ran
+      // inside the block rather than after it.
+      boolean unnamedParameter = i == stats.size() - 1 && stat.getExprents() != null
+        && !stat.getExprents().isEmpty() && getParent() != null
+        && (getParent().type == StatementType.SEQUENCE || getParent().type == StatementType.ROOT)
+        && catchScopeEnd(stat) < 0 && unnamedCatchParameter(stat, var.getIndex());
+
       // A rename for a lambda clash reaches the uses (which lose their lvt) but not this
       // declaration. The renamed form extends the lvt name; a synthetic varN from the processor
       // does not, and there the lvt is the right name.
       String mapped = var.getProcessor() == null ? null
         : var.getProcessor().getVarName(var.getVarVersionPair());
-      if (mapped != null && var.getLVT() != null && !mapped.equals(var.getLVT().getName())
+      if (!unnamedParameter && mapped != null && var.getLVT() != null && !mapped.equals(var.getLVT().getName())
           && mapped.startsWith(var.getLVT().getName())) {
         var.setLVT(null);
       }
@@ -254,7 +262,11 @@ public class CatchStatement extends Statement {
 
       // Temporarily set variable as not a definition, since we just wrote the type above
       try (var v = var.new DefinitionLocker()) {
-        buf.append(var.toJava(indent));
+        if (unnamedParameter) {
+          buf.append("_");
+        } else {
+          buf.append(var.toJava(indent));
+        }
       }
 
       buf.append(") {").appendLineSeparator();
@@ -289,7 +301,7 @@ public class CatchStatement extends Statement {
       // folds such a tail into the handler, which lengthens the scope by the tail's first
       // statement. Print the tail after the brace, where the variable table says it belongs.
       List<Exprent> tail = null;
-      if (i == stats.size() - 1 && stat.getExprents() != null
+      if (!unnamedParameter && i == stats.size() - 1 && stat.getExprents() != null
           && getParent() != null
           && (getParent().type == StatementType.SEQUENCE || getParent().type == StatementType.ROOT)) {
         int scopeEnd = catchScopeEnd(stat);
@@ -451,6 +463,35 @@ public class CatchStatement extends Statement {
     }
     return lvt.matchingVars(block.getInstruction(0).operand(0), body)
       .findFirst().map(StructLocalVariableTableAttribute.LocalVariable::getEnd).orElse(-1);
+  }
+
+  /**
+   * True when the class file proves the catch parameter was written as Java 25's unnamed pattern
+   * `_` and the statement the decompiler folded after the brace ran inside the body. javac writes
+   * no table row for `_` — and none for an empty body either — so the row's absence alone does
+   * not say where the body ended; the slot does. A body inside the catch keeps the parameter
+   * live, so the folded statement's first store — the return's value temporary — takes a higher
+   * slot; after an empty catch javac is free to reuse the parameter's own slot for it.
+   */
+  private static boolean unnamedCatchParameter(Statement handler, int varIndex) {
+    if (!RoundTrip.selector("emptycatch")) {
+      return false;
+    }
+    int body = emptyCatchBodyStart(handler, varIndex);
+    BasicBlock block = handler.getBasichead() == null ? null : handler.getBasichead().getBlock();
+    if (body < 0 || block == null) {
+      return false;
+    }
+    int slot = block.getInstruction(0).operand(0);
+    StructMethod mt = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    int[] store = RoundTrip.firstStoreAfter(mt, body);
+    int end = RoundTrip.lastEnd(handler);
+    // The store has to belong to the statement the decompiler folded into the handler, not to
+    // code the source wrote after the try/catch.
+    if (store == null || (end >= 0 && store[0] > end)) {
+      return false;
+    }
+    return store[1] > slot;
   }
 
   /**
