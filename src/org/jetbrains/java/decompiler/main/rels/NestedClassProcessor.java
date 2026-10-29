@@ -9,6 +9,7 @@ import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.main.collectors.VarNamesCollector;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdgeType;
@@ -242,6 +243,14 @@ public class NestedClassProcessor {
                   originalVersions.put(varVersion, paramVersion);
                   mapNewNames.put(varVersion, enclosingVarProc.getVarName(paramVersion));
                   lvts.put(varVersion, ((VarExprent)param).getLVT());
+                  // A capture the enclosing method records as one of its `this` variables (a
+                  // member class's outer instance) is a `this` of the lambda too: an unqualified
+                  // creation of the outer's inner class inside the body resolves to it, and the
+                  // target's null check records whether the source qualified that creation.
+                  String capturedThis = enclosingVarProc.getThisVars().get(paramVersion);
+                  if (capturedThis != null && RoundTrip.selector("implicit-enclosing-capture")) {
+                    varProc.getThisVars().put(varVersion, capturedThis);
+                  }
                   if (enclosingVarProc.getVarFinal(paramVersion) == FinalType.NON_FINAL) {
                     //DecompilerContext.getLogger().writeMessage("Lambda in " + parent.simpleName + "." + enclosingMethod.methodStruct.getName() + " given non-final var " + ((VarExprent)param).getName() + "!", IFernflowerLogger.Severity.ERROR);
                   }
