@@ -1203,6 +1203,107 @@ public class SequenceStatement extends Statement {
         }
       }
 
+      // `if (!C) { E } rest…` where the target's branch lands on E and a join jump inside the
+      // statements printed after the guard skips E: the source wrote `if (C) { rest… } else { E }`.
+      // E is the arm the source wrote as its else and ends the path; printing it as a guard would
+      // run the source's then arm on E's path as well.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && hasContent(stats.subList(i + 1, stats.size()))) {
+        java.util.List<Statement> run = stats.subList(i + 1, stats.size());
+        int continuation = RoundTrip.realElseContinuation(ifStatement.getHeadexprent(),
+          ifStatement.getIfstat(), run);
+        if (continuation >= 0) {
+          // The statements starting before the join are the source's then arm; a basic block that
+          // straddles the join keeps its exprents before it in the arm and prints the rest after.
+          int end = i + 1;
+          while (end < stats.size() && RoundTrip.statementOffset(stats.get(end)) < continuation) {
+            end++;
+          }
+          Statement lastThen = stats.get(end - 1);
+          java.util.List<Exprent> thenExprents = lastThen.getExprents();
+          int cut = thenExprents == null ? -1 : thenExprents.size();
+          if (thenExprents != null) {
+            for (int k = 0; k < thenExprents.size(); k++) {
+              if (RoundTrip.firstExprentOffset(thenExprents.get(k)) >= continuation) {
+                cut = k;
+                break;
+              }
+            }
+          }
+          IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+          head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+          for (int k = i + 1; k < end - 1; k++) {
+            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+          }
+          if (thenExprents == null) {
+            buf.append(ExprProcessor.jmpWrapper(lastThen, indent + 1, end - 1 == i + 1));
+          } else if (cut == thenExprents.size()) {
+            buf.append(ExprProcessor.jmpWrapper(lastThen, indent + 1, end - 1 == i + 1));
+          } else if (cut > 0) {
+            buf.append(ExprProcessor.listToJava(thenExprents.subList(0, cut), indent + 1));
+          }
+          buf.appendIndent(indent).append("} else {").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          if (thenExprents != null && cut < thenExprents.size()) {
+            buf.append(ExprProcessor.listToJava(thenExprents.subList(cut, thenExprents.size()), indent));
+          }
+          for (int k = end; k < stats.size(); k++) {
+            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent, k == end));
+          }
+          notempty = true;
+          break;
+        }
+      }
+
+      // `if (C) { A } rest…` where the target's branch lands on the first statement after the
+      // guard and A ends with a join jump over all of them: the source wrote `if (C) { A }
+      // else { rest… }`. A written guard has no such jump: its branch skips the arm.
+      if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() != null
+          && hasContent(stats.subList(i + 1, stats.size()))
+          && RoundTrip.guardThenArm(ifStatement.getHeadexprent(), ifStatement.getIfstat(),
+               stats.subList(i + 1, stats.size()))) {
+        IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
+        Statement arm = ifStatement.getIfstat();
+        // The arm ends with a copy of the method's final return; the joined flow prints that
+        // return once after the whole if, so the copy must not print inside the arm.
+        Statement armCopy = null;
+        if (arm instanceof SequenceStatement armSeq && !armSeq.getStats().isEmpty()) {
+          Statement lastChild = armSeq.getStats().get(armSeq.getStats().size() - 1);
+          if (RoundTrip.tailReturnCopyOffset(lastChild) >= 0) {
+            armCopy = lastChild;
+          }
+        }
+        buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+        buf.append(ifStatement.getFirst().toJava(indent));
+        buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+        if (armCopy != null) {
+          ((SequenceStatement) arm).getStats().removeWithKey(armCopy.id);
+        }
+        try {
+          buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
+        } finally {
+          if (armCopy != null) {
+            ((SequenceStatement) arm).getStats().addWithKey(armCopy, armCopy.id);
+          }
+        }
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(
+          new SequenceStatement(stats.subList(i + 1, stats.size())), indent + 1, true));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
+      }
+
       // `if (C) { A } return X;` where the target's then-arm ends with a jump over the returning
       // block: the source wrote `if (C) { A } else { return X; }`, and only the false path returns.
       // Without that jump the arm falls into the return and the trailing print is the faithful one.

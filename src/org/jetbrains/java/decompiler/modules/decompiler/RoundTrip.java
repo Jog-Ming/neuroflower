@@ -1887,6 +1887,85 @@ public final class RoundTrip {
     return end == null ? -1 : end;
   }
 
+  /**
+   * True when the target proves this store was written inside a catch body: it lies in the
+   * handler's code, past the handler's first instruction and before the enclosing protected
+   * range's next boundary, and only the handler's path reaches it — the try's own normal exit
+   * jumps elsewhere. A statement written after the try/catch is the fall-through the try's
+   * normal path takes, so the normal-exit jump lands exactly on its first instruction; there the
+   * store is outside the handler's reach and the flatten is the source's own shape.
+   */
+  public static boolean catchArmWitness(int storeOffset, StructMethod method) {
+    if (!selector("catchstore") || method == null || storeOffset < 0) {
+      return false;
+    }
+    java.util.List<int[]> ranges = EXCEPTION_RANGES.get(method);
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    if (ranges == null || ranges.isEmpty() || ends == null || !ends.containsKey(storeOffset)) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> tryExits = TRY_EXIT_TARGETS.get(method);
+    for (int[] range : ranges) {
+      int handlerStart = range[2];
+      if (handlerStart < 0 || handlerStart >= storeOffset) {
+        continue;
+      }
+      int handlerEnd = handlerRegionEnd(method, handlerStart);
+      if (handlerEnd < 0 || storeOffset >= handlerEnd) {
+        continue;
+      }
+      Integer normalExit = tryExits == null ? null : tryExits.get(handlerStart);
+      if (normalExit != null && normalExit == storeOffset) {
+        continue;
+      }
+      if (dominates(method, handlerStart, storeOffset)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The first offset that cannot belong to the handler at this offset. javac closes the catch
+   * parameter's table row at the source's closing brace, so that row's end is the handler's own
+   * end: a store past it was written outside the catch. Without the row the nearest protected
+   * range boundary after the handler is the best evidence.
+   */
+  private static int handlerRegionEnd(StructMethod method, int handlerStart) {
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    Integer body = ends == null ? null : ends.get(handlerStart);
+    FullInstructionSequence seq = method.getInstructionSequence();
+    StructLocalVariableTableAttribute table = method.getLocalVariableAttr();
+    if (body != null && seq != null && table != null) {
+      Integer index = seq.offsetToIndex().get(handlerStart);
+      Instruction store = index == null ? null : seq.getInstr(index);
+      if (store != null && store.opcode == CodeConstants.opc_astore) {
+        java.util.Optional<LocalVariable> row = table.matchingVars(store.operand(0), body).findFirst();
+        if (row.isPresent() && row.get().getEnd() > handlerStart) {
+          return row.get().getEnd();
+        }
+      }
+    }
+    int best = -1;
+    java.util.List<int[]> ranges = EXCEPTION_RANGES.get(method);
+    if (ranges != null) {
+      for (int[] range : ranges) {
+        for (int boundary : new int[]{range[0], range[1], range[2]}) {
+          if (boundary > handlerStart && boundary != Integer.MAX_VALUE
+              && (best < 0 || boundary < best)) {
+            best = boundary;
+          }
+        }
+      }
+    }
+    Integer last = LAST_INSTRUCTION.get(method);
+    Integer lastEnd = last == null || ends == null ? null : ends.get(last);
+    if (lastEnd != null && lastEnd > handlerStart && (best < 0 || lastEnd < best)) {
+      best = lastEnd;
+    }
+    return best;
+  }
+
   /** The first handler offset of the try/catch whose body is being printed right now, or -1. */
   private static final ThreadLocal<Integer> TRY_BODY_HANDLER = new ThreadLocal<>();
   /** Returns a try body's print hands to the try, to print after its catch, in print order. */
@@ -7086,6 +7165,406 @@ public final class RoundTrip {
     }
 
     return flat > 0 && realElse == 0;
+  }
+
+  /** As {@link #elseArmWitness(Exprent, Statement, Statement, StructMethod)}, with the ambient method. */
+  public static boolean elseArmWitness(Exprent head, Statement thenArm, Statement elseArm) {
+    return elseArmWitness(head, thenArm, elseArm, currentMethod());
+  }
+
+  /**
+   * True when the target proves the source wrote a real {@code if (C) { thenArm } else { elseArm }}:
+   * the head's last branch lands on the else arm, the head falls through into the then arm, the
+   * then arm's tail is a single jump that skips the whole else arm, and the else arm ends the path
+   * with a return or a throw. A guard has no such merge jump — javac reaches what the source wrote
+   * next by falling out of the arm on its other edge — so the jump is the fact that separates the
+   * two forms. Printing the guard instead runs the then arm's code again on the else path.
+   *
+   * <p>{@code method} is the target's method: the prettify pass runs outside the printing pass,
+   * where the ambient method belongs to whichever method the context saw last.
+   */
+  public static boolean elseArmWitness(Exprent head, Statement thenArm, Statement elseArm,
+                                       StructMethod method) {
+    if (!selector("realelse") || head == null || thenArm == null || elseArm == null || method == null) {
+      return false;
+    }
+    BitSet offsets = head.bytecode;
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    BitSet noFallThrough = NO_FALLTHROUGH.get(method);
+    if (offsets == null || offsets.isEmpty() || ends == null || targets == null || gotos == null
+        || byEnd == null || noFallThrough == null) {
+      return false;
+    }
+    // A pattern variable declares its type in the test; a guard would keep that declaration and
+    // the real else would move it into the arm, so neither reading is printable here.
+    if (head instanceof IfExprent ifHead && ifHead.getCondition() != null
+        && declaresPatternVariable(ifHead.getCondition())) {
+      return false;
+    }
+    // An unconditional jump inside the test region is a guard the tree fused into the condition:
+    // the source wrote several statements, not one if/else.
+    for (int at = offsets.nextSetBit(0); at >= 0; at = offsets.nextSetBit(at + 1)) {
+      if (gotos.containsKey(at)) {
+        return false;
+      }
+    }
+    int thenStart = firstOffset(thenArm);
+    int elseStart = firstOffset(elseArm);
+    int thenEnd = lastEndWithin(thenArm, ends);
+    int elseEnd = lastEndWithin(elseArm, ends);
+    int lastHead = offsets.previousSetBit(Integer.MAX_VALUE);
+    if (thenStart < 0 || elseStart < 0 || thenEnd < 0 || elseEnd < 0 || lastHead < 0) {
+      return false;
+    }
+    Integer headEnd = ends.get(lastHead);
+    if (headEnd == null) {
+      return false;
+    }
+    // The condition's last branch is the one javac sends to the else arm.
+    int target = -1;
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end)) {
+        target = targets.get(end);
+      }
+    }
+    if (target != elseStart || headEnd != thenStart) {
+      return false;
+    }
+    // The then arm's tail is the merge jump over the else arm. A goto that lands inside the arm
+    // is the arm's own flow, and one that lands before it cannot skip it.
+    Integer after = gotos.get(thenEnd);
+    if (after == null || after < elseEnd) {
+      return false;
+    }
+    Integer lastElse = byEnd.get(elseEnd);
+    if (lastElse == null || !noFallThrough.get(lastElse)) {
+      return false;
+    }
+    // A branch into the middle of the else arm makes it a join, not the arm the source wrote.
+    for (Integer to : targets.values()) {
+      if (to != null && to > elseStart && to < elseEnd) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Last instruction end a statement covers, read from the given method's instruction table. */
+  private static int lastEndWithin(Statement stat, java.util.Map<Integer, Integer> ends) {
+    int max = -1;
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+    queue.add(stat);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          for (Exprent inner : exprent.getAllExprents(true, true)) {
+            BitSet bits = inner.bytecode;
+            if (bits == null) {
+              continue;
+            }
+            for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+              Integer end = ends.get(off);
+              if (end != null && end > max) {
+                max = end;
+              }
+            }
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return max;
+  }
+
+  /**
+   * The offset where the code after a guard's real if/else starts, or -1. The target proves the
+   * source wrote {@code if (C) { <the statements printed after the guard, up to this offset> }
+   * else { <guard's arm> }}: the condition's last branch lands on the guard's arm, the head falls
+   * through into the statements printed after it, the arm ends the path with a return or a throw,
+   * and a join jump inside those statements skips the whole arm. Printing the arm as a guard
+   * would run the source's then arm on its path as well. The caller splits the statements at the
+   * returned offset and prints the arm as the else.
+   */
+  public static int realElseContinuation(Exprent head, Statement arm, java.util.List<Statement> rest) {
+    return realElseContinuation(head, arm, rest, currentMethod());
+  }
+
+  /** As {@link #realElseContinuation(Exprent, Statement, java.util.List)}, for a known method. */
+  public static int realElseContinuation(Exprent head, Statement arm, java.util.List<Statement> rest,
+                                         StructMethod method) {
+    if (!selector("realelse") || head == null || arm == null || rest == null || rest.isEmpty()
+        || method == null) {
+      return -1;
+    }
+    BitSet offsets = head.bytecode;
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    BitSet noFallThrough = NO_FALLTHROUGH.get(method);
+    if (offsets == null || offsets.isEmpty() || ends == null || targets == null || gotos == null
+        || byEnd == null || noFallThrough == null) {
+      return -1;
+    }
+    // An unconditional jump inside the test is a guard the tree fused into the condition.
+    for (int at = offsets.nextSetBit(0); at >= 0; at = offsets.nextSetBit(at + 1)) {
+      if (gotos.containsKey(at)) {
+        return -1;
+      }
+    }
+    int armStart = statementOffset(arm);
+    int armEnd = lastEndWithin(arm, ends);
+    int headEnd = offsets.length();
+    if (armStart < 0 || armEnd < armStart) {
+      return -1;
+    }
+    // The condition's last branch is the one javac sends to the else arm.
+    if (lastBranchTargetIn(offsets, ends, targets) != armStart) {
+      return -1;
+    }
+    // The arm is the else and leaves the path itself.
+    Integer lastArm = byEnd.get(armEnd);
+    if (lastArm == null || !noFallThrough.get(lastArm)) {
+      return -1;
+    }
+    for (Integer to : targets.values()) {
+      if (to != null && to > armStart && to < armEnd) {
+        return -1;
+      }
+    }
+    // The then arm starts where the head's fall-through lands. A pattern condition stores its
+    // variable in the few instructions right after the test; the source wrote the declaration in
+    // the test, so the gap up to the arm is the bind, not code.
+    int thenStart = statementOffset(rest.get(0));
+    if (thenStart < headEnd) {
+      return -1;
+    }
+    boolean patternGap = head instanceof IfExprent ifHead && ifHead.getCondition() != null
+      && declaresPatternVariable(ifHead.getCondition());
+    if (thenStart != headEnd && !(patternGap && thenStart - headEnd <= 8)) {
+      return -1;
+    }
+    // The join jump: javac ends the source's then arm with a jump that skips the else arm. It
+    // starts where one of the then arm's instructions ends, precedes the else arm physically,
+    // and lands on a boundary of the printed run at or after the arm's end.
+    int continuation = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      int from = entry.getKey();
+      int to = entry.getValue();
+      if (from < headEnd || from >= armStart || to < armEnd || to <= thenStart) {
+        continue;
+      }
+      if (!endsAnExprent(rest, from, to, ends)) {
+        continue;
+      }
+      if (!startsRunPart(rest, to)) {
+        continue;
+      }
+      if (continuation < 0 || to < continuation) {
+        continuation = to;
+      }
+    }
+    return continuation;
+  }
+
+  /**
+   * True when the target proves the source's then arm is the guard's own arm and the statements
+   * after it are its else: the condition's last branch lands on the first following statement,
+   * the head falls through into the arm, the arm's last instruction is a return or throw, and
+   * the arm ends with a jump over every following statement to the join. A written guard keeps
+   * its arm first and has no such jump — its branch skips the arm to the following statements.
+   */
+  public static boolean guardThenArm(Exprent head, Statement arm, java.util.List<Statement> rest) {
+    return guardThenArm(head, arm, rest, currentMethod());
+  }
+
+  /** As {@link #guardThenArm(Exprent, Statement, java.util.List)}, for a known method. */
+  public static boolean guardThenArm(Exprent head, Statement arm, java.util.List<Statement> rest,
+                                     StructMethod method) {
+    if (!selector("realelse") || head == null || arm == null || rest == null || rest.isEmpty()
+        || method == null) {
+      return false;
+    }
+    BitSet offsets = head.bytecode;
+    java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    java.util.Map<Integer, Integer> byEnd = INSTRUCTION_BY_END.get(method);
+    BitSet noFallThrough = NO_FALLTHROUGH.get(method);
+    if (offsets == null || offsets.isEmpty() || ends == null || targets == null || gotos == null
+        || byEnd == null || noFallThrough == null) {
+      return false;
+    }
+    for (int at = offsets.nextSetBit(0); at >= 0; at = offsets.nextSetBit(at + 1)) {
+      if (gotos.containsKey(at)) {
+        return false;
+      }
+    }
+    int armStart = statementOffset(arm);
+    int headEnd = offsets.length();
+    if (armStart < 0 || armStart != headEnd) {
+      return false;
+    }
+    int runStart = statementOffset(rest.get(0));
+    int runEnd = -1;
+    for (Statement stat : rest) {
+      int end = lastEndWithin(stat, ends);
+      if (end > runEnd) {
+        runEnd = end;
+      }
+    }
+    if (runStart < 0 || runEnd < runStart) {
+      return false;
+    }
+    // The branch lands on the else arm, and the else arm ends the path.
+    if (lastBranchTargetIn(offsets, ends, targets) != runStart) {
+      return false;
+    }
+    Integer lastRun = byEnd.get(runEnd);
+    if (lastRun == null || !noFallThrough.get(lastRun)) {
+      return false;
+    }
+    // The then arm's own code ends with a return/throw whose instruction is followed by the join
+    // jump over the whole else arm. A `break;`/`continue;` arm ends with the jump itself and is
+    // no evidence of an else.
+    int armEnd = lastEndWithoutTailCopy(arm, method, ends);
+    if (armEnd < 0) {
+      return false;
+    }
+    Integer lastArm = byEnd.get(armEnd);
+    Integer after = gotos.get(armEnd);
+    return lastArm != null && noFallThrough.get(lastArm) && after != null && after > runEnd;
+  }
+
+  /** The last branch target among the head's offsets, read from the given method's tables. */
+  private static int lastBranchTargetIn(BitSet offsets, java.util.Map<Integer, Integer> ends,
+                                        java.util.Map<Integer, Integer> targets) {
+    int target = -1;
+    for (int offset = offsets.nextSetBit(0); offset >= 0; offset = offsets.nextSetBit(offset + 1)) {
+      Integer end = ends.get(offset);
+      if (end != null && targets.containsKey(end)) {
+        target = targets.get(end);
+      }
+    }
+    return target;
+  }
+
+  /** True when a goto at {@code from} starts where an exprent of the run ends before {@code to}. */
+  private static boolean endsAnExprent(java.util.List<Statement> rest, int from, int to,
+                                       java.util.Map<Integer, Integer> ends) {
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>(rest);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          int start = firstExprentOffset(exprent);
+          if (start < 0 || start >= to) {
+            continue;
+          }
+          if (lastEndWithin(exprent, ends) == from) {
+            return true;
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return false;
+  }
+
+  /** True when an offset is where a statement or one of its exprents begins. */
+  private static boolean startsRunPart(java.util.List<Statement> rest, int offset) {
+    java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>(rest);
+    while (!queue.isEmpty()) {
+      Statement cur = queue.poll();
+      if (statementOffset(cur) == offset) {
+        return true;
+      }
+      List<Exprent> exprents = cur.getExprents();
+      if (exprents != null) {
+        for (Exprent exprent : exprents) {
+          if (firstExprentOffset(exprent) == offset) {
+            return true;
+          }
+        }
+      }
+      queue.addAll(cur.getStats());
+    }
+    return false;
+  }
+
+  /** The last instruction end an exprent covers, mirroring {@link #lastEnd(Statement)}. */
+  private static int lastEndWithin(Exprent exprent, java.util.Map<Integer, Integer> ends) {
+    int max = -1;
+    for (Exprent inner : exprent.getAllExprents(true, true)) {
+      BitSet bits = inner.bytecode;
+      if (bits == null) {
+        continue;
+      }
+      for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+        Integer end = ends.get(off);
+        if (end != null && end > max) {
+          max = end;
+        }
+      }
+    }
+    return max;
+  }
+
+  /**
+   * The last instruction end of an arm's own code, ignoring a trailing copy of the method's
+   * final return: the copy is the join's instruction, printed after the whole if, not the arm's.
+   */
+  private static int lastEndWithoutTailCopy(Statement arm, StructMethod method,
+                                            java.util.Map<Integer, Integer> ends) {
+    Statement last = arm;
+    while (last != null && last.getExprents() == null && !last.getStats().isEmpty()) {
+      last = last.getStats().get(last.getStats().size() - 1);
+    }
+    if (last != null && last.getExprents() != null && !last.getExprents().isEmpty()) {
+      Exprent tail = last.getExprents().get(last.getExprents().size() - 1);
+      Integer methodLast = LAST_INSTRUCTION.get(method);
+      if (tail instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent exit
+          && exit.getExitType() == org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent.Type.RETURN
+          && tail.bytecode != null && !tail.bytecode.isEmpty() && methodLast != null
+          && tail.bytecode.previousSetBit(Integer.MAX_VALUE) == methodLast) {
+        int max = -1;
+        java.util.ArrayDeque<Statement> queue = new java.util.ArrayDeque<>();
+        queue.add(arm);
+        while (!queue.isEmpty()) {
+          Statement cur = queue.poll();
+          List<Exprent> exprents = cur.getExprents();
+          if (exprents != null) {
+            for (Exprent exprent : exprents) {
+              if (exprent == tail) {
+                continue;
+              }
+              for (Exprent inner : exprent.getAllExprents(true, true)) {
+                BitSet bits = inner.bytecode;
+                if (bits == null) {
+                  continue;
+                }
+                for (int off = bits.nextSetBit(0); off >= 0; off = bits.nextSetBit(off + 1)) {
+                  Integer end = ends.get(off);
+                  if (end != null && end > max) {
+                    max = end;
+                  }
+                }
+              }
+            }
+          }
+          queue.addAll(cur.getStats());
+        }
+        return max;
+      }
+    }
+    return lastEndWithin(arm, ends);
   }
 
   /**

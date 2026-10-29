@@ -375,6 +375,12 @@ public class MergeHelper {
     if (inc == null) {
       return false;
     }
+    // This lift is only right when the try always leaves the method, so the update runs solely
+    // when the catch catches. A store only the handler's path reaches was written inside the
+    // catch body; lifting it into the header would run it after the try's normal path too.
+    if (RoundTrip.catchArmWitness(RoundTrip.firstExprentOffset(inc), RoundTrip.currentMethod())) {
+      return false;
+    }
 
     boolean hasinit = false;
     Statement pre = null;
@@ -543,6 +549,19 @@ public class MergeHelper {
         ? new ArrayList<>(lastData.getExprents().subList(updateFrom, lastData.getExprents().size()))
         : Collections.singletonList(lastExp);
 
+      // A store the catch's path alone reaches was written inside the catch body: lifting it into
+      // the for header would run it after every iteration, including the try's normal path. The
+      // handler region and the try's normal-exit jump are the class file's proof of where it ran.
+      // Only a loop whose own body is the try/catch can merge this way; a loop nested inside a
+      // catch keeps its own update at its back edge, still inside the handler.
+      if (catchBodyUpdate(stat, lastData)) {
+        for (Exprent move : moved) {
+          if (RoundTrip.catchArmWitness(RoundTrip.firstExprentOffset(move), RoundTrip.currentMethod())) {
+            return;
+          }
+        }
+      }
+
       // A for header's update takes the header's line while a while body's last statement takes
       // its own: a distinct line proves the source kept this exprent in the body, so the loop stays
       // a while and the exprent prints where the source wrote it (inside a guard's arm, for one).
@@ -617,6 +636,15 @@ public class MergeHelper {
     }
 
     cleanEmptyStatements(stat, lastData);
+  }
+
+  /** True when the loop's own body is the try/catch statement {@code lastData} belongs to. */
+  private static boolean catchBodyUpdate(DoStatement stat, Statement lastData) {
+    Statement first = stat.getFirst();
+    while (first instanceof SequenceStatement && first.getStats().size() == 1) {
+      first = first.getFirst();
+    }
+    return first.type == Statement.StatementType.TRY_CATCH && first.containsStatement(lastData);
   }
 
   private static Set<VarExprent> getFinalVariables(Statement stat, Set<VarExprent> variables) {

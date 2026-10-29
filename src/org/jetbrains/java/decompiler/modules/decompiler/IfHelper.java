@@ -930,6 +930,13 @@ public final class IfHelper {
       if (ifStat != null && isExit(ifStat)) {
         // TODO: if the same var exprents are found in the if and an if-inside-the-else, try to keep as else if
 
+        // The class file's real else: the head's last branch lands on the else arm and the then
+        // arm ends with a merge jump that skips it. Dissolving the else would print the exiting
+        // then arm as a guard and run the source's then arm on both paths.
+        if (RoundTrip.elseArmWitness(ifSt.getHeadexprent(), elseStat, ifStat, method)) {
+          return false;
+        }
+
         // If the inside of the if is only one return/throw, be more aggressive in reordering
         boolean force = ifStat.getExprents().size() == 1 && elseStat.getExprents() != null && elseStat.getExprents().size() > 1;
         if (!force) {
