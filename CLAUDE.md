@@ -117,7 +117,7 @@ killed after `--timeout` minutes per version (default 15); its staging tree is d
 devtools/cli versions [--no-cache]                    list Mojang's versions
 devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class] [--options "..."] [--timeout minutes]
 devtools/cli tree      <version> [--only Class]       print the cached tree path
-devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--options "..."] [--timeout minutes] [--since Tree]
+devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--options "..."] [--timeout minutes] [--since Tree]
 devtools/cli diff      <version> <Class> [<Class>...]  verify classes and explain every failing attribute
 devtools/cli compile   <version> <Class>             compile that one class like the verifier does
 devtools/cli corpus    <version> --ground-truth <dir> write the class-to-ground-truth corpus
@@ -127,11 +127,11 @@ devtools/cli clean     [--trees] [--compile] [--downloads] [--all]
 devtools/cli cache     [--measure]                    show cache usage; --measure sizes old trees once
 ```
 
-Several versions in one `score` run, `--jobs` at a time (default 1: two decompiles beside the
-verifier's javac exhaust the machine's page file — measured, the second JVM died at startup with
-`os::commit_memory ... the paging file is too small`), with the thread count
-split across them; logs go to `.dev/tmp/score-<version>.out`. A single version is the normal
-iteration loop; score the whole goal set only after a batch of large gains.
+Several versions in one `score` run are scored one after another — there is no concurrency
+switch, because two decompiles beside the verifier's javac exhaust this machine's page file
+(measured: the second JVM died at startup with `os::commit_memory ... the paging file is too
+small`); logs go to `.dev/tmp/score-<version>.out`. A single version is the normal iteration
+loop; score the whole goal set only after a batch of large gains.
 
 **Changing this interface means changing this block.** Any new, removed or renamed command, flag or
 default must be reflected here in the same change; an out-of-date usage block is a broken interface.

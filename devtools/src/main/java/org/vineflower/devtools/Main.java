@@ -23,7 +23,7 @@ import java.util.concurrent.Future;
  *   versions [--no-cache]
  *   decompile &lt;version&gt; [--no-cache] [--threads N] [--only Class] [--options "..."]
  *   tree      &lt;version&gt; [--only Class]
- *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--since Tree]
+ *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--since Tree]
  *   diff      &lt;version&gt; &lt;Class&gt; [&lt;Class&gt;...]
  *   compile   &lt;version&gt; &lt;Class&gt;
  *   corpus    &lt;version&gt; --ground-truth &lt;dir&gt;
@@ -189,9 +189,10 @@ public final class Main {
   }
 
   /**
-   * Scores several versions concurrently, one child process per version: their trees, verifier
-   * heaps and decompiler processes are independent. Threads are split across the jobs, so the
-   * machine is not oversubscribed. Logs: {@code .dev/tmp/score-<version>.out}.
+   * Scores several versions one after another, one child process per version. Serial by
+   * construction: two decompiles beside the verifier's javac exhaust this machine's page file
+   * (measured: the second JVM dies at startup with os::commit_memory "the paging file is too
+   * small"), so there is no concurrency knob. Logs: {@code .dev/tmp/score-<version>.out}.
    */
   private static void scoreMany(Workspace workspace, List<String> versions, List<String> rest)
       throws Exception {
@@ -201,73 +202,57 @@ public final class Main {
     if (new java.util.HashSet<>(versions).size() != versions.size()) {
       throw new IllegalArgumentException("duplicate version in " + versions);
     }
-    // One version at a time by default: two decompiles beside the verifier's javac exhaust this
-    // machine's page file — measured with the heap cap at 8 GB, the second JVM died at startup
-    // with os::commit_memory "the paging file is too small" before decompiling anything.
-    int jobs = Math.max(1, Math.min(versions.size(), intFlag(rest, "--jobs", 1)));
+    if (rest.contains("--jobs")) {
+      throw new IllegalArgumentException("--jobs was removed: versions run one at a time");
+    }
     int timeout = intFlag(rest, "--timeout", 15);
-    int threads = intFlag(rest, "--threads",
-      Math.max(1, Runtime.getRuntime().availableProcessors() / jobs));
+    int threads = intFlag(rest, "--threads", Runtime.getRuntime().availableProcessors());
     boolean noCache = rest.contains("--no-cache");
     Path jar = Path.of(Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
     Path java = Path.of(System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java");
     Files.createDirectories(workspace.tmp);
-    System.out.printf(Locale.ROOT, "scoring %d versions, %d at a time, %d threads each%n",
-      versions.size(), jobs, threads);
+    System.out.printf(Locale.ROOT, "scoring %d versions one at a time, %d threads each%n",
+      versions.size(), threads);
 
-    ExecutorService pool = Executors.newFixedThreadPool(jobs);
-    List<Future<String>> futures = new ArrayList<>();
     long started = System.nanoTime();
-    try {
-      for (String version : versions) {
-        futures.add(pool.submit(() -> {
-          Path log = workspace.tmp.resolve("score-" + version + ".out");
-          List<String> command = new ArrayList<>(List.of(java.toString(), "-jar", jar.toString(),
-            "score", version, "--threads", Integer.toString(threads), "--json",
-            "--timeout", Integer.toString(timeout)));
-          if (noCache) {
-            command.add("--no-cache");
-          }
-          long begin = System.nanoTime();
-          ProcessBuilder builder = new ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .redirectOutput(log.toFile());
-          // This process may itself have been re-executed into one version's JDK; a child must be
-          // free to pick its own, or every version after the first compiles at the wrong release.
-          builder.environment().remove(REEXEC);
-          Process process = builder.start();
-          boolean finished = process.waitFor(timeout, TimeUnit.MINUTES);
-          long seconds = (System.nanoTime() - begin) / 1_000_000_000L;
-          if (!finished) {
-            process.destroyForcibly();
-            process.waitFor();
-            return version + "\tfailed (timed out after " + timeout + "m)\t" + seconds + "s";
-          }
-          int status = process.exitValue();
-          return version + "\t" + (status == 0 ? summaryOf(log) : "failed (exit " + status + ")")
-            + "\t" + seconds + "s";
-        }));
+    int failures = 0;
+    for (String version : versions) {
+      Path log = workspace.tmp.resolve("score-" + version + ".out");
+      List<String> command = new ArrayList<>(List.of(java.toString(), "-jar", jar.toString(),
+        "score", version, "--threads", Integer.toString(threads), "--json",
+        "--timeout", Integer.toString(timeout)));
+      if (noCache) {
+        command.add("--no-cache");
       }
-      int failures = 0;
-      for (int i = 0; i < futures.size(); i++) {
-        String line;
-        try {
-          line = futures.get(i).get();
-        } catch (ExecutionException e) {
-          line = versions.get(i) + "\tfailed: " + e.getCause().getMessage() + "\t";
-        }
-        System.out.println(line);
-        if (line.contains("failed")) {
-          failures++;
-        }
+      long begin = System.nanoTime();
+      ProcessBuilder builder = new ProcessBuilder(command)
+        .redirectErrorStream(true)
+        .redirectOutput(log.toFile());
+      // This process may itself have been re-executed into one version's JDK; a child must be
+      // free to pick its own, or every version after the first compiles at the wrong release.
+      builder.environment().remove(REEXEC);
+      Process process = builder.start();
+      boolean finished = process.waitFor(timeout, TimeUnit.MINUTES);
+      long seconds = (System.nanoTime() - begin) / 1_000_000_000L;
+      String line;
+      if (!finished) {
+        process.destroyForcibly();
+        process.waitFor();
+        line = version + "\tfailed (timed out after " + timeout + "m)\t" + seconds + "s";
+      } else {
+        int status = process.exitValue();
+        line = version + "\t" + (status == 0 ? summaryOf(log) : "failed (exit " + status + ")")
+          + "\t" + seconds + "s";
       }
-      System.out.printf(Locale.ROOT, "total %ds; logs in %s%n",
-        (System.nanoTime() - started) / 1_000_000_000L, workspace.tmp);
-      if (failures > 0) {
-        throw new IllegalStateException(failures + " version(s) failed");
+      System.out.println(line);
+      if (line.contains("failed")) {
+        failures++;
       }
-    } finally {
-      pool.shutdownNow();
+    }
+    System.out.printf(Locale.ROOT, "total %ds; logs in %s%n",
+      (System.nanoTime() - started) / 1_000_000_000L, workspace.tmp);
+    if (failures > 0) {
+      throw new IllegalStateException(failures + " version(s) failed");
     }
   }
 
@@ -824,7 +809,7 @@ public final class Main {
     List<String> values = new ArrayList<>();
     for (int i = 0; i < args.size(); i++) {
       String arg = args.get(i);
-      if (arg.equals("--threads") || arg.equals("--only") || arg.equals("--jobs")
+      if (arg.equals("--threads") || arg.equals("--only")
           || arg.equals("--options") || arg.equals("--timeout") || arg.equals("--since")) {
         i++;
         continue;
@@ -870,8 +855,8 @@ public final class Main {
         versions [--no-cache]                  list Mojang's versions
         decompile <version> [--no-cache] [--threads N] [--only Class]
         tree      <version> [--only Class]    print the cached tree path
-        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--jobs N] [--timeout minutes] [--since Tree]
-                                             several versions run concurrently, --jobs at a time;
+        score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--timeout minutes] [--since Tree]
+                                             several versions run one at a time;
                                              --since lists what changed against an earlier tree
         diff      <version> <Class> [<Class>...] verify classes and explain every failing attribute
         compile   <version> <Class>            compile that one class with the verifier's javac
