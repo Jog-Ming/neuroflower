@@ -524,6 +524,17 @@ public class SwitchStatement extends Statement {
         }
       }
 
+      // The arm's own tail jump lands on the switch's join and the arm's table rows close at that
+      // jump: the source closed the brace before the `break;`, so the break stands after it. A
+      // second, distinct jump onto the same landing is the next empty group's own break, and two
+      // jumps onto one instruction are what makes that landing the join: a group the source only
+      // fell through has no jump of its own, so the arm's jump alone proves nothing.
+      boolean closedBeforeBreak = braced.contains(stat) && !breakOutside && breakJump >= 0
+        && !yields && !orderUnknown && guard == null && !patternArm && !breakInside
+        && !breakPrinted && !RoundTrip.printsExplicitJump(stat) && !tailJumpsToJoin
+        && RoundTrip.selector("switchbreak") && RoundTrip.canCompleteNormally(stat) && !armLeaves
+        && RoundTrip.anotherJumpTo(breakJump, switchEnd);
+
       if (braced.contains(stat)) {
         buf.appendIndent(indent + 1);
         buf.append("}");
@@ -531,7 +542,7 @@ public class SwitchStatement extends Statement {
         // that decide a dropped `break` apply, since the brace does not change reachability. A
         // deferred break is the one the table proves: its jump is reachable from the jump onto it.
         // A guarded arm prints its deferred break too: the proof is the table's, not the label's.
-        if ((breakOutside || deferredBreak > 0
+        if ((breakOutside || closedBeforeBreak || deferredBreak > 0
              || bracedEarly.contains(stat) && !RoundTrip.printsExplicitJump(stat))
             && (breakJump >= 0 || deferredBreak > 0) && !breakInside
             && (guard == null || deferredBreak > 0)

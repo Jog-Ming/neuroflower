@@ -8101,6 +8101,27 @@ public final class RoundTrip {
     return method == null ? null : GOTO_TARGETS.get(method);
   }
 
+  /**
+   * True when a forward goto other than the one at {@code known} lands on {@code target}: two
+   * distinct jumps onto one instruction prove both were written exits, where a group the source
+   * left to fall through has no jump of its own.
+   */
+  public static boolean anotherJumpTo(int known, int target) {
+    if (target < 0) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = gotosHere();
+    if (gotos == null) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      if (entry.getKey() != known && entry.getValue() == target && entry.getValue() > entry.getKey()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public static int blockEnd(Statement stat) {
     return stat == null ? -1 : lastEnd(stat);
   }
