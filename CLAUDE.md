@@ -127,8 +127,9 @@ devtools/cli clean     [--trees] [--compile] [--downloads] [--all]
 devtools/cli cache     [--measure]                    show cache usage; --measure sizes old trees once
 ```
 
-Several versions in one `score` run concurrently, `--jobs` at a time (default 2), with the thread
-count split across them; logs go to `.dev/tmp/score-<version>.out`. A single version is the normal
+Several versions in one `score` run, `--jobs` at a time (default 1: each decompile claims a 4 GB
+heap and two beside the verifier's javac exhausts the machine's page file), with the thread count
+split across them; logs go to `.dev/tmp/score-<version>.out`. A single version is the normal
 iteration loop; score the whole goal set only after a batch of large gains.
 
 **Changing this interface means changing this block.** Any new, removed or renamed command, flag or

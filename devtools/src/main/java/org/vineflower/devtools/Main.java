@@ -201,7 +201,10 @@ public final class Main {
     if (new java.util.HashSet<>(versions).size() != versions.size()) {
       throw new IllegalArgumentException("duplicate version in " + versions);
     }
-    int jobs = Math.max(1, Math.min(versions.size(), intFlag(rest, "--jobs", 2)));
+    // One version at a time by default: each decompile claims a 4 GB heap, and two of them
+    // beside the verifier's javac exhausts this machine's page file (which silently produces
+    // failed-method stubs when it hits the decompiler).
+    int jobs = Math.max(1, Math.min(versions.size(), intFlag(rest, "--jobs", 1)));
     int timeout = intFlag(rest, "--timeout", 15);
     int threads = intFlag(rest, "--threads",
       Math.max(1, Runtime.getRuntime().availableProcessors() / jobs));
