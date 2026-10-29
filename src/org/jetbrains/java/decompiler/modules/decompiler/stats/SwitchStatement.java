@@ -183,6 +183,16 @@ public class SwitchStatement extends Statement {
     }
     braced.addAll(bracedEarly);
 
+    // A case pattern's variables close with the switch's own block, so the table writes their rows
+    // after every local a braced arm declared; an arm whose own rows all come first closed its
+    // body on the brace before that scope ended.
+    for (int a = 0; a < caseStatements.size(); a++) {
+      if (a < caseValues.size()
+          && RoundTrip.armClosesBeforePatternVars(caseStatements.get(a), armRows.get(a), caseValues.get(a))) {
+        braced.add(caseStatements.get(a));
+      }
+    }
+
     VarType switch_type = headexprent.get(0).getExprType();
 
     // The instruction just after the whole switch: an arm whose block ends with a jump landing
@@ -414,6 +424,18 @@ public class SwitchStatement extends Statement {
           && !declaredScopePast(armRows.get(i), armClose[i])
           && RoundTrip.jumpsOnto(armClose[i]) && RoundTrip.breaksTo(stat, this)) {
         deferredBreak = armClose[i];
+      }
+      // The last arm's code runs into the switch's join and its tail jump is the join itself (the
+      // loop's back edge, in a switch a for-each body ends with): the source's `break;` stood
+      // after the arm's closing brace, and javac elided its jump because it led to the very next
+      // instruction. The table's rows end at the join, so the block closed before the break.
+      // The evidence is the arm's own table rows and its own code ending at the join, not a jump
+      // whose group could move with a reordered layout, so the print order does not unprove it.
+      if (deferredBreak < 0 && breakJump < 0 && braced.contains(stat) && !breakOutside && !yields
+          && guard == null && RoundTrip.selector("switchbreak")
+          && RoundTrip.blockEnd(stat) == switchEnd && RoundTrip.breaksTo(stat, this)
+          && RoundTrip.canCompleteNormally(stat)) {
+        deferredBreak = switchEnd;
       }
       Statement previousJump = breakOutside ? RoundTrip.suppressJump(stat) : null;
       Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(this) : null;

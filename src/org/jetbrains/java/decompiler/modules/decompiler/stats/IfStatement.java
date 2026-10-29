@@ -605,8 +605,12 @@ public class IfStatement extends Statement {
           buf.appendIndent(indent + 1).append("break label").append(trampolineBreak.id);
         } else {
           if (ifedge.getType() == StatEdge.TYPE_BREAK) {
-            // break
-            buf.appendIndent(indent + 1).append("break");
+            // A break and a continue compile alike where the break's target is the loop's back
+            // edge; the goto the head carries says whether the source's jump went to the loop's
+            // head, where only a written `continue` lands.
+            boolean continues = !ifedge.labeled && condition instanceof IfExprent ifHead
+              && RoundTrip.printContinueGuardAtHead(ifHead, this);
+            buf.appendIndent(indent + 1).append(continues ? "continue" : "break");
           }
           else {
             // continue

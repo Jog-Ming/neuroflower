@@ -6865,6 +6865,62 @@ public final class RoundTrip {
     return false;
   }
 
+  /**
+   * True when the table proves this switch arm's body was a block of its own: a case pattern's
+   * variables are declared by the label and close with the switch's block, so their rows are
+   * written after every row of a body block that closed where the arm's code ends. When the
+   * table writes all of the arm's own rows that end there before all of the pattern's rows that
+   * end there, the source braced the arm's body — an unbraced arm shares the switch's block, and
+   * javac writes its locals and the pattern's in one ascending run. Rows that end earlier than
+   * the arm close at a merge inside the body and say nothing about the arm's scope.
+   */
+  public static boolean armClosesBeforePatternVars(
+      Statement arm, java.util.List<int[]> own, java.util.List<Exprent> values) {
+    if (!selector("armbraces") || arm == null || own == null || own.isEmpty() || values == null) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    java.util.Set<Integer> patternSlots = new java.util.HashSet<>();
+    for (Exprent value : values) {
+      if (value instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent function
+          && function.getFuncType() == org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent.FunctionType.INSTANCEOF
+          && function.getAllExprents().size() > 2
+          && function.getAllExprents().get(2) instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.Pattern pattern) {
+        for (org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent var : pattern.getPatternVars()) {
+          patternSlots.add(var.getIndex());
+        }
+      }
+    }
+    if (patternSlots.isEmpty()) {
+      return false;
+    }
+    int end = lastEnd(arm);
+    if (end < 0) {
+      return false;
+    }
+    int ownLast = -1;
+    int patternFirst = Integer.MAX_VALUE;
+    for (StructLocalVariableTableAttribute.LocalVariable row : table.getVariables().toList()) {
+      if (row.getEnd() != end || row.getOrder() < 0) {
+        continue;
+      }
+      if (patternSlots.contains(row.getIndex())) {
+        patternFirst = Math.min(patternFirst, row.getOrder());
+      } else if (ownedRow(own, row)) {
+        ownLast = Math.max(ownLast, row.getOrder());
+      }
+    }
+    return ownLast >= 0 && patternFirst != Integer.MAX_VALUE && ownLast < patternFirst;
+  }
+
   /** Last instruction end covered by a statement, or -1. */
   /** Every recorded goto, keyed by its own start offset, or null without a current method. */
   public static java.util.Map<Integer, Integer> gotosHere() {
