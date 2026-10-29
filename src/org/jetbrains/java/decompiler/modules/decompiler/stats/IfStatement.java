@@ -355,6 +355,25 @@ public class IfStatement extends Statement {
       return buf;
     }
 
+    // `if (!C) { } else <arm>`: the target jumps into the arm on C being true and falls through
+    // to a jump out of it — the empty then block's exit, which a written `if (C) { <arm> }` does
+    // not have. The tree dropped the empty arm and kept the source's else as the then, so the
+    // test prints negated with the arm after the brace, as the chain's first clause when it is
+    // itself an if.
+    if (ifstat != null && elsestat == null && !isLabeled() && !isPatternMatched()
+        && condition instanceof IfExprent ifHead
+        && RoundTrip.emptyThenArm(ifHead, ifstat)) {
+      IfExprent head = (IfExprent) ifHead.copy();
+      head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+      buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+      if (!printElseIfArm(buf, indent, ifstat)) {
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+      }
+      return buf;
+    }
+
     // The same source shape with the rest of the body as the else arm: `if (C) { ...; continue; }
     // rest`. The arm's terminal goto to the loop head proves the continue; the arm always exits,
     // so the rest runs exactly where the else arm did. Hoisting is exact only when the if ends the

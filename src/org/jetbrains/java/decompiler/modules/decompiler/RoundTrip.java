@@ -974,6 +974,34 @@ public final class RoundTrip {
     return target > 0 && target == statementOffset(thenArm);
   }
 
+  /**
+   * True when the target proves the source's then arm was empty: the head's last branch enters
+   * the arm on the printed condition being true, and the instruction right after it is a goto
+   * that leaves the arm. javac lays a written {@code if (!C) { } else <arm>} out that way; the
+   * plain {@code if (C) { <arm> }} branches the other way round and puts no jump between the
+   * branch and the arm's first instruction. The tree dropped the empty arm and kept the source's
+   * else as the then.
+   */
+  public static boolean emptyThenArm(Exprent head, Statement arm) {
+    if (!selector("emptythen") || !swapIfArmsByLastTarget(head, arm)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    BitSet offsets = head.bytecode;
+    if (gotos == null || offsets == null || offsets.isEmpty()) {
+      return false;
+    }
+    Integer after = gotos.get(offsets.length());
+    if (after == null || after == lastBranchTarget(head)) {
+      return false;
+    }
+    // The jump has to skip the arm: a target inside it would be the arm's own flow.
+    int armStart = statementOffset(arm);
+    int armEnd = lastEnd(arm);
+    return armStart >= 0 && armEnd >= armStart && (after < armStart || after >= armEnd);
+  }
+
   /** Whether the expression declares a pattern variable of its own. */
   private static boolean declaresPatternVariable(Exprent exprent) {
     for (Exprent part : exprent.getAllExprents(true, true)) {
