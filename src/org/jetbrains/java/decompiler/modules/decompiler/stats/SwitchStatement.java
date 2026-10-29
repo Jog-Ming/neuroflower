@@ -379,6 +379,10 @@ public class SwitchStatement extends Statement {
               ? var.getDefinitionType() : null;
             if (unnamed != null && !unnamed.equals("var")) {
               buf.append(unnamed).append(" _");
+            } else if (pattern instanceof PatternExprent deconstruction) {
+              // A record pattern's components take the same evidence one level down: an unbound
+              // component has no table row and the arm never reads it, so it printed `_` too.
+              buf.append(deconstruction.toJava(indent, stat));
             } else {
               buf.append(value.getAllExprents().get(2).toJava(indent));
             }

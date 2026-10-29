@@ -3,7 +3,9 @@ package org.jetbrains.java.decompiler.modules.decompiler.exps;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.java.decompiler.modules.decompiler.DecHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.CheckTypesResult;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructRecordComponent;
@@ -53,12 +55,21 @@ public class PatternExprent extends Exprent implements Pattern {
 
   @Override
   public TextBuffer toJava(int indent) {
+    return toJava(indent, null);
+  }
+
+  /**
+   * Prints the deconstruction. With the arm the pattern matches, a component the target never
+   * binds prints as the unnamed pattern {@code Type _}: javac writes no local row for a component
+   * the source left unnamed and the arm's code never reads it.
+   */
+  public TextBuffer toJava(int indent, Statement arm) {
     TextBuffer buf = new TextBuffer();
     buf.appendCastTypeName(varType);
     buf.append("(");
 
     for (int i = 0; i < exprents.size(); i++) {
-      buf.append(exprents.get(i).toJava());
+      appendComponent(buf, indent, exprents.get(i), arm);
 
       if (i < exprents.size() - 1) {
         buf.append(", ");
@@ -68,6 +79,23 @@ public class PatternExprent extends Exprent implements Pattern {
     buf.append(")");
 
     return buf;
+  }
+
+  private static void appendComponent(TextBuffer buf, int indent, Exprent component, Statement arm) {
+    if (arm != null && component instanceof VarExprent var && RoundTrip.unnamedPatternVariable(arm, var)) {
+      String type = var.getDefinitionType();
+      // A type the target does not record, or a generic one, stays in its ordinary form: an
+      // erased name here would print a type the class file never wrote.
+      if (!type.equals("var") && type.indexOf('<') < 0) {
+        buf.append(type).append(" _");
+        return;
+      }
+    }
+    if (arm != null && component instanceof PatternExprent nested) {
+      buf.append(nested.toJava(indent, arm));
+      return;
+    }
+    buf.append(component.toJava());
   }
 
   @Override
