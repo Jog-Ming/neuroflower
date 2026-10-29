@@ -1458,7 +1458,115 @@ public class SequenceStatement extends Statement {
    * shapes with no label at all. False, printing nothing, for any other block.
    */
   private boolean printLabelledChain(TextBuffer buf, int indent) {
-    return stats.size() >= 2 && (printChainArms(buf, indent) || printFlippedArms(buf, indent));
+    return stats.size() >= 2
+      && (printChainArms(buf, indent) || printFlippedArms(buf, indent) || printLabelledElse(buf, indent));
+  }
+
+  /**
+   * Prints a labelled block whose first if's arm jumps over the statements after it as the if/else
+   * the source wrote. The arm's own completion leaving the block is a jump a written
+   * {@code if (C) { arm } rest} cannot produce — that form falls into rest — so the source wrote
+   * an else arm there. The target's last condition branch says which arm the source printed
+   * first: landing on the tree's arm means the source wrote the negated test with that arm last.
+   */
+  private boolean printLabelledElse(TextBuffer buf, int indent) {
+    if (!RoundTrip.selector("elsearm") || stats.size() != 2
+        || !(stats.get(0) instanceof IfStatement branch) || !isPlainIf(branch)) {
+      return false;
+    }
+    Statement arm = branch.getIfstat();
+    Statement rest = stats.get(1);
+    StatEdge exit = terminalExit(arm);
+    if (exit == null || !exit.explicit || exit.getType() != StatEdge.TYPE_BREAK || exit.closure != this) {
+      return false;
+    }
+    if (breaksToLabelCount(arm, this) != 1) {
+      return false;
+    }
+    boolean fallsToRest = false;
+    for (StatEdge edge : branch.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.getType() == StatEdge.TYPE_REGULAR && edge.getDestination() == rest) {
+        fallsToRest = true;
+      }
+    }
+    if (!fallsToRest || !hasContent(stats.subList(1, stats.size()))) {
+      return false;
+    }
+    // The statements after the branch reach the block's end without a jump of their own — anywhere
+    // in their own flow, not only at its top: a break to this label inside them is a jump the
+    // source wrote there, and hiding the label would re-shape the block around it.
+    for (int i = 1; i < stats.size(); i++) {
+      if (breaksToLabel(stats.get(i), this)) {
+        return false;
+      }
+    }
+    if (!terminalExitsOnly(this, this) || !labelConfined()) {
+      return false;
+    }
+    boolean flipped = RoundTrip.swapIfArmsByLastTarget(branch.getHeadexprent(), arm)
+      || (RoundTrip.swapIfArmsByLine(arm, rest)
+          && !RoundTrip.polaritySelfConsistent(branch.getHeadexprent(), arm, rest));
+    IfExprent head = (IfExprent) branch.getHeadexprent().copy();
+    if (flipped) {
+      head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+    }
+    Statement thenArm = flipped ? rest : arm;
+    Statement elseArm = flipped ? arm : rest;
+    if (!RoundTrip.isHeadConsumed(branch)) {
+      buf.append(branch.getFirst().toJava(indent));
+    }
+    buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+    Statement previous = RoundTrip.hideClosure(this);
+    try {
+      appendElseArm(buf, indent, thenArm == rest ? null : thenArm);
+      buf.appendIndent(indent).append("} else {").appendLineSeparator();
+      appendElseArm(buf, indent, elseArm == rest ? null : elseArm);
+      buf.appendIndent(indent).append("}").appendLineSeparator();
+    }
+    finally {
+      RoundTrip.restoreClosure(previous);
+    }
+    return true;
+  }
+
+  /** The number of explicit jumps under this statement that leave the block through its label. */
+  private static int breaksToLabelCount(Statement stat, Statement closure) {
+    int count = 0;
+    for (StatEdge edge : stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.explicit && edge.getType() != StatEdge.TYPE_REGULAR && edge.closure == closure) {
+        count++;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      count += breaksToLabelCount(child, closure);
+    }
+    return count;
+  }
+
+  /** True when any explicit jump under this statement leaves the block through its label. */
+  private static boolean breaksToLabel(Statement stat, Statement closure) {
+    for (StatEdge edge : stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.explicit && edge.getType() != StatEdge.TYPE_REGULAR && edge.closure == closure) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (breaksToLabel(child, closure)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Prints one arm: a single statement, or the block's run when it is the statements after the if. */
+  private void appendElseArm(TextBuffer buf, int indent, Statement arm) {
+    if (arm != null) {
+      buf.append(ExprProcessor.jmpWrapper(arm, indent + 1, true));
+      return;
+    }
+    for (int i = 1; i < stats.size(); i++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(i), indent + 1, i == 1));
+    }
   }
 
   /**

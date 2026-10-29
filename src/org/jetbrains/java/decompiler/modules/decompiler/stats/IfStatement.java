@@ -713,8 +713,16 @@ public class IfStatement extends Statement {
     List<Integer> groups = new ArrayList<>();
     groups.add(0);
     for (int i = 1; i < operands.size(); i++) {
-      boolean starts = RoundTrip.operandStartsStatement(andOf(operands, 0, i), operands.get(i));
+      int afterStart = RoundTrip.exprentStart(operands.get(i));
+      int afterEnd = i + 1 < operands.size() ? RoundTrip.exprentStart(operands.get(i + 1))
+        : head.bytecode == null ? -1 : head.bytecode.length();
+      // A nested test's false exit is chained past the inner test to the final destination beyond
+      // the arm, so the branch before the operand lands farther than the operand's own; one `&&`
+      // chain sends both to the same target.
+      boolean chained = RoundTrip.chainedIfTests(head, afterStart, afterEnd);
+      boolean starts = chained || RoundTrip.operandStartsStatement(andOf(operands, 0, i), operands.get(i));
       if (declaresPattern(operands.get(i))
+          && !chained
           && (!starts
               || !RoundTrip.continuesBefore(operands.get(i), arm)
                  && !RoundTrip.patternSlotReused(operands.get(i)))) {

@@ -1924,6 +1924,44 @@ public final class RoundTrip {
     return lineAtOffset(first);
   }
 
+  /** The target of the last branch instruction inside {@code [from, to)}, or -1. */
+  public static int branchTargetInRange(Exprent condition, int from, int to) {
+    StructMethod method = currentMethod();
+    BitSet offsets = condition == null ? null : condition.bytecode;
+    java.util.Map<Integer, Integer> ends = method == null ? null : INSTRUCTION_ENDS.get(method);
+    java.util.Map<Integer, Integer> targets = method == null ? null : BRANCH_TARGETS.get(method);
+    if (offsets == null || offsets.isEmpty() || ends == null || targets == null) {
+      return -1;
+    }
+    int lastStart = -1;
+    int lastTarget = -1;
+    for (int o = offsets.nextSetBit(Math.max(from, 0)); o >= 0 && (to < 0 || o < to); o = offsets.nextSetBit(o + 1)) {
+      Integer end = ends.get(o);
+      if (end != null && targets.containsKey(end) && o > lastStart) {
+        lastStart = o;
+        lastTarget = targets.get(end);
+      }
+    }
+    return lastTarget;
+  }
+
+  /**
+   * True when the target chains the test before an operand past the operand's own test: javac
+   * resolves a nested if's false exit through the inner test to the final destination beyond the
+   * arm, while one {@code &&} chain sends every test to the same target. A guard whose test jumps
+   * into the arm sends the first branch backwards relative to the second and is not this shape, so
+   * only a strictly farther outer target counts.
+   */
+  public static boolean chainedIfTests(Exprent head, int afterStart, int afterEnd) {
+    if (!selector("ifnesttarget") || head == null || head.bytecode == null || head.bytecode.isEmpty()
+        || afterStart < 0 || afterEnd <= afterStart) {
+      return false;
+    }
+    int outer = branchTargetInRange(head, 0, afterStart);
+    int inner = branchTargetInRange(head, afterStart, afterEnd);
+    return outer > inner && inner >= 0;
+  }
+
   /**
    * Whether the target's table starts a line exactly at this operand's first instruction, after
    * the line the text before it ends on. javac anchors a statement at its condition's first
