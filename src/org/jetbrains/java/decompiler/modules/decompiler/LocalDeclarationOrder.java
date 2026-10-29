@@ -211,15 +211,6 @@ public final class LocalDeclarationOrder {
     return slots;
   }
 
-  /** The slots whose every row opens after the witness's store: named but not yet stored there. */
-  private static java.util.BitSet rowSlots(java.util.Map<Integer, List<LocalVariable>> rows) {
-    java.util.BitSet slots = new java.util.BitSet();
-    for (java.util.Map.Entry<Integer, List<LocalVariable>> entry : rows.entrySet()) {
-      slots.set(entry.getKey());
-    }
-    return slots;
-  }
-
   /**
    * True when the code uses a slot outside every table row that names it: a compiler temporary,
    * which advances the slot allocator without the table recording a declaration. A row opens at
