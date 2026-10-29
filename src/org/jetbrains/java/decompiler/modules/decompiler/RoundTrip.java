@@ -947,8 +947,10 @@ public final class RoundTrip {
     if (tail == stat) {
       return -1;
     }
-    BitSet tailOffsets = new BitSet();
-    tail.getOffset(tailOffsets);
+    BitSet tailOffsets = statementOffsets(tail);
+    if (tailOffsets == null) {
+      return -1;
+    }
     int join = firstOffset(stat);
     return tailOffsets.get(start) && join >= 0 ? join : -1;
   }
@@ -1111,14 +1113,33 @@ public final class RoundTrip {
     return or ? target == thenStart : target == elseStart;
   }
 
-  /** The first instruction offset a statement covers, including its condition's operands. */
-  public static int statementOffset(Statement statement) {
+  /**
+   * The raw offsets a statement covers, or null when its range cannot be read. An
+   * {@link org.jetbrains.java.decompiler.modules.decompiler.exps.AssertExprent} keeps a null
+   * first parameter for {@code assert false;}, and its range walk dereferences every element of
+   * that list, so a statement holding one throws instead of reporting a range. Offsets here are
+   * only evidence for a print decision, so a statement whose range cannot be read has none.
+   */
+  private static BitSet statementOffsets(Statement statement) {
     if (statement == null) {
-      return -1;
+      return null;
     }
     BitSet bits = new BitSet();
-    statement.getOffset(bits);
-    return bits.nextSetBit(0);
+    try {
+      statement.getOffset(bits);
+    } catch (NullPointerException e) {
+      return null;
+    }
+    return bits;
+  }
+
+  /**
+   * The first instruction offset a statement covers, including its condition's operands, or -1
+   * when its range cannot be read.
+   */
+  public static int statementOffset(Statement statement) {
+    BitSet bits = statementOffsets(statement);
+    return bits == null ? -1 : bits.nextSetBit(0);
   }
 
   /**
@@ -1231,9 +1252,8 @@ public final class RoundTrip {
 
   /** The first offset a statement covers, its head exprents included, or -1. */
   private static int rangeStart(Statement statement) {
-    BitSet bits = new BitSet();
-    statement.getOffset(bits);
-    return bits.isEmpty() ? -1 : bits.nextSetBit(0);
+    BitSet bits = statementOffsets(statement);
+    return bits == null || bits.isEmpty() ? -1 : bits.nextSetBit(0);
   }
 
   /**
@@ -1789,8 +1809,10 @@ public final class RoundTrip {
     if (guards == null || guards.isEmpty()) {
       return -1;
     }
-    BitSet range = new BitSet();
-    loop.getOffset(range);
+    BitSet range = statementOffsets(loop);
+    if (range == null) {
+      return -1;
+    }
     int start = range.nextSetBit(0);
     int end = range.length();
     if (start < 0) {
@@ -3269,8 +3291,10 @@ public final class RoundTrip {
     int bodyStart = firstOffset(body);
     // The loop's header exprents count: a for-update the tree moved into the header sits past the
     // body, and lastOffset only walks child statements.
-    BitSet loopBits = new BitSet();
-    loop.getOffset(loopBits);
+    BitSet loopBits = statementOffsets(loop);
+    if (loopBits == null) {
+      return null;
+    }
     int loopEnd = loopBits.length() - 1;
     if (bodyStart < 0 || loopEnd < 0) {
       return null;
@@ -6081,8 +6105,10 @@ public final class RoundTrip {
     if (ends == null || gotos == null) {
       return -1;
     }
-    BitSet bits = new BitSet();
-    stat.getOffset(bits);
+    BitSet bits = statementOffsets(stat);
+    if (bits == null) {
+      return -1;
+    }
     int end = bits.length();
     if (end <= 0) {
       return -1;
@@ -9065,9 +9091,8 @@ public final class RoundTrip {
    * its first child block.
    */
   public static int startOffset(Statement statement) {
-    java.util.BitSet bits = new java.util.BitSet();
-    statement.getOffset(bits);
-    return bits.nextSetBit(0);
+    BitSet bits = statementOffsets(statement);
+    return bits == null ? -1 : bits.nextSetBit(0);
   }
 
   /** First target offset covered by a statement, or -1. */
