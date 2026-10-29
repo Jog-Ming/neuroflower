@@ -2262,9 +2262,16 @@ public class ClassWriter implements StatementWriter {
             if (RecordHelper.isHiddenRecordMethod(cl, mt, root)) {
               hideMethod = true;
             } else {
-              ReturnedVariable.restore(root);
+              if (System.getenv("NEUROFLOWER_TREE_DEBUG") != null
+                  && (System.getenv("NEUROFLOWER_TREE_DEBUG").isEmpty()
+                      || System.getenv("NEUROFLOWER_TREE_DEBUG").equals(mt.getName()))) {
+                System.err.println("TREE " + mt.getName() + mt.getDescriptor());
+                dumpStat(root, 0);
+              }
+                ReturnedVariable.restore(root);
               LocalDeclarationOrder.reorder(root);
               TextBuffer code = root.toJava(indent + 1);
+              appendUndeclaredLocals(buffer, mt, md, cl, indent + 1);
               if (!clInit || !endsWithLiftedInitializer(methodWrapper, wrapper)) {
                 code.addBytecodeMapping(root.getDummyExit().bytecode);
               }
@@ -2304,6 +2311,145 @@ public class ClassWriter implements StatementWriter {
     //tracer.setCurrentSourceLine(buffer.countLines(start_index_method));
 
     return !hideMethod;
+  }
+
+  /**
+   * A local the target declared but never used leaves exactly one trace: the class's max_locals
+   * is larger than every slot the parameters, the code and the local table reference. javac
+   * allocates a slot when it reaches a declaration, and a variable that is never assigned writes
+   * no instruction, no table entry and no line; the declaration is the only source form that
+   * produces such a slot. Print it back, or the recompiled method reports fewer locals than the
+   * target and the code attribute differs. Only a plain (non-generic) first parameter type is
+   * printed: a generic signature would make the erased name a raw type, which changes lint.
+   */
+  private static void appendUndeclaredLocals(TextBuffer buffer, StructMethod mt, MethodDescriptor md,
+                                             StructClass cl, int indent) {
+    int maxLocals = mt.getLocalVariables();
+    if (maxLocals <= 0 || !mt.containsCode()
+        || CodeConstants.INIT_NAME.equals(mt.getName()) || CodeConstants.CLINIT_NAME.equals(mt.getName())) {
+      return;
+    }
+    int used = mt.hasModifier(CodeConstants.ACC_STATIC) ? 0 : 1;
+    for (VarType param : md.params) {
+      used += param.stackSize;
+    }
+    StructLocalVariableTableAttribute table = mt.getLocalVariableAttr();
+    if (table != null) {
+      for (StructLocalVariableTableAttribute.LocalVariable var : table.getVariables().toList()) {
+        used = Math.max(used, var.getIndex() + var.getVarType().stackSize);
+      }
+    }
+    if (used >= maxLocals) {
+      return;
+    }
+    // The gap so far may be a compiler temporary (an exception handler's store, a switch's
+    // selector); only a slot no instruction ever references is a declaration's.
+    FullInstructionSequence seq = mt.getInstructionSequence();
+    if (seq == null) {
+      try {
+        mt.expandData(cl);
+      } catch (IOException e) {
+        return;
+      }
+      seq = mt.getInstructionSequence();
+    }
+    if (seq == null) {
+      return;
+    }
+    for (int i = 0; i < seq.length(); i++) {
+      Instruction instr = seq.getInstr(i);
+      int slot = variableSlot(instr);
+      if (slot >= 0) {
+        used = Math.max(used, slot + variableWidth(instr));
+      }
+    }
+    if (used >= maxLocals) {
+      return;
+    }
+    if (md.params.length == 0 || md.genericInfo != null || md.params[0].stackSize != 1
+        || md.params[0].arrayDim > 0) {
+      return;
+    }
+    String typeName = ExprProcessor.getCastTypeName(md.params[0]);
+    if (ExprProcessor.isInvalidTypeName(typeName)) {
+      return;
+    }
+    if (table != null && table.containsName("var" + used)) {
+      return;
+    }
+    for (int slot = used; slot < maxLocals; slot++) {
+      buffer.appendIndent(indent).append(typeName).append(" var").append(slot).append(";").appendLineSeparator();
+    }
+  }
+
+  /** The slot a load, store, iinc or ret reads or writes, or -1 when the instruction is not one. */
+  private static int variableSlot(Instruction instr) {
+    int opcode = instr.opcode;
+    if ((opcode >= CodeConstants.opc_iload && opcode <= CodeConstants.opc_aload)
+        || (opcode >= CodeConstants.opc_istore && opcode <= CodeConstants.opc_astore)
+        || opcode == CodeConstants.opc_iinc || opcode == CodeConstants.opc_ret) {
+      return instr.operandsCount() > 0 ? instr.operand(0) : -1;
+    }
+    return -1;
+  }
+
+  /** The number of slots a variable instruction occupies. */
+  private static int variableWidth(Instruction instr) {
+    int opcode = instr.opcode;
+    return opcode == CodeConstants.opc_lload || opcode == CodeConstants.opc_dload
+      || opcode == CodeConstants.opc_lstore || opcode == CodeConstants.opc_dstore ? 2 : 1;
+  }
+
+  /** Developer aid: NEUROFLOWER_TREE_DEBUG=<method name> prints the statement tree before printing. */
+  private static void dumpStat(Statement stat, int depth) {
+    StringBuilder line = new StringBuilder();
+    for (int i = 0; i < depth; i++) {
+      line.append("  ");
+    }
+    line.append(stat).append(" first=").append(RoundTrip.firstOffset(stat))
+      .append(" lastEnd=").append(RoundTrip.lastEnd(stat))
+      .append(" defs=").append(stat.getVarDefinitions().size());
+    System.err.println(line);
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        StringBuilder entry = new StringBuilder();
+        for (int i = 0; i <= depth; i++) {
+          entry.append("  ");
+        }
+        String bits;
+        try {
+          bits = String.valueOf(exprent.bytecode);
+        } catch (RuntimeException e) {
+          bits = "?";
+        }
+        if (bits.length() > 60) {
+          bits = bits.substring(0, 60) + "...";
+        }
+        String text;
+        try (var v = DecompilerContext.getImportCollector().lock()) {
+          text = exprent.toJava(0).convertToStringAndAllowDataDiscard();
+        } catch (RuntimeException e) {
+          text = "<" + e + ">";
+        }
+        if (text.length() > 120) {
+          text = text.substring(0, 120);
+        }
+        entry.append(exprent.getClass().getSimpleName()).append(' ').append(bits).append(" :: ").append(text);
+        System.err.println(entry);
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      dumpStat(child, depth + 1);
+    }
+    for (org.jetbrains.java.decompiler.modules.decompiler.StatEdge edge : stat.getAllSuccessorEdges()) {
+      StringBuilder entry = new StringBuilder();
+      for (int i = 0; i <= depth; i++) {
+        entry.append("  ");
+      }
+      entry.append("-> ").append(edge.getType()).append(' ').append(edge.getDestination());
+      System.err.println(entry);
+    }
   }
 
   private static int writeMethodParameterHeader(StructMethod mt, TextBuffer buffer, int indent, MethodWrapper methodWrapper, MethodDescriptor md, boolean isEnum, boolean init, boolean thisVar, GenericMethodDescriptor descriptor, int paramCount, boolean isInterface, int flags, StructClass cl) {
