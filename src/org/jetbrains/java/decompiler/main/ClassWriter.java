@@ -250,6 +250,7 @@ public class ClassWriter implements StatementWriter {
           StructMethod outerStructMethod = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
           DecompilerContext.setProperty(DecompilerContext.CURRENT_STRUCT_METHOD, mt);
           try {
+            TryReturnFold.fold(root);
             ReturnedVariable.restore(root);
           }
           finally {
@@ -1919,6 +1920,7 @@ public class ClassWriter implements StatementWriter {
       if (methodWrapper.decompileError == null) {
         if (root != null) { // check for existence
           try {
+            TryReturnFold.fold(root);
             ReturnedVariable.restore(root);
             // A lambda body is a method of its own in the class file: its local table proves the
             // declaration order the same way, and the context is the lambda's own method here.
@@ -2268,7 +2270,8 @@ public class ClassWriter implements StatementWriter {
                 System.err.println("TREE " + mt.getName() + mt.getDescriptor());
                 dumpStat(root, 0);
               }
-                ReturnedVariable.restore(root);
+              TryReturnFold.fold(root);
+              ReturnedVariable.restore(root);
               LocalDeclarationOrder.reorder(root);
               TextBuffer code = root.toJava(indent + 1);
               appendUndeclaredLocals(buffer, mt, md, cl, indent + 1);
