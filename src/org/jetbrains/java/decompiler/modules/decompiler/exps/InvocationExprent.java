@@ -1025,6 +1025,15 @@ public class InvocationExprent extends Exprent {
             genericArgs.add(OPTIONAL_MAP_DEMAND_TYPE.get());
           }
 
+          // A receiver's value was fixed by the source, not by javac: the enclosing call's
+          // functional argument is a method reference, and the metafactory's instantiated method
+          // type (the ground target's element type, erased) disagrees with what the printer
+          // inferred for this call's return. The referenced method's recorded parameter type is
+          // the only fully parameterised name that reproduces it.
+          if (DecompilerContext.getOption(IFernflowerPreferences.ROUND_TRIP_DEMAND_WITNESS)) {
+            outerReferenceParameterWitness(fparams, ret);
+          }
+
           // The solved builder argument is printed even where the printer's own inference left
           // nothing: every type variable it names is in scope and every constraint holds.
           if (builderInference != null && !builderInference.isEmpty()) {
@@ -4700,6 +4709,138 @@ public class InvocationExprent extends Exprent {
       }
     }
     return type.type != CodeType.OBJECT || !isGenericClass(type.value);
+  }
+
+  /**
+   * A receiver whose value the source had to name: the enclosing call takes a method reference at
+   * a contravariant functional position, and the metafactory's instantiated method type there is
+   * the ground target's element type, erased. When the printer's own inference for this call's
+   * return erases to a different class, javac could not have inferred the source's value from the
+   * argument either (it would have recorded the printer's), so the source constrained the call
+   * explicitly. The referenced method's recorded parameter type is the only fully parameterised
+   * name that reproduces the recorded instantiation and accepts the printer's value; a
+   * non-generic implementation signature names no type arguments and is not used.
+   */
+  private boolean outerReferenceParameterWitness(List<String> fparams, VarType ret) {
+    if (!RoundTrip.selector("outerrefwitness") || !isInvocationInstance || fparams.size() != 1
+      || ret == null || ret.type != CodeType.OBJECT || !ret.isGeneric() || desc == null
+      || desc.getSignature() == null) {
+      return false;
+    }
+    List<VarType> returnedArgs = ((GenericType) ret).getArguments();
+    if (returnedArgs.size() != 1) {
+      return false;
+    }
+    VarType returnedArg = returnedArgs.get(0);
+    if (returnedArg == null || returnedArg.type != CodeType.GENVAR || !fparams.contains(returnedArg.value)) {
+      return false;
+    }
+    InvocationExprent outer = OUTER_INVOCATION.get();
+    if (outer == null || outer == this || outer.desc == null || outer.desc.getSignature() == null
+      || outer.lstParameters.isEmpty() || !outer.classname.equals(ret.value)) {
+      return false;
+    }
+    StructClass outerClass = DecompilerContext.getStructContext().getClass(outer.classname);
+    if (outerClass == null || outerClass.getSignature() == null
+      || outerClass.getSignature().fparameters.size() != 1) {
+      return false;
+    }
+    String classParam = outerClass.getSignature().fparameters.get(0);
+    VarType printerValue = genericsMap.get(returnedArg);
+    if (printerValue == null || printerValue.type != CodeType.OBJECT || printerValue.arrayDim != 0
+      || !printerValue.isGeneric()) {
+      return false;
+    }
+    VarType printerErasure = eraseWitnessType(printerValue);
+    if (printerErasure == null) {
+      return false;
+    }
+    List<VarType> declared = outer.desc.getSignature().parameterTypes;
+    int count = Math.min(declared.size(), outer.lstParameters.size());
+    for (int p = 0; p < count; p++) {
+      if (!(declared.get(p) instanceof GenericType functional) || functional.getArguments().size() != 1) {
+        continue;
+      }
+      VarType argument = functional.getArguments().get(0);
+      if (argument == null) {
+        continue;
+      }
+      if (argument instanceof GenericType wildcard && wildcard.getWildcard() == GenericType.WILDCARD_SUPER) {
+        argument = GenericType.withWildcard(wildcard, GenericType.WILDCARD_NO);
+      }
+      if (argument.type != CodeType.GENVAR || !classParam.equals(argument.value)) {
+        continue;
+      }
+      if (!(outer.lstParameters.get(p) instanceof NewExprent reference) || !reference.isLambda()
+        || !reference.isMethodReference()) {
+        continue;
+      }
+      ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(reference.getNewType().value);
+      if (node == null || node.lambdaInformation == null || node.lambdaInformation.method_descriptor == null) {
+        continue;
+      }
+      MethodDescriptor recorded = MethodDescriptor.parseDescriptor(node.lambdaInformation.method_descriptor);
+      StructClass samClass = DecompilerContext.getStructContext().getClass(functional.value);
+      if (samClass == null || samClass.getSignature() == null) {
+        continue;
+      }
+      List<String> interfaceParams = samClass.getSignature().fparameters;
+      if (interfaceParams.size() != 1) {
+        continue;
+      }
+      StructMethod sam = functionalMethod(samClass, node.lambdaInformation.method_name, recorded.params.length);
+      if (sam == null || sam.getSignature() == null) {
+        continue;
+      }
+      List<VarType> samParams = sam.getSignature().parameterTypes;
+      int position = -1;
+      for (int k = 0; k < samParams.size() && k < recorded.params.length; k++) {
+        if (samParams.get(k) != null && samParams.get(k).type == CodeType.GENVAR
+          && interfaceParams.get(0).equals(samParams.get(k).value)) {
+          position = k;
+          break;
+        }
+      }
+      if (position < 0) {
+        continue;
+      }
+      VarType recordedParam = recorded.params[position];
+      if (recordedParam == null || recordedParam.type != CodeType.OBJECT
+        || recordedParam.equals(printerErasure)) {
+        continue; // the record agrees with the printer: no witness was written
+      }
+      StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+      if (content == null) {
+        continue;
+      }
+      StructMethod implementation = content.getMethod(node.lambdaInformation.content_method_name,
+        node.lambdaInformation.content_method_descriptor);
+      if (implementation == null || implementation.getSignature() == null
+        || implementation.getSignature().parameterTypes.size() != samParams.size()) {
+        continue;
+      }
+      VarType candidate = implementation.getSignature().parameterTypes.get(position);
+      if (!isPrintableWitness(candidate) || candidate.arrayDim != 0
+        || candidate.type != CodeType.OBJECT || !candidate.isGeneric()) {
+        continue;
+      }
+      VarType candidateErasure = eraseWitnessType(candidate);
+      if (candidateErasure == null || !candidateErasure.equals(recordedParam)) {
+        continue;
+      }
+      if (!DecompilerContext.getStructContext().instanceOf(printerValue.value, candidate.value)) {
+        continue;
+      }
+      if (genericArgs.size() == fparams.size()
+        && (genericArgs.get(0) == null || genericArgs.get(0).type == CodeType.GENVAR
+            || sameType(genericArgs.get(0), candidate))) {
+        return false;
+      }
+      genericArgs.clear();
+      genericArgs.add(candidate);
+      return true;
+    }
+    return false;
   }
 
   /**
