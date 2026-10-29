@@ -1853,6 +1853,11 @@ public final class RoundTrip {
     return firstOffsetOf(exprent);
   }
 
+  /** The first instruction offset the exprent covers, nested expressions included, or -1. */
+  public static int exprentStart(Exprent exprent) {
+    return firstOffsetOf(exprent);
+  }
+
   /** The smallest instruction offset any part of the expression owns, or -1. */
   private static int firstOffsetOf(Exprent exprent) {
     int first = -1;
@@ -3711,6 +3716,151 @@ public final class RoundTrip {
       list.add(at, bare);
     }
     return true;
+  }
+
+  /**
+   * Moves the declarations of the locals the join exprents read out of the arm, so the join can
+   * print after the if's brace: the moved code's own use proves the source declared them before
+   * the test. A bare declaration exprent moves itself; an initialized one leaves its store and
+   * only a bare copy moves. A definition the arm does not hold directly blocks the move.
+   */
+  public static boolean hoistJoinDeclarations(
+      org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifStat, Statement arm,
+      java.util.List<Exprent> moved) {
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> reads = new java.util.HashSet<>();
+    for (Exprent exprent : moved) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && !var.isDefinition()) {
+          reads.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+        }
+      }
+    }
+    java.util.List<Exprent> bares = new java.util.ArrayList<>();
+    for (org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair pair : reads) {
+      VarExprent definition = findDefinition(arm, pair);
+      if (definition == null) {
+        // A parameter, or a local the if's head block already declares: still in scope.
+        continue;
+      }
+      Statement host = directOwner(arm, definition);
+      if (host != null && host.getExprents() != null) {
+        removeIdentity(host.getExprents(), definition);
+        definition.bytecode = null;
+        bares.add(definition);
+        continue;
+      }
+      org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent initialized =
+        assignmentOwning(arm, definition);
+      if (initialized == null) {
+        return false;
+      }
+      VarExprent bare = (VarExprent)definition.copy();
+      bare.bytecode = null;
+      definition.setDefinition(false);
+      bares.add(bare);
+    }
+    if (bares.isEmpty()) {
+      return true;
+    }
+    Statement head = ifStat.getFirst();
+    java.util.List<Exprent> list = head != null && head.getExprents() != null && !head.getExprents().isEmpty()
+      ? head.getExprents() : ifStat.getVarDefinitions();
+    for (Exprent bare : bares) {
+      int slot = bare instanceof VarExprent var && var.getLVT() != null ? var.getLVT().getIndex() : -1;
+      int at = list.size();
+      for (int i = 0; i < list.size(); i++) {
+        VarExprent other = definedVar(list.get(i));
+        int otherSlot = other == null || other.getLVT() == null ? -1 : other.getLVT().getIndex();
+        if (otherSlot > slot && slot >= 0) {
+          at = i;
+          break;
+        }
+      }
+      list.add(at, bare);
+    }
+    return true;
+  }
+
+  /** The statement whose direct exprent list holds this exprent itself, or null. */
+  private static Statement directOwner(Statement stat, Exprent target) {
+    java.util.List<Exprent> direct = stat.getExprents();
+    if (direct != null) {
+      for (Exprent exprent : direct) {
+        if (exprent == target) {
+          return stat;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      Statement found = directOwner(child, target);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /** The assignment exprent whose left side this variable is, or null. */
+  private static org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assignmentOwning(
+      Statement stat, VarExprent target) {
+    java.util.List<Exprent> direct = stat.getExprents();
+    if (direct != null) {
+      for (Exprent exprent : direct) {
+        if (exprent instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assignment
+            && assignment.getLeft() == target) {
+          return assignment;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent found = assignmentOwning(child, target);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  private static void removeIdentity(java.util.List<Exprent> list, Exprent target) {
+    for (int i = 0; i < list.size(); i++) {
+      if (list.get(i) == target) {
+        list.remove(i);
+        return;
+      }
+    }
+  }
+
+  /** True when the statement's print already ends on a bare `return;`. */
+  public static boolean printsVoidReturn(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    java.util.List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (int i = exprents.size() - 1; i >= 0; i--) {
+        if (exprents.get(i) != null) {
+          return exprents.get(i) instanceof ExitExprent exit
+            && exit.getExitType() == ExitExprent.Type.RETURN && exit.getValue() == null;
+        }
+      }
+      return false;
+    }
+    if (!stat.getStats().isEmpty()) {
+      return printsVoidReturn(stat.getStats().get(stat.getStats().size() - 1));
+    }
+    return false;
+  }
+
+  /** Prints `return;` where the target has a void return ending exactly at this offset. */
+  public static void appendVoidReturnEnding(org.jetbrains.java.decompiler.util.TextBuffer buf, int end, int indent) {
+    int exit = voidReturnEndingAt(end);
+    if (exit < 0) {
+      return;
+    }
+    org.jetbrains.java.decompiler.util.TextBuffer line = new org.jetbrains.java.decompiler.util.TextBuffer();
+    line.appendIndent(indent).append("return;").appendLineSeparator();
+    mapSynthesizedLine(line, exit);
+    buf.append(line);
   }
 
   private static void collectAfterShell(Statement stat, int shellEnd, java.util.List<Statement> out) {

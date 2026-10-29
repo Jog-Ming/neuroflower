@@ -552,7 +552,7 @@ public class SequenceStatement extends Statement {
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
           && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
-          && !ifStatement.isPatternMatched() && !isLabeled()
+          && !isLabeled()
           && ifStatement.getIfstat() != null
           && RoundTrip.selector("elseover")
           && RoundTrip.lastBranchTarget(ifStatement.getHeadexprent()) >= 0
@@ -572,8 +572,16 @@ public class SequenceStatement extends Statement {
             elseEnd = k;
             break;
           }
+          // The writer folded a void return the source ended the else with into the method's
+          // exit; the jump over the else lands past that return, not at the last exprent.
+          int withReturn = endWithDroppedReturn(stats.get(k), end);
+          if (withReturn != end && from >= 0 && RoundTrip.jumpsOnto(from, elseStart, withReturn)) {
+            elseEnd = k;
+            break;
+          }
         }
-        int elseStop = elseEnd < 0 ? -1 : RoundTrip.lastEnd(stats.get(elseEnd));
+        int elseStop = elseEnd < 0 ? -1
+          : endWithDroppedReturn(stats.get(elseEnd), RoundTrip.lastEnd(stats.get(elseEnd)));
         // A sequence arm may carry the join it jumps to as its own last statement; the sequence
         // holds the same statements after the if, so print those once and leave the arm's copy out.
         int bodyEnd = arm.getStats().size();
@@ -609,12 +617,13 @@ public class SequenceStatement extends Statement {
         }
         // The arm's last basic block may hold the join as trailing exprents instead: the block
         // starts before the else and ends on the join's own instruction, which only code after
-        // the if/else can own. Split them off so the arm prints without them.
+        // the if/else can own. Split them off so the arm prints without them. The arm itself is
+        // that block when the whole then-arm is one basic block.
         List<Exprent> joinExprents = null;
         Statement joinExprentHost = null;
-        if (elseEnd > i && elseStop > 0 && bodyEnd > 0 && joinTail.isEmpty()
+        if (elseEnd > i && elseStop > 0 && joinTail.isEmpty()
             && elseEnd + 1 >= stats.size()) {
-          Statement lastArm = arm.getStats().get(bodyEnd - 1);
+          Statement lastArm = bodyEnd > 0 ? arm.getStats().get(bodyEnd - 1) : arm;
           List<Exprent> exprents = lastArm.getExprents();
           if (exprents != null && exprents.size() > 1) {
             int split = -1;
@@ -632,9 +641,22 @@ public class SequenceStatement extends Statement {
             }
           }
         }
-        if (elseEnd > i && elseStart >= 0 && elseStop > elseStart && bodyEnd > 0
+        // A pattern-matched if joins this rule only when the split below proves its then arm
+        // ended on the join; otherwise the pattern printers own the shape.
+        boolean printElseOver = elseEnd > i && elseStart >= 0 && elseStop > elseStart
+            && (bodyEnd > 0 || joinExprents != null)
+            && (!ifStatement.isPatternMatched() || joinExprents != null)
             && !fallsInto(arm, elseStart, elseStop)
-            && !breaksOut(arm, elseStop)) {
+            && !breaksOut(arm, elseStop);
+        if (printElseOver && joinExprents != null
+            && !RoundTrip.hoistJoinDeclarations(ifStatement, arm, joinExprents)) {
+          // A local the moved code reads is declared where the arm held it and cannot move:
+          // print the arm whole instead, as before the rule existed.
+          joinExprents = null;
+          joinExprentHost = null;
+          printElseOver = bodyEnd > 0 && !ifStatement.isPatternMatched();
+        }
+        if (printElseOver) {
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
@@ -688,6 +710,14 @@ public class SequenceStatement extends Statement {
             buf.appendIndent(indent).append("} else {").appendLineSeparator();
             for (int k = i + 1; k <= elseEnd; k++) {
               buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+            }
+            // The source may have ended the else with a void return the writer folded into the
+            // method's exit; the target's instruction ending where the join starts proves it.
+            int joinStart = joinExprents != null && !joinExprents.isEmpty()
+              ? RoundTrip.exprentStart(joinExprents.get(0))
+              : elseEnd + 1 < stats.size() ? RoundTrip.firstOffset(stats.get(elseEnd + 1)) : -1;
+            if (!RoundTrip.printsVoidReturn(stats.get(elseEnd))) {
+              RoundTrip.appendVoidReturnEnding(buf, joinStart, indent + 1);
             }
             buf.appendIndent(indent).append("}").appendLineSeparator();
           }
@@ -2302,6 +2332,18 @@ public class SequenceStatement extends Statement {
       }
     }
     return slot;
+  }
+
+  /**
+   * The end offset an arm really has: the last exprent's instruction, plus the void return the
+   * writer folded into the method's exit when the target records one right after it. The dropped
+   * return is part of the arm, and a jump to the join lands past it.
+   */
+  private static int endWithDroppedReturn(Statement stat, int end) {
+    if (end < 0 || RoundTrip.printsVoidReturn(stat)) {
+      return end;
+    }
+    return RoundTrip.voidReturnEndingAt(end + 1) == end ? end + 1 : end;
   }
 
   /**
