@@ -405,6 +405,28 @@ public final class LocalDeclarationOrder {
           // stands above and each range's store is a plain assignment.
           absorbSplitRanges(seq, (VarExprent) declaration);
         }
+        // A local the printer put after this try (a later sibling's own definitions print at this
+        // sequence's level) or inside its body (a nested statement's definitions print within it)
+        // whose slot lies below one of the handler's parameters was declared above the try: javac
+        // hands a parameter the lowest slot free at the handler, so a parameter above the local's
+        // whole range means the local's slot was occupied there. It moves to the try's own
+        // definitions, which print just above `try` in the same block.
+        if (!handlerSlots.isEmpty()) {
+          for (Statement sibling : siblingsAfter(children, child)) {
+            for (Exprent definition : new ArrayList<>(sibling.getVarDefinitions())) {
+              hoistOutOfHandlerScope(sibling.getVarDefinitions(), definition, child, handlerSlots, seq, names, method);
+            }
+          }
+          List<Statement> inner = new ArrayList<>();
+          for (Statement childOfBody : body.getStats()) {
+            collectStatements(childOfBody, inner);
+          }
+          for (Statement stat : inner) {
+            for (Exprent definition : new ArrayList<>(stat.getVarDefinitions())) {
+              hoistOutOfHandlerScope(stat.getVarDefinitions(), definition, child, handlerSlots, seq, names, method);
+            }
+          }
+        }
       }
       for (Exprent definition : child.getVarDefinitions()) {
         maxSlot = Math.max(maxSlot, targetSlot(definition));
@@ -415,6 +437,48 @@ public final class LocalDeclarationOrder {
         }
       }
     }
+  }
+
+  /** Every statement in this subtree, this one first. */
+  private static void collectStatements(Statement stat, List<Statement> out) {
+    out.add(stat);
+    for (Statement child : stat.getStats()) {
+      collectStatements(child, out);
+    }
+  }
+
+  /**
+   * Moves one bare declaration into a try statement's own definitions when the handler's
+   * exception parameter was allocated above its whole slot range: the slot was occupied at the
+   * handler, so the source declared the local before the try. The slot must be this one local's
+   * throughout the method: a different local's range at the same slot means the parameter's
+   * number may measure that local instead.
+   */
+  private static void hoistOutOfHandlerScope(List<Exprent> list, Exprent definition, Statement tryStatement,
+                                             List<Integer> handlerSlots, Statement seq, NameTable names, String method) {
+    VarExprent var = definedVar(definition);
+    if (var == null || !isRealDefinition(var) || var.getLVT() == null) {
+      return;
+    }
+    int slot = var.getLVT().getIndex();
+    if (slot < 0 || !belowHandlerSlot(handlerSlots, var) || slotReuseEnd(var) >= 0) {
+      return;
+    }
+    if ((!names.uniqueName(var) && !names.sameSlotName(var)) || mentionsField(seq, var.getName())) {
+      debug(method, var, "rejected: handler hoist would capture a name");
+      return;
+    }
+    debug(method, var, "hoisted above a try whose handler steps over slot-" + slot);
+    Exprent declaration;
+    if (definition == var) {
+      removeIdentity(list, definition);
+      declaration = definition;
+    } else {
+      declaration = var.copy();
+      var.setDefinition(false);
+    }
+    insertByTargetSlot(tryStatement.getVarDefinitions(), declaration);
+    absorbSplitRanges(seq, (VarExprent)declaration);
   }
 
   /**
@@ -781,6 +845,20 @@ public final class LocalDeclarationOrder {
       before.add(sibling);
     }
     return before;
+  }
+
+  /** The siblings printed after this child, in print order. */
+  private static List<Statement> siblingsAfter(List<Statement> children, Statement child) {
+    List<Statement> after = new ArrayList<>();
+    boolean seen = false;
+    for (Statement sibling : children) {
+      if (seen) {
+        after.add(sibling);
+      } else if (sibling == child) {
+        seen = true;
+      }
+    }
+    return after;
   }
 
   /** True when every child prints as a plain run of statements, so the root reads like a sequence. */
