@@ -623,7 +623,15 @@ public class SequenceStatement extends Statement {
           if (elseEnd + 1 < stats.size()) {
             join = RoundTrip.firstOffset(stats.get(elseEnd + 1));
           } else if (finalReturnTail) {
-            join = RoundTrip.printedAfter(this);
+            // The copy's own instruction is the method's last return, which the enclosing flow
+            // prints; when that return is not the next thing this sequence would print (an
+            // enclosing else prints between them), the copy's offset still names the join.
+            join = RoundTrip.selector("elsejoin")
+              ? RoundTrip.firstOffset(arm.getStats().get(bodyEnd)) : RoundTrip.printedAfter(this);
+            if (join != elseStop) {
+              int enclosing = RoundTrip.printedAfter(this);
+              join = enclosing == elseStop ? enclosing : join;
+            }
           } else if (bodyEnd < arm.getStats().size()
               && RoundTrip.firstOffset(arm.getStats().get(bodyEnd)) == elseStop) {
             join = elseStop;
