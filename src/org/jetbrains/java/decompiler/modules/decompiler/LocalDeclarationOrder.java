@@ -68,7 +68,7 @@ public final class LocalDeclarationOrder {
     hoistToPrintedOrder(root, varproc, names, method);
   }
 
-  /** Per method: true when some slot the code uses has no local-table row. */
+  /** Per method: true when the code uses a slot outside every table row that names it. */
   private static final java.util.Map<StructMethod, Boolean> HIDDEN_LOCALS = new java.util.concurrent.ConcurrentHashMap<>();
 
   /**
