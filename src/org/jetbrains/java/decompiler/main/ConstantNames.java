@@ -957,8 +957,9 @@ public final class ConstantNames {
   /**
    * The generation rank of every method body, keyed like the printer's position map.
    *
-   * <p>javac generates constructors first, then the other methods in class-file order, and
-   * {@code <clinit>} last. The rank must come from the class's method list rather than from the
+   * <p>javac generates the method bodies in the class file's method order -- which for the
+   * compiler's own output is the source declaration order -- and {@code <clinit>} last. The rank
+   * must come from the class's method list rather than from the
    * pool's first uses: a method that only repeats references introduced earlier holds no first use,
    * yet its body still has a place in the generation order, and a site in it must still be
    * comparable with a bound placed in another method.
@@ -969,9 +970,7 @@ public final class ConstantNames {
     int count = methods.size();
     for (int i = 0; i < count; i++) {
       StructMethod method = methods.get(i);
-      int rank = CodeConstants.INIT_NAME.equals(method.getName()) ? i
-        : CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i
-        : count + i;
+      int rank = CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i : i;
       ranks.put(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()), rank);
     }
     return ranks;
@@ -1184,8 +1183,8 @@ public final class ConstantNames {
   /**
    * Where each pool entry an instruction references is first used.
    *
-   * <p>javac generates constructors first, then the other method bodies in class-file order, and
-   * {@code <clinit>} last. The instruction's offset orders the uses inside one method.
+   * <p>javac generates the method bodies in the class file's method order and {@code <clinit>}
+   * last. The instruction's offset orders the uses inside one method.
    */
   private static Map<Integer, FirstUse> firstUses(StructClass cls) {
     return firstUses(cls, null);
@@ -1197,9 +1196,7 @@ public final class ConstantNames {
     int count = methods.size();
     for (int i = 0; i < count; i++) {
       StructMethod method = methods.get(i);
-      int rank = CodeConstants.INIT_NAME.equals(method.getName()) ? i
-        : CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i
-        : count + i;
+      int rank = CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i : i;
       if (method.getInstructionSequence() == null) {
         try {
           method.expandData(cls); // released after decompilation; reparse for the pool order
@@ -1251,17 +1248,15 @@ public final class ConstantNames {
   /**
    * The instructions of the method whose generation rank is {@code rank}, or {@code null}.
    *
-   * <p>The ranks are the ones {@link #firstUses} assigns: constructors first, then the other
-   * methods, then static initializers.
+   * <p>The ranks are the ones {@link #firstUses} assigns: the class's method order, static
+   * initializers last.
    */
   private static FullInstructionSequence codeOfRank(StructClass cls, int rank) {
     VBStyleCollection<StructMethod, String> methods = cls.getMethods();
     int count = methods.size();
     for (int i = 0; i < count; i++) {
       StructMethod method = methods.get(i);
-      int rankOf = CodeConstants.INIT_NAME.equals(method.getName()) ? i
-        : CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i
-        : count + i;
+      int rankOf = CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i : i;
       if (rankOf != rank) {
         continue;
       }
@@ -5237,6 +5232,19 @@ public final class ConstantNames {
           return; // a constant cannot be named inside its own initializer
         }
       }
+      if (!provenSite && placement != null && placement.cls() != null && !placement.ownEarly()) {
+        // Naming an own constant interns the class's own Class entry at the naming site. The
+        // original's entry sits where the pool has it: if that is a generated point, a site
+        // before it would move the entry; if it is only this_class, no naming existed at all.
+        // A naming in a constant field initializer is generated before every body, so only a
+        // pool whose own pair opens the prefix can have come from one.
+        if (insideInitializer(ownInitializers, anchor)) {
+          return;
+        }
+        if (!placement.existsAt(own, anchor)) {
+          return;
+        }
+      }
     }
     String name = simpleName(constant.owner());
     String printed;
@@ -5395,7 +5403,7 @@ public final class ConstantNames {
     // wrong site here both mistypes the expression and moves the owner's Class entry.
     // A small value is coincidence evidence even inside a window.
     if (owner.equals(own) || placement.strict().contains(owner)
-        || !placement.windows().containsKey(owner) || !placement.proves(owner, start)
+        || !placement.windows().containsKey(owner) || !placement.provesExactly(owner, start)
         || tooCommon(key)) {
       return;
     }
@@ -5463,7 +5471,7 @@ public final class ConstantNames {
     }
     String owner = chosen.owner();
     if (owner.equals(own) || placement.strict().contains(owner)
-        || !placement.windows().containsKey(owner) || !placement.proves(owner, start)) {
+        || !placement.windows().containsKey(owner) || !placement.provesExactly(owner, start)) {
       return;
     }
     // A bare pair holds no folded value (the constant folded to an immediate, e.g. a value the
@@ -5859,6 +5867,12 @@ public final class ConstantNames {
     for (int i = sites.size() - 1; i >= 0; i--) {
       Site existing = sites.get(i);
       if (existing.start() == site.start() && existing.end() == site.end()) {
+        return;
+      }
+      if (site.start() < existing.end() && existing.start() < site.end()) {
+        // Two replacements over one span cannot both run: the second would rewrite text the
+        // first already changed, with offsets computed on the original. The first site placed
+        // is the one the earlier evidence chose.
         return;
       }
     }

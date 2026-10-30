@@ -7,6 +7,7 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.ValidationHelper;
 import org.jetbrains.java.decompiler.struct.StructClass;
+import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
@@ -138,79 +139,118 @@ public class ConstExprent extends Exprent {
   private final Object value;
   private final boolean boolPermitted;
   private boolean wasCondy = false;
-  private static final Map<String, Set<String>> POOL_CLASSES = new java.util.concurrent.ConcurrentHashMap<>();
+  /** Folded-naming keys ("owner|value") the class's pool records, per class name. */
   private static final Map<String, Set<String>> POOL_NAMED = new java.util.concurrent.ConcurrentHashMap<>();
 
   /**
-   * Whether one of the printer's named forms may be used here.
+   * Whether one of the printer's named forms may be used for this value.
    *
    * <p>Naming {@code Math.PI}, {@code Double.MAX_VALUE} or {@code Long.MIN_VALUE} folds to the same
    * literal, but javac still enters the owner's class into the pool at the naming site, and the
-   * class being printed records whether the original did. When its pool has no entry for the owner,
-   * the original wrote the literal and the named form would add a pool entry the class never had.
+   * class being printed records whether the original did. A pooled Class entry alone is not enough:
+   * the original can name one of the owner's constants and write another value as a literal. A
+   * naming enters the Class, its name and then the folded value itself, so only a Class entry
+   * immediately followed by the name and <em>this very value</em> is the pool's record of it.
    */
-  private static boolean ownerNamedInPool(TextBuffer printed) {
-    if (printed.count("Math.", 0) > 0) {
-      return poolHasNaming("java/lang/Math");
-    }
-    if (printed.count("Float.", 0) > 0) {
-      return poolHasNaming("java/lang/Float");
-    }
-    if (printed.count("Double.", 0) > 0) {
-      return poolHasNaming("java/lang/Double");
-    }
-    return true;
-  }
-
-  private static boolean poolHasClass(String owner) {
-    ClassNode node = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
-    StructClass cls = node == null ? null : node.classStruct;
-    if (cls == null) {
-      return true; // nothing records the original's form here; keep the printer's own choice
-    }
-    Set<String> names = POOL_CLASSES.computeIfAbsent(cls.qualifiedName, name -> {
-      Set<String> classes = new HashSet<>();
-      for (PooledConstant constant : cls.getPool().getPool()) {
-        if (constant instanceof PrimitiveConstant primitive
-            && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null) {
-          classes.add(primitive.getString());
-        }
-      }
-      return classes;
-    });
-    return names.contains(owner);
+  private static boolean namedFormInPool(String owner, Object value) {
+    return poolHasNaming(owner, value);
   }
 
   /**
-   * Whether the class's pool holds a folded-constant naming of this owner.
+   * The owner a float or double named form names: {@code Float}/{@code Double} for one of their
+   * special constants, {@code Math} for the pi-derived forms, which are the only other entries.
+   */
+  private static String namedFormOwner(boolean single, Number value) {
+    if (single) {
+      float number = value.floatValue();
+      if (Float.isNaN(number) || number == Float.POSITIVE_INFINITY
+          || number == Float.NEGATIVE_INFINITY || number == Float.MAX_VALUE
+          || number == -Float.MAX_VALUE || number == Float.MIN_NORMAL
+          || number == -Float.MIN_NORMAL || number == Float.MIN_VALUE
+          || number == -Float.MIN_VALUE) {
+        return "java/lang/Float";
+      }
+      return "java/lang/Math";
+    }
+    double number = value.doubleValue();
+    if (Double.isNaN(number) || number == Double.POSITIVE_INFINITY
+        || number == Double.NEGATIVE_INFINITY || number == Double.MAX_VALUE
+        || number == -Double.MAX_VALUE || number == Double.MIN_NORMAL
+        || number == -Double.MIN_NORMAL || number == Double.MIN_VALUE
+        || number == -Double.MIN_VALUE) {
+      return "java/lang/Double";
+    }
+    return "java/lang/Math";
+  }
+
+  /**
+   * Whether the class's pool holds a folded naming of this owner that entered this exact value.
    *
    * <p>A Class entry alone says nothing: a field or method reference enters one as its operand.
    * A naming enters the Class, its name and then the constant's value, in that order, so the
-   * adjacent value is what distinguishes the two. The printer's un-inlined form is only the
-   * original's when the original named this owner's constant at all; otherwise the literal must
-   * stay, and the constant-names pass can name the owner the pool does prove.
+   * adjacent value is what distinguishes the two; it must equal the value being printed, or the
+   * named form inserts the Class entry where the original only had a literal's value. An owner
+   * with a reference before its Class entry had the entry entered as that reference's operand,
+   * and the value that follows is the reference's next neighbour, not a naming's.
    */
-  private static boolean poolHasNaming(String owner) {
+  private static boolean poolHasNaming(String owner, Object value) {
     ClassNode node = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
     StructClass cls = node == null ? null : node.classStruct;
     if (cls == null) {
       return true; // nothing records the original's form here; keep the printer's own choice
     }
     Set<String> named = POOL_NAMED.computeIfAbsent(cls.qualifiedName, name -> {
-      Set<String> owners = new HashSet<>();
+      Set<String> entries = new HashSet<>();
       List<PooledConstant> pool = cls.getPool().getPool();
+      Map<String, Integer> classIndex = new HashMap<>();
+      Set<String> operand = new HashSet<>();
+      for (int i = 1; i < pool.size(); i++) {
+        if (pool.get(i) instanceof PrimitiveConstant primitive
+            && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null) {
+          classIndex.putIfAbsent(primitive.getString(), i);
+        }
+        else if (pool.get(i) instanceof LinkConstant link && link.classname != null) {
+          Integer index = classIndex.get(link.classname);
+          if (index != null && i < index) {
+            operand.add(link.classname); // this reference entered its class as the operand
+          }
+        }
+      }
       for (int i = 1; i + 2 < pool.size(); i++) {
         if (pool.get(i) instanceof PrimitiveConstant primitive
             && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null
+            && !operand.contains(primitive.getString())
             && primitive.index == i + 1
-            && pool.get(i + 2) instanceof PrimitiveConstant value
-            && value.type != CodeConstants.CONSTANT_Utf8) {
-          owners.add(primitive.getString());
+            && pool.get(i + 2) instanceof PrimitiveConstant neighbour
+            && neighbour.type != CodeConstants.CONSTANT_Utf8
+            && neighbour.type != CodeConstants.CONSTANT_Class
+            && neighbour.value != null) {
+          entries.add(primitive.getString() + "|" + valueKey(neighbour.value));
         }
       }
-      return owners;
+      return entries;
     });
-    return named.contains(owner);
+    return named.contains(owner + "|" + valueKey(value));
+  }
+
+  /** A constant value reduced to a key two equal values share, with float/double bit equality. */
+  private static String valueKey(Object value) {
+    if (value instanceof Integer integer) {
+      return "I:" + integer;
+    }
+    if (value instanceof Long wider) {
+      return "J:" + wider;
+    }
+    if (value instanceof Float single) {
+      return "F:" + Float.floatToIntBits(single);
+    }
+    if (value instanceof Double wider) {
+      return "D:" + Double.doubleToLongBits(wider);
+    }
+    if (value instanceof String text) {
+      return "S:" + text;
+    }
+    return "?:" + value;
   }
 
   public ConstExprent(int val, boolean boolPermitted, BitSet bytecodeOffsets) {
@@ -332,7 +372,7 @@ public class ConstExprent extends Exprent {
       case SHORT:
       case INT:
         int intVal = (Integer)value;
-        if (!literal && poolHasClass("java/lang/Integer")) {
+        if (!literal && poolHasNaming("java/lang/Integer", intVal)) {
           if (intVal == Integer.MAX_VALUE) {
             return buf.append(new FieldExprent("MAX_VALUE", "java/lang/Integer", true, null, FieldDescriptor.INTEGER_DESCRIPTOR, bytecode).toJava(0));
           }
@@ -346,7 +386,7 @@ public class ConstExprent extends Exprent {
 
         long longVal = (Long)value;
 
-        if (!literal && poolHasClass("java/lang/Long")) {
+        if (!literal && poolHasNaming("java/lang/Long", longVal)) {
           if (longVal == Long.MAX_VALUE) {
             return buf.append(new FieldExprent("MAX_VALUE", "java/lang/Long", true, null, FieldDescriptor.LONG_DESCRIPTOR, bytecode).toJava(0));
           }
@@ -360,16 +400,24 @@ public class ConstExprent extends Exprent {
         float floatVal = (Float)value;
         if (!literal) {
           if (Float.isNaN(floatVal)) {
-            if (poolHasClass("java/lang/Float")) {
+            if (poolHasNaming("java/lang/Float", Float.NaN)) {
               return buf.append(new FieldExprent("NaN", "java/lang/Float", true, null, FieldDescriptor.FLOAT_DESCRIPTOR, bytecode).toJava(0));
             }
             return buf.append("0.0F / 0.0F");
           }
           else if (UNINLINED_FLOATS.containsKey(floatVal)) {
             TextBuffer uninlined = UNINLINED_FLOATS.get(floatVal).apply(bytecode);
-            if (ownerNamedInPool(uninlined)) {
+            if (namedFormInPool(namedFormOwner(true, floatVal), floatVal)) {
               return buf.append(uninlined);
             }
+          }
+          // Without the pool's proof the named form may not be used, and an infinity is not
+          // writable as a literal: the division is the same constant expression javac folds.
+          if (floatVal == Float.POSITIVE_INFINITY) {
+            return buf.append("1.0F / 0.0F");
+          }
+          if (floatVal == Float.NEGATIVE_INFINITY) {
+            return buf.append("-1.0F / 0.0F");
           }
         }
         else {
@@ -391,14 +439,14 @@ public class ConstExprent extends Exprent {
         double doubleVal = (Double)value;
         if (!literal) {
           if (Double.isNaN(doubleVal)) {
-            if (poolHasClass("java/lang/Double")) {
+            if (poolHasNaming("java/lang/Double", Double.NaN)) {
               return buf.append(new FieldExprent("NaN", "java/lang/Double", true, null, FieldDescriptor.DOUBLE_DESCRIPTOR, bytecode).toJava(0));
             }
             return buf.append("0.0 / 0.0");
           }
           else if (UNINLINED_DOUBLES.containsKey(doubleVal)) {
             TextBuffer uninlined = UNINLINED_DOUBLES.get(doubleVal).apply(bytecode);
-            if (ownerNamedInPool(uninlined)) {
+            if (namedFormInPool(namedFormOwner(false, doubleVal), doubleVal)) {
               return buf.append(uninlined);
             }
           }
@@ -409,10 +457,17 @@ public class ConstExprent extends Exprent {
           if (floatRepresentation == doubleVal) {
             if (UNINLINED_FLOATS.containsKey(floatRepresentation)) {
               TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
-              if (ownerNamedInPool(uninlined)) {
+              if (namedFormInPool(namedFormOwner(true, floatRepresentation), floatRepresentation)) {
                 return buf.append(uninlined);
               }
             }
+          }
+          // As for floats: without the pool's proof an infinity is written as the division.
+          if (doubleVal == Double.POSITIVE_INFINITY) {
+            return buf.append("1.0 / 0.0");
+          }
+          if (doubleVal == Double.NEGATIVE_INFINITY) {
+            return buf.append("-1.0 / 0.0");
           }
         }
         else if (Double.isNaN(doubleVal)) {
@@ -485,7 +540,7 @@ public class ConstExprent extends Exprent {
           && trimFloat(Float.toString(floatRepresentation), floatRepresentation).length() < trimDouble(Double.toString(doubleVal), doubleVal).length()
           && UNINLINED_FLOATS.containsKey(floatRepresentation) && !NO_PAREN_VALUES.contains(floatRepresentation)) {
           TextBuffer uninlined = UNINLINED_FLOATS.get(floatRepresentation).apply(bytecode);
-          if (uninlined.countChars('(') < 2 && ownerNamedInPool(uninlined)) {
+          if (uninlined.countChars('(') < 2 && namedFormInPool(namedFormOwner(true, floatRepresentation), floatRepresentation)) {
             return 4;
           }
         }
