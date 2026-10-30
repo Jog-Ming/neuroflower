@@ -27,7 +27,6 @@ import java.util.concurrent.Future;
  *   score     &lt;version&gt; [&lt;version&gt;...] [--no-cache] [--only Class] [--threads N] [--json] [--since Tree]
  *   diff      &lt;version&gt; &lt;Class&gt; [&lt;Class&gt;...]
  *   compile   &lt;version&gt; &lt;Class&gt;
- *   bytes     &lt;version&gt; &lt;Class&gt;
  *   corpus    &lt;version&gt; --ground-truth &lt;dir&gt;
  *   dataset   &lt;version&gt;
  *   clean     [--trees] [--compile] [--downloads] [--all]
@@ -149,46 +148,6 @@ public final class Main {
           System.out.printf(Locale.ROOT, "%s %s%n", problems.isEmpty() ? "compiled" : "failed",
             tree.relativize(source));
           ok &= problems.isEmpty();
-        }
-        if (!ok) {
-          System.exit(1);
-        }
-      }
-      case "bytes" -> {
-        // The verifier compiles in memory; byte-level diagnosis (constant-pool order, LVT rows,
-        // frames) needs the class files on disk to compare against the jar's.
-        List<String> positional = positionals(rest);
-        if (positional.size() < 2) {
-          throw new IllegalArgumentException("usage: bytes <version> <Class> [--no-cache] [--options \"...\"]");
-        }
-        String version = positional.get(0);
-        String className = positional.get(1);
-        boolean noCache = rest.contains("--no-cache");
-        Path tree = decompiler.tree(version, threadsDefault(), noCache, className, optionsFlag(rest));
-        List<Path> sources = Verifier.sources(tree, className);
-        if (sources.isEmpty()) {
-          throw new IllegalArgumentException("no source for " + className + " under " + tree);
-        }
-        List<Path> classpath = minecraft.classpath(version, false);
-        int release = Verifier.releaseOf(minecraft.clientJar(version, false));
-        Path out = workspace.tmp.resolve("compiled");
-        boolean ok = true;
-        for (Path source : sources) {
-          Verifier.Compiled compiled = Verifier.compile(source, classpath, release);
-          if (!compiled.ok()) {
-            for (String error : compiled.errors()) {
-              System.out.printf(Locale.ROOT, "%s: %s%n", tree.relativize(source), error);
-            }
-            ok = false;
-            continue;
-          }
-          for (Map.Entry<String, byte[]> entry : compiled.outputs().entrySet()) {
-            Path target = out.resolve(entry.getKey() + ".class");
-            Files.createDirectories(target.getParent());
-            Workspace.write(target, entry.getValue());
-            System.out.printf(Locale.ROOT, "%s  %d bytes  %s%n",
-              entry.getKey(), entry.getValue().length, target);
-          }
         }
         if (!ok) {
           System.exit(1);
