@@ -68,7 +68,10 @@ allowed to change as the work does.
   permission dialog buries the user. The brief must name only paths and commands the agent can run
   without a prompt — reading, grepping, the project's own scripts under `.dev/tmp` — and must state
   that a step which would need approval is skipped and written into the report instead of attempted.
-  Message a running agent this rule the moment it is added.
+  Message a running agent this rule the moment it is added. Two known prompt traps stay out of every
+  brief: `DOT_EXPORT_DIR`-style graph dumps (thousands of files per method) followed by a wildcard
+  `rm` to clean them, and any `rm` whose target is not a literal path — one such pair stalled an
+  agent for five hours on an approval nobody saw.
 ## The family loop
 
 Every unaligned metric is worked the same way. The main process classifies and dispatches; it does
