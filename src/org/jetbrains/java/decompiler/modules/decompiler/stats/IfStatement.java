@@ -609,6 +609,8 @@ public class IfStatement extends Statement {
       if (guard) {
         buf.appendIndent(indent).append("}").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifstat, indent, false));
+      } else if (appendFlatElse(buf, indent, elsestat, ifstat, false)) {
+        // The table proves the source wrote the second arm flat after the first.
       } else if (!printElseIfArm(buf, indent, ifstat)) {
         buf.appendIndent(indent).append("} else {").appendLineSeparator();
         buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
@@ -701,6 +703,40 @@ public class IfStatement extends Statement {
   }
 
   /**
+   * Prints the then arm's closing brace and the else arm flat after the if when the target's table
+   * proves the source wrote the arm flat: the arm's first local closes with the enclosing block,
+   * and every row that opened before the arm was written after it. A real else closes its own
+   * block first and writes the arm's rows ahead of every enclosing row. The then arm has to leave
+   * on its own, or the source's flat form would run into the statements after the test; a continue
+   * the arm's print folded into its edge is written here, and a plain break is left as an else
+   * because the arm's print may owe it to an enclosing switch, where a written break is illegal.
+   * False, printing nothing, when the else stays.
+   *
+   * @param printJump whether the caller has not already printed the then arm's terminal jump
+   */
+  private boolean appendFlatElse(TextBuffer buf, int indent, Statement thenArm, Statement elseArm, boolean printJump) {
+    if (!RoundTrip.selector("elseflat") || RoundTrip.isArmOpen(this)
+        || elseArm instanceof IfStatement
+        || !RoundTrip.armWasFlat(elseArm)) {
+      return false;
+    }
+    boolean armExits = endsWithExit(thenArm) || endsWithYield(thenArm);
+    StatEdge exitEdge = armExits ? null : SequenceStatement.terminalExit(thenArm);
+    boolean continues = exitEdge != null
+      && (exitEdge.getType() == StatEdge.TYPE_CONTINUE
+          || exitEdge.getType() == StatEdge.TYPE_BREAK && exitEdge.getDestination() instanceof DoStatement);
+    if (!armExits && !continues) {
+      return false;
+    }
+    if (continues && printJump) {
+      buf.appendIndent(indent + 1).append("continue;").appendLineSeparator();
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(elseArm, indent, false));
+    return true;
+  }
+
+  /**
    * True when the target ends the arm with a void return the writer dropped: its last instruction
    * is a return exactly where the other arm begins, and the arm's print does not already carry
    * one. The source closed the branch there, so the other arm prints after the if, not as an else.
@@ -730,6 +766,21 @@ public class IfStatement extends Statement {
     line.appendIndent(indent).append("return;").appendLineSeparator();
     RoundTrip.mapSynthesizedLine(line, exit);
     buf.append(line);
+  }
+
+  /** True when the arm's last exprent is a {@code yield}, which leaves its switch expression. */
+  private static boolean endsWithYield(Statement stat) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (int i = exprents.size() - 1; i >= 0; i--) {
+        if (exprents.get(i) != null) {
+          return exprents.get(i).type == Exprent.Type.YIELD;
+        }
+      }
+      return false;
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && endsWithYield(children.get(children.size() - 1));
   }
 
   /** True when the statement's print already ends with a bare `return;`. */
@@ -786,6 +837,9 @@ public class IfStatement extends Statement {
     boolean elseif = false;
 
     if (elsestat != null) {
+      if (appendFlatElse(buf, indent, ifstat, elsestat, true)) {
+        return;
+      }
       // The target's table can prove the else arm closed early: a local the arm declares has a
       // row ending at the first instruction of a trailing return or throw, so the source's brace
       // stood there and the return ran after the if/else. The flat print would keep the local

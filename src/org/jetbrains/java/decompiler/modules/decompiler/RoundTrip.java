@@ -22,6 +22,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.GeneralStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructClass;
@@ -672,6 +673,67 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /**
+   * The index of the run the source braced around the rest of this sequence, or -1. javac writes a
+   * local's row when its block closes; a run whose first local's row closes with the sequence but
+   * before every row that opened before the run proves the run sat in a block of its own. A flat
+   * run closes in the same pass as those enclosing rows, and the pass walks rising slots, so the
+   * enclosing row (allocated earlier) precedes it; after a real brace the run's rows are written
+   * ahead of every enclosing row. The run is the whole tail, so only the sequence's end is in
+   * question; a row opening inside the run says nothing about the enclosing block.
+   */
+  public static int trailingBareBlock(java.util.List<Statement> children, int i, Statement owner) {
+    if (!selector("blockbrace") || children == null || owner == null || i < 0 || i >= children.size()) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table =
+      method == null ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return -1;
+    }
+    // A run that starts after earlier statements is a block inside them: whatever prints the
+    // sequence (a method body, a try body, an arm) opened its brace before the run. A run that
+    // opens the sequence is only the source's own block when the sequence is the method body;
+    // anywhere else that brace is the enclosing construct's, and the printer already writes it.
+    if (i == 0 && !(owner.getParent() instanceof RootStatement)) {
+      return -1;
+    }
+    // A sequence holding one basic block prints its exprents itself, and the block printer reads
+    // the same table at exprent granularity; two braces around one run would nest them.
+    if (children.size() == 1 && children.get(0).type == Statement.StatementType.BASIC_BLOCK) {
+      return -1;
+    }
+    Statement firstStat = children.get(i);
+    LocalVariable first = firstPrefixLocal(firstStat);
+    int childStart = firstOffset(firstStat);
+    int close = lastEnd(owner);
+    if (first == null || first.getStart() <= 0 || childStart < 0 || close < 0
+        || first.getStart() < childStart || first.getEnd() != close) {
+      return -1;
+    }
+    for (int k = i; k < children.size(); k++) {
+      if (lastEnd(children.get(k)) > close) {
+        return -1;
+      }
+    }
+    ImplicitVars implicit = enclosingImplicitVars(firstStat);
+    int flat = 0;
+    int nested = 0;
+    for (LocalVariable row : table.getVariables().toList()) {
+      if (row.getOrder() < 0 || row.getStart() >= childStart || row.getEnd() != close
+          || implicit != null && implicit.matches(row)) {
+        continue;
+      }
+      if (row.getOrder() < first.getOrder()) {
+        flat++;
+      } else if (row.getOrder() > first.getOrder()) {
+        nested++;
+      }
+    }
+    return flat == 0 && nested > 0 ? i : -1;
   }
 
   /**
@@ -9466,7 +9528,12 @@ public final class RoundTrip {
           continue;
         }
         int e1 = row.getEnd();
-        if (slotHandover(row.getIndex(), s1, e1) == null) {
+        // A brace is also proven without a handover when the rows say so: a local whose row ends
+        // where this run ends, while every row that opened before it was written after it, was
+        // inside a block that closed first; a flat run shares the enclosing close pass, where the
+        // earlier-allocated row precedes it in rising-slot order.
+        boolean rowOrder = rowOrderProvesBlock(rows, row, s1, e1, e1 + 8, null);
+        if (!rowOrder && slotHandover(row.getIndex(), s1, e1) == null) {
           continue;
         }
         for (int b = a + 1; b < to; b++) {
@@ -9476,7 +9543,7 @@ public final class RoundTrip {
             if (b == to - 1) {
               // Nothing after this run proves the boundary: the next row's store has to sit behind
               // the declaration on every path, which a row that merely reuses the slot does not.
-              if (!closeAtEnd || slotHandoverAcrossPaths(row.getIndex(), s1, e1) == null) {
+              if (!closeAtEnd || (!rowOrder && slotHandoverAcrossPaths(row.getIndex(), s1, e1) == null)) {
                 continue;
               }
             }
@@ -9486,6 +9553,128 @@ public final class RoundTrip {
       }
     }
     return null;
+  }
+
+  /**
+   * Whether the run opening at this statement sat in a block of its own that closes with the
+   * enclosing sequence: the run's first local closes there, and every row that opened before the
+   * run was written after it. A flat run shares the enclosing block's close event, whose
+   * rising-slot pass writes the earlier-allocated enclosing row first.
+   */
+  public static boolean runWasBraced(Statement firstTail, int enclosingEnd) {
+    if (!selector("trailelse") || firstTail == null || currentMethod() == null) {
+      return false;
+    }
+    StructLocalVariableTableAttribute table =
+      currentMethod().getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return false;
+    }
+    LocalVariable first = firstPrefixLocal(firstTail);
+    int start = firstOffset(firstTail);
+    if (first == null || first.getStart() <= 0 || start < 0 || first.getEnd() <= 0
+        || enclosingEnd < 0 || first.getEnd() < enclosingEnd || first.getEnd() > enclosingEnd + 8) {
+      return false;
+    }
+    return rowOrderProvesBlock(table.getVariables().toList(), first, start, first.getEnd(), enclosingEnd,
+      enclosingImplicitVars(firstTail));
+  }
+
+  /**
+   * Whether the rows prove the run opening at this local sat in a block of its own: the local's
+   * scope closed before the enclosing scope did, so its row was written ahead of every row that
+   * closes with the enclosing scope; a flat run closes at the enclosing scope's own end and lands
+   * in that final rising-slot pass, where the earlier-allocated enclosing row precedes it.
+   */
+  private static boolean rowOrderProvesBlock(List<LocalVariable> rows, LocalVariable row, int start, int end,
+                                             int enclosingEnd, ImplicitVars excluded) {
+    if (row.getOrder() < 0 || row.getStart() <= 0) {
+      return false;
+    }
+    int flat = 0;
+    int nested = 0;
+    for (LocalVariable other : rows) {
+      if (other.getOrder() < 0 || other.getStart() >= start
+          || excluded != null && excluded.matches(other)) {
+        continue;
+      }
+      if (other.getEnd() == end && other.getOrder() < row.getOrder()) {
+        flat++;
+      }
+      // Only rows that close with the block's own enclosing scope count: a row ending far past
+      // it belongs to an outer construct whose brace the printer already wrote.
+      if (other.getEnd() >= end && other.getEnd() <= enclosingEnd + 8
+          && other.getOrder() > row.getOrder()) {
+        nested++;
+      }
+    }
+    return flat == 0 && nested > 0;
+  }
+
+  /** The class file's slot for a variable the tree renumbered, or its own index. */
+  private static int slotOf(VarExprent var) {
+    int slot = originalSlot(var);
+    return slot >= 0 ? slot : var.getIndex();
+  }
+
+  /**
+   * The variables of the constructs around this statement that javac scopes to the whole
+   * construct rather than to a block of its own: a loop's own variable or pattern, a catch
+   * variable, an if's pattern. Their rows close after the run's body, so they must not pass for an
+   * enclosing block local that proves the run was braced. A variable the tree renumbered is
+   * matched by name when its class-file slot is no longer recorded.
+   */
+  private static ImplicitVars enclosingImplicitVars(Statement firstTail) {
+    java.util.Set<Integer> slots = new java.util.HashSet<>();
+    java.util.Set<String> names = new java.util.HashSet<>();
+    Statement stat = firstTail == null ? null : firstTail.getParent();
+    while (stat != null) {
+      if (stat instanceof DoStatement loop) {
+        java.util.List<Exprent> heads = new java.util.ArrayList<>();
+        heads.addAll(loop.getInitExprentList());
+        heads.addAll(loop.getConditionExprentList());
+        heads.addAll(loop.getIncExprentList());
+        for (Exprent head : heads) {
+          if (head == null) {
+            continue;
+          }
+          for (Exprent part : head.getAllExprents(true, true)) {
+            if (part instanceof VarExprent var) {
+              slots.add(slotOf(var));
+              String name = varName(var);
+              if (name != null) {
+                names.add(name);
+              }
+            }
+          }
+        }
+      }
+      java.util.List<VarExprent> implicit = stat.getImplicitlyDefinedVars();
+      if (implicit != null) {
+        for (VarExprent var : implicit) {
+          slots.add(slotOf(var));
+          String name = varName(var);
+          if (name != null) {
+            names.add(name);
+          }
+        }
+      }
+      stat = stat.getParent();
+    }
+    return slots.isEmpty() && names.isEmpty() ? null : new ImplicitVars(slots, names);
+  }
+
+  private static String varName(VarExprent var) {
+    if (var.getLVT() != null) {
+      return var.getLVT().getName();
+    }
+    return var.getProcessor() == null ? null : var.getProcessor().getVarName(var.getVarVersionPair());
+  }
+
+  private record ImplicitVars(java.util.Set<Integer> slots, java.util.Set<String> names) {
+    boolean matches(LocalVariable row) {
+      return slots.contains(row.getIndex()) || names.contains(row.getName());
+    }
   }
 
   /** The exprents a statement prints before its own body, or null when its print cannot split. */

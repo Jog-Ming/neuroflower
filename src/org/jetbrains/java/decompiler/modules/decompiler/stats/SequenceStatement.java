@@ -1231,7 +1231,11 @@ public class SequenceStatement extends Statement {
             for (int k = armSplit; k < armChildren.size(); k++) {
               buf.append(ExprProcessor.jmpWrapper(armChildren.get(k), indent, k == armSplit));
             }
-          } else if (RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), tail)) {
+          } else if (RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), tail)
+              // The table proves the arm lived in a block of its own: the source wrote it as the
+              // guard's else arm, and a flat run would move its first local's row into the
+              // method's final close pass.
+              || RoundTrip.runWasBraced(ifStatement.getIfstat(), RoundTrip.lastEnd(ifStatement.getIfstat()))) {
             buf.appendIndent(indent).append("} else {").appendLineSeparator();
             buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
             buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -1537,7 +1541,10 @@ public class SequenceStatement extends Statement {
           Statement movedRest = new SequenceStatement(stats.subList(i + 1, stats.size()));
           boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest)
             || RoundTrip.jumpsOnto(RoundTrip.firstOffset(movedRest),
-                 RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()));
+                 RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()))
+            // The arm is the source's else arm when the table proves its first local lived in a
+            // block of its own: a flat run would put that row in the method's final close pass.
+            || RoundTrip.runWasBraced(ifStatement.getIfstat(), RoundTrip.lastEnd(ifStatement.getIfstat()));
           // The target's table can prove the arm held an else block that closed before a
           // trailing return: the first local the arm declares ends its row at that return's
           // first instruction. The flat print would keep the local alive through the return.
@@ -1622,7 +1629,10 @@ public class SequenceStatement extends Statement {
           && ifStatement.getIfstat() != null && !ifStatement.isLabeled()
           && !ifStatement.isPatternMatched()
           && endsWithReturn(ifStatement.getIfstat())
-          && RoundTrip.opensTrailingBlock(stats.get(i + 1), elseArmEnd())) {
+          // The original evidence: a block-scoped tail that runs to the method's end. The row
+          // order adds the shapes the parameters cannot prove, bounded by this sequence's end.
+          && (RoundTrip.opensTrailingBlock(stats.get(i + 1), elseArmEnd())
+              || RoundTrip.runWasBraced(stats.get(i + 1), RoundTrip.lastEnd(this)))) {
         IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
         buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
         buf.append(ifStatement.getFirst().toJava(indent));
@@ -1730,15 +1740,38 @@ public class SequenceStatement extends Statement {
               buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
             }
           }
-          buf.appendIndent(indent).append("}").appendLineSeparator();
+          // The arm is the source's else when the table proves its first local lived in a block of
+          // its own; a flat run would put that row in the method's final close pass. The try-body
+          // return the try prints later keeps the flat form: the arm's brace cannot hold it.
+          boolean armElse = RoundTrip.deferTryReturn(ifStatement.getIfstat()) == null
+            && RoundTrip.runWasBraced(ifStatement.getIfstat(), RoundTrip.lastEnd(ifStatement.getIfstat()));
+          buf.appendIndent(indent).append(armElse ? "} else {" : "}").appendLineSeparator();
           // As a try body's print, the trailing return's own instruction may sit past the
           // protected range: the source wrote it after the try/catch, and the try prints it.
           if (RoundTrip.deferTryReturn(ifStatement.getIfstat()) == null) {
-            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
+            buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), armElse ? indent + 1 : indent, false));
+          }
+          if (armElse) {
+            buf.appendIndent(indent).append("}").appendLineSeparator();
           }
           notempty = true;
           break;
         }
+      }
+
+      // The target's table proves the source braced the rest of this block: the run's first local
+      // closes with the sequence, while every row that opened before the run was written after it
+      // — a nested block closes before its enclosing one, and a flat run shares the rising-slot
+      // pass, where the earlier-allocated enclosing row comes first.
+      int braceAt = RoundTrip.trailingBareBlock(stats, i, this);
+      if (braceAt >= 0) {
+        buf.appendIndent(indent).append("{").appendLineSeparator();
+        for (int k = braceAt; k < stats.size(); k++) {
+          buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == braceAt));
+        }
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        notempty = true;
+        break;
       }
 
       TextBuffer str = ExprProcessor.jmpWrapper(st, indent, false);
@@ -2182,7 +2215,7 @@ public class SequenceStatement extends Statement {
    * The jump the statement's last printed statement ends with, or null. Walks the tail path the
    * same way the printer does, so the edge found is the one that will be printed last.
    */
-  private static StatEdge terminalExit(Statement stat) {
+  static StatEdge terminalExit(Statement stat) {
     while (true) {
       List<StatEdge> edges = stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
       if (edges.size() == 1 && edges.get(0).getType() != StatEdge.TYPE_REGULAR) {

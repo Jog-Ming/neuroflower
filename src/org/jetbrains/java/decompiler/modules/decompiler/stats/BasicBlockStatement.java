@@ -145,13 +145,23 @@ public final class BasicBlockStatement extends Statement {
    * closing brace of the construct is the one that ends the scope.
    */
   private boolean printsOwnEnd() {
+    // A method body is a block of its own among the parameters: the target's rows say whether the
+    // source braced it, and the method's own braces are the outer scope either way.
+    if (getParent() instanceof RootStatement) {
+      return true;
+    }
     if (!(getParent() instanceof SequenceStatement sequence)) {
       return false;
     }
     Statement above = sequence.getParent();
-    return above == null || !(above instanceof DoStatement || above instanceof IfStatement
+    // A sequence built during printing is a split of some statement's print; that statement
+    // prints the brace its own reading needs, so this block's end is not its own.
+    if (above == null) {
+      return false;
+    }
+    return !(above instanceof DoStatement || above instanceof IfStatement
       || above instanceof CatchAllStatement || above instanceof CatchStatement
-      || above instanceof SynchronizedStatement);
+      || above instanceof SynchronizedStatement || above instanceof SwitchStatement);
   }
 
   private void planBlockScopes(boolean[] openAt, boolean[] closeBefore) {
