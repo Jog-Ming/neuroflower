@@ -2762,6 +2762,7 @@ public final class ConstantNames {
         case LONG -> Long.valueOf(Long.parseLong(text));
         case FLOAT -> Float.valueOf(Float.parseFloat(text));
         case DOUBLE -> Double.valueOf(Double.parseDouble(text));
+        case BOOLEAN -> Boolean.valueOf(text);
         default -> null;
       };
     }
@@ -2832,7 +2833,13 @@ public final class ConstantNames {
       String first = null;
       String expression = null;
       for (SourceConstant source : sources) {
-        if (!numeric(source.kind()) || promote(source.kind(), kind) != kind) {
+        if (kind == VariableType.BOOLEAN) {
+          if (source.kind() != VariableType.BOOLEAN) {
+            continue;
+          }
+        }
+        else if (!numeric(source.kind()) || (promote(source.kind(), kind) != kind
+            && !castable(source.kind(), kind))) {
           continue; // the expression's static type must be the recorded literal's own type
         }
         String fieldName = source.name().substring(source.name().lastIndexOf('.') + 1);
@@ -2856,14 +2863,13 @@ public final class ConstantNames {
         if (direct == null && solved.equals(name)) {
           direct = solved;
         }
-        if (expression == null
-            && (immediateConstant(source) || pooledBefore.contains(constantKey(source)))
+        if (expression == null && (immediateKey(key) || pooledBefore.contains(key))
             && poolFree(solved, pooledBefore)) {
-          // Named before a reference successor, a constant enters its own value after the class
-          // and its name. An immediate enters nothing, and a value the pool already holds below
-          // the pair is reused, so either reproduces the pair the pool leaves free-standing. The
-          // solved expression's own literals must obey the same rule: a pooled value it introduces
-          // would land after the pair, where the original had none.
+          // Named before a reference successor, the folded expression's value would be entered
+          // right after the class and its name; the pair admitted this literal only because that
+          // value is an immediate or already pooled below the pair. The solved expression's own
+          // literals must obey the same rule: a pooled value one of them introduces would land
+          // after the pair, where the original had none.
           expression = solved;
         }
       }
@@ -2920,6 +2926,7 @@ public final class ConstantNames {
       case "LONG" -> VariableType.LONG;
       case "FLOAT" -> VariableType.FLOAT;
       case "DOUBLE" -> VariableType.DOUBLE;
+      case "BOOLEAN" -> VariableType.BOOLEAN;
       default -> null;
     };
   }
@@ -3610,6 +3617,9 @@ public final class ConstantNames {
   private static String constantExpression(FieldConstant target, VariableType sourceKind,
                                            Object sourceValue, String name) {
     VariableType t = target.kind();
+    if (t == VariableType.BOOLEAN || sourceKind == VariableType.BOOLEAN) {
+      return booleanExpression(target, sourceKind, sourceValue, name);
+    }
     if (!numeric(t) || !numeric(sourceKind)) {
       return t == sourceKind && target.value().equals(sourceValue) ? name : null;
     }
@@ -3624,7 +3634,85 @@ public final class ConstantNames {
         || sourceKind == VariableType.LONG) && foldsTo(complement(sourceValue, u), u, target)) {
       return "~" + name;
     }
-    return binaryExpression(target, sourceKind, sourceValue, name);
+    String binary = binaryExpression(target, sourceKind, sourceValue, name);
+    if (binary != null) {
+      return binary;
+    }
+    // A constant of a wider kind needs an explicit cast before arithmetic in the target's kind:
+    // `(int) Owner.FLOAT_CONST + 1`. A cast of a constant variable is itself a constant
+    // expression, and javac folds it exactly as the literal's value.
+    return castExpression(target, sourceKind, sourceValue, name);
+  }
+
+  /** The boolean literal's source form: the constant itself, or its negation. */
+  private static String booleanExpression(FieldConstant target, VariableType sourceKind,
+                                          Object sourceValue, String name) {
+    if (sourceKind != VariableType.BOOLEAN || !(sourceValue instanceof Integer source)
+        || !(target.value() instanceof Boolean value)) {
+      return null;
+    }
+    return (source != 0) == value ? name : "!" + name;
+  }
+
+  /** An expression whose source constant is cast to the target's kind before arithmetic. */
+  private static String castExpression(FieldConstant target, VariableType sourceKind,
+                                       Object sourceValue, String name) {
+    VariableType t = target.kind();
+    Object cast = castValue(sourceValue, sourceKind, t);
+    if (cast == null) {
+      return null;
+    }
+    String castName = "(" + javaName(t) + ") " + name;
+    if (foldsTo(cast, t, target)) {
+      return castName;
+    }
+    return binaryExpression(target, t, cast, castName);
+  }
+
+  /** The value of {@code (to) value} when javac folds the cast, or null for a widening or lossy pair. */
+  private static Object castValue(Object value, VariableType from, VariableType to) {
+    if (from == VariableType.CHAR) {
+      from = VariableType.INT;
+    }
+    if (!(value instanceof Number number)) {
+      return null;
+    }
+    return switch (to) {
+      case INT -> from == VariableType.LONG ? Integer.valueOf((int) number.longValue())
+        : from == VariableType.FLOAT ? Integer.valueOf((int) number.floatValue())
+        : from == VariableType.DOUBLE ? Integer.valueOf((int) number.doubleValue()) : null;
+      case LONG -> from == VariableType.FLOAT ? Long.valueOf((long) number.floatValue())
+        : from == VariableType.DOUBLE ? Long.valueOf((long) number.doubleValue()) : null;
+      case FLOAT -> from == VariableType.DOUBLE ? Float.valueOf((float) number.doubleValue()) : null;
+      default -> null;
+    };
+  }
+
+  /** Whether an explicit cast is the only way this source kind reaches the target kind. */
+  private static boolean castable(VariableType from, VariableType to) {
+    if (from == VariableType.CHAR) {
+      from = VariableType.INT;
+    }
+    return switch (to) {
+      case INT -> from == VariableType.LONG || from == VariableType.FLOAT || from == VariableType.DOUBLE;
+      case LONG -> from == VariableType.FLOAT || from == VariableType.DOUBLE;
+      case FLOAT -> from == VariableType.DOUBLE;
+      default -> false;
+    };
+  }
+
+  private static String javaName(VariableType kind) {
+    return switch (kind) {
+      case INT -> "int";
+      case LONG -> "long";
+      case FLOAT -> "float";
+      case DOUBLE -> "double";
+      case BOOLEAN -> "boolean";
+      case CHAR -> "char";
+      case BYTE -> "byte";
+      case SHORT -> "short";
+      case STRING -> "String";
+    };
   }
 
   /**
@@ -3876,6 +3964,9 @@ public final class ConstantNames {
 
   /** Whether naming this constant enters no value into the pool: it compiles to an immediate. */
   private static boolean immediateConstant(SourceConstant source) {
+    if (source.kind() == VariableType.BOOLEAN) {
+      return true; // a boolean folds to iconst_0/iconst_1
+    }
     if (source.value() instanceof Character value) {
       return value <= Short.MAX_VALUE;
     }
