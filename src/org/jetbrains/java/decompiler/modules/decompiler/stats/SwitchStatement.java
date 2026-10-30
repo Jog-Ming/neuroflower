@@ -175,16 +175,40 @@ public class SwitchStatement extends Statement {
     for (int a = 0; a < armSlots.size(); a++) {
       for (int b = a + 1; b < armSlots.size(); b++) {
         int armEnd = RoundTrip.lastOffset(caseStatements.get(a));
-        for (Map.Entry<Integer, int[]> first : armSlots.get(a).entrySet()) {
+        // An arm whose locals are all pattern variables declares none of them by assignment; for
+        // those the table's rows are the only evidence, and a row that starts inside the arm and
+        // dies at the arm's own end is the arm's local. A row ending at the switch's join instead
+        // dies in the switch's block and cannot pair with a later one, since the later row would
+        // have to start after it. An arm that declares its locals by assignment keeps the older,
+        // owned-rows-only reading.
+        boolean widened = armSlots.get(a).isEmpty() && RoundTrip.bindsPatternVariable(caseStatements.get(a));
+        for (Map.Entry<Integer, int[]> first
+            : (widened ? armSlotsAny.get(a) : armSlots.get(a)).entrySet()) {
           int[] second = armSlots.get(b).get(first.getKey());
           if (second == null) {
             second = armSlotsAny.get(b).get(first.getKey());
           }
           // The earlier local has to die at its arm's closing brace and the later one to start
-          // after it: a local declared in a nested block dies inside the arm instead.
+          // after it: a local declared in a nested block dies inside the arm instead. On the
+          // widened side the same name on both rows is one local whose liveness javac split per
+          // arm, not a handover between two scopes.
+          boolean sameVariable = false;
+          if (widened && second != null) {
+            String firstName = RoundTrip.slotNameAt(first.getKey(), first.getValue()[0]);
+            String secondName = RoundTrip.slotNameAt(first.getKey(), second[0]);
+            sameVariable = firstName != null && firstName.equals(secondName);
+          }
           if (second != null && first.getValue()[1] <= second[0]
-              && armEnd >= 0 && first.getValue()[1] >= armEnd - 1) {
+              && armEnd >= 0 && first.getValue()[1] >= armEnd - 1 && !sameVariable) {
             bracedEarly.add(caseStatements.get(a));
+            // A pattern binding is hoisted by javac into the block that encloses its arm. An
+            // unbraced arm's binding would be declared just before the switch, taking its slot
+            // before the earlier arm's code ran, so two bindings sharing a slot prove the later
+            // arm was braced as well.
+            if (widened && armSlots.get(b).isEmpty()
+                && RoundTrip.bindsPatternVariable(caseStatements.get(b))) {
+              bracedEarly.add(caseStatements.get(b));
+            }
           }
         }
       }
@@ -237,7 +261,12 @@ public class SwitchStatement extends Statement {
     java.util.Arrays.fill(armClose, -1);
     if (gotos != null) {
       for (int a = 0; a < caseStatements.size(); a++) {
-        for (int[] row : armSlots.get(a).values()) {
+        // The arm's pattern bindings close with its block just as a declared local does, and the
+        // table is what says so: their rows need no declaration exprent of their own to end
+        // exactly where the arm's jump begins. An arm that declares its locals by assignment
+        // keeps the older, owned-rows-only reading.
+        for (int[] row : (armSlots.get(a).isEmpty() && RoundTrip.bindsPatternVariable(caseStatements.get(a))
+            ? armSlotsAny.get(a) : armSlots.get(a)).values()) {
           Integer dest = row[1] >= 0 ? gotos.get(row[1]) : null;
           if (dest != null && dest == switchEnd) {
             braced.add(caseStatements.get(a));

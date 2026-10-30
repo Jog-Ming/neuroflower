@@ -35,7 +35,10 @@ public final class IfPatternMatchProcessor {
 
   private static boolean matchInstanceofRec(Statement statement, RootStatement root) {
     boolean res = false;
-    for (Statement stat : statement.getStats()) {
+    // A record pattern identified from a branch that is a plain block reaches its extraction
+    // statements through the enclosing sequence, and applying it destroys and adds statements
+    // there; walk a copy so a match does not disturb the walk that found it.
+    for (Statement stat : new ArrayList<>(statement.getStats())) {
       if (matchInstanceofRec(stat, root)) {
         res = true;
       }
@@ -358,7 +361,21 @@ public final class IfPatternMatchProcessor {
 
     VarType type = instOf.getLstOperands().get(1).getExprType();
 
-    PatternExprent exprent = identifyRecordPatternMatch(stat, branch, headRight, type, false);
+    PatternExprent exprent;
+    if (RoundTrip.selector("patternrecord") && branch instanceof BasicBlockStatement
+        && branch.getParent() instanceof SequenceStatement parentSeq) {
+      // A guard-throw leaves the deconstruction in the run that follows the `if`: the branch the
+      // condition enters is the store block alone, and the extraction tries are its siblings in
+      // the enclosing sequence. The run from the store block on is the same list of statements a
+      // condensed sequence branch would hold, so it is read through its parent.
+      int at = parentSeq.getStats().indexOf(branch);
+      if (at < 0) {
+        return false;
+      }
+      exprent = identifyRecordPatternMatch(stat, parentSeq, headRight, type, false, at + 1, true);
+    } else {
+      exprent = identifyRecordPatternMatch(stat, branch, headRight, type, false);
+    }
     if (exprent == null) {
       return false;
     }
@@ -374,6 +391,10 @@ public final class IfPatternMatchProcessor {
   }
 
   public static PatternExprent identifyRecordPatternMatch(Statement parent, Statement branch, Exprent storeVariable, VarType type, boolean simulate) {
+    return identifyRecordPatternMatch(parent, branch, storeVariable, type, simulate, 1, false);
+  }
+
+  private static PatternExprent identifyRecordPatternMatch(Statement parent, Statement branch, Exprent storeVariable, VarType type, boolean simulate, int startIndex, boolean continuationView) {
     StructClass cl = DecompilerContext.getStructContext().getClass(type.value);
 
     if (cl == null || cl.getRecordComponents() == null || cl.getRecordComponents().isEmpty()) {
@@ -386,13 +407,20 @@ public final class IfPatternMatchProcessor {
     List<Statement> toDestroy = new ArrayList<>();
     List<StatEdge> removeEdge = new ArrayList<>();
 
-    PatternData pattern = getChildPattern(cl, storeVariable, type, branch, 1, toDestroy, remove, removeEdge);
+    PatternData pattern = getChildPattern(cl, storeVariable, type, branch, startIndex, toDestroy, remove, removeEdge);
     if (pattern == null) {
       return null;
     }
 
     if (simulate) {
       return pattern.exp;
+    }
+
+    // A continuation run is only a window into the enclosing sequence: a pattern that had to dig
+    // into a nested statement would have to be detached from that statement, which this view
+    // cannot express. Nothing was applied yet, so the match is simply refused.
+    if (continuationView && pattern.stat != branch) {
+      return null;
     }
 
     if (branch != pattern.stat) {

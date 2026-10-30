@@ -8153,6 +8153,53 @@ public final class RoundTrip {
     return slots;
   }
 
+  /** Whether this statement binds a pattern variable anywhere in its subtree. */
+  public static boolean bindsPatternVariable(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    java.util.List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (declaresPatternVariable(exprent)) {
+          return true;
+        }
+      }
+    }
+    for (Exprent exprent : stat.getStatExprents()) {
+      if (declaresPatternVariable(exprent)) {
+        return true;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (bindsPatternVariable(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The target's name for the table row at this slot and start, or null when no row matches. The
+   * name separates a slot handover from one local whose liveness javac split into several rows:
+   * the same slot under the same name is the same variable, not a later local reusing a slot.
+   */
+  public static String slotNameAt(int slot, int start) {
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return null;
+    }
+    return table.getRange(0, Integer.MAX_VALUE)
+      .filter(v -> v.getIndex() == slot && v.getStart() == start)
+      .map(StructLocalVariableTableAttribute.LocalVariable::getName)
+      .findFirst().orElse(null);
+  }
+
   private static boolean ownedRow(java.util.List<int[]> own, StructLocalVariableTableAttribute.LocalVariable row) {
     for (int[] candidate : own) {
       if (candidate[0] == row.getIndex() && candidate[1] == row.getStart()) {
