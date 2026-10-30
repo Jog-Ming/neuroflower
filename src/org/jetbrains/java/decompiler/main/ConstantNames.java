@@ -363,6 +363,19 @@ public final class ConstantNames {
 
   private static final long NO_COORDINATE = Long.MIN_VALUE;
 
+  /**
+   * The attribute names javac's class-file writer interns while writing. Every entry a naming
+   * interned exists before the first of these, because all code generation precedes the write.
+   */
+  private static final Set<String> ATTRIBUTE_NAMES = Set.of(
+    "ConstantValue", "Code", "StackMapTable", "Exceptions", "InnerClasses", "EnclosingMethod",
+    "Synthetic", "Signature", "SourceFile", "SourceDebugExtension", "LineNumberTable",
+    "LocalVariableTable", "LocalVariableTypeTable", "Deprecated", "RuntimeVisibleAnnotations",
+    "RuntimeInvisibleAnnotations", "RuntimeVisibleParameterAnnotations",
+    "RuntimeInvisibleParameterAnnotations", "RuntimeVisibleTypeAnnotations",
+    "RuntimeInvisibleTypeAnnotations", "AnnotationDefault", "BootstrapMethods",
+    "MethodParameters", "NestHost", "NestMembers", "Record", "PermittedSubclasses");
+
   /** A (generation rank, instruction offset) point packed into one comparable value. */
   private static long coordinate(int rank, int offset) {
     return ((long) rank << 32) | (offset & 0xffffffffL);
@@ -819,9 +832,6 @@ public final class ConstantNames {
       coordinates.put(owner, coordinates(firstUses, index, early, -1));
       strict.add(owner);
     }
-    if (candidates.isEmpty()) {
-      return null;
-    }
     // A Class entry that follows its own first field or method reference was entered as that
     // reference's operand; the reference's instruction is where the Class first exists.
     Map<String, Long> internedAt = new HashMap<>();
@@ -836,6 +846,17 @@ public final class ConstantNames {
         internedAt.put(link.classname, coordinate(use.order(), use.offset()));
       }
     }
+    // Everything javac generates is interned before the class-file writer interns the first
+    // attribute name; from there on the pool holds attribute data exactly as written, including
+    // the InnerClasses table's and the StackMapTable's Class entries. A pair above that point is
+    // attribute data, not a folded naming, however pair-shaped it looks.
+    int writeStart = Integer.MAX_VALUE;
+    for (int i = 1; i < pool.size(); i++) {
+      if (pool.get(i) instanceof PrimitiveConstant utf8 && utf8.type == CodeConstants.CONSTANT_Utf8
+          && ATTRIBUTE_NAMES.contains(utf8.getString())) {
+        writeStart = Math.min(writeStart, i);
+      }
+    }
     // A Class entry the pool leaves completely unexplained, entered as a bare pair (its name, then
     // neither a value nor a reference), exists only because the source named one of the owner's
     // constants, and that naming left no value entry: the constant folded to an immediate or to a
@@ -847,8 +868,8 @@ public final class ConstantNames {
         continue;
       }
       Integer index = classIndices.get(owner);
-      if (index == null || index + 1 >= pool.size()) {
-        continue;
+      if (index == null || index + 1 >= pool.size() || index >= writeStart) {
+        continue; // absent, or interned by the class-file writer's attribute data
       }
       if (!(pool.get(index) instanceof PrimitiveConstant entry)
           || entry.type != CodeConstants.CONSTANT_Class || entry.index != index + 1
@@ -880,6 +901,18 @@ public final class ConstantNames {
         continue; // the value rules read the folded value exactly
       }
       bares.add(owner);
+    }
+    // A bare pair's owner has no value or reference successor to anchor its site, but the pool
+    // order still bounds it: every lower entry's first use precedes the naming, and a higher
+    // entry's first use follows it. The generation-order bracket is the bare site's evidence.
+    for (String owner : bares) {
+      Integer index = classIndices.get(owner);
+      if (index != null && !coordinates.containsKey(owner) && !activePairs.containsKey(owner)) {
+        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+      }
+    }
+    if (candidates.isEmpty() && bares.isEmpty()) {
+      return null;
     }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
@@ -2383,7 +2416,81 @@ public final class ConstantNames {
       }
     }
     earlySites(text, spans, rules, deferred, sites);
+    bareSites(text, spans, rules, sites);
     compositeSites(text, spans, rules, sites);
+  }
+
+  /**
+   * Names a constant of an owner whose pair has no value or reference successor at all.
+   *
+   * <p>A {@code Class}+name pair whose next entry is neither a reference nor a value was entered
+   * by a folded naming that left no other trace: the constant folded to an immediate (or to a
+   * value the pool already held). The literal the source wrote is therefore any literal that one
+   * of the owner's constants can reproduce, and the pool order places it between the lower
+   * entries' first uses and the higher ones'. Which literal of that value the source used is not
+   * recorded and does not matter: naming any constant of the owner enters the same pair.
+   */
+  private static void bareSites(String text, List<int[]> spans, Rules rules, List<Site> sites) {
+    if (!org.jetbrains.java.decompiler.modules.decompiler.RoundTrip.selector("barepairs")) {
+      return;
+    }
+    if (rules.placement().bares().isEmpty() || rules.placement().pairs() == null) {
+      return;
+    }
+    StructClass cls = rules.placement().cls();
+    if (cls == null) {
+      return;
+    }
+    List<long[]> literals = intLiterals(text, spans);
+    Map<String, Integer> indices = classIndices(cls);
+    for (String owner : rules.placement().bares()) {
+      if (siteIn(sites, owner, spans) || rules.placement().pairs().containsKey(owner)) {
+        continue;
+      }
+      Integer index = indices.get(owner);
+      if (index == null) {
+        continue;
+      }
+      List<SourceConstant> sources = sourceConstants(owner, cls, rules.imports(), rules.packageName());
+      if (sources.isEmpty()) {
+        continue;
+      }
+      Set<String> pooledBefore = pooledKeys(cls, index);
+      Site found = null;
+      for (long[] literal : literals) {
+        int start = (int) literal[0];
+        long raw = literal[2];
+        if (raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE || hasSiteAt(sites, start)) {
+          continue;
+        }
+        String key = VariableType.INT.name() + "|" + raw;
+        if ((!immediateKey(key) && !pooledBefore.contains(key))
+            || !rules.placement().provesExactly(owner, start)) {
+          continue;
+        }
+        for (SourceConstant source : sources) {
+          if (!numeric(source.kind())) {
+            continue;
+          }
+          String expression = constantExpression(new FieldConstant(null, VariableType.INT, (int) raw),
+            source.kind(), source.value(), source.name());
+          if (expression == null || !poolFree(expression, pooledBefore)) {
+            continue;
+          }
+          if (source.kind() != VariableType.INT && expression.equals(source.name())) {
+            continue; // a bare constant of another kind would change the literal's type
+          }
+          found = new Site(start, (int) literal[1], "(" + expression + ")", owner);
+          break;
+        }
+        if (found != null) {
+          break;
+        }
+      }
+      if (found != null) {
+        addSiteOnce(sites, found);
+      }
+    }
   }
 
   /**
@@ -3774,6 +3881,15 @@ public final class ConstantNames {
     boolean inScope = nestOf(owner).equals(nestOf(site.qualifiedName))
       || imports.contains(owner.replace('/', '.'))
       || (!nested && packageName.equals(packageOf(owner)));
+    if (nested && publiclyNameable(owner, packageName)) {
+      // A nested type's simple name can be shadowed in the class whose body holds the site (an
+      // inherited `Entry` hides the nested `Outer.Entry` inside Outer's own subclass), and the
+      // dotted source name cannot. The pool entry is the same binary name either way.
+      String dotted = dottedSourceName(owner);
+      if (dotted != null) {
+        return dotted;
+      }
+    }
     if (inScope) {
       return simple;
     }
@@ -3782,6 +3898,26 @@ public final class ConstantNames {
         : owner.replace('/', '.').replace('$', '.');
     }
     return owner.replace('/', '.');
+  }
+
+  /** The dotted source name of a nested class, or null when a segment is not an identifier. */
+  private static String dottedSourceName(String owner) {
+    StringBuilder out = new StringBuilder(owner.length());
+    for (int i = 0; i < owner.length(); i++) {
+      char c = owner.charAt(i);
+      out.append(c == '/' || c == '$' ? '.' : c);
+    }
+    for (String part : out.toString().split("\\.")) {
+      if (part.isEmpty() || !Character.isJavaIdentifierStart(part.charAt(0))) {
+        return null; // a local class's numbered segment has no source spelling
+      }
+      for (int i = 1; i < part.length(); i++) {
+        if (!Character.isJavaIdentifierPart(part.charAt(i))) {
+          return null;
+        }
+      }
+    }
+    return out.toString();
   }
 
   /** The first site that names this owner inside one of the class's constant initializers, or null. */
