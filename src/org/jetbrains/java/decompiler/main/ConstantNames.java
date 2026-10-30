@@ -6487,20 +6487,30 @@ public final class ConstantNames {
       return; // this body has no instance initializer block
     }
     List<Map.Entry<Integer, String>> conditions = new ArrayList<>();
-    if (rules != null && !rules.missing().isEmpty()) {
-      Map<String, Integer> indices = classIndices(own);
-      Set<Integer> prefix = prefixClassIndices(own);
+    // A name whose Class entry opens the pool was written while the class body was attributed,
+    // before any generated code: either in a constant field initializer or in a constant condition
+    // that folded away. A site already reproduces the initializer form; without one, the dead
+    // condition is what is left. This holds whether or not the class text mentions the owner
+    // elsewhere, so the missing-name rule is not the trigger.
+    Map<String, Integer> indices = classIndices(own);
+    Set<Integer> prefix = prefixClassIndices(own);
+    Set<Integer> added = new HashSet<>();
+    Map<String, List<int[]>> constantInitializers = ownInitializers(text, own);
+    if (rules != null) {
       for (String owner : rules.missing()) {
-        Integer index = indices.get(owner);
-        if (index == null || !prefix.contains(index) || siteWithin(sites, owner, spans)) {
-          continue;
-        }
-        String condition = deadCondition(owner, own.qualifiedName, packageName);
-        if (condition != null) {
-          conditions.add(Map.entry(index, condition));
-        }
+        addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
+          rules.placement(), conditions, added);
       }
-      conditions.sort(Map.Entry.comparingByKey());
+    }
+    Placement placement = rules == null ? null : rules.placement();
+    for (String owner : prefixOwners(own)) {
+      addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
+        placement, conditions, added);
+    }
+    conditions.sort(Map.Entry.comparingByKey());
+    if (System.getenv("NF_CONST_TRACE") != null) {
+      System.err.println("[dead] " + own.qualifiedName + " conds=" + conditions.size()
+        + " anon=" + anonymous + " prefix=" + prefix);
     }
     if (conditions.isEmpty() && anonymous <= 0) {
       return;
@@ -6524,6 +6534,63 @@ public final class ConstantNames {
     }
     block.append(" }");
     addSiteOnce(sites, new Site(at, at, block.toString(), "@dead"));
+  }
+
+  /**
+   * Adds the dead condition for one prefix-pair owner, when the pool and the text make it the
+   * only possible source of that pair.
+   */
+  private static void addDeadCondition(Map<String, Integer> indices, Set<Integer> prefix,
+                                       String owner, StructClass own, String packageName,
+                                       List<Site> sites, Map<String, List<int[]>> constantInitializers,
+                                       Placement placement,
+                                       List<Map.Entry<Integer, String>> conditions,
+                                       Set<Integer> added) {
+    if (own.superClass != null && owner.equals(own.superClass.getString())) {
+      return; // the superclass's entry is class setup, not a naming; a dead name would move it
+    }
+    Integer index = indices.get(owner);
+    // Only a naming attributed with a constant field initializer enters the pair before any code
+    // was generated; a method-body site or a non-constant initializer is compiled into <clinit>
+    // or a constructor and reuses the pair there, not at the pool's front.
+    boolean explained = siteInConstantInitializer(sites, owner, constantInitializers);
+    // A site the pair's own generation bracket proves is compiled where the pool wants the pair;
+    // a dead condition folds earlier and would move it ahead of that code's entries.
+    PairSite pair = placement == null || placement.pairs() == null
+      ? null : placement.pairs().get(owner);
+    if (pair != null && !explained) {
+      for (Site site : sites) {
+        if (owner.equals(site.owner()) && pairProvesBounds(pair, site.start(), placement)) {
+          explained = true;
+          break;
+        }
+      }
+    }
+    if (index == null || !prefix.contains(index) || !added.add(index) || explained) {
+      return;
+    }
+    String condition = deadCondition(owner, own.qualifiedName, packageName);
+    if (condition != null) {
+      conditions.add(Map.entry(index, condition));
+    }
+  }
+
+  /** Whether a site of this owner lies inside one of the class's constant field initializers. */
+  private static boolean siteInConstantInitializer(List<Site> sites, String owner,
+                                                   Map<String, List<int[]>> initializers) {
+    for (Site site : sites) {
+      if (!owner.equals(site.owner())) {
+        continue;
+      }
+      for (List<int[]> ranges : initializers.values()) {
+        for (int[] range : ranges) {
+          if (site.start() >= range[0] && site.start() < range[1]) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   private static void appendAnonymous(StringBuilder block, int count) {
@@ -6568,7 +6635,10 @@ public final class ConstantNames {
       if (kind == null) {
         continue;
       }
-      String name = qualifier + "." + field.getName();
+      // An own constant is written bare: javac resolves an unqualified constant in a constant
+      // context through the class's own entry, which is what the pool's front pair records. A
+      // qualified own name in a folded condition is not interned at all.
+      String name = owner.equals(ownName) ? field.getName() : qualifier + "." + field.getName();
       switch (kind) {
         case BOOLEAN:
           return number.intValue() != 0 ? "!" + name : name;
