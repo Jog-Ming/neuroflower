@@ -79,10 +79,18 @@ public final class ClassDiff {
       return diff;
     }
     diff.fail("bytes", "raw bytes differ");
-    diff.noLnt = java.util.Arrays.equals(stripLineNumbers(originalBytes), stripLineNumbers(recompiledBytes));
+    byte[] originalNoLnt = stripLineNumbers(originalBytes);
+    byte[] recompiledNoLnt = stripLineNumbers(recompiledBytes);
+    diff.noLnt = java.util.Arrays.equals(originalNoLnt, recompiledNoLnt);
     diff.matches.put(NOLNT, diff.noLnt);
     if (!diff.noLnt) {
-      diff.details.add("nolnt: bytes differ outside the line table");
+      int at = 0;
+      int limit = Math.min(originalNoLnt.length, recompiledNoLnt.length);
+      while (at < limit && originalNoLnt[at] == recompiledNoLnt[at]) {
+        at++;
+      }
+      diff.details.add("nolnt: first difference at byte " + at
+        + " (lengths " + originalNoLnt.length + " vs " + recompiledNoLnt.length + ")");
     }
 
     ClassNode original = parse(originalBytes);

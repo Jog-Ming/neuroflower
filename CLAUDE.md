@@ -123,6 +123,7 @@ devtools/cli tree      <version> [--only Class]       print the cached tree path
 devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--options "..."] [--timeout minutes] [--since Tree]
 devtools/cli diff      <version> <Class> [<Class>...]  verify classes and explain every failing attribute
 devtools/cli compile   <version> <Class>             compile that one class like the verifier does
+devtools/cli bytes     <version> <Class>             write that class's verifier-compiled bytes under .dev/tmp/compiled
 devtools/cli corpus    <version> --ground-truth <dir> write the class-to-ground-truth corpus
 devtools/cli dataset   <version>                      export per-instruction line alignment for the model
 devtools/cli reports   [--version V] [--limit N]      list past scores
