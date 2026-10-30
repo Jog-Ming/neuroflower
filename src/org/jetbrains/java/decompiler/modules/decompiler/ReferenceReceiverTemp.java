@@ -99,7 +99,7 @@ public final class ReferenceReceiverTemp {
         if (!(exprents.get(i) instanceof AssignmentExprent assignment)) {
           continue;
         }
-        if (!(assignment.getLeft() instanceof VarExprent temp) || temp.isStack() || temp.getLVT() != null) {
+        if (!(assignment.getLeft() instanceof VarExprent temp) || temp.isStack()) {
           continue;
         }
         Exprent value = assignment.getRight();
@@ -195,7 +195,13 @@ public final class ReferenceReceiverTemp {
       return null;
     }
     // The receiver temp must be untabled and appear exactly twice: its store and this capture.
-    if (named(method, slot, store.temp()) || named(method, slot, capture)) {
+    // A table row is allowed only when it is the `rec$` row this javac puts on the hidden slot at
+    // the capture load: the name is the bridge's receiver parameter, not a local the source
+    // declared. Any other row keeps the temp a declared local.
+    int captureOffset = capture.bytecode == null || capture.bytecode.isEmpty()
+      ? -1 : capture.bytecode.nextSetBit(0);
+    if (!receiverNamed(method, slot, store.temp(), captureOffset)
+        || !receiverNamed(method, slot, capture, captureOffset)) {
       return null;
     }
     List<VarExprent> uses = occurrences.get(slot);
@@ -416,6 +422,36 @@ public final class ReferenceReceiverTemp {
       return (instr.opcode - CodeConstants.opc_iload_0) % 4;
     }
     return (instr.opcode - CodeConstants.opc_istore_0) % 4;
+  }
+
+  /**
+   * True when the variable carries no table row, or only the one this javac copies onto the
+   * hidden receiver slot: a row named exactly {@code rec$} starting at the capture load. The
+   * source declared no local there — the name is the bridge's receiver parameter — so the store
+   * can still fold into the reference. Any other name, or a row starting anywhere else, keeps
+   * the temp a declared local.
+   */
+  private static boolean receiverNamed(StructMethod method, int slot, VarExprent var, int captureOffset) {
+    LocalVariable row = var.getLVT();
+    if (row == null) {
+      if (var.bytecode == null || var.bytecode.isEmpty()) {
+        return true;
+      }
+      int offset = var.bytecode.nextSetBit(0);
+      StructLocalVariableTableAttribute table = method.getLocalVariableAttr();
+      if (table != null) {
+        for (LocalVariable candidate : table.getVariables().toList()) {
+          if (candidate.getIndex() == slot && candidate.getStart() <= offset && candidate.getEnd() > offset) {
+            row = candidate;
+            break;
+          }
+        }
+      }
+      if (row == null) {
+        return true;
+      }
+    }
+    return "rec$".equals(row.getName()) && captureOffset >= 0 && row.getStart() == captureOffset;
   }
 
   /** Whether a table row for {@code slot} covers the instruction at {@code offset}. */
