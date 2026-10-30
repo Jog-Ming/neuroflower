@@ -519,6 +519,21 @@ public class SwitchStatement extends Statement {
       if (labelArm) {
         deferredBreak = armClose[i];
       }
+      // A local the arm declares ends its target row exactly at the break's jump: javac closes a
+      // scope where the source's closing brace stood, and the break's goto is emitted after that
+      // brace, so the row ends where the jump starts. The source wrote `{ … } break;`, and the
+      // break prints after the arm's closing brace; a break inside the brace would have closed
+      // the scope after the jump instead. Exactly one explicit break to this switch keeps the
+      // deferral from hiding a second, conditional break the printed body still needs.
+      if (deferredBreak < 0 && braced.contains(stat) && !stat.isLabeled() && !breakOutside
+          && !yields && !orderUnknown && guard == null && !patternArm
+          && RoundTrip.selector("switchbreak") && breakJump >= 0
+          && !declaredScopePast(armRows.get(i), breakJump, RoundTrip.patternVariableSlots(values))
+          && rowEndsAt(armRows.get(i), breakJump)
+          && RoundTrip.printsExplicitJump(stat) && !tailIfCarriesBreak(stat)
+          && countBreaksTo(stat, this) == 1) {
+        deferredBreak = breakJump;
+      }
       // An arm whose code ends exactly where the table's default target begins falls into the
       // empty default group printed after it: the source wrote one `break;`, in that group, and
       // the arm reaches it by falling through. Printing the arm's break too would add a jump.
@@ -1338,6 +1353,36 @@ public class SwitchStatement extends Statement {
       }
     }
     return false;
+  }
+
+  /** True when a local this arm declares at its own level has its target row end at {@code offset}. */
+  private static boolean rowEndsAt(List<int[]> rows, int offset) {
+    if (offset < 0) {
+      return false;
+    }
+    for (int[] row : rows) {
+      if (row[2] == offset) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The explicit breaks to {@code switchStat} held anywhere in this arm. */
+  private static int countBreaksTo(Statement stat, Statement switchStat) {
+    if (stat == null) {
+      return 0;
+    }
+    int count = 0;
+    for (StatEdge edge : stat.getAllSuccessorEdges()) {
+      if (edge.getType() == StatEdge.TYPE_BREAK && edge.explicit && edge.closure == switchStat) {
+        count++;
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      count += countBreaksTo(child, switchStat);
+    }
+    return count;
   }
 
   /** True when a local this arm declares at its own level is still in scope at {@code offset}. */

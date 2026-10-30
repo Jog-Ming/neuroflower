@@ -7441,7 +7441,19 @@ public final class RoundTrip {
     // instruction, so bound the start here and compare the end directly.
     java.util.Map<Integer, Integer> gotos = gotosHere();
     java.util.Map<Integer, Integer> ends = INSTRUCTION_ENDS.get(method);
-    Integer jumpEnd = ends == null ? null : ends.get(end);
+    // The goto the source's continue compiled to need not start at the last exprent's end: a
+    // discarded call's pop is an instruction the printer deleted, and the jump follows it. The
+    // first goto within that gap is the one the arm leaves by.
+    int jump = -1;
+    if (gotos != null) {
+      for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+        int at = entry.getKey();
+        if (at >= end && at - end <= 4 && (jump < 0 || at < jump)) {
+          jump = at;
+        }
+      }
+    }
+    Integer jumpEnd = jump >= 0 && ends != null ? ends.get(jump) : null;
     for (LocalVariable row : table.getRange(start, Integer.MAX_VALUE).toList()) {
       if (row.getStart() > end || row.getEnd() < end) {
         continue;
@@ -7449,7 +7461,7 @@ public final class RoundTrip {
       if (row.getEnd() == end) {
         return true;
       }
-      if (gotos != null && gotos.containsKey(end) && jumpEnd != null && row.getEnd() == jumpEnd) {
+      if (jumpEnd != null && row.getEnd() == jumpEnd) {
         continue;
       }
       return true;
