@@ -24,6 +24,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructTypeAnnotationAttribute;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PrimitiveConstant;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
@@ -33,6 +34,7 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericClassDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.InterpreterUtil;
+import org.jetbrains.java.decompiler.util.Key;
 import org.jetbrains.java.decompiler.util.collections.ListStack;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
@@ -411,6 +413,62 @@ public class NewExprent extends Exprent {
     return true;
   }
 
+  /**
+   * A type annotation recorded on this array-creation expression ({@code target_type 0x44}) whose
+   * path descends one array level names the element type: the source wrote it between
+   * {@code new} and the element type, as in {@code new @Nullable String[128]}.
+   */
+  private void appendNewExpressionTypeAnnotations(TextBuffer buf) {
+    if (!RoundTrip.selector("typeuse") || bytecode == null || bytecode.isEmpty()) {
+      return;
+    }
+    // A field's initializer is printed outside a method-writing context; the writer names the
+    // owning method through CURRENT_STRUCT_METHOD there, and CURRENT_METHOD_WRAPPER elsewhere.
+    StructMethod method = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_STRUCT_METHOD);
+    if (method == null) {
+      MethodWrapper wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_METHOD_WRAPPER);
+      method = wrapper == null ? null : wrapper.methodStruct;
+    }
+    if (method == null) {
+      return;
+    }
+    for (Key<?> key : ClassWriter.TYPE_ANNOTATION_ATTRIBUTES) {
+      StructTypeAnnotationAttribute attribute =
+        method.getAttribute((Key<StructTypeAnnotationAttribute>) key);
+      if (attribute == null) {
+        continue;
+      }
+      for (TypeAnnotation annotation : attribute.getAnnotations()) {
+        if (annotation.getTargetType() != TypeAnnotation.EXPR_NEW) {
+          continue;
+        }
+        // javac anchors the expression target on the dimension expression's first instruction
+        // (the `128` of `new String[128]`), not on the array-creating instruction itself.
+        boolean anchor = bytecode.get(annotation.getIndex());
+        for (int i = 0; !anchor && i < lstDims.size(); i++) {
+          BitSet dimRange = new BitSet();
+          lstDims.get(i).getBytecodeRange(dimRange);
+          anchor = dimRange.get(annotation.getIndex());
+        }
+        if (!anchor) {
+          continue;
+        }
+        TypeAnnotation.PathValue[] path = annotation.path;
+        // Only the element position of this array is printable here; any other path would need a
+        // different textual slot and is left to the printer's comment dump.
+        if (path.length != 1 || path[0].kind() != TypeAnnotation.PathKind.DEEPER_ARRAY) {
+          continue;
+        }
+        AnnotationExprent annotationExprent = annotation.getAnnotation();
+        if (annotationExprent.didWriteAlready()) {
+          continue;
+        }
+        annotationExprent.setDidWriteAlready(true);
+        buf.append(annotationExprent.toJava(-1)).append(' ');
+      }
+    }
+  }
+
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
@@ -701,7 +759,9 @@ public class NewExprent extends Exprent {
       }
     }
     else {
-      buf.append("new ").appendTypeName(newType);
+      buf.append("new ");
+      appendNewExpressionTypeAnnotations(buf);
+      buf.appendTypeName(newType);
 
       if (lstArrayElements.isEmpty()) {
         for (int i = 0; i < newType.arrayDim; i++) {

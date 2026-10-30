@@ -5,10 +5,12 @@ import org.jetbrains.java.decompiler.code.*;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.extern.IVariableNameProvider;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.struct.attr.StructCodeAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGenericSignatureAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructTypeAnnotationAttribute;
 import org.jetbrains.java.decompiler.struct.consts.ConstantPool;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericMain;
@@ -45,7 +47,20 @@ public class StructMethod extends StructMember {
     Map<Key<?>, Object> attributes = readAttributes(in, pool, own, bytecodeVersion);
     StructCodeAttribute code = (StructCodeAttribute)attributes.remove(StructGeneralAttribute.ATTRIBUTE_CODE);
     if (code != null) {
-      attributes.putAll(code.codeAttributes);
+      // A type annotation table exists at both levels: the method holds return, parameter,
+      // receiver, throws and type-parameter targets, the Code attribute holds local-variable
+      // targets. One map entry cannot hold both, so fold the Code table into the method table
+      // instead of replacing it.
+      for (Map.Entry<Key<?>, Object> entry : code.codeAttributes.entrySet()) {
+        if (RoundTrip.selector("typeuse")
+            && entry.getValue() instanceof StructTypeAnnotationAttribute codeLevel
+            && attributes.get(entry.getKey()) instanceof StructTypeAnnotationAttribute methodLevel) {
+          methodLevel.merge(codeLevel);
+        }
+        else {
+          attributes.put(entry.getKey(), entry.getValue());
+        }
+      }
     }
 
     GenericMethodDescriptor signature = null;

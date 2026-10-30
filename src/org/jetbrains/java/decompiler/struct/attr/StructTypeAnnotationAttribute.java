@@ -112,6 +112,29 @@ public class StructTypeAnnotationAttribute extends StructGeneralAttribute {
     }
   }
 
+  /**
+   * Fold the annotations of a Code attribute into a method-level table. javac writes
+   * local-variable targets (0x40, 0x41) on the Code attribute and every other target on the
+   * method, so one source annotation list arrives as two attributes that must both survive:
+   * the map holds one value per key, and overwriting either table loses the other one's
+   * positions.
+   */
+  public void merge(StructTypeAnnotationAttribute other) {
+    if (other.annotations.isEmpty() && other.localAnnotations.isEmpty()) {
+      return;
+    }
+
+    List<TypeAnnotation> combined = new ArrayList<>(annotations.size() + other.annotations.size());
+    combined.addAll(annotations);
+    combined.addAll(other.annotations);
+    annotations = combined;
+
+    List<LocalTypeAnnotation> locals = new ArrayList<>(localAnnotations.size() + other.localAnnotations.size());
+    locals.addAll(localAnnotations);
+    locals.addAll(other.localAnnotations);
+    localAnnotations = locals;
+  }
+
   public List<TypeAnnotation> getAnnotations() {
     return annotations;
   }

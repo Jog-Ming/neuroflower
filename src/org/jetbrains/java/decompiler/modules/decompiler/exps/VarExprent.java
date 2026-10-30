@@ -150,8 +150,19 @@ public class VarExprent extends Exprent implements Pattern {
         continue;
       }
       for (StructTypeAnnotationAttribute.LocalTypeAnnotation local : attribute.getLocalAnnotations()) {
-        // The table starts the range after the store, so the store's own offset sits one byte earlier.
-        if (local.index() != slot || offset < local.startPc() - 1 || offset >= local.startPc() + local.length()) {
+        // javac opens the annotated scope at the instruction after the initializing store: the
+        // range start minus the store's own length is that store's offset. The store is not
+        // always the one-byte local form (astore_2); an index above three makes it two bytes,
+        // and a wide one four.
+        boolean matches;
+        if (RoundTrip.selector("typeuse")) {
+          matches = local.index() == slot && local.startPc() == offset + storeLength(method, offset);
+        }
+        else {
+          matches = local.index() == slot && offset >= local.startPc() - 1
+            && offset < local.startPc() + local.length();
+        }
+        if (!matches) {
           continue;
         }
         if (result == null) {
@@ -161,6 +172,37 @@ public class VarExprent extends Exprent implements Pattern {
       }
     }
     return result == null ? java.util.Collections.<Pair<java.util.Queue<TypeAnnotation.PathValue>, AnnotationExprent>>emptyList() : result;
+  }
+
+  /** The byte length of the instruction at {@code offset}, the local's initializing store. */
+  private static int storeLength(MethodWrapper method, int offset) {
+    org.jetbrains.java.decompiler.code.FullInstructionSequence seq = method.methodStruct.getInstructionSequence();
+    // Printing happens after the method's code was released; a sequence expanded here must be
+    // released again, or the print-time rules that test whether it is present change their path.
+    boolean released = seq == null;
+    try {
+      if (seq == null) {
+        StructClass owner = DecompilerContext.getStructContext().getClass(method.methodStruct.getClassQualifiedName());
+        if (owner != null) {
+          try {
+            method.methodStruct.expandData(owner);
+          }
+          catch (java.io.IOException ignored) {
+          }
+          seq = method.methodStruct.getInstructionSequence();
+        }
+      }
+      if (seq == null) {
+        return 1;
+      }
+      Integer at = seq.offsetToIndex().get(offset);
+      return at == null ? 1 : seq.getInstr(at).length;
+    }
+    finally {
+      if (released) {
+        method.methodStruct.releaseResources();
+      }
+    }
   }
 
   @Override

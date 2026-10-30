@@ -5,6 +5,7 @@ import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.ClassesProcessor;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
@@ -115,7 +116,18 @@ public class TypeAnnotation {
     TextBuffer appendBuffer = new TextBuffer();
     if (type.arrayDim > 0) {
       for (int i = 0; i < type.arrayDim; i++) {
-        stepwiseWriteAnnotations(appendBuffer, true, typeAnnotations, filter, v -> v.kind() == TypeAnnotation.PathKind.DEEPER_ARRAY);
+        if (RoundTrip.selector("typeuse")) {
+          // The type path starts at the array type itself: an empty path names this array and is
+          // written at its brackets (`ShortList @Nullable []`), while a DEEPER_ARRAY step names
+          // the component type and must precede the component's own name (`@Nullable ShortList[]`).
+          stepwiseWriteAnnotations(appendBuffer, true, typeAnnotations, filter, v -> false);
+          stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter,
+            v -> v.kind() == TypeAnnotation.PathKind.DEEPER_ARRAY);
+        }
+        else {
+          stepwiseWriteAnnotations(appendBuffer, true, typeAnnotations, filter,
+            v -> v.kind() == TypeAnnotation.PathKind.DEEPER_ARRAY);
+        }
 
         if (i == type.arrayDim - 1 && vararg && flush) { // flush == top level, only check for varargs there
           appendBuffer.append("...");
@@ -183,7 +195,8 @@ public class TypeAnnotation {
         // javac rejects.
         if (i >= startIdx) {
           stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter,
-            v -> v.kind() == TypeAnnotation.PathKind.DEEPER_NESTED, i == fullClasses.size() - 1);
+            v -> v.kind() == TypeAnnotation.PathKind.DEEPER_NESTED, i == fullClasses.size() - 1,
+            RoundTrip.selector("typeuse") && i == fullClasses.size() - 1);
         }
 
         buffer.appendClass(name, false, clazz.replace(".", "/"));
@@ -255,15 +268,24 @@ public class TypeAnnotation {
   }
 
   private static void stepwiseWriteAnnotations(TextBuffer buffer, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<TypeAnnotation.PathValue> canProceed) {
-    stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter, canProceed, true);
+    stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter, canProceed, true, false);
   }
 
   private static void stepwiseWriteAnnotations(TextBuffer buffer, boolean extraSpace, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<PathValue> canProceed) {
-    stepwiseWriteAnnotations(buffer, extraSpace, typeAnnotations, filter, canProceed, true);
+    stepwiseWriteAnnotations(buffer, extraSpace, typeAnnotations, filter, canProceed, true, false);
   }
 
-  private static void stepwiseWriteAnnotations(TextBuffer buffer, boolean extraSpace, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<PathValue> canProceed, boolean topLevelNow) {
+  private static void stepwiseWriteAnnotations(TextBuffer buffer, boolean extraSpace, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<PathValue> canProceed, boolean topLevelNow, boolean writeAfterProceed) {
     for (Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent> anno : typeAnnotations) {
+      // A step consumed here names the position written next: an array dimension's brackets,
+      // or the simple name of the segment after this one. When earlier segments were skipped
+      // (a static nested type starts at a later segment), the pending step is consumed on the
+      // segment that carries the name, and the annotation goes there.
+      boolean proceed = writeAfterProceed && !anno.a.isEmpty() && canProceed.test(anno.a.peek());
+      if (proceed) {
+        anno.a.poll();
+      }
+
       if (anno.a.isEmpty()) {
         if (!topLevelNow) {
           continue; // a qualified name carries a top-level annotation on its simple name only
@@ -283,7 +305,7 @@ public class TypeAnnotation {
           buffer.append(annoJava);
           buffer.append(" ");
         }
-      } else {
+      } else if (!proceed) {
         if (canProceed.test(anno.a.peek())) {
           anno.a.poll();
         }

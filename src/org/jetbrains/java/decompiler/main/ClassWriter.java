@@ -1783,7 +1783,8 @@ public class ClassWriter implements StatementWriter {
     }
 
     if (descriptor != null && !descriptor.fparameters.isEmpty()) {
-      appendTypeParameters(buffer, descriptor.fparameters, descriptor.fbounds);
+      appendTypeParameters(buffer, descriptor.fparameters, descriptor.fbounds, cl,
+        TypeAnnotation.CLASS_TYPE_PARAMETER_BOUND, Collections.emptySet());
     }
 
     if (components != null) {
@@ -2348,7 +2349,8 @@ public class ClassWriter implements StatementWriter {
         boolean thisVar = !mt.hasModifier(CodeConstants.ACC_STATIC);
 
         if (descriptor != null && !descriptor.typeParameters.isEmpty()) {
-          appendTypeParameters(buffer, descriptor.typeParameters, descriptor.typeParameterBounds);
+          appendTypeParameters(buffer, descriptor.typeParameters, descriptor.typeParameterBounds, mt,
+            TypeAnnotation.METHOD_TYPE_PARAMETER_BOUND, writtenAnnotations);
           buffer.append(' ');
         }
 
@@ -3861,6 +3863,17 @@ public class ClassWriter implements StatementWriter {
   }
 
   public static void appendTypeParameters(TextBuffer buffer, List<String> parameters, List<List<VarType>> bounds) {
+    appendTypeParameters(buffer, parameters, bounds, null, -1, Collections.emptySet());
+  }
+
+  /**
+   * Prints a type parameter list, including the type annotations the class file records on a
+   * bound ({@code target_type} 0x11 on a class, 0x12 on a method). An annotation on the implicit
+   * {@code Object} bound forces the otherwise omitted {@code extends} clause to be written:
+   * {@code <T extends @Nullable Object>}.
+   */
+  public static void appendTypeParameters(TextBuffer buffer, List<String> parameters, List<List<VarType>> bounds,
+                                          StructMember member, int targetType, Set<String> filter) {
     buffer.append('<');
 
     for (int i = 0; i < parameters.size(); i++) {
@@ -3871,12 +3884,32 @@ public class ClassWriter implements StatementWriter {
       buffer.append(parameters.get(i));
 
       List<VarType> parameterBounds = bounds.get(i);
-      if (parameterBounds.size() > 1 || !"java/lang/Object".equals(parameterBounds.get(0).value)) {
+      boolean annotated = false;
+      if (member != null && RoundTrip.selector("typeuse")) {
+        for (int j = 0; j < parameterBounds.size(); j++) {
+          if (!getTypeAnnotations(member, targetType, (i << 8) | j).isEmpty()) {
+            annotated = true;
+            break;
+          }
+        }
+      }
+
+      if (parameterBounds.size() > 1 || !"java/lang/Object".equals(parameterBounds.get(0).value) || annotated) {
         buffer.append(" extends ");
-        buffer.appendCastTypeName(parameterBounds.get(0));
-        for (int j = 1; j < parameterBounds.size(); j++) {
-          buffer.append(" & ");
-          buffer.appendCastTypeName(parameterBounds.get(j));
+        for (int j = 0; j < parameterBounds.size(); j++) {
+          if (j > 0) {
+            buffer.append(" & ");
+          }
+          List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> annos =
+            member != null && RoundTrip.selector("typeuse")
+              ? getTypeAnnotations(member, targetType, (i << 8) | j)
+              : Collections.emptyList();
+          if (!annos.isEmpty()) {
+            buffer.appendCastTypeName(parameterBounds.get(j), annos, filter);
+          }
+          else {
+            buffer.appendCastTypeName(parameterBounds.get(j));
+          }
         }
       }
     }
