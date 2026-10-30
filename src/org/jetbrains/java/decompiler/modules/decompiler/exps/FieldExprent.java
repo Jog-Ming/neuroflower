@@ -165,7 +165,7 @@ public class FieldExprent extends Exprent {
       buf.append("/* $VF: constant dynamic */ ");
     }
 
-    if (isStatic) {
+    if (isStatic && instance == null) {
       if (name.equals("TYPE") && ExprUtil.PRIMITIVE_TYPES.containsKey(classname)) {
         buf.append(ExprUtil.PRIMITIVE_TYPES.get(classname));
         buf.append(".class");
@@ -175,6 +175,29 @@ public class FieldExprent extends Exprent {
         buf.appendAllClasses(DecompilerContext.getImportCollector().getShortNameInClassContext(ExprProcessor.buildJavaClassName(classname)), classname);
         buf.append(".");
       }
+    }
+    else if (isStatic) {
+      // A static field the source read through an expression (`itemStatsList.BLOCK_COLUMNS`):
+      // javac evaluated the qualifier and discarded the value, and the class name alone would
+      // drop the load the pop proves. Print that expression as the qualifier; a cast would be
+      // wrong here, since a static member access needs no receiver.
+      if (!isQualifier) {
+        buf.pushNewlineGroup(indent, 1);
+      }
+      instance.setIsQualifier();
+      TextBuffer qualifier = new TextBuffer();
+      qualifier.append(instance.toJava(indent));
+      if (instance.getPrecedence() > getPrecedence()) {
+        qualifier.encloseWithParens();
+      }
+      buf.append(qualifier);
+      if (instance.allowNewlineAfterQualifier()) {
+        buf.appendPossibleNewline();
+      }
+      if (!isQualifier) {
+        buf.popNewlineGroup();
+      }
+      buf.append(".");
     }
     else {
       String super_qualifier = null;

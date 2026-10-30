@@ -501,9 +501,18 @@ public class ExprProcessor implements CodeConstants {
           break;
         case opc_getstatic:
         case opc_getfield:
-          pushEx(stack, exprlist,
-                 new FieldExprent(pool.getLinkConstant(instr.operand(0)), instr.opcode == opc_getstatic ? null : stack.pop(),
-                                  bytecode_offsets));
+          FieldExprent readField = new FieldExprent(pool.getLinkConstant(instr.operand(0)),
+            instr.opcode == opc_getstatic ? null : stack.pop(), bytecode_offsets);
+          if (instr.opcode == opc_getstatic && pendingStaticQualifier != null
+              && stack.size() == pendingStaticDepth) {
+            // The value popped right before this read is the expression the source wrote before
+            // the static field (`itemStatsList.BLOCK_COLUMNS`): javac evaluates it only for its
+            // side effects, and printing the class name instead would drop the load.
+            readField.setInstance(pendingStaticQualifier);
+            pendingStaticQualifier = null;
+            pendingStaticDepth = -1;
+          }
+          pushEx(stack, exprlist, readField);
           break;
         case opc_putstatic:
         case opc_putfield:
