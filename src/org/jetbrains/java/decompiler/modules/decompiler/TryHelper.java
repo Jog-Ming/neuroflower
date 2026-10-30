@@ -1,6 +1,8 @@
 package org.jetbrains.java.decompiler.modules.decompiler;
 
+import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.struct.StructClass;
 
@@ -88,6 +90,13 @@ public class TryHelper {
       if (!stat.getResources().isEmpty() && inner.getStats().size() > 1) {
         return false;
       }
+      // A sibling that starts where the nested resource's scope ended runs after the source
+      // closed it: the table's row for the resource says where that block closed, and merging
+      // would print the sibling inside the resource's scope. The rest of the enclosing try stays
+      // outside, as in GlDevice's hidden-window context and the GL capabilities read after it.
+      if (siblingAfterResourceScope(inner)) {
+        return false;
+      }
       parent = inner;
       inner = inner.getStats().get(0);
     }
@@ -132,6 +141,37 @@ public class TryHelper {
       }
     }
 
+    return false;
+  }
+
+  /**
+   * Whether a statement beside the nested try runs after the nested resource's scope ended. The
+   * resource variable's table row ends where the source closed the resource; a sibling that
+   * starts at or after that offset belongs to the enclosing try, not to the resource's block.
+   * Only a declared resource carries the row; without one there is no offset evidence.
+   */
+  private static boolean siblingAfterResourceScope(Statement sequence) {
+    List<Statement> stats = sequence.getStats();
+    if (stats.size() < 2 || !(stats.get(0) instanceof CatchStatement nested)
+        || nested.getResources().isEmpty()) {
+      return false;
+    }
+    int scopeEnd = -1;
+    for (Exprent resource : nested.getResources()) {
+      if (resource instanceof AssignmentExprent assignment
+          && assignment.getLeft() instanceof VarExprent var && var.getLVT() != null) {
+        scopeEnd = Math.max(scopeEnd, var.getLVT().getEnd());
+      }
+    }
+    if (scopeEnd < 0) {
+      return false;
+    }
+    for (int i = 1; i < stats.size(); i++) {
+      int start = RoundTrip.firstOffset(stats.get(i));
+      if (start >= 0 && start >= scopeEnd) {
+        return true;
+      }
+    }
     return false;
   }
 }
