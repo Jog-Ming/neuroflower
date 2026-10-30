@@ -18,6 +18,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionNode;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionsGraph;
@@ -498,8 +499,19 @@ public class StackVarsProcessor {
       // whatever else that expression evaluates.
       boolean soleSwitchUse = right instanceof SwitchExprent && usedVers.size() == 1
         && RoundTrip.selector("switchinline");
+      // A receiver the target evaluates before a switch-expression argument stays on the stack
+      // across it: the class file has no astore/aload pair and no local row for it. The tree had
+      // to name the value to carry it over the switch, and its one use is the first thing the
+      // exprent after the switch evaluates, so inlining prints the receiver in front of the
+      // switch argument exactly where the target evaluates it.
+      boolean receiverAcrossSwitch = RoundTrip.selector("switcharg")
+        && usedVers.size() == 1 && usedver.var == leftVar.var
+        && next instanceof SwitchHeadExprent
+        && stat instanceof SwitchStatement switchStat && switchStat.isPhantom()
+        && receiverBeforeSwitchValue(switchStat, usedver);
       if (isVersionToBeReplaced(usedver, mapVars, ssau, leftVar) &&
-          (soleSwitchUse || right instanceof ConstExprent || right instanceof VarExprent || right instanceof FieldExprent
+          (soleSwitchUse || receiverAcrossSwitch
+           || right instanceof ConstExprent || right instanceof VarExprent || right instanceof FieldExprent
            || setNextVars == null || setNextVars.contains(usedver))) {
 
         setTempUsedVers.add(usedver);
@@ -537,6 +549,96 @@ public class StackVarsProcessor {
       setRet(ret, -1, changed);
       return;
     }
+  }
+
+  /**
+   * True when the only use of a stack value is the first thing evaluated in an exprent that also
+   * holds the phantom switch {@code switchStat}'s expression. javac keeps such a value -- the
+   * receiver of a call whose argument is a switch expression, say -- on the stack while the
+   * switch's selector and arms run, so the source wrote it in front of the switch argument.
+   * Inlining prints it there, ahead of the switch in the same expression, which is the target's
+   * own evaluation order; the value must not move behind anything else the switch evaluates.
+   */
+  private static boolean receiverBeforeSwitchValue(Statement switchStat, VarVersionPair used) {
+    Statement top = switchStat.getTopParent();
+    if (top == null) {
+      return false;
+    }
+    Exprent use = findUseExprent(top, used);
+    if (use == null) {
+      return false;
+    }
+    boolean holdsSwitch = false;
+    for (Exprent part : use.getAllExprents(true, true)) {
+      if (part instanceof SwitchExprent sw && sw.getBacking() == switchStat) {
+        holdsSwitch = true;
+        break;
+      }
+    }
+    return holdsSwitch && evaluatedFirst(use, used);
+  }
+
+  /** The one exprent in the statement tree that reads {@code used}, or null for none or several. */
+  private static Exprent findUseExprent(Statement stat, VarVersionPair used) {
+    List<Exprent> uses = new ArrayList<>();
+    collectUses(stat, used, uses);
+    return uses.size() == 1 ? uses.get(0) : null;
+  }
+
+  private static void collectUses(Statement stat, VarVersionPair used, List<Exprent> uses) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (exprent != null && exprent.containsVar(used)) {
+          uses.add(exprent);
+        }
+      }
+    }
+    for (Exprent exprent : stat.getStatExprents()) {
+      if (exprent != null && exprent.containsVar(used)) {
+        uses.add(exprent);
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      collectUses(child, used, uses);
+    }
+  }
+
+  /**
+   * True when {@code target} is on the first-evaluated path of {@code exprent}: the receiver
+   * chain of the outermost call, a return's value, a condition, or an assignment's right side.
+   * Everything else in the exprent is evaluated after that path, so a value inlined there is
+   * evaluated before every argument the exprent carries.
+   */
+  private static boolean evaluatedFirst(Exprent exprent, VarVersionPair target) {
+    while (exprent != null) {
+      if (exprent instanceof VarExprent var) {
+        return var.getIndex() == target.var && var.getVersion() == target.version;
+      } else if (exprent instanceof InvocationExprent invocation) {
+        exprent = invocation.getInstance();
+      } else if (exprent instanceof FieldExprent field) {
+        exprent = field.getInstance();
+      } else if (exprent instanceof AssignmentExprent assignment) {
+        // A field or array store evaluates its target first, which may have side effects of its
+        // own; only a plain variable store leaves the right side first.
+        if (!(assignment.getLeft() instanceof VarExprent)) {
+          return false;
+        }
+        exprent = assignment.getRight();
+      } else if (exprent instanceof ExitExprent exit) {
+        exprent = exit.getValue();
+      } else if (exprent instanceof YieldExprent yield) {
+        exprent = yield.getContent();
+      } else if (exprent instanceof FunctionExprent function) {
+        List<Exprent> operands = function.getLstOperands();
+        exprent = operands.isEmpty() ? null : operands.get(0);
+      } else if (exprent instanceof IfExprent ifExprent) {
+        exprent = ifExprent.getCondition();
+      } else {
+        return false;
+      }
+    }
+    return false;
   }
 
   // When variables are deleted, apply some post processing
