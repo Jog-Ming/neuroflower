@@ -111,14 +111,27 @@ public final class BasicBlockStatement extends Statement {
         .withBlocks(exprents, 0, size, indent, printsOwnEnd()));
       return tb;
     }
-    for (int i = 0; i < size; i++) {
-      if (closeBefore[i]) {
+    // The runs between the windows still print through the handover reader: it finds a local the
+    // table closed where a later declaration takes its slot over, whether or not the name
+    // repeats, and the windows this pass found only cover the repeated names. A window's closing
+    // position starts the next run, so the statement written right after the brace is read too.
+    int at = 0;
+    while (at < size) {
+      if (closeBefore[at]) {
         tb.appendIndent(indent).append("}").appendLineSeparator();
       }
-      if (openAt[i]) {
+      if (openAt[at]) {
         tb.appendIndent(indent).append("{").appendLineSeparator();
+        tb.append(ExprProcessor.listToJava(List.of(exprents.get(at)), indent));
+        at++;
+        continue;
       }
-      tb.append(ExprProcessor.listToJava(List.of(exprents.get(i)), indent));
+      int next = at + 1;
+      while (next < size && !openAt[next] && !closeBefore[next]) {
+        next++;
+      }
+      tb.append(RoundTrip.withBlocks(exprents, at, next, indent, next == size && printsOwnEnd()));
+      at = next;
     }
     if (closeBefore[size]) {
       tb.appendIndent(indent).append("}").appendLineSeparator();
