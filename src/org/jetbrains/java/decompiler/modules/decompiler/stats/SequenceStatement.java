@@ -783,8 +783,9 @@ public class SequenceStatement extends Statement {
               }
             }
           } else {
-            // The arm's trailing jump is the loop's own continue: the else arm's end carries it.
-            Statement previous = RoundTrip.suppressJump(arm);
+            // The arm's trailing jump is the loop's own continue only when it lands on the join
+            // the else end reaches; a jump to the loop head from here is a written continue.
+            Statement previous = RoundTrip.suppressJumpIfCarried(arm, elseStop);
             List<Exprent> savedExprents = null;
             if (joinExprentHost != null) {
               savedExprents = joinExprentHost.getExprents();

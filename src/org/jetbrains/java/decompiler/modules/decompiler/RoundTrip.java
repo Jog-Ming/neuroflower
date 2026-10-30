@@ -6470,6 +6470,111 @@ public final class RoundTrip {
   }
 
   /**
+   * The offset of the goto that ends this if arm on a written {@code continue;} past its else
+   * arm, or -1. The tree merges the arm's continue into the enclosing loop when it lands on the
+   * loop head another path also reaches, but javac keeps the goto at the arm's end, between the
+   * arm and the else arm. A jump to the loop head from there is the source's written jump: the
+   * else arm cannot reproduce it by falling through to the join.
+   */
+  public static int armContinueSite(Statement arm, Statement elseArm) {
+    if (!selector("continuearm") || arm == null || elseArm == null) {
+      return -1;
+    }
+    java.util.List<StatEdge> edges = arm.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (edges.size() != 1) {
+      return -1;
+    }
+    StatEdge edge = edges.get(0);
+    if (edge.getType() != StatEdge.TYPE_CONTINUE || edge.getDestination() != edge.closure
+        || !(edge.getDestination() instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement loop)) {
+      return -1;
+    }
+    // A classic `for` prints its increment in the header, right where an if/else's join lands:
+    // the target alone cannot tell the source's continue from the join, so leave it unprinted.
+    if (loop.getLooptype() == org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.FOR
+        || loop.getLooptype() == org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement.Type.INFINITE) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return -1;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    int end = lastEnd(arm);
+    // The block's deleted instructions (the pop of a discarded result, say) sit between the last
+    // exprent's end and the jump, so the jump is the first goto before the else arm.
+    int limit = firstOffset(elseArm);
+    if (gotos == null || end < 0 || limit <= end) {
+      return -1;
+    }
+    int site = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      int at = entry.getKey();
+      if (at >= end && at < limit && (site < 0 || at < site)) {
+        site = at;
+      }
+    }
+    if (site < 0 || !atLoopContinueTarget(loop, gotos.get(site))) {
+      return -1;
+    }
+    // The source wrote no continue when the else arm's own fall-through already reaches the same
+    // loop head: the arm's jump is then the if/else join javac emits over the else, not a jump
+    // the arm needed to spell out.
+    Integer elseTarget = continuationTarget(gotos, lastEnd(elseArm));
+    if (elseTarget == null || elseTarget.equals(gotos.get(site))) {
+      return -1;
+    }
+    return site;
+  }
+
+  /**
+   * The target of the jump that continues the code after a statement, or null. The statement's
+   * last exprent ends before any deleted instruction (a discarded call's {@code pop}), so the
+   * jump is looked for in the few bytes right after its end.
+   */
+  private static Integer continuationTarget(java.util.Map<Integer, Integer> gotos, int end) {
+    if (gotos == null || end < 0) {
+      return null;
+    }
+    Integer target = null;
+    int at = -1;
+    for (java.util.Map.Entry<Integer, Integer> entry : gotos.entrySet()) {
+      int key = entry.getKey();
+      if (key >= end && key - end <= 4 && (at < 0 || key < at)) {
+        at = key;
+        target = entry.getValue();
+      }
+    }
+    return target;
+  }
+
+  /**
+   * A statement the caller prints under a wider shape whose else end carries its trailing jump;
+   * the mark only holds when the jump lands on the join the else end reaches, since a jump to any
+   * other offset is a written {@code continue}/{@code break} the arm itself has to print.
+   * Returns the previously marked statement, for {@link #restoreJump}.
+   */
+  public static Statement suppressJumpIfCarried(Statement arm, int join) {
+    Statement old = SUPPRESSED_JUMP.get();
+    if (!selector("continuearm") || jumpCarriedByJoin(arm, join)) {
+      SUPPRESSED_JUMP.set(arm);
+    }
+    return old;
+  }
+
+  /** True when the statement's trailing jump lands on the given join, or cannot be read. */
+  private static boolean jumpCarriedByJoin(Statement arm, int join) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    int armEnd = arm == null ? -1 : lastEnd(arm);
+    if (gotos == null || armEnd < 0) {
+      return true;
+    }
+    Integer target = gotos.get(armEnd);
+    return target == null || target == join;
+  }
+
+  /**
    * Whether a local declared in this statement closes at or past its end, so that a {@code continue}
    * printed after its last use would close the scope after the jump the hoist adds instead of
    * before it and grow the local's table range. One row is not such a local: one that closes

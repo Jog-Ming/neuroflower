@@ -581,6 +581,7 @@ public class IfStatement extends Statement {
         && RoundTrip.startsWithMethodScopeLocal(ifstat);
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(elsestat, indent + 1, true));
+      appendArmContinue(buf, elsestat, ifstat, indent + 1);
       appendVoidArmReturn(buf, elsestat, ifstat, indent + 1);
       if (guard) {
         buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -664,6 +665,7 @@ public class IfStatement extends Statement {
     }
     else {
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
+      appendArmContinue(buf, ifstat, elsestat, indent + 1);
       appendVoidArmReturn(buf, ifstat, elsestat, indent + 1);
     }
 
@@ -723,6 +725,23 @@ public class IfStatement extends Statement {
       return endsWithVoidReturn(stat.getStats().get(stat.getStats().size() - 1));
     }
     return false;
+  }
+
+  /**
+   * Prints the continue the source ended this arm with when the target keeps a goto from the
+   * arm's end to the loop head while the else arm follows it: the jump skips the else, so the
+   * arm cannot reach the loop by falling through, and the tree folded the written continue into
+   * the loop's own edge.
+   */
+  private static void appendArmContinue(TextBuffer buf, Statement arm, Statement elseArm, int indent) {
+    int site = RoundTrip.armContinueSite(arm, elseArm);
+    if (site < 0) {
+      return;
+    }
+    TextBuffer line = new TextBuffer();
+    line.appendIndent(indent).append("continue;").appendLineSeparator();
+    line.addStartBytecodeMapping(site);
+    buf.append(line);
   }
 
   /** Prints the continue that ends a hoisted arm, pinned to the jump the target records. */
