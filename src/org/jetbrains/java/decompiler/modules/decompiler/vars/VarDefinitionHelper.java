@@ -188,7 +188,15 @@ public class VarDefinitionHelper {
             continue;
           }
           else {
-            List<Exprent> lstSpecial = Arrays.asList(dstat.getConditionExprent(), dstat.getIncExprent());
+            // A head part may be absent: `for (int i; cond; )` declares without initializing, and
+            // an empty update leaves no increment exprent.
+            List<Exprent> lstSpecial = new ArrayList<>();
+            if (dstat.getConditionExprent() != null) {
+              lstSpecial.add(dstat.getConditionExprent());
+            }
+            if (dstat.getIncExprent() != null) {
+              lstSpecial.add(dstat.getIncExprent());
+            }
             for (VarExprent var : getAllVars(lstSpecial)) {
               if (var.getIndex() == index) {
                 stat = stat.getParent();

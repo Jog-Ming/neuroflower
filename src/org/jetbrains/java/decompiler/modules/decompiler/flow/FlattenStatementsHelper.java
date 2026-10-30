@@ -295,8 +295,11 @@ public class FlattenStatementsHelper {
               initNode.exprents = doStat.getInitExprentList();
             }
 
-            DirectNode conditionNode = this.createDirectNode(stat, DirectNodeType.CONDITION, doStat.getConditionExprentList());
-            DirectNode incrementNode = this.createDirectNode(stat, DirectNodeType.INCREMENT, doStat.getIncExprentList());
+            // A head part may be absent (`for (;;)`); the placeholder slot is not an expression.
+            DirectNode conditionNode = this.createDirectNode(stat, DirectNodeType.CONDITION,
+              DoStatement.presentParts(doStat.getConditionExprentList()));
+            DirectNode incrementNode = this.createDirectNode(stat, DirectNodeType.INCREMENT,
+              DoStatement.presentParts(doStat.getIncExprentList()));
 
             this.addDestination(stat, initNode); // for a for, the start is the init
             this.addDestination(stat, incrementNode, Edge.Type.CONTINUE); // target for all continue edges
@@ -307,7 +310,10 @@ public class FlattenStatementsHelper {
 
             this.handleLoopEnd(stat, body);
 
-            this.addEdge(conditionNode, stat.getFirstSuccessor());
+            // `for (init; ; update)` never falls out of its test, so it may have no exit edge.
+            if (!stat.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL).isEmpty()) {
+              this.addEdge(conditionNode, stat.getFirstSuccessor());
+            }
             return initNode;
           }
           case FOR_EACH: {

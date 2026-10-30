@@ -7,6 +7,7 @@ import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ArrayExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ExitExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
@@ -17,6 +18,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.GeneralStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
@@ -2407,8 +2409,11 @@ public final class RoundTrip {
     if (!selector("whileupdate")) {
       return false;
     }
-    int updateLine = sourceLine(update);
-    int conditionLine = sourceLine(condition);
+    // A condition the merge passes built from an and/or carries no instruction range of its own;
+    // its operands still record the lines the source gave the header, and the first operand
+    // begins the test. Without the deep read a `while (a && b)` update reads no evidence at all.
+    int updateLine = sourceLineDeep(update);
+    int conditionLine = sourceLineDeep(condition);
     return updateLine >= 0 && conditionLine >= 0 && updateLine != conditionLine;
   }
 
@@ -2434,6 +2439,167 @@ public final class RoundTrip {
     int updateLine = sourceLine(update);
     int conditionLine = sourceLine(condition);
     return updateLine >= 0 && conditionLine >= 0 && updateLine == conditionLine;
+  }
+
+  /**
+   * The offset the loop's test sends control to when it fails, i.e. where the statement after the
+   * loop begins. javac ends a for header's locals at this offset, so a table row that ends here
+   * was written in the header while one that ends at the enclosing block's close was declared
+   * before the loop. The condition's own branch is preferred; a condition the merge passes built
+   * from operands carries no range, and then the successor statement's start is the same offset.
+   */
+  public static int loopExitOffset(Statement loop) {
+    if (loop instanceof DoStatement doStat) {
+      int target = branchTargetInRange(doStat.getConditionExprent(), 0, -1);
+      if (target >= 0) {
+        return target;
+      }
+    }
+    java.util.List<StatEdge> successors = loop.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    if (successors.size() == 1) {
+      return startOffset(successors.get(0).getDestination());
+    }
+    return -1;
+  }
+
+  /**
+   * The class file slot a store inside the expression writes, or -1. The last store in the
+   * expression's range is its own: operands evaluate before the store that ends them.
+   */
+  public static int storedSlot(Exprent exprent) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> stores = method == null ? null : ALL_STORE_SLOTS.get(method);
+    if (stores == null || exprent == null || exprent.bytecode == null || exprent.bytecode.isEmpty()) {
+      return -1;
+    }
+    int slot = -1;
+    for (int off = exprent.bytecode.nextSetBit(0); off >= 0; off = exprent.bytecode.nextSetBit(off + 1)) {
+      Integer found = stores.get(off);
+      if (found != null) {
+        slot = found;
+      }
+    }
+    return slot;
+  }
+
+  /** The end of the local table row that covers the loop's test for the init expression's slot. */
+  public static int initScopeEnd(Statement loop, Exprent init) {
+    // A tree VarExprent's index is not the class file's slot until the variable passes are done;
+    // the store instruction the expression ends with names the row's slot at any point.
+    int slot = init instanceof AssignmentExprent assign
+      ? storedSlot(assign) : init instanceof VarExprent var ? var.getIndex() : -1;
+    if (slot < 0) {
+      return -1;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null : method.getLocalVariableAttr();
+    if (table == null) {
+      return -1;
+    }
+    // The body's first instruction is inside any head-declared local's scope, and inside a
+    // declaration before the loop too; the row covering it is the variable's row either way.
+    int at = firstOffset(loop.getFirst());
+    if (at < 0) {
+      return -1;
+    }
+    for (LocalVariable row : table.matchingVars(slot).toList()) {
+      if (row.getStart() <= at && at < row.getEnd()) {
+        return row.getEnd();
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * True when the target's local table scopes the init expression's variable to the loop: its row
+   * ends exactly where the loop exits. The source then declared it in a for header. The same row
+   * ending anywhere else means the declaration preceded the loop and its row covers the following
+   * block, so the source wrote a separate statement.
+   */
+  public static boolean initHeaderScoped(Statement loop, Exprent init) {
+    if (!selector("forhead")) {
+      return false;
+    }
+    // A for head's parts share one line; a separate while's declaration carries the line before
+    // the test. A row ending at the loop exit is not enough on its own — a declaration before a
+    // loop that ends its block has the same end — so the statement must also sit on the head's
+    // line. The init's first instruction may be the expression's start; the condition's own range
+    // begins at its branch, which inherits the line the source gave the test.
+    if (loop instanceof DoStatement doStat && doStat.getConditionExprent() != null) {
+      int initLine = sourceLineDeep(init);
+      int conditionLine = sourceLineDeep(doStat.getConditionExprent());
+      if (initLine >= 0 && conditionLine >= 0 && initLine != conditionLine) {
+        return false;
+      }
+    }
+    int end = initScopeEnd(loop, init);
+    int exit = loopExitOffset(loop);
+    return end >= 0 && exit >= 0 && end == exit;
+  }
+
+  /**
+   * True when a local declared inside the loop's body has a table row ending exactly at
+   * {@code offset}: the body's block closed before this instruction, so the expression cannot be
+   * the body's last statement. A while body's own last statement keeps its block open past
+   * itself.
+   */
+  public static boolean bodyScopeEndsAt(Statement loop, int offset) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null : method.getLocalVariableAttr();
+    if (table == null || offset <= 0) {
+      return false;
+    }
+    int bodyStart = firstOffset(loop.getFirst());
+    if (bodyStart < 0) {
+      return false;
+    }
+    for (LocalVariable row : table.getVariables().toList()) {
+      if (row.getStart() > bodyStart && row.getEnd() == offset) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when the class file places the candidate update in the for header rather than at the
+   * end of the body: a for header's update shares the head's line, a body statement carries its
+   * own. A recorded continue that lands on the update block proves it on its own. A while body's
+   * last statement fails the line test — and so does the desugared update of an enhanced for,
+   * which the for-each matcher must keep its chance to fold.
+   */
+  public static boolean updateInHeader(Exprent update, Exprent condition, int updateFrom) {
+    if (!selector("forhead")) {
+      return false;
+    }
+    if (updateFrom >= 0) {
+      return true;
+    }
+    int updateLine = sourceLineDeep(update);
+    int conditionLine = sourceLineDeep(condition);
+    return updateLine >= 0 && conditionLine >= 0 && updateLine == conditionLine;
+  }
+
+  /**
+   * The variable the loop's own condition assigns whose table row ends at the loop exit, or null:
+   * the source declared it in the for head — {@code for (int i; (i = next()) != -1; )}. The
+   * condition starting its own line proves a separate while instead.
+   */
+  public static VarExprent headerLocalAssignedInCondition(Statement loop) {
+    if (!selector("forhead") || !(loop instanceof DoStatement doStat)) {
+      return null;
+    }
+    Exprent condition = doStat.getConditionExprent();
+    if (condition == null || lineStartsHere(condition)) {
+      return null;
+    }
+    for (Exprent inner : condition.getAllExprents(true, true)) {
+      if (inner instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent var
+          && initHeaderScoped(loop, assign)) {
+        return var;
+      }
+    }
+    return null;
   }
 
   /**

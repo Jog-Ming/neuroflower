@@ -60,6 +60,8 @@ public class MergeHelper {
         else {
           // identify a do{}while loop
           //matchDoWhile(stat);
+          // an endless loop can still be the source's `for (init; ; update)`
+          matchInfiniteFor(stat);
         }
 
         break;
@@ -490,7 +492,23 @@ public class MergeHelper {
       return;
     }
 
-    List<Exprent> lstExpr = lastData.getExprents();
+    // The block whose edge jumps back to the head is the last code an iteration runs. A switch
+    // body's own statement order does not put it last, so when the last direct data ends in a
+    // transfer — a return inside an arm, never an update — and the loop has exactly one continue
+    // source that is a non-empty basic block, that block holds the update instead. A plausible
+    // last statement is left alone: the loop's later reshaping may still settle around it.
+    Statement updateData = lastData;
+    Set<Statement> continues = stat.getNeighboursSet(StatEdge.TYPE_CONTINUE, EdgeDirection.BACKWARD);
+    if (RoundTrip.selector("forhead") && continues.size() == 1
+        && !updateData.getExprents().isEmpty()
+        && updateData.getExprents().get(updateData.getExprents().size() - 1) instanceof ExitExprent) {
+      Statement back = continues.iterator().next();
+      if (back instanceof BasicBlockStatement && !back.getExprents().isEmpty()) {
+        updateData = back;
+      }
+    }
+
+    List<Exprent> lstExpr = updateData.getExprents();
     lastDoExprent = lstExpr.get(lstExpr.size() - 1);
     // javac sends every `continue` to the first instruction of the update block, so an exprent
     // starting exactly where one lands is part of the header: the source wrote a comma-separated
@@ -500,16 +518,13 @@ public class MergeHelper {
 
     boolean issingle = false;
     if (lstExpr.size() == 1) {  // single exprent
-      if (lastData.getAllPredecessorEdges().size() > 1) { // break edges
+      if (updateData.getAllPredecessorEdges().size() > 1) { // break edges
         issingle = true;
       }
     }
 
     boolean haslast = issingle || firstUpdate instanceof AssignmentExprent || firstUpdate instanceof FunctionExprent
       || (updateFrom >= 0 && firstUpdate instanceof InvocationExprent);
-    if (!haslast) {
-      return;
-    }
 
     boolean hasinit = false;
 
@@ -547,14 +562,55 @@ public class MergeHelper {
       }
     }
 
+    Exprent initExp = hasinit ? preData.getExprents().get(preData.getExprents().size() - 1) : null;
+    Exprent condition = stat.getConditionExprent();
+
+    // A desugared enhanced for looks exactly like a header for at the class-file level — the
+    // synthetic index or iterator carries the same scope and line — but the source wrote neither.
+    // The for-each matcher folds these later; merging one into the head now would destroy the
+    // shape it recognizes.
+    if (arrayForEachShape(stat, preData, firstUpdate, condition)) {
+      return;
+    }
+
+    // The target's local table scopes the init's variable to the loop only when the source
+    // declared it in the head: a for header's locals end at the loop's exit, a declaration
+    // before the loop ends at the enclosing block's close. A loop with no update still has a for
+    // head then; the trailing assignment the tree guessed is not the update and stays in the body.
+    boolean headerScopedInit = hasinit && condition != null && RoundTrip.initHeaderScoped(stat, initExp);
+    boolean updateHeader = haslast && RoundTrip.updateInHeader(firstUpdate, condition, updateFrom);
+
+    if (headerScopedInit && !updateHeader && !backEdgeIncrement(stat)
+        && initVarReadByCondition(initExp, condition)) {
+      stat.setLooptype(DoStatement.Type.FOR);
+      Exprent exp = preData.getExprents().remove(preData.getExprents().size() - 1);
+      stat.setInitExprent(exp);
+      return;
+    }
+
+    // A for head may declare its variable without an initializer; the loop's own condition then
+    // assigns it. The target's table scopes that variable to the loop, so the source wrote
+    // `for (int i; (i = next()) != -1; )`: nothing moves, and the printer writes the declaration
+    // in the head.
+    boolean headerLocal = condition != null && !headerScopedInit && !updateHeader
+      && RoundTrip.headerLocalAssignedInCondition(stat) != null;
+    if (headerLocal) {
+      stat.setLooptype(DoStatement.Type.FOR);
+      return;
+    }
+
+    if (!haslast) {
+      return;
+    }
+
     // A loop with no initialiser still has a for header when the target's line table puts the
     // update on the head's line: the source wrote `for (; cond; update)`, whose header javac
     // marks with one line. Without the initialiser nothing else can prove the header.
-    boolean headerUpdate = updateFrom < 0 && RoundTrip.updateOnHeaderLine(stat.getConditionExprent(), lastDoExprent);
+    boolean headerUpdate = updateFrom < 0 && RoundTrip.updateOnHeaderLine(condition, lastDoExprent);
 
     if (hasinit || issingle || headerUpdate) {  // FIXME: issingle sufficient?
       Set<Statement> set = stat.getNeighboursSet(StatEdge.TYPE_CONTINUE, EdgeDirection.BACKWARD);
-      set.remove(lastData);
+      set.remove(updateData);
 
       if (!set.isEmpty()) {
         return;
@@ -585,9 +641,9 @@ public class MergeHelper {
         }
       }
 
-      Exprent lastExp = lastData.getExprents().get(lastData.getExprents().size() - 1);
+      Exprent lastExp = updateData.getExprents().get(updateData.getExprents().size() - 1);
       List<Exprent> moved = updateFrom >= 0
-        ? new ArrayList<>(lastData.getExprents().subList(updateFrom, lastData.getExprents().size()))
+        ? new ArrayList<>(updateData.getExprents().subList(updateFrom, updateData.getExprents().size()))
         : Collections.singletonList(lastExp);
 
       // A store the catch's path alone reaches was written inside the catch body: lifting it into
@@ -607,8 +663,9 @@ public class MergeHelper {
       // its own: a distinct line proves the source kept this exprent in the body, so the loop stays
       // a while and the exprent prints where the source wrote it (inside a guard's arm, for one).
       // Both forms compile to the same instructions, so only the target's table separates them.
-      // A run the recorded continue proves is the update block keeps the header whatever its line.
-      if (updateFrom < 0 && RoundTrip.updateIsBodyStatement(stat.getConditionExprent(), lastExp)) {
+      // A run the recorded continue proves is the update block keeps the header whatever its line,
+      // and so does an update the target puts on the head's line.
+      if (updateFrom < 0 && !updateHeader && RoundTrip.updateIsBodyStatement(condition, lastExp)) {
         return;
       }
 
@@ -650,8 +707,8 @@ public class MergeHelper {
       }
 
       // Check if the init var is contained in the cond var or the inc var, otherwise don't make the loop
-      if (hasinit && preData.getExprents().get(preData.getExprents().size() - 1) instanceof AssignmentExprent assign) {
-        if (assign.getLeft() instanceof VarExprent var && !stat.getConditionExprent().containsVar(var.getVarVersionPair())
+      if (hasinit && initExp instanceof AssignmentExprent assign) {
+        if (assign.getLeft() instanceof VarExprent var && !condition.containsVar(var.getVarVersionPair())
             && moved.stream().noneMatch(exp -> exp.containsVar(var.getVarVersionPair()))) {
           return;
         }
@@ -665,7 +722,7 @@ public class MergeHelper {
         }
         stat.setInitExprent(exp);
       }
-      lastData.getExprents().removeAll(moved);
+      updateData.getExprents().removeAll(moved);
       Exprent previous = stat.getIncExprent();
       for (Exprent move : moved) {
         if (previous != null) {
@@ -676,7 +733,149 @@ public class MergeHelper {
       }
     }
 
-    cleanEmptyStatements(stat, lastData);
+    if (updateData == lastData) {
+      cleanEmptyStatements(stat, updateData);
+    }
+  }
+
+  /**
+   * An endless loop whose head carries an initializer and whose back-edge block is the source's
+   * update: the target's table closes a local declared in the body exactly where the update
+   * starts, and the line table puts the update on the initializer's line. The source wrote
+   * {@code for (init; ; update)}; the two forms compile to the same instructions, so the tables
+   * are the only evidence.
+   */
+  private static void matchInfiniteFor(DoStatement stat) {
+    if (!RoundTrip.selector("forhead") || !RoundTrip.selector("infhead")
+        || stat.getConditionExprent() != null) {
+      return;
+    }
+    // A body that opens with the loop's own test has its condition infolded: a later pass folds
+    // it back into a while, and a headless for would run the update on the test's false path.
+    Statement head = stat.getFirst();
+    while (head instanceof SequenceStatement && !head.getStats().isEmpty()) {
+      head = head.getFirst();
+    }
+    if (head instanceof IfStatement ifstat && ifstat.getHeadexprent() != null
+        && RoundTrip.firstExprentOffset(ifstat.getHeadexprent().getCondition())
+          == RoundTrip.startOffset(stat.getFirst())) {
+      return;
+    }
+    // The update sits at the loop's only continue source, a non-empty basic block.
+    Set<Statement> continues = stat.getNeighboursSet(StatEdge.TYPE_CONTINUE, EdgeDirection.BACKWARD);
+    if (continues.size() != 1) {
+      return;
+    }
+    Statement updateData = continues.iterator().next();
+    if (!(updateData instanceof BasicBlockStatement) || updateData.getExprents().isEmpty()) {
+      return;
+    }
+    List<Exprent> updateExprs = updateData.getExprents();
+    Exprent lastExp = updateExprs.get(updateExprs.size() - 1);
+    if (lastExp instanceof ExitExprent) {
+      return;
+    }
+    int updateFrom = RoundTrip.updateBlockStart(stat, updateExprs);
+    List<Exprent> moved = updateFrom >= 0
+      ? new ArrayList<>(updateExprs.subList(updateFrom, updateExprs.size()))
+      : Collections.singletonList(lastExp);
+    // The initializer is the last expression of the block before the loop.
+    List<Statement> before = stat.getNeighbours(StatEdge.TYPE_REGULAR, EdgeDirection.BACKWARD);
+    Statement preData = before.isEmpty() ? null : before.get(0);
+    if (!(preData instanceof BasicBlockStatement)) {
+      return;
+    }
+    preData = getLastDirectData(preData);
+    if (preData == null || preData.getExprents().isEmpty()) {
+      return;
+    }
+    Exprent initExp = preData.getExprents().get(preData.getExprents().size() - 1);
+    if (!(initExp instanceof AssignmentExprent)) {
+      return;
+    }
+    int at = RoundTrip.firstExprentOffset(moved.get(0));
+    int initLine = RoundTrip.sourceLineDeep(initExp);
+    int updateLine = RoundTrip.sourceLineDeep(moved.get(0));
+    if (at < 0 || !RoundTrip.bodyScopeEndsAt(stat, at) || initLine < 0 || updateLine < 0
+        || initLine != updateLine) {
+      return;
+    }
+
+    stat.setLooptype(DoStatement.Type.FOR);
+    stat.setInitExprent(preData.getExprents().remove(preData.getExprents().size() - 1));
+    updateExprs.removeAll(moved);
+    for (Exprent move : moved) {
+      stat.addIncExprent(move);
+    }
+    cleanEmptyStatements(stat, updateData);
+  }
+
+  /** Whether the init assignment's variable is read by the loop's condition. */
+  private static boolean initVarReadByCondition(Exprent init, Exprent condition) {
+    return init instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent var
+      && condition != null && condition.containsVar(var.getVarVersionPair());
+  }
+
+  /**
+   * True when the loop's single continue source ends in an increment: the source's update is
+   * real, and the tree has not settled the loop around it yet. An empty head then is not proof
+   * of an empty update — only a back edge that ends in ordinary code is.
+   */
+  private static boolean backEdgeIncrement(DoStatement stat) {
+    Set<Statement> continues = stat.getNeighboursSet(StatEdge.TYPE_CONTINUE, EdgeDirection.BACKWARD);
+    if (continues.size() != 1) {
+      return false;
+    }
+    Statement back = continues.iterator().next();
+    if (!(back instanceof BasicBlockStatement) || back.getExprents().isEmpty()) {
+      return false;
+    }
+    Exprent last = back.getExprents().get(back.getExprents().size() - 1);
+    return last instanceof FunctionExprent function
+      && (function.getFuncType() == FunctionType.PPI || function.getFuncType() == FunctionType.IPP
+          || function.getFuncType() == FunctionType.MMI || function.getFuncType() == FunctionType.IMM);
+  }
+
+  /**
+   * True when the loop is the desugared form of an enhanced for over an array: a constant index
+   * walk over the array whose length the source copied into a local. The synthetic index carries
+   * the same table row and line as a for head's variable, so only the shape separates the two;
+   * the for-each matcher folds this loop later.
+   */
+  private static boolean arrayForEachShape(DoStatement stat, Statement preData, Exprent update, Exprent condition) {
+    if (preData == null || condition == null || !(update instanceof FunctionExprent increment)
+        || (increment.getFuncType() != FunctionType.PPI && increment.getFuncType() != FunctionType.IPP)
+        || increment.getLstOperands().isEmpty()
+        || !(increment.getLstOperands().get(0) instanceof VarExprent counter)) {
+      return false;
+    }
+    Statement firstData = getFirstDirectData(stat.getFirst());
+    if (firstData == null || firstData.getExprents().isEmpty()
+        || !(firstData.getExprents().get(0) instanceof AssignmentExprent element)
+        || !(element.getRight() instanceof ArrayExprent array)
+        || !(array.getIndex() instanceof VarExprent index)
+        || !(array.getArray() instanceof VarExprent base)
+        || index.getIndex() != counter.getIndex() || index.getVersion() != counter.getVersion()) {
+      return false;
+    }
+    // A real enhanced for reads the index nowhere but the element load; a hand-written loop that
+    // also writes or re-reads the array keeps its index and stays a for.
+    if (counter.isVarReferenced(stat.getFirst(), index)
+        || isVarUsedBefore((VarExprent) element.getLeft(), stat)) {
+      return false;
+    }
+    Exprent init = preData.getExprents().get(preData.getExprents().size() - 1);
+    if (!(init instanceof AssignmentExprent counterInit) || !(counterInit.getRight() instanceof ConstExprent)) {
+      return false;
+    }
+    for (Exprent candidate : preData.getExprents()) {
+      if (candidate instanceof AssignmentExprent copy && copy.getRight() instanceof FunctionExprent length
+          && length.getFuncType() == FunctionType.ARRAY_LENGTH && !length.getLstOperands().isEmpty()
+          && base.equalsVersions(length.getLstOperands().get(0))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** True when the loop's own body is the try/catch statement {@code lastData} belongs to. */

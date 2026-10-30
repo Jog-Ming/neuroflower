@@ -269,6 +269,19 @@ public class DoStatement extends Statement {
       case FOR:
         int incLine = RoundTrip.sourceLineDeep(incExprent.get(0));
         int condLine = RoundTrip.sourceLineDeep(conditionExprent.get(0));
+        // A for head may declare its variable with no initializer, its condition assigning it:
+        // the declaration is a var definition, not an init exprent, and prints in the head.
+        VarExprent headerDecl = headerDeclaration();
+        if (headerDecl != null) {
+          List<Exprent> rest = new ArrayList<>();
+          for (Exprent decl : varDefinitions) {
+            if (decl != headerDecl) {
+              rest.add(decl);
+            }
+          }
+          buf.setLength(varDefsStart);
+          buf.append(ExprProcessor.listToJava(rest, indent));
+        }
         // A guard statement the decompiler fused into the condition lands on a later line in the
         // target than the loop's increment: that line difference is the guard's, not proof of a
         // split `int i = 0; while (...) { ...; i++; }`. When the branch-then-goto pair proves the
@@ -302,15 +315,20 @@ public class DoStatement extends Statement {
           }
         }
         buf.appendIndent(indent);
-        Exprent forGuard = RoundTrip.foldedBreakGuard(conditionExprent.get(0), this, first);
+        Exprent condition = conditionExprent.get(0);
+        Exprent forGuard = RoundTrip.foldedBreakGuard(condition, this, first);
         buf.pushNewlineGroup(indent, 1);
         buf.append("for (");
         if (initExprent.get(0) != null) {
           buf.append(initExprent.get(0).toJava(indent));
+        } else if (headerDecl != null) {
+          buf.append(headerDecl.toJava(indent));
         }
+        TextBuffer conditionText = forGuard != null
+          ? ((FunctionExprent) condition).getLstOperands().get(0).toJava(indent)
+          : condition == null ? new TextBuffer() : condition.toJava(indent);
         buf.append(";").appendPossibleNewline(" ")
-          .append(forGuard == null ? conditionExprent.get(0).toJava(indent)
-            : ((FunctionExprent) conditionExprent.get(0)).getLstOperands().get(0).toJava(indent))
+          .append(conditionText)
           .append(";").appendPossibleNewline(" ")
           .append(incToJava(indent))
           .appendPossibleNewline("", true);
@@ -384,7 +402,10 @@ public class DoStatement extends Statement {
           lst.add(getInitExprent());
         }
       case WHILE:
-        lst.add(getConditionExprent());
+        // A head may have no test: `for (init; ; update)` runs until a break.
+        if (getConditionExprent() != null) {
+          lst.add(getConditionExprent());
+        }
         break;
       case FOR_EACH:
         lst.add(getInitExprent());
@@ -552,6 +573,25 @@ public class DoStatement extends Statement {
     return incExprent;
   }
 
+  /**
+   * The header list without the placeholder slot an absent part leaves. The same list is returned
+   * when every part is present, so the graph keeps sharing the loop's own exprents.
+   */
+  public static List<Exprent> presentParts(List<Exprent> parts) {
+    for (Exprent part : parts) {
+      if (part == null) {
+        List<Exprent> out = new ArrayList<>(parts.size());
+        for (Exprent present : parts) {
+          if (present != null) {
+            out.add(present);
+          }
+        }
+        return out;
+      }
+    }
+    return parts;
+  }
+
   public Exprent getConditionExprent() {
     return conditionExprent.get(0);
   }
@@ -575,6 +615,30 @@ public class DoStatement extends Statement {
     } else {
       this.incExprent.add(exprent);
     }
+  }
+
+  /**
+   * The declaration the source wrote in the for head with no initializer, as a var definition:
+   * {@code for (int i; (i = next()) != -1; )}. The target's table scopes that local to the loop,
+   * so the declaration belongs in the head and not above it.
+   */
+  private VarExprent headerDeclaration() {
+    Exprent condition = conditionExprent.get(0);
+    if (initExprent.get(0) != null || condition == null) {
+      return null;
+    }
+    for (int i = varDefinitions.size() - 1; i >= 0; i--) {
+      if (varDefinitions.get(i) instanceof VarExprent decl) {
+        for (Exprent inner : condition.getAllExprents(true, true)) {
+          if (inner instanceof org.jetbrains.java.decompiler.modules.decompiler.exps.AssignmentExprent assign
+              && assign.getLeft() instanceof VarExprent var
+              && var.getIndex() == decl.getIndex() && RoundTrip.initHeaderScoped(this, decl)) {
+            return decl;
+          }
+        }
+      }
+    }
+    return null;
   }
 
   /** The for header's update text: every recorded increment, comma-separated. */

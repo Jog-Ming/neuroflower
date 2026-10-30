@@ -228,9 +228,13 @@ public class StackVarsProcessor {
         if (nd.statement instanceof DoStatement) {
           DoStatement loop = (DoStatement)nd.statement;
 
+          // A head that declares its variable without an initializer has no init exprent yet —
+          // its condition assigns the local the target scopes to the loop, and the declaration
+          // prints in the head. Only a head with nothing in it is a while the source wrote.
           if (loop.getLooptype() == DoStatement.Type.FOR &&
               loop.getInitExprent() == null &&
-              loop.getIncExprent() == null) { // "downgrade" loop to 'while'
+              loop.getIncExprent() == null &&
+              RoundTrip.headerLocalAssignedInCondition(loop) == null) { // "downgrade" loop to 'while'
             loop.setLooptype(DoStatement.Type.WHILE);
           }
         }
