@@ -67,6 +67,220 @@ public final class LocalDeclarationOrder {
     hoistReserved(root, varproc, names, method);
     reorderWithinList(root, varproc);
     hoistToPrintedOrder(root, varproc, names, method);
+    placeByScope(root, names, method);
+  }
+
+  /**
+   * Places a declaration in the block the target's table says the source wrote it in. javac
+   * writes a local's row at the scope that closes there, so a row that ends somewhere other than
+   * the printer's placement names the source's closing brace:
+   * <ul>
+   *   <li>a definition in a loop body whose row ends past the loop was declared above the loop
+   *       ({@code T v; while (…) { v = …; }}), which the flat print would keep alive only inside
+   *       the body;</li>
+   *   <li>one variable defined in both arms of an if, whose row ends past the if (the second
+   *       path's range reaches the enclosing block's end and the join frame names the local), was
+   *       declared above the if ({@code T v; if (…) { v = …; } else { v = …; }});</li>
+   *   <li>a declaration in a finally's own definitions whose row ends inside the try body was
+   *       written inside the try ({@code try { T v; … } finally { … }}), not above it.</li>
+   * </ul>
+   * Only declarations move and every store stays where it printed; no evaluation order changes.
+   */
+  private static void placeByScope(Statement stat, NameTable names, String method) {
+    if (!RoundTrip.selector("declscope")) {
+      return;
+    }
+    if (stat instanceof DoStatement loop) {
+      placeAboveLoop(loop, names, method);
+    } else if (stat instanceof IfStatement ifStatement) {
+      mergeArmDeclarations(ifStatement, names, method);
+    } else if (stat instanceof CatchAllStatement tryStatement) {
+      placeInsideFinally(tryStatement, names, method);
+    }
+    for (Statement child : stat.getStats()) {
+      placeByScope(child, names, method);
+    }
+  }
+
+  /** A definition exprent and the list that prints it. */
+  private record PrefixDef(Exprent exprent, List<Exprent> list) {
+  }
+
+  /** The first definition printed in this statement's prefix, and its list. */
+  private static PrefixDef firstPrefixDefinition(Statement stat) {
+    if (stat == null) {
+      return null;
+    }
+    PrefixDef own = definitionIn(stat.getVarDefinitions());
+    if (own == null) {
+      own = definitionIn(stat.getExprents());
+    }
+    if (own != null) {
+      return own;
+    }
+    Statement first = null;
+    if (stat instanceof IfStatement ifStatement) {
+      if (!RoundTrip.isHeadConsumed(ifStatement)) {
+        first = ifStatement.getFirst();
+      }
+    } else if (stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement sequence) {
+      first = sequence.getStats().isEmpty() ? null : sequence.getStats().get(0);
+    }
+    return first == null || first == stat ? null : firstPrefixDefinition(first);
+  }
+
+  private static PrefixDef definitionIn(List<Exprent> exprents) {
+    if (exprents == null) {
+      return null;
+    }
+    for (Exprent exprent : exprents) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && isRealDefinition(var)) {
+          return new PrefixDef(exprent, exprents);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Moves a loop-body definition's declaration above the loop when the local's row ends past the
+   * loop: the body's own scope ends at the back edge, so the target proves the source declared it
+   * in the enclosing block and assigned it in the body.
+   */
+  private static void placeAboveLoop(DoStatement loop, NameTable names, String method) {
+    // Only a `while (true)` loop that ends the method: its body closes at the back edge, so a
+    // local declared in the body keeps a row ending there, while a local declared above the loop
+    // spans the whole method. A for-each loop is never taken: its body's scope closes after the
+    // back-edge jump, where both readings look alike.
+    if (loop.getLooptype() != DoStatement.Type.INFINITE) {
+      return;
+    }
+    Statement body = loop.getFirst();
+    PrefixDef definition = firstPrefixDefinition(body);
+    if (definition == null) {
+      return;
+    }
+    VarExprent var = definedVar(definition.exprent());
+    if (var == null || var.getLVT() == null) {
+      return;
+    }
+    LocalVariable row = var.getLVT();
+    int start = RoundTrip.firstOffset(loop);
+    int end = RoundTrip.lastEnd(loop);
+    int rangeEnd = RoundTrip.loopRangeEnd(loop);
+    int methodEnd = RoundTrip.methodCodeEnd();
+    if (start < 0 || end < 0 || rangeEnd <= end || methodEnd < 0
+        || row.getStart() < start || row.getEnd() != methodEnd || rangeEnd != methodEnd) {
+      return;
+    }
+    if ((!names.uniqueName(var) && !names.sameSlotName(var)) || mentionsField(loop, var.getName())) {
+      debug(method, var, "rejected: loop-hoisted declaration would capture a name");
+      return;
+    }
+    Exprent declaration;
+    if (definition.exprent() == var) {
+      removeIdentity(definition.list(), var);
+      var.bytecode = null;
+      declaration = var;
+    } else {
+      declaration = var.copy();
+      declaration.bytecode = null;
+      var.setDefinition(false);
+    }
+    insertByTargetSlot(loop.getVarDefinitions(), declaration);
+    debug(method, var, "placed above the loop: its row ends past the loop");
+  }
+
+  /**
+   * Merges two arm definitions of one variable into a declaration above the if when a row of the
+   * variable ends past the if: javac splits the range at the join but keeps a frame that names
+   * the local there, so the source declared it before the test and only assigned it in the arms.
+   */
+  private static void mergeArmDeclarations(IfStatement ifStatement, NameTable names, String method) {
+    PrefixDef thenDef = firstPrefixDefinition(ifStatement.getIfstat());
+    PrefixDef elseDef = firstPrefixDefinition(ifStatement.getElsestat());
+    if (thenDef == null || elseDef == null) {
+      return;
+    }
+    VarExprent thenVar = definedVar(thenDef.exprent());
+    VarExprent elseVar = definedVar(elseDef.exprent());
+    if (thenVar == null || elseVar == null || thenVar.getLVT() == null || elseVar.getLVT() == null) {
+      return;
+    }
+    LocalVariable thenRow = thenVar.getLVT();
+    LocalVariable elseRow = elseVar.getLVT();
+    if (!thenRow.getName().equals(elseRow.getName()) || thenRow.getIndex() != elseRow.getIndex()
+        || !isRealDefinition(thenVar) || !isRealDefinition(elseVar)) {
+      return;
+    }
+    // One declaration above the if gives the variable two ranges split at the merge, not two
+    // variables: the then path's range ends exactly where the else arm begins (the condition's
+    // else target), and the else path's range runs at least to the end of the if. Two separate
+    // arm declarations each close at their own arm's end instead.
+    int end = RoundTrip.lastEnd(ifStatement);
+    int thenArmStart = RoundTrip.firstOffset(ifStatement.getIfstat());
+    int elseArmStart = RoundTrip.firstOffset(ifStatement.getElsestat());
+    boolean thenJoins = end >= 0 && elseArmStart >= 0 && thenRow.getEnd() == elseArmStart
+      && elseRow.getEnd() > end;
+    boolean elseJoins = end >= 0 && thenArmStart >= 0 && elseRow.getEnd() == thenArmStart
+      && thenRow.getEnd() > end;
+    if (!thenJoins && !elseJoins) {
+      return;
+    }
+    if ((!names.uniqueName(thenVar) && !names.sameSlotName(thenVar)) || mentionsField(ifStatement, thenVar.getName())) {
+      debug(method, thenVar, "rejected: merged arm declaration would capture a name");
+      return;
+    }
+    Exprent declaration = thenVar.copy();
+    declaration.bytecode = null;
+    thenVar.setDefinition(false);
+    elseVar.setDefinition(false);
+    insertByTargetSlot(ifStatement.getVarDefinitions(), declaration);
+    debug(method, thenVar, "merged the arm declarations above the if: a row ends past it");
+  }
+
+  /**
+   * Moves a declaration the printer put above a finally into the try body when its row ends
+   * inside the try: the body's scope closes at the protected range's end, above the handler, so
+   * the target proves the source wrote the declaration inside the braces.
+   */
+  private static void placeInsideFinally(CatchAllStatement tryStatement, NameTable names, String method) {
+    Statement body = tryStatement.getFirst();
+    if (body == null) {
+      return;
+    }
+    int bodyEnd = RoundTrip.lastEnd(body);
+    int tryEnd = RoundTrip.lastEnd(tryStatement);
+    if (bodyEnd < 0 || tryEnd < 0) {
+      return;
+    }
+    for (Exprent exprent : new ArrayList<>(tryStatement.getVarDefinitions())) {
+      VarExprent var = definedVar(exprent);
+      if (var == null || !isRealDefinition(var) || var.getLVT() == null) {
+        continue;
+      }
+      LocalVariable row = var.getLVT();
+      if (row.getEnd() <= bodyEnd || row.getEnd() >= tryEnd) {
+        continue;
+      }
+      if ((!names.uniqueName(var) && !names.sameSlotName(var)) || mentionsField(tryStatement, var.getName())) {
+        debug(method, var, "rejected: try-body declaration would capture a name");
+        continue;
+      }
+      Exprent declaration;
+      if (exprent == var) {
+        removeIdentity(tryStatement.getVarDefinitions(), var);
+        var.bytecode = null;
+        declaration = var;
+      } else {
+        declaration = var.copy();
+        declaration.bytecode = null;
+        var.setDefinition(false);
+      }
+      insertByTargetSlot(body.getVarDefinitions(), declaration);
+      debug(method, var, "placed inside the try body: its row ends there");
+    }
   }
 
   /**

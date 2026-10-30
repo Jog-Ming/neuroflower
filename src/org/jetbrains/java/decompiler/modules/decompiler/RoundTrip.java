@@ -4820,6 +4820,32 @@ public final class RoundTrip {
     return set != null && set.contains(stat);
   }
 
+  /** The end of the method's last instruction, or -1. */
+  public static int methodCodeEnd() {
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
+    if (last == null || last < 0) {
+      return -1;
+    }
+    int end = instructionEnd(method, last);
+    return end > last ? end : -1;
+  }
+
+  /**
+   * The end of the loop's own last instruction, its back-edge jump included, or -1. A local the
+   * loop body declares closes its row before the jump, so a row that reaches this end was
+   * declared in the enclosing block.
+   */
+  public static int loopRangeEnd(Statement loop) {
+    StructMethod method = currentMethod();
+    int back = backEdgeOffset(loop);
+    if (method == null || back < 0) {
+      return -1;
+    }
+    int end = instructionEnd(method, back);
+    return end > back ? end : -1;
+  }
+
   /** The offset of the goto that returns to this loop's head, or -1. */
   public static int backEdgeOffset(Statement loop) {
     StructMethod method = currentMethod();
