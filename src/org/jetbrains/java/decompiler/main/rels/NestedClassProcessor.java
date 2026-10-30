@@ -241,7 +241,13 @@ public class NestedClassProcessor {
                 if (param instanceof VarExprent) {
                   VarVersionPair paramVersion = new VarVersionPair((VarExprent) param);
                   originalVersions.put(varVersion, paramVersion);
-                  mapNewNames.put(varVersion, enclosingVarProc.getVarName(paramVersion));
+                  // The row the captured variable's declaration carries is its source name: the
+                  // enclosing name map can land on a sibling local that reused the slot, while
+                  // the exprent keeps the row its own declaration prints.
+                  LocalVariable capturedRow = ((VarExprent)param).getLVT();
+                  String capturedName = capturedRow != null && RoundTrip.selector("slotname")
+                    ? capturedRow.getName() : enclosingVarProc.getVarName(paramVersion);
+                  mapNewNames.put(varVersion, capturedName);
                   lvts.put(varVersion, ((VarExprent)param).getLVT());
                   // A capture the enclosing method records as one of its `this` variables (a
                   // member class's outer instance) is a `this` of the lambda too: an unqualified

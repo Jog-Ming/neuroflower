@@ -50,6 +50,11 @@ public class VarDefinitionHelper {
   private final StructMethod mt;
   private final Map<VarVersionPair, String> clashingNames = new HashMap<>();
 
+  // The table row of each variable's own declaration store, keyed by the variable's index. Two
+  // variables whose rows name different locals are different source variables even when the tree
+  // lets them share a slot: javac reuses a slot once the earlier local's scope died.
+  private final Map<Integer, LocalVariable> declarationRows = new HashMap<>();
+
   // A lambda content method is scanned with the enclosing method's names in scope. Whether an
   // outer name really clashes with a name inside the lambda is a bytecode question: the outer
   // variable is in scope only where its LVT range covers the lambda's instruction. The site map
@@ -677,14 +682,19 @@ public class VarDefinitionHelper {
     }
 
     Map<VarVersionPair, VarVersionPair> denylist = new HashMap<>();
-    VPPEntry remap = mergeVars(stat, parent, new HashMap<>(), denylist);
-    while (remap != null) {
+    VPPEntry remap;
+    while (true) {
+      // The rows are read from the tree before each pass: a remap rewrites the variables' indices,
+      // so the declaration the table records has to be looked up under the current index.
+      recordDeclarationRows(stat);
+      remap = mergeVars(stat, parent, new HashMap<>(), denylist);
+      if (remap == null) {
+        break;
+      }
       //System.out.println("Remapping: " + remap.getKey() + " -> " + remap.getValue());
       if (!remapVar(stat, remap.getKey(), remap.getValue())) {
         denylist.put(remap.getKey(), remap.getValue());
       }
-
-      remap = mergeVars(stat, parent, new HashMap<>(), denylist);
     }
 
     if (sources != null) {
@@ -692,6 +702,36 @@ public class VarDefinitionHelper {
       compareVarExprentSources(sources, newSources);
     }
     return null;
+  }
+
+  /** Records the table row each variable's own declaration store carries. */
+  private void recordDeclarationRows(Statement stat) {
+    declarationRows.clear();
+    StatementIterator.iterate(stat, exprent -> {
+      if (exprent instanceof VarExprent var && var.getLVT() != null
+          && var.bytecode != null && !var.bytecode.isEmpty()) {
+        declarationRows.putIfAbsent(var.getIndex(), var.getLVT());
+      }
+      return 0;
+    });
+  }
+
+  /**
+   * True when the target's table records this declaration and the surviving variable as different
+   * source locals: each carries a row of its own and the rows name different locals. javac reuses
+   * a slot once the earlier local's scope died, and writes the later local's own row; merging the
+   * two would print the earlier name at the later declaration. A variable split into several
+   * rows keeps one name, and a declaration the fallback attached a row to has no store bytecode
+   * of its own, so neither shape is vetoed here.
+   */
+  private boolean distinctRows(VarExprent victim, VarVersionPair survivor) {
+    if (!RoundTrip.selector("slotname")) {
+      return false;
+    }
+    LocalVariable victimRow = declarationRows.get(victim.getIndex());
+    LocalVariable survivorRow = declarationRows.get(survivor.var);
+    return victimRow != null && survivorRow != null
+      && !victimRow.getName().equals(survivorRow.getName());
   }
 
   // FIXME: Needed for variable merging combat, get rid of it!
@@ -717,6 +757,13 @@ public class VarDefinitionHelper {
           if (index != null) {
             if (this_vars.containsKey(index)) {
               VarVersionPair survivor = this_vars.get(index);
+              if (distinctRows(var, survivor)) {
+                // The table names both locals: the later declaration is a new variable that
+                // reuses the slot, and it becomes the current one for the rest of this scope.
+                this_vars.put(index, new VarVersionPair(var));
+                leaked.put(index, new VarVersionPair(var));
+                continue;
+              }
               if (getMergedType(new VarVersionPair(var), survivor) == null) {
                 // The two variables share no common type, so the remap cannot succeed. Removing
                 // this declaration would leave its uses naming a variable that no longer exists.
@@ -961,7 +1008,7 @@ public class VarDefinitionHelper {
     if (new_ != null) {
       VarVersionPair old = new VarVersionPair(var);
       VarVersionPair deny = denylist.get(old);
-      if (deny == null || !deny.equals(new_)) {
+      if ((deny == null || !deny.equals(new_)) && !distinctRows(var, new_)) {
         return new VPPEntry(var, this_vars.get(index));
       }
     }
@@ -2118,7 +2165,9 @@ public class VarDefinitionHelper {
    * variables whose ranges are disjoint were legal in the original source (sibling blocks,
    * try/catch arms, or several ranges of one variable), so the later declaration keeps the name
    * the table gives it. Across a lambda boundary the enclosing variable's range likewise decides:
-   * it only reaches into the body where it covers the instruction that creates the lambda.
+   * it only reaches into the body where it covers the instruction that creates the lambda, and
+   * the same holds for a body local — the source reused the name wherever the table says the
+   * outer variable was already dead, and the printer's scopes are bound by those same rows.
    * Anonymous class bodies are separate class scopes, where javac allows the shadowing anyway.
    */
   private boolean clashes(VarInMethod vim, String name, Map<VarInMethod, String> nameMap,
@@ -2132,10 +2181,7 @@ public class VarDefinitionHelper {
     if (separateClassScope) {
       return false;
     }
-    if (!selfParam) {
-      // A local of the lambda body is printed at the scope the decompiler built, which may reach
-      // past the original table range (a dropped block, a hoisted declaration); only a parameter
-      // gets the benefit of the site evidence here.
+    if (!selfParam && !RoundTrip.selector("lambdaname")) {
       return true;
     }
 
