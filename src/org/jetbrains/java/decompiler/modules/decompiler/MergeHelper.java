@@ -288,6 +288,47 @@ public class MergeHelper {
             return true;
           }
         }
+
+        // A loop copied into a finally keeps the source's head test as an if/else: the test's arm
+        // is the finally's empty exit block and the body is the else. The target's test branches
+        // past the loop where a written `if (C) continue;` would branch into the body, so the
+        // source wrote the test in the loop header and the else is its body.
+        if (firstif.iftype == IfStatement.IFTYPE_IFELSE && firstif.getElsestat() != null
+            && firstif.getIfstat() != null
+            && firstif.getIfstat().getExprents() != null && firstif.getIfstat().getExprents().isEmpty()
+            && RoundTrip.firstOffset(firstif.getIfstat()) < 0
+            && RoundTrip.branchesOutOfLoop(firstif.getHeadexprent(), stat)) {
+          stat.setLooptype(DoStatement.Type.WHILE);
+
+          IfExprent ifexpr = (IfExprent)firstif.getHeadexprent().copy();
+          ifexpr.negateIf();
+          ifexpr.getCondition().addBytecodeOffsets(firstif.getHeadexprent().bytecode);
+          stat.setConditionExprent(ifexpr.getCondition());
+
+          // The head's own edges carry the test's two arms; the if's map is not built yet here.
+          Statement head = firstif.getFirst();
+          for (StatEdge edge : new ArrayList<>(head.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL))) {
+            head.removeSuccessor(edge);
+          }
+
+          // The test's arm leaves the loop, so its own exit is the loop's exit.
+          boolean exitMoved = false;
+          for (StatEdge edge : new ArrayList<>(firstif.getIfstat().getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL))) {
+            firstif.getIfstat().removeSuccessor(edge);
+            if (!exitMoved) {
+              edge.setSource(stat);
+              if (edge.closure == stat) {
+                edge.closure = stat.getParent();
+              }
+              stat.addSuccessor(edge);
+              exitMoved = true;
+            }
+          }
+
+          Statement body = firstif.getElsestat();
+          firstif.getParent().replaceStatement(firstif, body);
+          return true;
+        }
       }
     }
 

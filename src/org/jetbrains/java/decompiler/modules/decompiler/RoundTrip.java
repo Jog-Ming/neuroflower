@@ -8153,6 +8153,17 @@ public final class RoundTrip {
     return slots;
   }
 
+  /**
+   * True when the condition's last branch leaves the loop: the source wrote the test in the loop
+   * header, whose failing path jumps past the body. A written {@code if (C) continue;} branches
+   * back into the body instead, where the guard really is a statement of the source's own.
+   */
+  public static boolean branchesOutOfLoop(Exprent head, Statement loop) {
+    int target = lastBranchTarget(head);
+    int end = lastEnd(loop);
+    return target >= 0 && end > 0 && target >= end;
+  }
+
   /** Whether this statement binds a pattern variable anywhere in its subtree. */
   public static boolean bindsPatternVariable(Statement stat) {
     if (stat == null) {
