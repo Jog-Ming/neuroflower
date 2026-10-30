@@ -325,6 +325,25 @@ public final class SwitchPatternMatchProcessor {
 
     Statement replaceWith = stat;
     Statement parent = stat.getParent();
+    // The dispatch loop javac builds for a pattern switch is not source: its body is the switch
+    // and the method's own final return, and no back edge reaches it once the index assignments
+    // are gone. The source wrote the switch bare at the method's end, so the loop, the copy of
+    // the selector in a local, and the return the loop printed as its break all go away.
+    boolean dispatchLoop = parent instanceof SequenceStatement dispatchSeq
+        && RoundTrip.selector("switchjoin")
+        && dispatchSeq.getStats().size() == 2
+        && dispatchSeq.getStats().get(0) == stat
+        && dispatchSeq.getStats().get(1) instanceof BasicBlockStatement tail
+        && tail.getExprents() != null && tail.getExprents().size() == 1
+        && tail.getExprents().get(0) instanceof ExitExprent tailExit
+        && tailExit.getExitType() == ExitExprent.Type.RETURN && tailExit.getValue() == null
+        && RoundTrip.isMethodFinalReturn(tailExit)
+        && dispatchSeq.getParent() instanceof DoStatement dispatchDo
+        && dispatchDo.getLooptype() == DoStatement.Type.INFINITE
+        // No back edge from the loop's own body: the jumps that still reach it are the dispatch
+        // blocks the pattern extraction detached from the arms, which the source never wrote.
+        && dispatchDo.getPredecessorEdges(StatEdge.TYPE_CONTINUE).stream()
+            .noneMatch(edge -> dispatchDo.containsStatementStrict(edge.getSource()));
     if (parent instanceof SequenceStatement seq
         && seq.getStats().size() == 2
         && seq.getStats().get(0) == stat
@@ -335,7 +354,17 @@ public final class SwitchPatternMatchProcessor {
       replaceWith = parent;
       parent = parent.getParent();
     }
-    if (guarded && parent instanceof DoStatement) {
+    else if (dispatchLoop) {
+      replaceWith = parent;
+      parent = parent.getParent();
+    }
+    if ((guarded || dispatchLoop) && parent instanceof DoStatement) {
+      if (dispatchLoop) {
+        // The dispatch jumps go with the loop they were lowered into; the source has neither.
+        for (StatEdge edge : new ArrayList<>(parent.getPredecessorEdges(StatEdge.TYPE_CONTINUE))) {
+          edge.remove();
+        }
+      }
       // remove the enclosing while(true) loop of a guarded switch
       parent.replaceWith(replaceWith);
       // FIXME: this replacement code looks wrong,
