@@ -497,6 +497,28 @@ public class SwitchStatement extends Statement {
           && RoundTrip.canCompleteNormally(stat)) {
         deferredBreak = switchEnd;
       }
+      // A braced pattern arm whose table closes an arm local exactly at the break's jump: the
+      // source closed the block before the written break, so the break prints after the brace.
+      // Another jump onto the same join proves the landing is the switch's end, not the arm's own
+      // fall-through; a pattern variable's row is no scope evidence and is skipped.
+      if (deferredBreak < 0 && braced.contains(stat) && !breakOutside && !yields && !orderUnknown
+          && patternArm && RoundTrip.selector("switchbreak") && breakJump >= 0
+          && RoundTrip.jumpTargetAt(breakJump) == switchEnd
+          && !declaredScopePast(armRows.get(i), breakJump, RoundTrip.patternVariableSlots(values))
+          && RoundTrip.anotherJumpTo(breakJump, switchEnd)) {
+        deferredBreak = breakJump;
+      }
+      // A labelled arm whose label exists only for its own break to the switch's join: the source
+      // wrote the brace and the break itself, never a labelled block. The arm's own row closes at
+      // the break's jump and every label edge is that one break, so the label can go and the
+      // break prints after the brace.
+      boolean labelArm = deferredBreak < 0 && stat.isLabeled() && braced.contains(stat)
+        && !yields && !orderUnknown && RoundTrip.selector("switchbreak") && armClose[i] > 0
+        && !declaredScopePast(armRows.get(i), armClose[i], RoundTrip.patternVariableSlots(values))
+        && labelsBreakToJoin(stat);
+      if (labelArm) {
+        deferredBreak = armClose[i];
+      }
       // An arm whose code ends exactly where the table's default target begins falls into the
       // empty default group printed after it: the source wrote one `break;`, in that group, and
       // the arm reaches it by falling through. Printing the arm's break too would add a jump.
@@ -504,7 +526,8 @@ public class SwitchStatement extends Statement {
         && RoundTrip.blockEnd(stat) >= 0
         && RoundTrip.blockEnd(stat) == defaultTargetOffset();
       Statement previousJump = breakOutside || fallsIntoDefault ? RoundTrip.suppressJump(stat) : null;
-      Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(this) : null;
+      Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(labelArm ? stat : this) : null;
+      Statement previousLabel = labelArm ? RoundTrip.hideLabel(stat) : null;
       // A shared join return is not this arm's statement: the arm's jump is, and it prints as the
       // `break;` below. Keep the return out of the page while the arm prints.
       Exprent joinedReturn = i < joinedReturns.length ? joinedReturns[i] : null;
@@ -523,6 +546,9 @@ public class SwitchStatement extends Statement {
         }
         if (deferredBreak > 0) {
           RoundTrip.restoreDeferredBreak(previousDefer);
+        }
+        if (labelArm) {
+          RoundTrip.restoreLabel(previousLabel);
         }
         if (breakOutside) {
           RoundTrip.restoreJump(previousJump);
@@ -1222,6 +1248,34 @@ public class SwitchStatement extends Statement {
       jump = target;
     }
     return jump;
+  }
+
+  /**
+   * True when every label edge of this arm is one explicit break from inside it to the switch's
+   * own join: the label only stands for the arm's written `break;`, so hiding it and printing the
+   * break after the brace reproduces the source.
+   */
+  private boolean labelsBreakToJoin(Statement stat) {
+    if (stat.getLabelEdges().isEmpty()) {
+      return false;
+    }
+    Statement join = null;
+    for (StatEdge edge : getAllSuccessorEdges()) {
+      if (edge.getType() == StatEdge.TYPE_REGULAR) {
+        join = edge.getDestination();
+        break;
+      }
+    }
+    if (join == null) {
+      return false;
+    }
+    for (StatEdge edge : stat.getLabelEdges()) {
+      if (edge.getType() != StatEdge.TYPE_BREAK || !edge.explicit || edge.closure != stat
+          || edge.getDestination() != join) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** True when the arm's tail leaves by the enclosing loop's own, unprinted back edge. */

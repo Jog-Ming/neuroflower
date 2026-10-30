@@ -6063,6 +6063,29 @@ public final class RoundTrip {
    */
   private static final ThreadLocal<Statement> DEFERRED_BREAK = new ThreadLocal<>();
 
+  /** The statement whose CFG label the printer must not write: the caller re-creates its scope. */
+  private static final ThreadLocal<Statement> HIDDEN_LABEL = new ThreadLocal<>();
+
+  /** Hides this statement's printed label while it prints; returns the previous hidden one. */
+  public static Statement hideLabel(Statement stat) {
+    Statement old = HIDDEN_LABEL.get();
+    HIDDEN_LABEL.set(stat);
+    return old;
+  }
+
+  public static void restoreLabel(Statement old) {
+    if (old == null) {
+      HIDDEN_LABEL.remove();
+    } else {
+      HIDDEN_LABEL.set(old);
+    }
+  }
+
+  /** True when the caller prints this statement's braces itself, without the CFG's label. */
+  public static boolean isLabelHidden(Statement stat) {
+    return stat != null && stat == HIDDEN_LABEL.get();
+  }
+
   /** Defers the break edges closing over {@code closure} to the caller; returns the previous. */
   public static Statement deferBreakTo(Statement closure) {
     Statement old = DEFERRED_BREAK.get();

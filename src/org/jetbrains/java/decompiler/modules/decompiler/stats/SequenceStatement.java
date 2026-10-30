@@ -100,7 +100,7 @@ public class SequenceStatement extends Statement {
   @Override
   public TextBuffer toJava(int indent) {
     TextBuffer buf = new TextBuffer();
-    boolean islabeled = isLabeled();
+    boolean islabeled = isLabeled() && !RoundTrip.isLabelHidden(this);
 
     buf.append(ExprProcessor.listToJava(varDefinitions, indent));
 
