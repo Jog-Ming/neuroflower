@@ -80,6 +80,14 @@ public class TryHelper {
     TryWithResourcesProcessor.findEdgesLeaving(stat, inner, edges);
     Statement parent = stat;
     if (inner instanceof SequenceStatement && edges.isEmpty()) {
+      // Two resource trials merged into one header: a statement beside the inner try then lies
+      // between the two close blocks, where the inner resource is already closed, and the
+      // merged header would move it inside the inner scope. javac only nests resources without
+      // siblings for one header's list. A try without resources of its own is the shell the
+      // printer lifts a nested try-with-resources into, and its siblings belong inside.
+      if (!stat.getResources().isEmpty() && inner.getStats().size() > 1) {
+        return false;
+      }
       parent = inner;
       inner = inner.getStats().get(0);
     }
