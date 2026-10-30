@@ -991,6 +991,79 @@ public final class RoundTrip {
   }
 
   /**
+   * Whether folding this pattern if into a ternary would hide the else-if chain the source wrote.
+   * javac hoists every pattern binding an else-if chain declares into one prefix, in source order,
+   * so the first test's binding precedes the second's. A genuine nested ternary hoists the else
+   * side's binding first: the conditional expression's inner test is attributed before the outer
+   * condition's binding is allocated, so its slot comes first. {@code elseValue} is the value the
+   * else arm would contribute to the ternary.
+   */
+  public static boolean ternaryHidesPatternChain(IfStatement ifstat, Exprent elseValue) {
+    if (!selector("yieldtern") || ifstat == null || elseValue == null) {
+      return false;
+    }
+    LocalVariable thenBinding = conditionPatternLocal(ifstat);
+    LocalVariable elseBinding = patternBindingIn(elseValue);
+    return thenBinding != null && thenBinding.getIndex() >= 0
+      && elseBinding != null && elseBinding.getIndex() >= 0
+      && thenBinding.getIndex() < elseBinding.getIndex();
+  }
+
+  /**
+   * Whether the statement opens an else arm the target's slots prove is the source's else-if
+   * chain: the leading if binds a pattern variable and the chain's binding is hoisted above the
+   * shared subject temp the way javac lays an else-if prefix out ({@link #elseChainSlots}). Only
+   * a pattern test has that evidence; an ordinary if behind `else {` is a block, not a clause.
+   */
+  public static boolean patternChainArm(IfStatement owner, Statement arm) {
+    if (!selector("elsechain") || owner == null || arm == null) {
+      return false;
+    }
+    Statement lead = leadingStatement(arm);
+    return lead instanceof IfStatement elseIf && conditionPatternLocal(elseIf) != null
+      && elseChainSlots(owner, arm);
+  }
+
+  /**
+   * Whether folding this if into a ternary would bury an else-if chain the target's slots prove
+   * ({@link #elseChainSlots}): the if leads the else arm of an enclosing if whose hoisted binding
+   * sits in the chain prefix. The chain's printer rebuilds that arm as `} else if (…) {`; a fold
+   * would flatten the test into an expression and renumber the hoisted bindings.
+   */
+  public static boolean foldsElseChain(IfStatement ifstat) {
+    if (!selector("yieldtern") || ifstat == null || ifstat.getParent() == null
+        || conditionPatternLocal(ifstat) == null) {
+      return false;
+    }
+    Statement child = ifstat;
+    for (Statement parent = ifstat.getParent(); parent != null;
+         child = parent, parent = parent.getParent()) {
+      if (parent instanceof IfStatement owner) {
+        if (owner.getElsestat() != child || owner.getIfstat() == null) {
+          return false;
+        }
+        return leadingStatement(child) == ifstat && elseChainSlots(owner, child);
+      }
+    }
+    return false;
+  }
+
+  /** The first pattern binding an expression tree declares, or null. */
+  private static LocalVariable patternBindingIn(Exprent exprent) {
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2) {
+        LocalVariable binding = patternBindingLocal(function.getLstOperands().get(2));
+        if (binding != null) {
+          return binding;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * The slot the first unnamed temp of the if's condition stores into, or -1. javac keeps the
    * expression a pattern tests in a synthetic local when it is not a plain variable, and the
    * table has no row for that slot.

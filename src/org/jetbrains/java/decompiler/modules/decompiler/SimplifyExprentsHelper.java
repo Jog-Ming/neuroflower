@@ -1112,6 +1112,11 @@ public class SimplifyExprentsHelper {
                 }
               }
 
+              if (found && (RoundTrip.ternaryHidesPatternChain(statement, elseAssign.getRight())
+                  || RoundTrip.foldsElseChain(statement))) {
+                return false;
+              }
+
               if (found) {
                 List<Exprent> data = new ArrayList<>(statement.getFirst().getExprents());
 

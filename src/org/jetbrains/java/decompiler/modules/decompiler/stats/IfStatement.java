@@ -786,7 +786,7 @@ public class IfStatement extends Statement {
     boolean elseif = false;
 
     if (elsestat != null) {
-      if (printElseIfArm(buf, indent, elsestat)) {
+      if (printElseIfArm(buf, indent, elsestat, this)) {
         elseif = true;
       }
       else {
@@ -855,6 +855,87 @@ public class IfStatement extends Statement {
    */
   private boolean printedAsElseIfArm() {
     return ELSE_IF_ARM.get().contains(this);
+  }
+
+  /**
+   * The same, for an else arm printed by its owner: a sequence that opens with a plain if is the
+   * source's chain when the target's slots prove it ({@link RoundTrip#elseChainSlots}), and its
+   * remaining statements are the chain's final else.
+   */
+  static boolean printElseIfArm(TextBuffer buf, int indent, Statement arm, IfStatement owner) {
+    if (printElseIfArm(buf, indent, arm)) {
+      return true;
+    }
+    if (owner == null || !RoundTrip.selector("elseifchain")
+        || !(arm instanceof SequenceStatement sequence)
+        || !sequence.varDefinitions.isEmpty() || sequence.getStats().size() < 2) {
+      return false;
+    }
+    Statement lead = sequence.getStats().get(0);
+    if (!(lead instanceof IfStatement elseIf) || elseIf.iftype != IFTYPE_IF
+        || elseIf.getElsestat() != null || elseIf.getIfstat() == null
+        || elseIf.isLabeled() || !elseIf.varDefinitions.isEmpty()
+        || elseIf.getHeadexprent() == null || elseIf.getHeadexprent().getCondition() == null
+        // A clause has to open with its own `if`: a head block with exprents prints statements
+        // ahead of the test, which cannot follow an `else` keyword.
+        || elseIf.getFirst() == null || elseIf.getFirst().getExprents() == null
+        || !elseIf.getFirst().getExprents().isEmpty()) {
+      return false;
+    }
+    // The chain's own slots: the else binding is hoisted above the shared subject temp, where a
+    // written `else { if … }` declares it behind the inner test's own temp. Only a pattern test
+    // has that evidence.
+    if (!RoundTrip.patternChainArm(owner, sequence)) {
+      return false;
+    }
+    // The else keyword can only take the rest of the block when the arm leaves on its own: a path
+    // from the then into the rest would run those statements on both branches.
+    if (reachesAny(elseIf.getIfstat(), sequence.getStats(), 1)) {
+      return false;
+    }
+    Statement previous = RoundTrip.openArm(elseIf);
+    TextBuffer content;
+    boolean open;
+    try {
+      content = printElseIfArmContent(elseIf, indent);
+    } finally {
+      open = RoundTrip.closeArm(previous);
+    }
+    buf.appendIndent(indent).append("} else ");
+    content.setStart(TextUtil.getIndentString(indent).length());
+    buf.append(content);
+    // The arm withheld its closing brace for this line: `} else {` closes the inner if.
+    buf.appendIndent(indent).append(open ? "} else {" : "else {").appendLineSeparator();
+    List<Statement> rest = sequence.getStats();
+    for (int i = 1; i < rest.size(); i++) {
+      buf.append(ExprProcessor.jmpWrapper(rest.get(i), indent + 1, i == 1));
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    return true;
+  }
+
+  /**
+   * Whether any statement of this subtree jumps to one of the statements at or after {@code from}
+   * in the list: such a path falls into the code the caller prints behind the next brace.
+   */
+  private static boolean reachesAny(Statement stat, List<Statement> stats, int from) {
+    if (stat == null) {
+      return false;
+    }
+    for (StatEdge edge : stat.getAllSuccessorEdges()) {
+      Statement destination = edge.getDestination();
+      for (int i = from; i < stats.size(); i++) {
+        if (stats.get(i) == destination) {
+          return true;
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      if (reachesAny(child, stats, from)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
