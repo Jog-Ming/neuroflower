@@ -2707,6 +2707,13 @@ public class ClassWriter implements StatementWriter {
     //if (init && !isEnum && ((node.access & CodeConstants.ACC_STATIC) == 0) && node.type == ClassNode.CLASS_MEMBER)
     //    index++;
 
+    // A parameter whose entry the target records in declaration position must be written with a
+    // leading annotation, which javac only allows on a simple type name; the member-name form
+    // (see TypeAnnotation.appendCastTypeName) supplies that name.
+    Set<Integer> declarationPosition = RoundTrip.selector("typeuse")
+      ? declarationPositionParameters(mt)
+      : Collections.emptySet();
+
     buffer.pushNewlineGroup(indent, 0);
     for (int i = start; i < md.params.length; i++) {
       boolean real = mask == null || mask.get(i) == null;
@@ -2745,7 +2752,8 @@ public class ClassWriter implements StatementWriter {
             tempParam = tempParam.resizeArrayDim(tempParam.arrayDim + 1);
           }
           // TODO: does this need typeName?
-          buffer.appendCastTypeName(tempParam, annos, writtenAnnotations, isVarArg, true);
+          buffer.appendCastTypeName(tempParam, annos, writtenAnnotations, isVarArg, true,
+            declarationPosition.contains(paramCount));
           isVarArg = false; // already handled
         } else {
           buffer.appendCastTypeName(typeName, parameterType);
@@ -3796,6 +3804,49 @@ public class ClassWriter implements StatementWriter {
     } catch (NumberFormatException e) {
       return -1;
     }
+  }
+
+  /**
+   * The parameters whose type annotations the target records in declaration position. javac
+   * separates the annotations written before a type from those written inside it, appends the
+   * former to the method while walking the parameters and the latter while scanning the types,
+   * and each group stays in parameter order. The recorded entry order is therefore a prefix
+   * (declaration position) followed by a suffix (type position), split at the first index that
+   * falls; when it never falls, the target does not say how the groups were mixed.
+   */
+  private static Set<Integer> declarationPositionParameters(StructMethod mt) {
+    List<Integer> indices = new ArrayList<>();
+    List<Boolean> topLevel = new ArrayList<>();
+    for (Key<?> key : TYPE_ANNOTATION_ATTRIBUTES) {
+      StructTypeAnnotationAttribute attribute = mt.getAttribute((Key<StructTypeAnnotationAttribute>) key);
+      if (attribute != null) {
+        for (TypeAnnotation annotation : attribute.getAnnotations()) {
+          if (annotation.getTargetType() == TypeAnnotation.METHOD_PARAMETER) {
+            indices.add(annotation.getIndex());
+            topLevel.add(annotation.isTopLevel());
+          }
+        }
+      }
+    }
+
+    int split = -1;
+    for (int i = 0; i + 1 < indices.size(); i++) {
+      if (indices.get(i) > indices.get(i + 1)) {
+        split = i;
+        break;
+      }
+    }
+    if (split < 0) {
+      return Collections.emptySet();
+    }
+
+    Set<Integer> result = new HashSet<>();
+    for (int i = 0; i <= split; i++) {
+      if (topLevel.get(i)) {
+        result.add(indices.get(i));
+      }
+    }
+    return result;
   }
 
   public static List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> getTypeAnnotations(StructMember mb, int targetType, int index) {

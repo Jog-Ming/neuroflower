@@ -100,6 +100,11 @@ public class TextBuffer {
     return this;
   }
 
+  public TextBuffer appendCastTypeName(VarType type, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, boolean vararg, boolean flush, boolean memberName) {
+    TypeAnnotation.appendCastTypeName(this, type, typeAnnotations, filter, vararg, flush, memberName);
+    return this;
+  }
+
   public TextBuffer appendCastTypeName(VarType type) {
     return appendCastTypeName(ExprProcessor.getCastTypeName(type), type);
   }

@@ -112,6 +112,16 @@ public class TypeAnnotation {
   }
 
   public static void appendCastTypeName(TextBuffer buffer, VarType type, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, boolean vararg, boolean flush) {
+    appendCastTypeName(buffer, type, typeAnnotations, filter, vararg, flush, false);
+  }
+
+  /**
+   * @param memberName the caller's target records this position's top-level annotation in
+   *                   declaration position, so the name must be written as a bare member name
+   *                   (javac groups an annotation written before a simple name ahead of every
+   *                   type-position entry)
+   */
+  public static void appendCastTypeName(TextBuffer buffer, VarType type, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, boolean vararg, boolean flush, boolean memberName) {
     // Before going through the rest of the classes, go through the array. Save the values for later, as we'll need to append them.
     TextBuffer appendBuffer = new TextBuffer();
     if (type.arrayDim > 0) {
@@ -173,8 +183,28 @@ public class TypeAnnotation {
         }
       }
 
-      int i = 0;
-      for (String clazz : fullClasses) {
+      int first = 0;
+      if (memberName && RoundTrip.selector("typeuse") && type.arrayDim == 0 && fullClasses.size() > 1
+        && isMemberNameInScope(type)) {
+        boolean plain = true;
+        for (Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent> anno : typeAnnotations) {
+          if (!anno.a.isEmpty() && anno.a.peek().kind() == TypeAnnotation.PathKind.DEEPER_NESTED) {
+            plain = false;
+            break;
+          }
+        }
+        if (plain) {
+          // The target's table puts this parameter's top-level entry ahead of a lower-index entry,
+          // which javac only does for an annotation written in declaration position. A bare member
+          // name lets the annotation lead the type; the enclosing name would trip the scoping
+          // construct rule and leave the entry in the type-position group instead.
+          stepwiseWriteAnnotations(buffer, false, typeAnnotations, filter, v -> false);
+          first = fullClasses.size() - 1;
+        }
+      }
+
+      for (int i = first; i < fullClasses.size(); i++) {
+        String clazz = fullClasses.get(i);
         ClassesProcessor.ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(clazz.replace('.', '/'));
         // Try to find the name, if the node exists use that, otherwise just use the descriptor
         String name;
@@ -185,7 +215,7 @@ public class TypeAnnotation {
           name = clazz.substring(clazz.lastIndexOf(".") + 1, $ > 0 ? $ : clazz.length());
         }
 
-        if (i > 0) {
+        if (i > first) {
           buffer.append(".");
         }
 
@@ -200,8 +230,6 @@ public class TypeAnnotation {
         }
 
         buffer.appendClass(name, false, clazz.replace(".", "/"));
-
-        i++;
       }
 
       // Write generic parameters if the type is generic. Go through the arguments and recurse on the types there.
@@ -265,6 +293,30 @@ public class TypeAnnotation {
     if (flush) {
       dumpUnwrittenAnnotations(buffer, typeAnnotations);
     }
+  }
+
+  /**
+   * Whether {@code type}'s simple name can be written bare here: the type is a member class of the
+   * class being written or of one of its enclosing classes, whose body is inside its scope, so a
+   * leading annotation stays on this type rather than naming a scoping construct.
+   */
+  private static boolean isMemberNameInScope(VarType type) {
+    int dollar = type.value.lastIndexOf('$');
+    if (dollar <= 0) {
+      return false;
+    }
+    ClassesProcessor.ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(type.value);
+    if (node == null || node.classStruct == null || node.type != ClassesProcessor.ClassNode.Type.MEMBER) {
+      return false;
+    }
+    String outer = type.value.substring(0, dollar);
+    for (ClassesProcessor.ClassNode current = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+         current != null; current = current.parent) {
+      if (current.classStruct != null && current.classStruct.qualifiedName.equals(outer)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static void stepwiseWriteAnnotations(TextBuffer buffer, List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> typeAnnotations, Set<String> filter, Predicate<TypeAnnotation.PathValue> canProceed) {
