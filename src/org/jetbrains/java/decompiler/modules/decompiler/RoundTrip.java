@@ -8121,6 +8121,38 @@ public final class RoundTrip {
     return slots;
   }
 
+  /**
+   * Every local the target's table places inside this switch arm's own instruction range, keyed by
+   * slot and holding the earliest row for that slot, whether or not the arm's own declaration
+   * exprents own it. A later local nested in an if arm still reused a slot the enclosing block
+   * freed, so the pairing needs the row without asking where the arm declared it.
+   */
+  public static java.util.Map<Integer, int[]> targetSlotsIn(Statement arm) {
+    java.util.Map<Integer, int[]> slots = new java.util.HashMap<>();
+    if (!selector("armbraces") || arm == null) {
+      return slots;
+    }
+    StructMethod method = currentMethod();
+    if (method == null) {
+      return slots;
+    }
+    StructLocalVariableTableAttribute table =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    if (table == null) {
+      return slots;
+    }
+    int start = firstOffset(arm);
+    int end = lastOffset(arm);
+    if (start < 0 || end < 0) {
+      return slots;
+    }
+    table.getRange(start, Integer.MAX_VALUE)
+      .filter(v -> v.getStart() >= start && v.getStart() <= end)
+      .forEach(v -> slots.merge(v.getIndex(), new int[]{v.getStart(), v.getEnd()},
+        (old, row) -> row[0] < old[0] ? row : old));
+    return slots;
+  }
+
   private static boolean ownedRow(java.util.List<int[]> own, StructLocalVariableTableAttribute.LocalVariable row) {
     for (int[] candidate : own) {
       if (candidate[0] == row.getIndex() && candidate[1] == row.getStart()) {

@@ -161,17 +161,25 @@ public class SwitchStatement extends Statement {
     // since the slot it reuses is simply free by then.
     Set<Statement> bracedEarly = new HashSet<>();
     List<Map<Integer, int[]>> armSlots = new ArrayList<>();
+    List<Map<Integer, int[]>> armSlotsAny = new ArrayList<>();
     List<List<int[]>> armRows = new ArrayList<>();
     for (Statement arm : caseStatements) {
       List<int[]> rows = RoundTrip.declarationRows(arm);
       armRows.add(rows);
       armSlots.add(RoundTrip.targetSlotsDeclaredIn(arm, rows));
+      // The later side of the pair needs no ownership: any row in the arm's range that starts
+      // after the earlier row ended is a reuse of the freed slot, even one the arm declared in a
+      // nested block of its own.
+      armSlotsAny.add(RoundTrip.targetSlotsIn(arm));
     }
     for (int a = 0; a < armSlots.size(); a++) {
       for (int b = a + 1; b < armSlots.size(); b++) {
         int armEnd = RoundTrip.lastOffset(caseStatements.get(a));
         for (Map.Entry<Integer, int[]> first : armSlots.get(a).entrySet()) {
           int[] second = armSlots.get(b).get(first.getKey());
+          if (second == null) {
+            second = armSlotsAny.get(b).get(first.getKey());
+          }
           // The earlier local has to die at its arm's closing brace and the later one to start
           // after it: a local declared in a nested block dies inside the arm instead.
           if (second != null && first.getValue()[1] <= second[0]
