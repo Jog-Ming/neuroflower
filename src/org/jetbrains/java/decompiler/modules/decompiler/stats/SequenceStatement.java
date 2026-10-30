@@ -167,6 +167,16 @@ public class SequenceStatement extends Statement {
         continue;
       }
 
+      // `if (C) { return; } throw;` where the target's last condition branch lands on the
+      // returning arm the tree keeps: the source wrote the negated test with the throw as its
+      // arm and the returning block as the else. javac lays the else of a then that always
+      // throws straight after it, so the tree's arm and the following throw swap.
+      if (printSwappedThrowGuard(buf, indent, i)) {
+        notempty = true;
+        i++;
+        continue;
+      }
+
       // The if this run was folded into prints this block after its closing brace: the target
       // laid it out past the branch shell, so the arm ends where the source's brace was.
       if (RoundTrip.isAfterIf(st)) {
@@ -1650,8 +1660,14 @@ public class SequenceStatement extends Statement {
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-          for (int k = i + 1; k < stats.size(); k++) {
-            buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+          // A guard whose arm ends in a returning block, followed by a lone throw, is the
+          // De Morgan twin of the source's `if (positive) throw; else return`: the tail's own
+          // two statements print swapped when the target's branch proves it.
+          if (stats.size() != i + 3
+              || !printSwappedThrow(buf, indent + 1, stats.get(i + 1), stats.get(i + 2))) {
+            for (int k = i + 1; k < stats.size(); k++) {
+              buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+            }
           }
           buf.appendIndent(indent).append("}").appendLineSeparator();
           // As a try body's print, the trailing return's own instruction may sit past the
@@ -2213,8 +2229,14 @@ public class SequenceStatement extends Statement {
     buf.append(ExprProcessor.listToJava(arm.varDefinitions, indent));
     buf.append(arm.getFirst().toJava(indent));
     buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
-    for (int k = i + 1; k < stats.size(); k++) {
-      buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+    // The body ends with a returning guard and a lone throw: the source wrote the positive test
+    // around the throw with the returning block as its else, and the two print swapped.
+    boolean swappedTail = stats.size() == i + 3
+      && printSwappedThrow(buf, indent + 1, stats.get(i + 1), stats.get(i + 2));
+    if (!swappedTail) {
+      for (int k = i + 1; k < stats.size(); k++) {
+        buf.append(ExprProcessor.jmpWrapper(stats.get(k), indent + 1, k == i + 1));
+      }
     }
     if (needsBreak) {
       buf.appendIndent(indent + 1).append("break label").append(exit.closure.id).append(";").appendLineSeparator();
@@ -2754,6 +2776,63 @@ public class SequenceStatement extends Statement {
     buf.appendIndent(indent).append("}").appendLineSeparator();
     buf.append(ExprProcessor.listToJava(exprents.subList(split, exprents.size()), indent));
     return true;
+  }
+
+  /** A lone {@code throw ...;} block, the arm a swapped guard turns into its then. */
+  private static boolean isLoneThrow(Statement stat) {
+    if (!(stat instanceof BasicBlockStatement block) || block.isLabeled()
+        || !block.getVarDefinitions().isEmpty() || !block.getStats().isEmpty()) {
+      return false;
+    }
+    List<Exprent> exprents = block.getExprents();
+    return exprents != null && exprents.size() == 1 && exprents.get(0) instanceof ExitExprent exit
+      && exit.getExitType() == ExitExprent.Type.THROW;
+  }
+
+  /**
+   * Prints {@code if (C) { return; } throw new X();} as the source's negated test around the
+   * throw, with the returning block as the else. The target has to prove both halves: the last
+   * condition branch carries the complement of the opcode the printed test would branch with,
+   * and it lands on the arm the tree keeps as its then, where a written test would branch past
+   * that arm instead. A guard whose then arm is the throw branches to it as well and is left to
+   * the guard rules. Returns false, having printed nothing, when the shape is not proven.
+   */
+  private static boolean printSwappedThrow(TextBuffer buf, int indent, Statement guardStat,
+                                           Statement abrupt) {
+    if (!(guardStat instanceof IfStatement guard)
+        || guard.iftype != IfStatement.IFTYPE_IF || guard.getElsestat() != null
+        || guard.isLabeled() || guard.getIfstat() == null
+        || guard.getHeadexprent() == null || guard.getHeadexprent().getCondition() == null
+        || !exits(guard.getIfstat()) || !isLoneThrow(abrupt)) {
+      return false;
+    }
+    if (!RoundTrip.swapIfArms(guard.getHeadexprent())
+        || RoundTrip.lastBranchTarget(guard.getHeadexprent())
+           != RoundTrip.statementOffset(guard.getIfstat())
+        // The table proves the arm's locals closed in the enclosing block: the source wrote the
+        // arm flat after the if, not as an else, and the guard rules print that shape.
+        || RoundTrip.armWasFlat(guard.getIfstat())) {
+      return false;
+    }
+    IfExprent head = (IfExprent) guard.getHeadexprent().copy();
+    head.setCondition(RoundTrip.negateCondition(head.getCondition()));
+    buf.append(ExprProcessor.listToJava(guard.varDefinitions, indent));
+    buf.append(guard.getFirst().toJava(indent));
+    buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(abrupt, indent + 1, true));
+    buf.appendIndent(indent).append("} else {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(guard.getIfstat(), indent + 1, true));
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    return true;
+  }
+
+  /**
+   * The sequence-level form of {@link #printSwappedThrow}: the if and the throw are the last two
+   * statements printed here, so the swap can take both.
+   */
+  private boolean printSwappedThrowGuard(TextBuffer buf, int indent, int i) {
+    return i + 2 == stats.size() && !isLabeled()
+      && printSwappedThrow(buf, indent, stats.get(i), stats.get(i + 1));
   }
 
   /** Whether this exprent declares a local, which cannot move into a brace. */
