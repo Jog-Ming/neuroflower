@@ -221,8 +221,8 @@ public final class ConstantNames {
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
-                           Set<String> earlyOwners, boolean ownEarly, boolean ownProven,
-                           StructClass cls) {
+                           Set<String> bares, Set<String> earlyOwners, boolean ownEarly,
+                           boolean ownProven, StructClass cls) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -351,7 +351,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), false, false, null);
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false, null);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -836,10 +836,55 @@ public final class ConstantNames {
         internedAt.put(link.classname, coordinate(use.order(), use.offset()));
       }
     }
+    // A Class entry the pool leaves completely unexplained, entered as a bare pair (its name, then
+    // neither a value nor a reference), exists only because the source named one of the owner's
+    // constants, and that naming left no value entry: the constant folded to an immediate or to a
+    // value already pooled. The pair's position is still the pool's record of the site, so a
+    // literal of any value the owner's constants reproduce can be the naming.
+    Set<String> bares = new HashSet<>();
+    for (String owner : present) {
+      if (explained.contains(owner) || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)) {
+        continue;
+      }
+      Integer index = classIndices.get(owner);
+      if (index == null || index + 1 >= pool.size()) {
+        continue;
+      }
+      if (!(pool.get(index) instanceof PrimitiveConstant entry)
+          || entry.type != CodeConstants.CONSTANT_Class || entry.index != index + 1
+          || !owner.equals(entry.getString())) {
+        continue;
+      }
+      if (!(pool.get(index + 1) instanceof PrimitiveConstant name)
+          || name.type != CodeConstants.CONSTANT_Utf8) {
+        continue;
+      }
+      boolean operand = false;
+      for (int i = 1; i < index && i < pool.size(); i++) {
+        if (pool.get(i) instanceof LinkConstant link && owner.equals(link.classname)) {
+          operand = true; // a reference below the entry created it as its operand
+          break;
+        }
+      }
+      if (operand) {
+        continue;
+      }
+      PooledConstant next = index + 2 < pool.size() ? pool.get(index + 2) : null;
+      if (next instanceof LinkConstant) {
+        continue; // the pair rules read this shape exactly
+      }
+      if (next instanceof PrimitiveConstant value
+          && (value.type == CodeConstants.CONSTANT_Integer || value.type == CodeConstants.CONSTANT_Long
+          || value.type == CodeConstants.CONSTANT_Float || value.type == CodeConstants.CONSTANT_Double
+          || value.type == CodeConstants.CONSTANT_String)) {
+        continue; // the value rules read the folded value exactly
+      }
+      bares.add(owner);
+    }
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, earlyOwners, ownEarly, ownProven, own),
+        activeValues, bares, earlyOwners, ownEarly, ownProven, own),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -1050,6 +1095,30 @@ public final class ConstantNames {
       default -> null;
     };
     return kind == null || value.value == null ? null : kind + "|" + value.value;
+  }
+
+  /**
+   * The pool entry a literal key names, with the kinds javac folds into one entry merged: a char
+   * constant and an int literal of the same value share an {@code Integer}, and a boolean constant
+   * is an {@code Integer} 0 or 1.
+   */
+  private static String canonicalKey(String key) {
+    if (key == null) {
+      return "";
+    }
+    int bar = key.indexOf('|');
+    if (bar < 0) {
+      return key;
+    }
+    String kind = key.substring(0, bar);
+    String value = key.substring(bar + 1);
+    if (kind.equals(VariableType.CHAR.name()) || kind.equals(VariableType.INT.name())) {
+      return VariableType.INT.name() + '|' + value;
+    }
+    if (kind.equals(VariableType.BOOLEAN.name())) {
+      return VariableType.INT.name() + '|' + (value.equals("true") ? "1" : "0");
+    }
+    return key;
   }
 
   /** Whether a constant equal to the pool entry at {@code index} already sat before it. */
@@ -1696,10 +1765,32 @@ public final class ConstantNames {
       // entered the pair was the last pool-entering event before it, so a site in the generation
       // gap between the neighbouring entries' first uses reproduces the same order.
       FirstUse use = firstUses.get(i + 2);
-      if (use == null) {
+      long point;
+      if (use != null) {
+        point = coordinate(use.order(), use.offset());
+      }
+      else if (anotherNaming(pool, i + 2)) {
+        // The entry after the pair is another naming's Class entry, which no instruction uses.
+        // The pool still says this pair precedes it, so the first higher entry an instruction uses
+        // is an upper bound on the generation point the naming occupies; the pair is then placed
+        // exactly as a reference successor's, from its generation gap.
+        long[] until = pairBounds(cls, firstUses, i, early, indices);
+        if (until[1] == Long.MAX_VALUE) {
+          continue;
+        }
+        point = until[1];
+        FirstUse successorUse = null;
+        for (FirstUse candidate : firstUses.values()) {
+          if (coordinate(candidate.order(), candidate.offset()) == point) {
+            successorUse = candidate;
+            break;
+          }
+        }
+        use = successorUse;
+      }
+      else {
         continue;
       }
-      long point = coordinate(use.order(), use.offset());
       // A direct instruction use of the owner's Class entry (new, checkcast, an array type) says
       // the entry already existed when that instruction was generated. The pool puts the entry
       // before this reference, so only a direct use after the reference leaves the pair as the
@@ -1724,6 +1815,11 @@ public final class ConstantNames {
         Integer printed = position(cls, use, positions);
         if (printed != null) {
           int found = nextOpenParen(text, printed);
+          if (found < 0) {
+            // An autoboxing call's recorded position sits at the boxed value, inside the argument
+            // list, so the call's own parenthesis is the nearest unmatched one to its left.
+            found = enclosingParen(text, printed);
+          }
           int end = found < 0 ? -1 : matchingParen(text, found);
           if (found >= 0 && end >= 0) {
             open = found;
@@ -1755,6 +1851,20 @@ public final class ConstantNames {
         lowerAt == null ? -1 : lowerAt));
     }
     return pairs;
+  }
+
+  /** Whether the pool entry is a {@code Class} entry followed by its own name: another naming. */
+  private static boolean anotherNaming(List<PooledConstant> pool, int index) {
+    if (index + 1 >= pool.size()) {
+      return false;
+    }
+    if (!(pool.get(index) instanceof PrimitiveConstant entry)
+        || entry.type != CodeConstants.CONSTANT_Class || entry.getString() == null
+        || entry.index != index + 1) {
+      return false;
+    }
+    return pool.get(index + 1) instanceof PrimitiveConstant name
+      && name.type == CodeConstants.CONSTANT_Utf8;
   }
 
   /**
@@ -1914,6 +2024,34 @@ public final class ConstantNames {
           }
           i = end + 1;
         }
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * The nearest unmatched '(' to the left of this position on the same statement, or -1.
+   *
+   * <p>The printer records a call's position at the buffer the call is printed from; for an
+   * autoboxing conversion that buffer is the boxed value, one level inside the argument list, so
+   * the call's own parenthesis is the last '(' whose group has not been closed by the time the scan
+   * reaches it. A quote before the position makes the scan give up rather than guess.
+   */
+  private static int enclosingParen(String text, int from) {
+    int depth = 0;
+    for (int i = Math.min(from, text.length()) - 1; i >= 0 && i >= from - 400; i--) {
+      char c = text.charAt(i);
+      if (c == ')' || c == ']') {
+        depth++;
+      }
+      else if (c == '(') {
+        if (depth == 0) {
+          return i;
+        }
+        depth--;
+      }
+      else if (c == '\n' || c == ';' || c == '{' || c == '}' || c == '"' || c == '\'') {
+        return -1;
       }
     }
     return -1;
@@ -2672,7 +2810,15 @@ public final class ConstantNames {
         }
         else {
           long sitePoint = siteCoordinate(placement.spaces(), start);
-          if (sitePoint == NO_COORDINATE || sitePoint <= pair.after()) {
+          // The last use before the reference bounds the site only inside the reference's own
+          // method: there the offsets order the two exactly. A site in an earlier method is
+          // generated before every use in the successor's method, so that comparison would reject
+          // a site the pool admits; the pair's own bracket already placed it.
+          if (sitePoint == NO_COORDINATE) {
+            continue;
+          }
+          boolean sameRank = (sitePoint >>> 32) == (pair.successor() >>> 32);
+          if (sameRank && sitePoint <= pair.after()) {
             // An instruction between this site and the reference used an entry the pair precedes,
             // so the original named the constant after that instruction; naming it here would
             // reorder the pool.
@@ -2974,7 +3120,22 @@ public final class ConstantNames {
         break;
       }
     }
-    if (first < 0 || classIndex != first - 2) {
+    // The naming interns the class, its name and -- when the folded value is not an immediate and
+    // is not already pooled -- the value itself, and then the assignment's field reference follows.
+    int foldedIndex = -1;
+    boolean pair = first > classIndex && first - classIndex == 2;
+    if (!pair && first > classIndex && pool.get(classIndex + 2) instanceof PrimitiveConstant value) {
+      int width = value.type == CodeConstants.CONSTANT_Long
+        || value.type == CodeConstants.CONSTANT_Double ? 4 : 3;
+      boolean numericOrString = value.type == CodeConstants.CONSTANT_Integer
+        || value.type == CodeConstants.CONSTANT_Long || value.type == CodeConstants.CONSTANT_Float
+        || value.type == CodeConstants.CONSTANT_Double
+        || value.type == CodeConstants.CONSTANT_String;
+      if (numericOrString && first - classIndex == width) {
+        foldedIndex = classIndex + 2;
+      }
+    }
+    if (!pair && foldedIndex < 0) {
       return;
     }
     if (!(pool.get(first) instanceof LinkConstant reference)
@@ -3017,7 +3178,16 @@ public final class ConstantNames {
       return;
     }
     String key = literalKey(text.substring(equals + 1, range[1]).trim());
-    List<String> names = key == null ? null : sources.get(key);
+    if (key == null) {
+      return;
+    }
+    if (foldedIndex > 0 && !canonicalKey(key).equals(
+        canonicalKey(valueKey((PrimitiveConstant)pool.get(foldedIndex))))) {
+      // The value the naming interned is not this initializer's value, so the pair was created
+      // elsewhere and naming a constant here would enter a different value at the same point.
+      return;
+    }
+    List<String> names = sources.get(key);
     if (names == null || names.isEmpty()) {
       return;
     }
@@ -4936,8 +5106,8 @@ public final class ConstantNames {
     // for the own entry's position): the foreign pair is the only evidence left, so it decides.
     boolean ownUnusable = ownCandidate && tooCommon(key) && placement != null
       && !placement.ownEarly() && !placement.ownProven();
-    if (solved != null && (exactProof[0] || !ownCandidate
-        || exactProof[1] && ownUnusable)) {
+    if (solved != null && (exactProof[0] || exactProof[1] || !ownCandidate
+        || ownUnusable)) {
       // A reference successor's pair records only that some naming entered the owner before the
       // reference: an invented expression is admitted at any literal of the pair's generation gap,
       // so that literal alone does not prove it is where the pool's one naming stood. A direct
@@ -4976,8 +5146,12 @@ public final class ConstantNames {
       usable.remove(excluded);
     }
     Constant provenOwn = ownProvenConstant(ownValue, key, own, anchor, placement);
-    Constant paired = usable.size() > 1 ? pairOwner(usable, anchor, placement) : null;
-    Constant constant = ownCandidate ? ownConstant
+    // A pair whose generation gap admits this site is the pool's record that its owner was named
+    // here. That record is stronger than a same-valued own constant, which interns no new entry:
+    // keeping the own name would leave the pair owner's Class entry missing from the pool.
+    Constant paired = pairOwner(usable, anchor, placement);
+    Constant constant = paired != null && provenOwn == null ? paired
+      : ownCandidate ? ownConstant
       : paired != null ? paired
       : usable.size() == 1 ? usable.get(0) : selectProvable(usable, anchor, placement, own);
     if (constant == null) {
@@ -5227,9 +5401,18 @@ public final class ConstantNames {
     }
     // The constant javac interned beside the owner's Class entry is the pool's own record of the
     // value the source named there; a literal of another value did not come from this constant.
+    // The constant javac interned beside the owner's Class entry is the pool's own record of the
+    // value the source named there; a literal of another value did not come from this constant.
+    // A bare pair holds no such value (the constant folded to an immediate), so the literal's own
+    // value, which the name must reproduce, is the only evidence and the pair's position places it.
     Double folded = placement.folded().get(owner);
     double literal = single ? (double) Float.parseFloat(printed) : Double.parseDouble(printed);
-    if (folded == null || Double.compare(folded, literal) != 0) {
+    if (folded != null) {
+      if (Double.compare(folded, literal) != 0) {
+        return;
+      }
+    }
+    else if (!placement.bares().contains(owner)) {
       return;
     }
     // The literal was a float or double, and an integral constant is not: a bare name would turn
@@ -5283,9 +5466,17 @@ public final class ConstantNames {
         || !placement.windows().containsKey(owner) || !placement.proves(owner, start)) {
       return;
     }
+    // A bare pair holds no folded value (the constant folded to an immediate, e.g. a value the
+    // bytecode pushes directly); the literal's own value, which the name must reproduce, is then
+    // the only evidence, and the pair's position still places the site.
     Double folded = placement.folded().get(owner);
     double literal = negative ? -magnitude : magnitude;
-    if (folded == null || Double.compare(folded, literal) != 0) {
+    if (folded != null) {
+      if (Double.compare(folded, literal) != 0) {
+        return;
+      }
+    }
+    else if (!placement.bares().contains(owner)) {
       return;
     }
     addSite(sites, start, end, key, negative ? "-(double) " : "(double) ", candidates, imports,
