@@ -494,7 +494,13 @@ public class SwitchStatement extends Statement {
           && RoundTrip.canCompleteNormally(stat)) {
         deferredBreak = switchEnd;
       }
-      Statement previousJump = breakOutside ? RoundTrip.suppressJump(stat) : null;
+      // An arm whose code ends exactly where the table's default target begins falls into the
+      // empty default group printed after it: the source wrote one `break;`, in that group, and
+      // the arm reaches it by falling through. Printing the arm's break too would add a jump.
+      boolean fallsIntoDefault = defaultEdge != null && defaultEdge.getDestination() != stat
+        && RoundTrip.blockEnd(stat) >= 0
+        && RoundTrip.blockEnd(stat) == defaultTargetOffset();
+      Statement previousJump = breakOutside || fallsIntoDefault ? RoundTrip.suppressJump(stat) : null;
       Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(this) : null;
       TextBuffer armBuf;
       try {
@@ -541,16 +547,26 @@ public class SwitchStatement extends Statement {
       // but the switch's join is the same block and the source's `break;` (a written `continue;`
       // compiles to the same jump) stands after the arm.
       int loopJoinJump = -1;
+      boolean loopJoin = false;
       if (breakJump < 0 && !breakPrinted && !yields && guard == null && !patternArm
-          && switchEnd >= 0 && RoundTrip.selector("switchjump") && !braced.contains(stat)
+          && RoundTrip.selector("switchjump")
           && RoundTrip.canCompleteNormally(stat) && !armLeaves
-          && RoundTrip.loopBackEdge(this, switchEnd) && continuesToEnclosingLoop(stat)) {
-        int candidate = RoundTrip.jumpOffsetTo(RoundTrip.blockEnd(stat), RoundTrip.blockEnd(this), switchEnd);
-        if (candidate >= 0) {
-          loopJoinJump = candidate;
+          && continuesToEnclosingLoop(stat)) {
+        if (switchEnd >= 0 && RoundTrip.loopBackEdge(this, switchEnd)) {
+          int candidate = RoundTrip.jumpOffsetTo(RoundTrip.blockEnd(stat), RoundTrip.blockEnd(this), switchEnd);
+          if (candidate >= 0) {
+            loopJoinJump = candidate;
+            loopJoin = true;
+          }
+        } else if (switchEnd < 0 && getParent() instanceof DoStatement loopBody && loopBody.getFirst() == this) {
+          // The switch is the loop's whole body, so its join is the loop's own back edge and the
+          // arm's implicit continue is the `break;` the source wrote: the next arm's code is
+          // where a fall-through would go.
+          loopJoin = true;
+          loopJoinJump = RoundTrip.tailJumpOffset(stat);
         }
       }
-      if (loopJoinJump >= 0) {
+      if (loopJoin) {
         buf.append(breakLine(indent + 2, loopJoinJump));
       }
       boolean breakInside = false;
@@ -1310,7 +1326,10 @@ public class SwitchStatement extends Statement {
           return null;
         }
         if (edge == defaultEdge) {
-          if (edges.size() > 1 || defaultIndex >= 0) {
+          // A default label written into a group with case labels shares that group's block; the
+          // arm's own offset still comes from its case labels, so the default need not stand
+          // alone for the block order to be readable.
+          if (defaultIndex >= 0) {
             return null;
           }
           defaultIndex = i;
@@ -1321,7 +1340,9 @@ public class SwitchStatement extends Statement {
           return null;
         }
       }
-      offsets[i] = RoundTrip.firstOffset(stat);
+      // The table target names the block even when the arm holds no instruction of its own: an
+      // empty group's `break;` is a jump the label lands on.
+      offsets[i] = entryOffset(i);
       if (offsets[i] < 0) {
         return null;
       }
