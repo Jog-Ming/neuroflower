@@ -255,6 +255,23 @@ public final class Verifier {
           structure = true;
           System.out.println("    " + detail);
         }
+        if (!cls.flags().getOrDefault("bytes", true)
+            && !cls.flags().getOrDefault(ClassDiff.NOLNT, true)) {
+          Compiled compiled = compile(source, classpath, release);
+          byte[] ours = compiled.outputs().get(cls.name().replace('/', '.'));
+          Path originalFile = originalClasses.resolve(cls.name() + ".class");
+          if (ours != null && Files.exists(originalFile)) {
+            for (String line : ClassDiff.byteDifference(Files.readAllBytes(originalFile), ours)) {
+              System.out.println("    " + line);
+            }
+            if (System.getenv("NEUROFLOWER_DIFF_BYTES") != null) {
+              Path dumped = workspace.tmp.resolve("compiled").resolve(cls.name() + ".class");
+              Files.createDirectories(dumped.getParent());
+              Workspace.write(dumped, ours);
+              System.out.println("    wrote " + dumped);
+            }
+          }
+        }
         if (!structure && failed.size() == 1 && failed.get(0).equals("bytes")) {
           System.out.println("    every structural attribute matches: only the constant pool or its"
             + " ordering differs");

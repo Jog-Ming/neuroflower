@@ -272,6 +272,300 @@ public final class ClassDiff {
     in.copy(length, out);
   }
 
+  /**
+   * A git-diff-style account of where two class files part ways once every LineNumberTable is
+   * removed: the first differing constant-pool entries (resolved one level so they read like
+   * source) and a hex window around the first differing byte.
+   */
+  public static List<String> byteDifference(byte[] original, byte[] recompiled) {
+    List<String> out = new ArrayList<>();
+    List<String> theirs = constantPool(original);
+    List<String> ours = constantPool(recompiled);
+    out.add("pool " + theirs.size() + " vs " + ours.size() + " entries");
+    int limit = Math.min(theirs.size(), ours.size());
+    int at = 0;
+    while (at < limit && theirs.get(at).equals(ours.get(at))) {
+      at++;
+    }
+    if (at < limit) {
+      int from = Math.max(0, at - 3);
+      int to = Math.min(limit, at + 4);
+      for (int i = from; i < to; i++) {
+        out.add("  #" + (i + 1) + (i == at ? " *" : "  ") + "  jar " + theirs.get(i)
+          + "   |   our " + ours.get(i));
+      }
+    }
+    byte[] strippedOriginal = stripLineNumbers(original);
+    byte[] strippedOurs = stripLineNumbers(recompiled);
+    int byteAt = 0;
+    int byteLimit = Math.min(strippedOriginal.length, strippedOurs.length);
+    while (byteAt < byteLimit && strippedOriginal[byteAt] == strippedOurs[byteAt]) {
+      byteAt++;
+    }
+    out.add("first non-lnt byte " + byteAt + " (lengths " + strippedOriginal.length
+      + " vs " + strippedOurs.length + ")");
+    out.add("  jar " + hexWindow(strippedOriginal, byteAt));
+    out.add("  our " + hexWindow(strippedOurs, byteAt));
+    // The stripped image keeps pool and offsets, so the original layout describes it too --
+    // removing a LineNumberTable only shifts bytes after it, and both sides shift alike.
+    // --no-cache stripping shifts offsets, so name the location from the original layouts: the
+    // first raw difference is the first difference outside a line table, unless the line tables
+    // themselves differ (then that attribute is reported on its own).
+    int rawAt = 0;
+    int rawLimit = Math.min(original.length, recompiled.length);
+    while (rawAt < rawLimit && original[rawAt] == recompiled[rawAt]) {
+      rawAt++;
+    }
+    Span jarSpan = spanAt(original, rawAt);
+    Span ourSpan = spanAt(recompiled, rawAt);
+    out.add("  jar at " + (jarSpan == null ? "?" : jarSpan.label()));
+    out.add("  our at " + (ourSpan == null ? "?" : ourSpan.label()));
+    if (jarSpan != null && jarSpan.label().contains("LocalVariableTable entry")
+        && ourSpan != null) {
+      out.add("  jar " + localEntry(original, jarSpan.start())
+        + "   our " + localEntry(recompiled, ourSpan.start()));
+    }
+    return out;
+  }
+
+  private static String hexWindow(byte[] bytes, int at) {
+    StringBuilder text = new StringBuilder();
+    int from = Math.max(0, at - 8);
+    int to = Math.min(bytes.length, at + 8);
+    for (int i = from; i < to; i++) {
+      if (i == at) {
+        text.append('[');
+      }
+      text.append(String.format(java.util.Locale.ROOT, "%02x ", bytes[i] & 0xff));
+    }
+    if (at < bytes.length) {
+      text.append(']');
+    }
+    return "@" + from + ": " + text.toString().trim();
+  }
+
+  /** The ten bytes of a LocalVariableTable entry as start/length/name/desc/slot. */
+  private static String localEntry(byte[] bytes, int offset) {
+    try {
+      Reader in = new Reader(bytes);
+      in.seek(offset);
+      int start = in.u2();
+      int length = in.u2();
+      int name = in.u2();
+      int descriptor = in.u2();
+      int slot = in.u2();
+      return "[" + start + "," + (start + length) + ") name#" + name + " desc#" + descriptor
+        + " slot " + slot;
+    } catch (RuntimeException e) {
+      return "unreadable";
+    }
+  }
+
+  public record Span(int start, int end, String label) {
+  }
+
+  /**
+   * Names the innermost class-file structure that holds {@code offset} -- method, attribute and
+   * entry index where the layout permits it -- so a byte difference reads as "method x / Code /
+   * LocalVariableTable entry 3" instead of a number.
+   */
+  public static Span spanAt(byte[] bytes, int offset) {
+    List<Span> spans = new ArrayList<>();
+    try {
+      walkSpans(bytes, spans);
+    } catch (RuntimeException ignored) {
+      return null;
+    }
+    Span best = null;
+    for (Span span : spans) {
+      if (offset >= span.start() && offset < span.end()
+          && (best == null || span.end() - span.start() < best.end() - best.start())) {
+        best = span;
+      }
+    }
+    return best;
+  }
+
+  private static void walkSpans(byte[] bytes, List<Span> spans) {
+    Reader in = new Reader(bytes);
+    in.copy(4, null);
+    in.copy(4, null);
+    int count = in.u2();
+    int poolStart = in.at();
+    String[] utf8 = new String[count];
+    for (int i = 1; i < count; i++) {
+      int tag = in.u1();
+      switch (tag) {
+        case 1 -> {
+          int length = in.u2();
+          utf8[i] = new String(in.copy(length, null), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        case 7, 8, 16, 19, 20 -> in.copy(2, null);
+        case 15 -> in.copy(3, null);
+        case 3, 4, 9, 10, 11, 12, 17, 18 -> in.copy(4, null);
+        case 5, 6 -> {
+          in.copy(8, null);
+          i++;
+        }
+        default -> throw new IllegalStateException("tag " + tag);
+      }
+    }
+    spans.add(new Span(poolStart, in.at(), "constant pool"));
+    in.copy(6, null);
+    int interfaces = in.u2();
+    in.copy(interfaces * 2, null);
+    int fields = in.u2();
+    for (int i = 0; i < fields; i++) {
+      walkMember(in, utf8, spans, "field");
+    }
+    int methods = in.u2();
+    for (int i = 0; i < methods; i++) {
+      walkMember(in, utf8, spans, "method");
+    }
+    int attributes = in.u2();
+    for (int i = 0; i < attributes; i++) {
+      walkAttribute(in, utf8, spans, "class attribute");
+    }
+  }
+
+  private static void walkMember(Reader in, String[] utf8, List<Span> spans, String kind) {
+    in.u2();                                       // access
+    String name = utf8[in.u2()];
+    String descriptor = utf8[in.u2()];
+    String owner = kind + " " + name + " " + descriptor;
+    int attributes = in.u2();
+    for (int i = 0; i < attributes; i++) {
+      walkAttribute(in, utf8, spans, owner);
+    }
+  }
+
+  private static void walkAttribute(Reader in, String[] utf8, List<Span> spans, String owner) {
+    int nameIndex = in.u2();
+    int length = in.u4();
+    int start = in.at();
+    int end = start + length;
+    String name = nameIndex < utf8.length ? utf8[nameIndex] : "?";
+    String label = owner + " / " + name;
+    spans.add(new Span(start, end, label));
+    if ("Code".equals(name)) {
+      walkCode(in, utf8, spans, label);
+    }
+    in.seek(end);
+  }
+
+  private static void walkCode(Reader in, String[] utf8, List<Span> spans, String owner) {
+    in.copy(4, null);                              // max_stack, max_locals
+    int codeLength = in.u4();
+    int codeStart = in.at();
+    spans.add(new Span(codeStart, codeStart + codeLength, owner + " / instructions"));
+    in.copy(codeLength, null);
+    int handlers = in.u2();
+    in.copy(handlers * 8, null);
+    int attributes = in.u2();
+    for (int i = 0; i < attributes; i++) {
+      int nameIndex = in.u2();
+      int length = in.u4();
+      int start = in.at();
+      int end = start + length;
+      String name = nameIndex < utf8.length ? utf8[nameIndex] : "?";
+      spans.add(new Span(start, end, owner + " / " + name));
+      int entrySize = switch (name) {
+        case "LineNumberTable" -> 4;
+        case "LocalVariableTable" -> 10;
+        default -> 0;
+      };
+      if (entrySize > 0) {
+        int entries = Math.max(0, (length - 2) / entrySize);
+        for (int entry = 0; entry < entries; entry++) {
+          int entryStart = start + 2 + entry * entrySize;
+          spans.add(new Span(entryStart, entryStart + entrySize,
+            owner + " / " + name + " entry " + (entry + 1)));
+        }
+      }
+      in.seek(end);
+    }
+  }
+
+  /** One rendered line per constant-pool entry, index-aligned (double slots render blank). */
+  private static List<String> constantPool(byte[] bytes) {
+    Reader in = new Reader(bytes);
+    in.copy(4, null);
+    in.copy(4, null);
+    int count = in.u2();
+    String[] utf8 = new String[count];
+    int[] tags = new int[count];
+    int[][] refs = new int[count][];
+    for (int i = 1; i < count; i++) {
+      int tag = in.u1();
+      tags[i] = tag;
+      switch (tag) {
+        case 1 -> {
+          int length = in.u2();
+          utf8[i] = new String(in.copy(length, null), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        case 7, 8, 16, 19, 20 -> refs[i] = new int[]{in.u2()};
+        case 15 -> refs[i] = new int[]{in.u1(), in.u2()};
+        case 3, 4 -> refs[i] = new int[]{in.u4()};
+        case 5, 6 -> {
+          in.copy(8, null);
+          i++;                                    // a wide constant takes two slots
+        }
+        case 9, 10, 11, 12, 17, 18 -> refs[i] = new int[]{in.u2(), in.u2()};
+        default -> throw new IllegalStateException("constant pool tag " + tag);
+      }
+    }
+    List<String> out = new ArrayList<>();
+    out.add("");
+    for (int i = 1; i < count; i++) {
+      out.add(tags[i] == 0 ? "" : render(i, tags, refs, utf8, 0));
+    }
+    return out;
+  }
+
+  private static String render(int index, int[] tags, int[][] refs, String[] utf8, int depth) {
+    if (index <= 0 || index >= tags.length) {
+      return "#" + index;
+    }
+    int tag = tags[index];
+    int[] ref = refs[index];
+    return switch (tag) {
+      case 1 -> "Utf8 " + quote(utf8[index]);
+      case 7 -> "Class " + render(ref[0], tags, refs, utf8, depth + 1);
+      case 8 -> "String " + render(ref[0], tags, refs, utf8, depth + 1);
+      case 16 -> "MethodType " + render(ref[0], tags, refs, utf8, depth + 1);
+      case 19 -> "Module " + render(ref[0], tags, refs, utf8, depth + 1);
+      case 20 -> "Package " + render(ref[0], tags, refs, utf8, depth + 1);
+      case 15 -> "MethodHandle kind " + ref[0] + " "
+        + (depth < 3 ? stripPrefix(render(ref[1], tags, refs, utf8, depth + 1)) : "#" + ref[1]);
+      case 3 -> "Integer " + ref[0];
+      case 4 -> "Float " + Float.intBitsToFloat(ref[0]);
+      case 5 -> "Long (wide)";
+      case 6 -> "Double (wide)";
+      case 9 -> "Field " + stripPrefix(render(ref[0], tags, refs, utf8, depth + 1)) + "."
+        + stripPrefix(render(ref[1], tags, refs, utf8, depth + 1));
+      case 10 -> "Method " + stripPrefix(render(ref[0], tags, refs, utf8, depth + 1)) + "."
+        + stripPrefix(render(ref[1], tags, refs, utf8, depth + 1));
+      case 11 -> "InterfaceMethod " + stripPrefix(render(ref[0], tags, refs, utf8, depth + 1)) + "."
+        + stripPrefix(render(ref[1], tags, refs, utf8, depth + 1));
+      case 12 -> "NameAndType " + render(ref[0], tags, refs, utf8, depth + 1) + ":"
+        + render(ref[1], tags, refs, utf8, depth + 1);
+      case 17 -> "Dynamic bsm " + ref[0] + " "
+        + stripPrefix(render(ref[1], tags, refs, utf8, depth + 1));
+      case 18 -> "InvokeDynamic bsm " + ref[0] + " "
+        + stripPrefix(render(ref[1], tags, refs, utf8, depth + 1));
+      default -> "tag " + tag;
+    };
+  }
+
+  private static String stripPrefix(String rendered) {
+    int space = rendered.indexOf(' ');
+    return space < 0 ? rendered : rendered.substring(space + 1);
+  }
+
+  private static String quote(String text) {
+    return text == null ? "?" : "\"" + text + "\"";
+  }
+
   private static final class Reader {
     private final byte[] bytes;
     private int at;
@@ -295,6 +589,14 @@ public final class ClassDiff {
 
     int peekU2() {
       return (bytes[at] & 0xff) << 8 | (bytes[at + 1] & 0xff);
+    }
+
+    int at() {
+      return at;
+    }
+
+    void seek(int position) {
+      at = position;
     }
 
     byte[] copy(int length, Writer out) {
