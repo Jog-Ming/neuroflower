@@ -10196,10 +10196,11 @@ public final class RoundTrip {
       default -> null;
     };
     if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
-      // The loop top may load a local the condition exprent does not own, so the target can sit
-      // a short load before the exprent's first byte.
-      int start = head.bytecode.nextSetBit(0);
-      if (target <= start && target >= start - 3) {
+      // The loop top may load a local the exprent does not own, so the target can sit a short
+      // load before the expression's first byte. Count nested parts: a for increment's own read
+      // of the variable is folded into the assignment, and only its other operand owns a byte.
+      int start = firstOffsetOf(head);
+      if (start >= 0 && target <= start && target >= start - 3) {
         return true;
       }
       // An array for-each keeps its increment after the body; the exprent owns that bytecode.
@@ -10254,10 +10255,11 @@ public final class RoundTrip {
       default -> null;
     };
     if (head != null && head.bytecode != null && !head.bytecode.isEmpty()) {
-      // The loop top may load a local the condition exprent does not own, so the target can sit
-      // a short load before the exprent's first byte.
-      int start = head.bytecode.nextSetBit(0);
-      if (target <= start && target >= start - 3) {
+      // The loop top may load a local the exprent does not own, so the target can sit a short
+      // load before the expression's first byte. Count nested parts: a for increment's own read
+      // of the variable is folded into the assignment, and only its other operand owns a byte.
+      int start = firstOffsetOf(head);
+      if (start >= 0 && target <= start && target >= start - 3) {
         return true;
       }
       // An array for-each keeps its increment after the body; the exprent owns that bytecode.
