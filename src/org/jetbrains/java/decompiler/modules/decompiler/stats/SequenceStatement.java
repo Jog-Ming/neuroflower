@@ -1649,10 +1649,15 @@ public class SequenceStatement extends Statement {
       // local the tail declares may be read after it, since its scope ends at the brace.
       if (i + 1 < stats.size() && st instanceof IfStatement ifStatement
           && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
-          && !ifStatement.isLabeled() && !ifStatement.isPatternMatched()
+          && !ifStatement.isLabeled()
           && ifStatement.getIfstat() != null && cannotComplete(ifStatement.getIfstat())
           && hasContent(stats.subList(i + 1, stats.size()))
-          && RoundTrip.swapIfArmsByLastTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat())) {
+          // A pattern condition declares its binding in the test, so a swap that printed a
+          // negated test around the arm would leave the binding out of scope: only the target's
+          // proof that the source wrote the positive form lets the pattern printer join.
+          && (ifStatement.isPatternMatched()
+              ? RoundTrip.positivePatternTest(ifStatement.getHeadexprent(), ifStatement.getIfstat())
+              : RoundTrip.swapIfArmsByLastTarget(ifStatement.getHeadexprent(), ifStatement.getIfstat()))) {
         Statement tail = new SequenceStatement(stats.subList(i + 1, stats.size()));
         if (cannotComplete(tail) && !tailLocalsUsedAfter(tail, ifStatement.getIfstat())) {
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();

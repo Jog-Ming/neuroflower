@@ -1440,6 +1440,48 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the target proves the source wrote the positive pattern test around the statements
+   * after this if: the tree kept the negation {@code !(x instanceof T t && …)} with the code after
+   * the if as its arm, and the head's last branch lands on that arm, where a negated test a source
+   * could write would branch past it. Only the positive form puts the binding in scope in the
+   * statements that use it, so the negation is the printer's and the arms swap back.
+   */
+  public static boolean positivePatternTest(Exprent head, Statement thenArm) {
+    if (!selector("polaritytarget") || !(head instanceof IfExprent ifHead)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    if (method == null || thenArm == null || ifHead.bytecode == null || ifHead.bytecode.isEmpty()) {
+      return false;
+    }
+    Exprent condition = ifHead.getCondition();
+    if (!(condition instanceof FunctionExprent not)
+        || not.getFuncType() != FunctionExprent.FunctionType.BOOL_NOT
+        || not.getLstOperands().size() != 1
+        || !declaresPatternVariable(not.getLstOperands().get(0))) {
+      return false;
+    }
+    BitSet conditionRange = new BitSet();
+    condition.getBytecodeRange(conditionRange);
+    if (conditionRange.isEmpty() || conditionRange.length() != ifHead.bytecode.length()) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (gotos != null) {
+      for (int at = ifHead.bytecode.nextSetBit(0); at >= 0 && at < ifHead.bytecode.length();
+           at = ifHead.bytecode.nextSetBit(at + 1)) {
+        if (gotos.containsKey(at)) {
+          return false;
+        }
+      }
+    }
+    int target = lastBranchTarget(ifHead.bytecode);
+    // The arm's own first instruction is where the source's true path fell through; a nested
+    // statement's head exprent can carry unrelated offsets, which statementOffset would read.
+    return target > 0 && target == statementStart(thenArm);
+  }
+
+  /**
    * True when the target proves the source's then arm was empty: the head's last branch enters
    * the arm on the printed condition being true, and the instruction right after it is a goto
    * that leaves the arm. javac lays a written {@code if (!C) { } else <arm>} out that way; the
