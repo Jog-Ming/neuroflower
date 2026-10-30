@@ -654,7 +654,21 @@ public final class IfHelper {
              && RoundTrip.canCompleteNormally(ifstat.getIfstat()));
       if (RoundTrip.selector("guardmerge") && ifstat.getIfstat() != null && guardRefuse
           && !mentionsAssertionsDisabled(ifstat)) {
-        return false;
+        // The target's slots can still prove the source wrote an else chain: the else's binding
+        // is hoisted above the then arm's scope, which a closed branch cannot be.
+        Statement nextStatement = null;
+        int elseEnd = -1;
+        if (parent instanceof SequenceStatement seq && seq.getStats().getLast() != ifstat) {
+          int index = seq.getStats().indexOf(ifstat);
+          if (index >= 0 && index + 1 < seq.getStats().size()) {
+            nextStatement = seq.getStats().get(index + 1);
+            elseEnd = RoundTrip.lastEnd(seq.getStats().getLast());
+          }
+        }
+        if (!RoundTrip.elseChainSlots(ifstat, nextStatement, elseEnd)
+            && !RoundTrip.chainArmHead(ifstat)) {
+          return false;
+        }
       }
 
       SequenceStatement sequence = (SequenceStatement) parent;

@@ -618,11 +618,14 @@ public class IfStatement extends Statement {
     }
 
     // A guard whose else was declared in the method body: the table writes the else's first
-    // local after the parameters, so the original source closed the branch before it.
+    // local after the parameters, so the original source closed the branch before it. The slots
+    // can still prove the opposite — an else-if's binding hoisted into the if's prefix reads like
+    // a method-scope local's row, but its slot precedes the one it would have reused.
     if (ifstat != null && elsestat != null
         && condition != null && !isLabeled()
         && (endsWithExit(ifstat) || targetVoidReturn(ifstat, elsestat))
-        && RoundTrip.startsWithMethodScopeLocal(elsestat)) {
+        && RoundTrip.startsWithMethodScopeLocal(elsestat)
+        && !RoundTrip.elseChainSlots(this, elsestat)) {
       buf.appendIndent(indent).append(condition.toJava(indent)).append(" {").appendLineSeparator();
       buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, true));
       appendVoidArmReturn(buf, ifstat, elsestat, indent + 1);

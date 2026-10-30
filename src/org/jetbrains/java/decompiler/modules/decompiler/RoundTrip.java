@@ -15,6 +15,10 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.FunctionExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.IfExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.InvocationExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DummyExitStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.GeneralStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SequenceStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -763,6 +767,259 @@ public final class RoundTrip {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether the target's local slots prove the source wrote this branch's else as a real else
+   * rather than closing the then arm and continuing with sibling statements. javac hoists the
+   * pattern binding an {@code else if} declares into a synthetic prefix around the whole if, so
+   * the binding is declared before the condition's shared subject temp and before the then arm's
+   * own locals, and the then arm's scope stays open until the chain ends. A sibling {@code if}
+   * closes the then arm first, so the next binding reuses a dead local's slot; {@code else { if }}
+   * fences the inner binding inside the block, where the inner subject temp is declared first.
+   * {@code elseFirst} is the statement the source's else arm would open with.
+   */
+  public static boolean elseChainSlots(IfStatement ifstat, Statement elseFirst) {
+    return elseChainSlots(ifstat, elseFirst, lastEnd(elseFirst));
+  }
+
+  /**
+   * The same, for an else arm that would take every statement after the if up to {@code elseEnd}.
+   */
+  public static boolean elseChainSlots(IfStatement ifstat, Statement elseFirst, int elseEnd) {
+    if (!selector("elsechain") || ifstat == null || elseFirst == null
+        || ifstat.getIfstat() == null) {
+      return false;
+    }
+    Statement lead = leadingStatement(elseFirst);
+    // A catch block and a try's own structure are not statements the source could write after
+    // `else`; the tree keeps them as siblings of the body's sequence.
+    if (lead instanceof CatchStatement || lead instanceof CatchAllStatement
+        || lead instanceof DummyExitStatement || lead.getParent() instanceof GeneralStatement) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null : method.getLocalVariableAttr();
+    LocalVariable thenBinding = conditionPatternLocal(ifstat);
+    LocalVariable thenBody = firstLocalOf(ifstat.getIfstat(), lastEnd(ifstat.getIfstat()), thenBinding);
+    LocalVariable elseLocal = elseLocal(elseFirst, elseEnd);
+    if (elseLocal == null || elseLocal.getIndex() < 0) {
+      return false;
+    }
+    // A local the method body declares is written after the parameter group; one inside the else
+    // block closes with that block, before it. The first local of a written else arm therefore
+    // precedes the parameters in the table.
+    if (table != null) {
+      int paramsEnd = -1;
+      for (LocalVariable var : table.getVariables().toList()) {
+        if (var.getStart() == 0) {
+          paramsEnd = Math.max(paramsEnd, var.getOrder());
+        }
+      }
+      if (paramsEnd >= 0 && elseLocal.getOrder() > paramsEnd) {
+        return false;
+      }
+    }
+    // The sibling writing is the one where the then arm's scope closed: the slots it freed are
+    // what the code after the if reuses. A local the arm declared still alive where the else
+    // would open, or a local inside the else reusing the arm's first binding slot, proves it.
+    java.util.Set<Integer> thenSlots = new java.util.HashSet<>();
+    int thenStart = firstOffset(ifstat.getIfstat());
+    int thenEnd = lastEnd(ifstat.getIfstat());
+    if (table != null && thenStart >= 0 && thenEnd > thenStart) {
+      for (LocalVariable var : table.getVariables().toList()) {
+        if (var.getStart() > 0 && var.getStart() >= thenStart && var.getStart() < thenEnd) {
+          thenSlots.add(var.getIndex());
+        }
+      }
+    }
+    if (thenBinding != null) {
+      thenSlots.add(thenBinding.getIndex());
+    }
+    int elseStart = firstOffset(lead);
+    if (table != null && elseStart >= 0) {
+      for (LocalVariable var : table.getVariables().toList()) {
+        if (var.getStart() < elseStart && var.getEnd() > elseStart
+            && thenSlots.contains(var.getIndex())) {
+          return false;
+        }
+      }
+    }
+    if (thenSlots.contains(elseLocal.getIndex())) {
+      return false;
+    }
+    if (lead instanceof IfStatement elseIf && sameLocal(conditionPatternLocal(elseIf), elseLocal)) {
+      // A hoisted binding's scope spans the whole chain, so nothing in the else arm can take its
+      // slot. A row there with the same slot is the binding's own scope closing with the then
+      // arm, and the rest of the arm declares in the freed slot.
+      if (table != null) {
+        for (LocalVariable var : table.getVariables().toList()) {
+          if (var.getStart() > 0 && var.getStart() >= elseStart && var.getStart() < elseEnd
+              && var.getIndex() == elseLocal.getIndex() && !sameLocal(var, elseLocal)) {
+            return false;
+          }
+        }
+      }
+      // The else opens with an `if` that binds this local. In the chain the binding is hoisted
+      // above the condition's shared subject temp; behind an else block it is declared after the
+      // inner condition's own subject temp. The chain's prefix holds one subject temp both tests
+      // store into, so a leading if whose own temp differs from the first test's is a separate
+      // statement behind a compiled boolean, not a hoisted else-if.
+      int subject = subjectTempSlot(elseIf);
+      if (subject >= 0 && subject != elseLocal.getIndex()) {
+        int outerSubject = subjectTempSlot(ifstat);
+        if (outerSubject >= 0 && outerSubject != subject) {
+          return false;
+        }
+        if (outerSubject >= 0) {
+          return elseLocal.getIndex() < subject;
+        }
+      }
+      // When the subject is a plain variable there is no temp, and the chain proves itself by
+      // declaring the binding before the then arm's own locals.
+      if (thenBody != null) {
+        return elseLocal.getIndex() < thenBody.getIndex();
+      }
+      return thenBinding != null && elseLocal.getIndex() < thenBinding.getIndex();
+    }
+    LocalVariable anchor = thenBody != null ? thenBody : thenBinding;
+    return anchor != null && elseLocal.getIndex() > anchor.getIndex();
+  }
+
+  /**
+   * Whether the statement heads an else arm whose owner's slots prove the chain
+   * ({@link #elseChainSlots}). An {@code else if} is the only chain form whose rest the else
+   * keyword can take, so the arm's remaining statements are this test's else.
+   */
+  public static boolean chainArmHead(Statement stat) {
+    if (!selector("elsechain") || stat == null) {
+      return false;
+    }
+    Statement parent = stat.getParent();
+    IfStatement owner = null;
+    Statement elseArm = null;
+    if (parent instanceof IfStatement parentIf && parentIf.getElsestat() == stat) {
+      owner = parentIf;
+      elseArm = stat;
+    } else if (parent instanceof SequenceStatement seq && !seq.getStats().isEmpty()
+        && seq.getStats().get(0) == stat
+        && seq.getParent() instanceof IfStatement parentIf && parentIf.getElsestat() == seq) {
+      owner = parentIf;
+      elseArm = seq;
+    }
+    return owner != null && owner.getIfstat() != null && leadingStatement(elseArm) == stat
+      && elseChainSlots(owner, elseArm);
+  }
+
+  /** The first statement a sequence opens with, following nested sequences. */
+  private static Statement leadingStatement(Statement stat) {
+    Statement cur = stat;
+    while (cur instanceof SequenceStatement seq && !seq.getStats().isEmpty()) {
+      cur = seq.getStats().get(0);
+    }
+    return cur;
+  }
+
+  /** The first local the else arm declares: the leading if's binding, else the arm's first row. */
+  private static LocalVariable elseLocal(Statement elseFirst, int elseEnd) {
+    Statement lead = leadingStatement(elseFirst);
+    if (lead instanceof IfStatement ifs) {
+      LocalVariable binding = conditionPatternLocal(ifs);
+      if (binding != null) {
+        return binding;
+      }
+    }
+    return firstLocalOf(lead, elseEnd, null);
+  }
+
+  /**
+   * The first table row a statement's instructions declare: the row that starts earliest inside
+   * the statement's range. A declaration's row starts at its first store, which is also the first
+   * instruction the source's statement runs for it.
+   */
+  private static LocalVariable firstLocalOf(Statement stat, int end, LocalVariable skip) {
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null : method.getLocalVariableAttr();
+    int start = firstOffset(stat);
+    if (table == null || start < 0 || end <= start) {
+      return null;
+    }
+    LocalVariable best = null;
+    for (LocalVariable var : table.getVariables().toList()) {
+      if (var.getStart() > 0 && var.getStart() >= start && var.getStart() < end
+          && !sameLocal(var, skip)
+          && (best == null || var.getStart() < best.getStart())) {
+        best = var;
+      }
+    }
+    return best;
+  }
+
+  /** The pattern variable the if's condition declares, or null. */
+  private static LocalVariable conditionPatternLocal(IfStatement ifstat) {
+    Exprent head = ifstat.getHeadexprent();
+    if (head == null) {
+      return null;
+    }
+    for (Exprent part : head.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2) {
+        LocalVariable binding = patternBindingLocal(function.getLstOperands().get(2));
+        if (binding != null) {
+          return binding;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** The first named variable a pattern binds, or null. */
+  private static LocalVariable patternBindingLocal(Exprent pattern) {
+    for (Exprent part : pattern.getAllExprents(true, true)) {
+      if (part instanceof VarExprent var && var.getLVT() != null && var.getLVT().getIndex() >= 0) {
+        return var.getLVT();
+      }
+    }
+    return null;
+  }
+
+  private static boolean sameLocal(LocalVariable a, LocalVariable b) {
+    return a != null && b != null && a.getIndex() == b.getIndex()
+      && a.getStart() == b.getStart()
+      && a.getName().equals(b.getName()) && a.getDescriptor().equals(b.getDescriptor());
+  }
+
+  /**
+   * The slot the first unnamed temp of the if's condition stores into, or -1. javac keeps the
+   * expression a pattern tests in a synthetic local when it is not a plain variable, and the
+   * table has no row for that slot.
+   */
+  private static int subjectTempSlot(IfStatement ifstat) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, java.util.List<int[]>> stores = method == null ? null : TEMP_STORES.get(method);
+    Exprent head = ifstat.getHeadexprent();
+    if (stores == null || !(head instanceof IfExprent ifHead) || ifHead.getCondition() == null) {
+      return -1;
+    }
+    BitSet range = new BitSet();
+    ifHead.getCondition().getBytecodeRange(range);
+    if (range.isEmpty()) {
+      return -1;
+    }
+    int start = range.nextSetBit(0);
+    int end = range.length();
+    int best = Integer.MAX_VALUE;
+    int slot = -1;
+    for (java.util.Map.Entry<Integer, java.util.List<int[]>> entry : stores.entrySet()) {
+      for (int[] store : entry.getValue()) {
+        if (store[0] >= start && store[0] < end && store[0] < best) {
+          best = store[0];
+          slot = entry.getKey();
+        }
+      }
+    }
+    return slot;
   }
 
   private static boolean spansMethod(List<LocalVariable> vars, int maxEnd) {
