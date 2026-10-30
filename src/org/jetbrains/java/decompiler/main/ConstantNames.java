@@ -3254,6 +3254,33 @@ public final class ConstantNames {
       int limit = initializerLimit(sites, owners, k + 1, spans, initializers);
       boolean self = owner.equals(own.qualifiedName);
       if (self) {
+        // `Own.Nested.CONST` interns the class's own Class entry when it resolves the nested
+        // type's qualifier, then the nested owner's: the pool's own pair immediately followed by
+        // a nested owner's pair is that one expression, and both entries open the pool together.
+        List<List<SourceConstant>> rooted = new ArrayList<>();
+        int rootedEnd = k;
+        while (rootedEnd + 1 < owners.size()
+            && owners.get(rootedEnd + 1).startsWith(own.qualifiedName + "$")
+            && firstInitializerSite(sites, owners.get(rootedEnd + 1), spans, initializers) == null) {
+          List<SourceConstant> next = sourceConstants(owners.get(rootedEnd + 1), own, imports,
+            packageName, own.qualifiedName);
+          if (next.isEmpty()) {
+            break;
+          }
+          rooted.add(next);
+          rootedEnd++;
+        }
+        if (!rooted.isEmpty()) {
+          int[] rootedUsed = new int[1];
+          Site rootedSite = placeChain(owner, constants, rooted, initializers, text, sites, last,
+            limit, rootedUsed);
+          if (rootedSite != null) {
+            addSiteOnce(sites, rootedSite);
+            last = rootedSite.start();
+            k += 1 + rootedUsed[0];
+            continue;
+          }
+        }
         Site placed = placeOwnConstant(owner, constants, initializers, text, sites, last, limit);
         if (placed == null) {
           return;
@@ -3290,7 +3317,9 @@ public final class ConstantNames {
       }
       addSiteOnce(sites, placed);
       last = placed.start();
-      k = end + 1;
+      // The expression may have named fewer owners than the run offered; the rest still need a
+      // site of their own, after this one.
+      k += used[0];
     }
   }
 
@@ -3828,11 +3857,25 @@ public final class ConstantNames {
   /** The accessible constant fields of a prefix owner, printed for this class's scope. */
   private static List<SourceConstant> sourceConstants(String owner, StructClass site,
                                                      List<String> imports, String packageName) {
+    return sourceConstants(owner, site, imports, packageName, null);
+  }
+
+  /**
+   * The same, with a root class whose simple name must qualify the owner.
+   *
+   * <p>{@code Own.Nested.CONST} interns the own class's {@code Class} entry before the nested
+   * owner's, which a fully qualified name does not order the same way; the pool's own pair before
+   * the nested pair is the record of that form.
+   */
+  private static List<SourceConstant> sourceConstants(String owner, StructClass site,
+                                                     List<String> imports, String packageName,
+                                                     String root) {
     StructClass cls = DecompilerContext.getStructContext().getClass(owner);
     if (cls == null) {
       return List.of();
     }
-    String qualifier = qualifier(owner, site, imports, packageName);
+    String qualifier = root != null && owner.startsWith(root + "$")
+      ? rootedQualifier(owner, root, site) : qualifier(owner, site, imports, packageName);
     if (qualifier == null) {
       return List.of();
     }
@@ -3898,6 +3941,21 @@ public final class ConstantNames {
         : owner.replace('/', '.').replace('$', '.');
     }
     return owner.replace('/', '.');
+  }
+
+  /** The name of an owner nested inside {@code root}, written from the root's simple name. */
+  private static String rootedQualifier(String owner, String root, StructClass site) {
+    String rest = owner.substring(root.length() + 1).replace('$', '.');
+    String head = root.equals(site.qualifiedName) ? simpleName(root) : dottedSourceName(root);
+    if (head == null || head.isEmpty() || !Character.isJavaIdentifierStart(head.charAt(0))) {
+      return null;
+    }
+    for (String part : rest.split("\\.")) {
+      if (part.isEmpty() || !Character.isJavaIdentifierStart(part.charAt(0))) {
+        return null;
+      }
+    }
+    return head + "." + rest;
   }
 
   /** The dotted source name of a nested class, or null when a segment is not an identifier. */
