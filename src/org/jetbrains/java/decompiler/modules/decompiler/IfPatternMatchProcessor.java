@@ -46,9 +46,112 @@ public final class IfPatternMatchProcessor {
 
     if (statement instanceof IfStatement) {
       res |= handleIf((IfStatement) statement, root);
+    } else if (statement instanceof DoStatement loop) {
+      res |= handleLoop(loop);
     }
 
     return res;
+  }
+
+  /**
+   * Folds a cast store at the head of a written {@code while}'s body into the loop condition:
+   * {@code while (x instanceof T) { T v = (T)x; ... }} was
+   * {@code while (x instanceof T v) { ... }}. javac stores a loop condition's pattern variable at
+   * the top of the body, which is exactly the shape the decompiler prints as a declaration there;
+   * the target's table names the slot the source wrote, and the store must be the first thing the
+   * body runs, or the condition's test would come after it in the source too.
+   */
+  private static boolean handleLoop(DoStatement loop) {
+    if (!RoundTrip.selector("looppattern") || loop.getLooptype() != DoStatement.Type.WHILE) {
+      return false;
+    }
+    Exprent condition = loop.getConditionExprent();
+    if (!(condition instanceof FunctionExprent iof) || iof.getFuncType() != FunctionType.INSTANCEOF
+        || iof.getLstOperands().size() != 2) {
+      return false;
+    }
+    Exprent source = iof.getLstOperands().get(0);
+    Exprent target = iof.getLstOperands().get(1);
+    List<Exprent> head = loopBodyHead(loop.getFirst());
+    if (head == null || head.isEmpty() || !(head.get(0) instanceof AssignmentExprent assignment)) {
+      return false;
+    }
+    Exprent left = assignment.getLeft();
+    Exprent right = assignment.getRight();
+    Exprent casted;
+    if (right instanceof FunctionExprent function && function.getFuncType() == FunctionType.CAST) {
+      casted = function.getLstOperands().get(0);
+    } else if (right instanceof VarExprent) {
+      casted = right;
+    } else {
+      return false;
+    }
+    // The stored value has to be the tested expression, and the slot's name must be one the source
+    // wrote: javac's own pattern temporaries are not declarations the decompiler folded here.
+    if (!source.equals(casted) || !(left instanceof VarExprent var)
+        || !target.getExprType().equals(var.getExprType())
+        || !declaredInSource(var)) {
+      return false;
+    }
+    VarType storeType = left.getInferredExprType(null);
+    if (!isLegalPatternType(source.getInferredExprType(null), storeType)) {
+      return false;
+    }
+    // A pattern variable cannot be assigned again: javac rejects it, so a second store proves the
+    // source wrote an ordinary local instead.
+    if (varAssignedAgain(loop, var)) {
+      return false;
+    }
+
+    head.remove(0);
+    iof.getLstOperands().add(2, left);
+    if (storeType.isGeneric()) {
+      iof.getLstOperands().set(1, new ConstExprent(storeType, null, iof.getLstOperands().get(1).bytecode));
+    }
+    return true;
+  }
+
+  /**
+   * The exprents the loop body prints first, in order: a basic block's own list, or the head block
+   * an if prints before its condition; a sequence is entered through its first child.
+   */
+  private static List<Exprent> loopBodyHead(Statement body) {
+    Statement stat = body;
+    while (stat != null) {
+      if (stat.getExprents() != null && !stat.getExprents().isEmpty()) {
+        return stat.getExprents();
+      }
+      if (stat instanceof IfStatement ifStat) {
+        Statement headBlock = ifStat.getFirst();
+        return headBlock.getExprents() != null && !headBlock.getExprents().isEmpty()
+          ? headBlock.getExprents() : null;
+      }
+      stat = stat.getStats().isEmpty() ? null : stat.getStats().get(0);
+    }
+    return null;
+  }
+
+  /** True when the loop stores this variable more than once; the head store is the first. */
+  private static boolean varAssignedAgain(Statement loop, VarExprent var) {
+    VarVersionPair pair = var.getVarVersionPair();
+    int stores = 0;
+    Deque<Statement> stack = new ArrayDeque<>();
+    stack.push(loop);
+    while (!stack.isEmpty()) {
+      Statement stat = stack.pop();
+      if (stat.getExprents() != null) {
+        for (Exprent exprent : stat.getExprents()) {
+          for (Exprent inner : exprent.getAllExprents(true, true)) {
+            if (inner instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent left
+                && left.getVarVersionPair().equals(pair)) {
+              stores++;
+            }
+          }
+        }
+      }
+      stack.addAll(stat.getStats());
+    }
+    return stores > 1;
   }
 
   private static boolean handleIf(IfStatement statement, RootStatement root) {
