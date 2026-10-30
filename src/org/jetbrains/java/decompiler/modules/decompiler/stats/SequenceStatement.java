@@ -253,6 +253,16 @@ public class SequenceStatement extends Statement {
         break;
       }
 
+      // `if (C) { …; return; } run; return X;` where the target's table closes a block right
+      // before the return: the run declares a local whose row ends at the return's first
+      // instruction, so the source wrote `if (C) { … } else { run }` and the return after the
+      // brace. The arm exits, so no jump joins it to the run and the flat reading compiles to
+      // the same instructions; only the table's scopes say which form the source wrote.
+      if (printArmScope(buf, indent, i)) {
+        notempty = true;
+        break;
+      }
+
       // A local whose scope the target's table proves ended at this block's boundary: the slot is
       // handed to a later local, which a source can only do by closing the block the first one
       // lived in. Print `{ … }` around the run of exprents that starts at the declaration and ends
@@ -1201,13 +1211,27 @@ public class SequenceStatement extends Statement {
         if (exit instanceof ExitExprent tailExit
             && !writesAny(java.util.Collections.singletonList(ifStatement.getIfstat()), readLocals(tailExit.getValue()))
             && RoundTrip.returnGuard(ifStatement.getIfstat(), tail)) {
+          int armSplit = RoundTrip.selector("armscope")
+            ? RoundTrip.armScopeSplit(ifStatement.getIfstat()) : -1;
           IfExprent head = (IfExprent) ifStatement.getHeadexprent().copy();
           head.setCondition(RoundTrip.negateCondition(head.getCondition()));
           buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
           buf.append(ifStatement.getFirst().toJava(indent));
           buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
           buf.append(ExprProcessor.jmpWrapper(tail, indent + 1, true));
-          if (RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), tail)) {
+          if (armSplit > 0) {
+            // The table closes a block inside the arm before a trailing return: those
+            // statements ran outside the source's brace, so print the else and the tail after it.
+            List<Statement> armChildren = ifStatement.getIfstat().getStats();
+            buf.appendIndent(indent).append("} else {").appendLineSeparator();
+            for (int k = 0; k < armSplit; k++) {
+              buf.append(ExprProcessor.jmpWrapper(armChildren.get(k), indent + 1, k == 0));
+            }
+            buf.appendIndent(indent).append("}").appendLineSeparator();
+            for (int k = armSplit; k < armChildren.size(); k++) {
+              buf.append(ExprProcessor.jmpWrapper(armChildren.get(k), indent, k == armSplit));
+            }
+          } else if (RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), tail)) {
             buf.appendIndent(indent).append("} else {").appendLineSeparator();
             buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
             buf.appendIndent(indent).append("}").appendLineSeparator();
@@ -1514,6 +1538,13 @@ public class SequenceStatement extends Statement {
           boolean asElse = RoundTrip.gotoJumpsOverArm(ifStatement.getIfstat(), movedRest)
             || RoundTrip.jumpsOnto(RoundTrip.firstOffset(movedRest),
                  RoundTrip.lastEnd(ifStatement.getIfstat()), RoundTrip.lastEnd(ifStatement.getIfstat()));
+          // The target's table can prove the arm held an else block that closed before a
+          // trailing return: the first local the arm declares ends its row at that return's
+          // first instruction. The flat print would keep the local alive through the return.
+          int armSplit = !asElse && RoundTrip.selector("armscope")
+            ? RoundTrip.armScopeSplit(ifStatement.getIfstat()) : -1;
+          boolean splitElse = armSplit > 0;
+          asElse |= splitElse;
           // The rest runs only up to the branch shell; the target laid the statements past it
           // out after the if, and the arm's jump went over them to the exit block. The split
           // decides what stays in the arm before the arm's declarations print: a variable the
@@ -1525,7 +1556,7 @@ public class SequenceStatement extends Statement {
           // The arms' copies of the method's final return stand for the jump the source took
           // there; the enclosing flow prints that return once, so the arms fall out to it.
           int exitStart = headExit.bytecode == null ? -1 : headExit.bytecode.nextSetBit(0);
-          boolean joinAfterArms = asElse && exitStart >= 0
+          boolean joinAfterArms = !splitElse && asElse && exitStart >= 0
             && (RoundTrip.joinOffset() == exitStart || RoundTrip.printedAfter(this) == exitStart);
           List<Statement> restAll = new ArrayList<>(stats.subList(i + 1, stats.size()));
           if (joinAfterArms && !restAll.isEmpty()
@@ -1546,19 +1577,30 @@ public class SequenceStatement extends Statement {
           buf.append(ExprProcessor.jmpWrapper(movedRest, indent + 1, true));
           if (asElse) {
             buf.appendIndent(indent).append("} else {").appendLineSeparator();
-            if (elseCopy != null) {
-              ((SequenceStatement) elseArm).getStats().removeWithKey(elseCopy.id);
-            }
-            try {
-              RoundTrip.pushJoinOffset(exitStart);
-              buf.append(ExprProcessor.jmpWrapper(elseArm, indent + 1, true));
-            } finally {
-              RoundTrip.popJoinOffset();
-              if (elseCopy != null) {
-                ((SequenceStatement) elseArm).getStats().addWithKey(elseCopy, elseCopy.id);
+            if (splitElse) {
+              List<Statement> armChildren = elseArm.getStats();
+              for (int k = 0; k < armSplit; k++) {
+                buf.append(ExprProcessor.jmpWrapper(armChildren.get(k), indent + 1, k == 0));
               }
+              buf.appendIndent(indent).append("}").appendLineSeparator();
+              for (int k = armSplit; k < armChildren.size(); k++) {
+                buf.append(ExprProcessor.jmpWrapper(armChildren.get(k), indent, k == armSplit));
+              }
+            } else {
+              if (elseCopy != null) {
+                ((SequenceStatement) elseArm).getStats().removeWithKey(elseCopy.id);
+              }
+              try {
+                RoundTrip.pushJoinOffset(exitStart);
+                buf.append(ExprProcessor.jmpWrapper(elseArm, indent + 1, true));
+              } finally {
+                RoundTrip.popJoinOffset();
+                if (elseCopy != null) {
+                  ((SequenceStatement) elseArm).getStats().addWithKey(elseCopy, elseCopy.id);
+                }
+              }
+              buf.appendIndent(indent).append("}").appendLineSeparator();
             }
-            buf.appendIndent(indent).append("}").appendLineSeparator();
           } else {
             buf.appendIndent(indent).append("}").appendLineSeparator();
             buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent, false));
@@ -2265,6 +2307,124 @@ public class SequenceStatement extends Statement {
     // source wrote it after the try/catch, and the try prints it there.
     if (RoundTrip.deferTryReturn(arm.getIfstat()) == null) {
       buf.append(ExprProcessor.jmpWrapper(arm.getIfstat(), indent, false));
+    }
+    return true;
+  }
+
+  /**
+   * Prints `if (C) { …; return; } else { run }` for a guard whose run the target's table closes
+   * before a trailing return or throw. The guard's arm always exits, so the flat reading
+   * `if (C) { …; return; } run; return X;` compiles to the same instructions; only the scopes of
+   * the locals the run declares distinguish the two sources, and the table records them: a row
+   * that ends where the return begins is the source's closing brace. False, printing nothing,
+   * when the table gives no such row, the split is not a boundary the printer can write, or the
+   * if would print through one of its special shapes, which the caller's other rules own.
+   */
+  private boolean printArmScope(TextBuffer buf, int indent, int i) {
+    if (!RoundTrip.selector("armscope") || isLabeled() || i + 1 >= stats.size()) {
+      return false;
+    }
+    Statement st = stats.get(i);
+    if (!(st instanceof IfStatement ifStatement) || ifStatement.iftype != IfStatement.IFTYPE_IF
+        || ifStatement.getElsestat() != null || ifStatement.getIfstat() == null
+        || ifStatement.getFirst() == null || ifStatement.getHeadexprent() == null
+        || ifStatement.getHeadexprent().getCondition() == null
+        || ifStatement.isLabeled() || st.isLabeled() || ifStatement.isPatternMatched()
+        || RoundTrip.isHeadConsumed(ifStatement) || !exits(ifStatement.getIfstat())) {
+      return false;
+    }
+    IfExprent ifHead = ifStatement.getHeadexprent();
+    // The if has to print through its plain shape: a guard, a merged test, or a nested split the
+    // statement's own printer would take prints statements of its own, and appending an else to
+    // that reading would attach it to the wrong test.
+    // A pure probe: the statement's own printer records the guard exit as consumed when it
+    // prints the guard, and this refusal must not take that print away from it.
+    if (RoundTrip.endsLoopBody(ifStatement) || getParent() instanceof DoStatement
+        || RoundTrip.emptyThenArm(ifHead, ifStatement.getIfstat())
+        || RoundTrip.guardConditionProbe(ifHead, ifStatement.getIfstat())
+        || RoundTrip.printContinueGuard(ifHead, this)
+        || RoundTrip.printContinueThroughClose(ifHead, this)
+        || !IfStatement.nestedIfGroups(ifHead, ifStatement.getIfstat()).isEmpty()) {
+      return false;
+    }
+    for (StatEdge edge : ifStatement.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL)) {
+      if (edge.getType() != StatEdge.TYPE_REGULAR) {
+        return false;
+      }
+    }
+    for (int j = i + 1; j < stats.size(); j++) {
+      Statement next = stats.get(j);
+      if (RoundTrip.isStatementSkipped(next) || RoundTrip.isAfterIf(next)
+          || RoundTrip.isPrintedInBranch(next) || RoundTrip.isConsumedGuardExit(next)
+          || RoundTrip.isDeferredExit(next)) {
+        return false;
+      }
+    }
+    int close = RoundTrip.heldBlockClose(stats.get(i + 1), RoundTrip.lastEnd(this));
+    if (close < 0) {
+      return false;
+    }
+    int split = i + 1;
+    int splitExprent = -1;
+    while (split < stats.size()) {
+      Statement child = stats.get(split);
+      int childStart = RoundTrip.firstOffset(child);
+      int childEnd = RoundTrip.lastEnd(child);
+      if (childStart < 0 || childEnd < 0) {
+        return false;
+      }
+      if (childStart >= close) {
+        if (childStart != close || !RoundTrip.transferEnds(child)) {
+          return false;
+        }
+        break;
+      }
+      if (childEnd <= close) {
+        split++;
+        continue;
+      }
+      // The close falls inside this statement: only a basic block can hold the transfer's own
+      // instructions after the brace, and the block's declarations stay inside the else.
+      List<Exprent> exprents = child.getExprents();
+      if (exprents == null || exprents.isEmpty() || !child.getVarDefinitions().isEmpty()) {
+        return false;
+      }
+      for (int e = 1; e < exprents.size(); e++) {
+        if (e == exprents.size() - 1 && RoundTrip.transferExprent(exprents.get(e))
+            && RoundTrip.lastEndOf(exprents.get(e - 1)) == close
+            && RoundTrip.exprentStart(exprents.get(e)) >= close) {
+          splitExprent = e;
+          break;
+        }
+      }
+      if (splitExprent < 0) {
+        return false;
+      }
+      break;
+    }
+    if (split >= stats.size()) {
+      return false;
+    }
+    buf.append(ExprProcessor.listToJava(ifStatement.getVarDefinitions(), indent));
+    buf.append(ifStatement.getFirst().toJava(indent));
+    buf.appendIndent(indent).append(ifHead.toJava(indent)).append(" {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, true));
+    buf.appendIndent(indent).append("} else {").appendLineSeparator();
+    for (int j = i + 1; j < split; j++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent + 1, j == i + 1));
+    }
+    if (splitExprent >= 0) {
+      List<Exprent> exprents = stats.get(split).getExprents();
+      buf.append(ExprProcessor.listToJava(exprents.subList(0, splitExprent), indent + 1));
+    }
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    if (splitExprent >= 0) {
+      List<Exprent> exprents = stats.get(split).getExprents();
+      buf.append(ExprProcessor.listToJava(exprents.subList(splitExprent, exprents.size()), indent));
+      split++;
+    }
+    for (int j = split; j < stats.size(); j++) {
+      buf.append(ExprProcessor.jmpWrapper(stats.get(j), indent, j == split));
     }
     return true;
   }

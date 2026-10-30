@@ -786,6 +786,24 @@ public class IfStatement extends Statement {
     boolean elseif = false;
 
     if (elsestat != null) {
+      // The target's table can prove the else arm closed early: a local the arm declares has a
+      // row ending at the first instruction of a trailing return or throw, so the source's brace
+      // stood there and the return ran after the if/else. The flat print would keep the local
+      // alive through the return instead.
+      int split = RoundTrip.isArmOpen(this) ? -1 : RoundTrip.armScopeSplit(elsestat);
+      if (split > 0) {
+        List<Statement> children = elsestat.getStats();
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        for (int k = 0; k < split; k++) {
+          buf.append(ExprProcessor.jmpWrapper(children.get(k), indent + 1, k == 0));
+        }
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        for (int k = split; k < children.size(); k++) {
+          buf.append(ExprProcessor.jmpWrapper(children.get(k), indent, k == split));
+        }
+        // The brace this arm ends with was printed above, before the trailing statements.
+        return;
+      }
       if (printElseIfArm(buf, indent, elsestat, this)) {
         elseif = true;
       }

@@ -3489,6 +3489,19 @@ public final class RoundTrip {
    * Returns null when the shape is the mirror or the target cannot prove the direction.
    */
   public static Exprent guardCondition(Exprent head, Statement body) {
+    return guardCondition(head, body, true);
+  }
+
+  /**
+   * Whether {@link #guardCondition} would print the guard at all, without recording the exit as
+   * consumed: a caller that only refuses its own shape must not take the print away from the
+   * statement's own printer.
+   */
+  public static boolean guardConditionProbe(Exprent head, Statement body) {
+    return guardCondition(head, body, false) != null;
+  }
+
+  private static Exprent guardCondition(Exprent head, Statement body, boolean mark) {
     if (!selector("guardprint") || !(head instanceof IfExprent ie)) {
       return null;
     }
@@ -3519,7 +3532,9 @@ public final class RoundTrip {
       java.util.Map<Integer, Integer> targets = BRANCH_TARGETS.get(method);
       Integer target = targets == null ? null : targets.get(lastEnd);
       if (target != null && target >= 0 && target < bodyStart && returns.get(target)) {
-        markGuardExit(method, target);
+        if (mark) {
+          markGuardExit(method, target);
+        }
         return negateCondition(condition);
       }
     }
@@ -3533,14 +3548,18 @@ public final class RoundTrip {
         Integer target = targets == null ? null : targets.get(lastEnd);
         int exit = target == null ? -1 : finallyCopyReturnBefore(method, target, bodyStart);
         if (exit >= 0) {
-          markGuardExit(method, exit);
+          if (mark) {
+            markGuardExit(method, exit);
+          }
           return negateCondition(condition);
         }
       }
       return null;
     }
     if (condition instanceof FunctionExprent function && function.getFuncType() == FunctionExprent.FunctionType.BOOL_NOT) {
-      markGuardExit(method, lastEnd);
+      if (mark) {
+        markGuardExit(method, lastEnd);
+      }
       return function.getLstOperands().get(0);
     }
     // A negated condition of the printer's own making: only the target's line table can say whether
@@ -3554,7 +3573,9 @@ public final class RoundTrip {
     if (exitLine < 0 || bodyLine < 0 || exitLine >= bodyLine) {
       return null;
     }
-    markGuardExit(method, lastEnd);
+    if (mark) {
+      markGuardExit(method, lastEnd);
+    }
     return negateCondition(condition);
   }
 
@@ -7000,6 +7021,143 @@ public final class RoundTrip {
     }
     java.util.List<int[]> rows = declarationRows(statement);
     return !rows.isEmpty() && rows.get(0)[2] == end;
+  }
+
+  /**
+   * The offset where a block the source wrote inside this statement closes, proven by the local
+   * variable table, or -1. The first local the statement's printed prefix declares has a row
+   * ending before the statement ends; javac writes a local's row at the scope it lives in, so a
+   * row ending inside the statement means the source closed a block there, not at the
+   * statement's end. The local must be declared inside the statement: a parameter or a local
+   * hoisted in from the enclosing block says nothing about a block here. Nothing is returned
+   * when the row runs to the statement's own end, where an unbraced local would close.
+   *
+   * <p>Only the prefix counts: a local declared inside a nested arm's own braces closes with
+   * that arm, so its row ending at the statement's end says nothing about an enclosing block.
+   */
+  public static int heldBlockClose(Statement stat, int enclosingEnd) {
+    if (stat == null) {
+      return -1;
+    }
+    int start = firstOffset(stat);
+    if (start < 0) {
+      return -1;
+    }
+    LocalVariable local = firstPrefixLocal(stat);
+    if (local == null || local.getStart() < start) {
+      return -1;
+    }
+    int end = local.getEnd();
+    return end > start && end < enclosingEnd ? end : -1;
+  }
+
+  /**
+   * The first local this statement declares in the part that prints before its own construct:
+   * its own definitions and exprents, an if's head block, and a sequence's first child's prefix.
+   * Locals inside an arm, a loop body or a try body are not in the prefix. None when the prefix
+   * declares nothing.
+   */
+  public static LocalVariable firstPrefixLocal(Statement stat) {
+    if (stat == null) {
+      return null;
+    }
+    LocalVariable own = definitionIn(stat.getVarDefinitions());
+    if (own == null) {
+      own = definitionIn(stat.getExprents());
+    }
+    if (own != null) {
+      return own;
+    }
+    Statement first = null;
+    if (stat instanceof IfStatement ifStatement) {
+      if (!isHeadConsumed(ifStatement)) {
+        first = ifStatement.getFirst();
+      }
+    } else if (stat instanceof SequenceStatement sequence) {
+      first = sequence.getStats().isEmpty() ? null : sequence.getStats().get(0);
+    }
+    return first == null || first == stat ? null : firstPrefixLocal(first);
+  }
+
+  private static LocalVariable definitionIn(List<Exprent> exprents) {
+    if (exprents == null) {
+      return null;
+    }
+    for (Exprent exprent : exprents) {
+      for (Exprent inner : exprent.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && var.isDefinition() && var.getLVT() != null) {
+          return var.getLVT();
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The child index of a sequence arm where the source's block reopened: the arm declares a
+   * local whose row ends at a trailing return's or throw's first instruction, so the statements
+   * at and after that child ran outside the source's closing brace. -1 when no row or no
+   * transfer proves it; the caller keeps the flat print then.
+   */
+  public static int armScopeSplit(Statement arm) {
+    if (!selector("armscope") || !(arm instanceof SequenceStatement) || arm.isLabeled()) {
+      return -1;
+    }
+    List<Statement> children = arm.getStats();
+    if (children.size() < 2) {
+      return -1;
+    }
+    int close = heldBlockClose(arm, lastEnd(arm));
+    if (close < 0) {
+      return -1;
+    }
+    int found = -1;
+    for (int j = 1; j < children.size(); j++) {
+      int childStart = firstOffset(children.get(j));
+      if (childStart == close) {
+        if (!transferEnds(children.get(j))) {
+          return -1;
+        }
+        found = j;
+        break;
+      }
+      if (childStart > close) {
+        return -1;
+      }
+    }
+    if (found < 0) {
+      return -1;
+    }
+    for (int k = 0; k < found; k++) {
+      if (lastEnd(children.get(k)) > close) {
+        return -1;
+      }
+    }
+    return found;
+  }
+
+  /** True when the exprent is a return or a throw. */
+  public static boolean transferExprent(Exprent exprent) {
+    return exprent instanceof ExitExprent exit
+      && (exit.getExitType() == ExitExprent.Type.RETURN || exit.getExitType() == ExitExprent.Type.THROW);
+  }
+
+  /** True when the statement's own last exprent is a return or a throw. */
+  public static boolean transferEnds(Statement stat) {
+    if (stat == null) {
+      return false;
+    }
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (int i = exprents.size() - 1; i >= 0; i--) {
+        if (exprents.get(i) != null) {
+          return transferExprent(exprents.get(i));
+        }
+      }
+      return false;
+    }
+    List<Statement> children = stat.getStats();
+    return !children.isEmpty() && transferEnds(children.get(children.size() - 1));
   }
 
   /**
