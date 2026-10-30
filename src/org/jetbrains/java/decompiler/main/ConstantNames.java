@@ -1683,7 +1683,7 @@ public final class ConstantNames {
    */
   private record PairSite(int classIndex, long successor, long lower, long after, int open, int close,
                           String member, String successorKey, Set<String> pooled, int successorAt,
-                          int lowerAt) {
+                          int lowerAt, int nextClass) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.equals(successorKey)) {
@@ -1841,9 +1841,12 @@ public final class ConstantNames {
       }
       Integer at = position(cls, use, positions);
       Integer lowerAt = position(cls, lastPoolUseEntry(firstUses, use), positions);
+      // A pair whose successor is another naming's Class entry records that the two names were
+      // written in one expression, in pool order: the source named this owner, then the next.
+      int nextClass = anotherNaming(pool, i + 2) ? i + 2 : -1;
       pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], lastPoolUse(firstUses, use),
         open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at,
-        lowerAt == null ? -1 : lowerAt));
+        lowerAt == null ? -1 : lowerAt, nextClass));
     }
     return pairs;
   }
@@ -2225,6 +2228,10 @@ public final class ConstantNames {
   }
 
   private static void scanClass(String text, List<int[]> spans, Rules rules, List<Site> sites) {
+    // A run of naming pairs is one folded expression over several owners, and the pool records
+    // only its owner order. It is solved before the single-pair rules so no one of its owners is
+    // placed on its own.
+    Set<String> chained = chainSites(text, spans, rules, sites);
     Map<String, List<Site>> deferred = new HashMap<>();
     // Sites the expression solver invented: it admits any literal of a reference successor's
     // generation gap, so a direct naming found later in the same gap withdraws the guess.
@@ -2259,7 +2266,7 @@ public final class ConstantNames {
     if (rules.placement().pairs() != null) {
       for (Map.Entry<String, PairSite> entry : rules.placement().pairs().entrySet()) {
         PairSite pair = entry.getValue();
-        if (hasSiteFor(sites, entry.getKey())) {
+        if (hasSiteFor(sites, entry.getKey()) || chained.contains(entry.getKey())) {
           continue; // one naming per class reproduces the pair; later names enter nothing
         }
         List<Site> candidates = deferred.get(entry.getKey());
@@ -2377,6 +2384,106 @@ public final class ConstantNames {
     }
     earlySites(text, spans, rules, deferred, sites);
     compositeSites(text, spans, rules, sites);
+  }
+
+  /**
+   * Names a run of owners whose pairs are adjacent in the pool with one folded expression.
+   *
+   * <p>When a pair's successor is the next owner's {@code Class}+name pair, the source named the
+   * two constants in one expression and the pool recorded the owners in evaluation order. The
+   * folded result is a literal at the site (usually an immediate the code pushes), so the literal's
+   * value only has to be reproducible by an expression over the run's constants, with the owners
+   * named left to right. One such expression reproduces the pair sequence exactly; choosing a
+   * different operator or member is byte-equivalent, so the first that folds wins.
+   *
+   * @return the owners the pass accounted for; their single-pair rules must not run
+   */
+  private static Set<String> chainSites(String text, List<int[]> spans, Rules rules, List<Site> sites) {
+    Map<String, PairSite> pairs = rules.placement().pairs();
+    Set<String> claimed = new HashSet<>();
+    if (pairs == null || pairs.size() < 2) {
+      return claimed;
+    }
+    Map<Integer, String> byIndex = new HashMap<>();
+    for (Map.Entry<String, PairSite> entry : pairs.entrySet()) {
+      byIndex.put(entry.getValue().classIndex(), entry.getKey());
+    }
+    List<List<String>> runs = new ArrayList<>();
+    Set<Integer> continued = new HashSet<>();
+    for (Map.Entry<String, PairSite> entry : pairs.entrySet()) {
+      PairSite pair = entry.getValue();
+      String next = pair.nextClass() < 0 ? null : byIndex.get(pair.nextClass());
+      if (next != null) {
+        continued.add(pair.nextClass());
+      }
+    }
+    for (Map.Entry<String, PairSite> entry : pairs.entrySet()) {
+      if (continued.contains(entry.getValue().classIndex())) {
+        continue;
+      }
+      List<String> run = new ArrayList<>();
+      PairSite pair = entry.getValue();
+      String owner = entry.getKey();
+      while (owner != null && !run.contains(owner)) {
+        run.add(owner);
+        String next = pair.nextClass() < 0 ? null : byIndex.get(pair.nextClass());
+        pair = next == null ? null : pairs.get(next);
+        owner = next;
+      }
+      if (run.size() >= 2) {
+        runs.add(run);
+      }
+    }
+    if (runs.isEmpty()) {
+      return claimed;
+    }
+    StructClass cls = rules.placement().cls();
+    if (cls == null) {
+      return claimed;
+    }
+    List<long[]> literals = intLiterals(text, spans);
+    for (List<String> run : runs) {
+      PairSite first = pairs.get(run.get(0));
+      List<List<SourceConstant>> sources = new ArrayList<>();
+      boolean writable = true;
+      for (String owner : run) {
+        List<SourceConstant> constants =
+          sourceConstants(owner, cls, rules.imports(), rules.packageName());
+        if (constants.isEmpty()) {
+          writable = false;
+          break;
+        }
+        sources.add(constants);
+      }
+      if (!writable) {
+        continue;
+      }
+      Set<String> pooledBefore = pooledKeys(cls, first.classIndex());
+      Site found = null;
+      for (long[] literal : literals) {
+        int start = (int) literal[0];
+        long raw = literal[2];
+        if (raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE || hasSiteAt(sites, start)) {
+          continue;
+        }
+        String key = VariableType.INT.name() + "|" + raw;
+        if (!pairProvesSite(first, key, start, rules.placement())) {
+          continue;
+        }
+        String expression = chainExpression(new FieldConstant(null, VariableType.INT, (int) raw),
+          sources, pooledBefore);
+        if (expression == null) {
+          continue;
+        }
+        found = new Site(start, (int) literal[1], "(" + expression + ")", run.get(0));
+        break;
+      }
+      if (found != null) {
+        addSiteOnce(sites, found);
+        claimed.addAll(run);
+      }
+    }
+    return claimed;
   }
 
   /**
@@ -3026,64 +3133,261 @@ public final class ConstantNames {
     List<String> imports = imports(text);
     String packageName = packageName(text);
     int last = -1;
-    for (int k = 0; k < owners.size(); k++) {
+    int k = 0;
+    while (k < owners.size()) {
       String owner = owners.get(k);
       Site existing = firstInitializerSite(sites, owner, spans, initializers);
       if (existing != null) {
         last = Math.max(last, existing.start());
+        k++;
         continue;
       }
       // A later pair that already has a site in an initializer fixes the upper end of the field
       // interval this naming may use; a placement after it would reorder the pool.
       int limit = initializerLimit(sites, owners, k + 1, spans, initializers);
       boolean self = owner.equals(own.qualifiedName);
-      List<SourceConstant> sources = self ? List.of() : sourceConstants(owner, own, imports, packageName);
-      if (!self && sources.isEmpty()) {
-        // This owner's naming cannot be written, and a later one would move up into its slot.
-        return;
+      if (self) {
+        Site placed = placeOwnConstant(owner, constants, initializers, text, sites, last, limit);
+        if (placed == null) {
+          return;
+        }
+        addSiteOnce(sites, placed);
+        last = placed.start();
+        k++;
+        continue;
       }
-      Site placed = null;
-      for (int i = self ? 1 : 0; i < constants.size() && placed == null; i++) {
-        FieldConstant target = constants.get(i);
-        List<int[]> ranges = initializers.get(target.field().getName());
-        if (ranges == null || ranges.isEmpty()) {
-          continue;
-        }
-        int[] range = ranges.get(0);
-        if (range[0] <= last || (limit >= 0 && range[0] >= limit) || occupied(sites, range)) {
-          continue; // outside the interval the pool order leaves, or already rewritten
-        }
-        int equals = text.indexOf('=', range[0]);
-        if (equals < 0 || equals >= range[1]) {
-          continue;
-        }
-        if (self) {
-          for (int j = 0; j < i; j++) {
-            FieldConstant source = constants.get(j);
-            String expression = constantExpression(target, source.kind(), source.value(),
-              source.field().getName());
-            if (expression != null) {
-              placed = new Site(equals + 1, range[1], " " + expression, owner);
-              break;
-            }
-          }
-        }
-        else {
-          for (SourceConstant source : sources) {
-            String expression = constantExpression(target, source.kind(), source.value(), source.name());
-            if (expression != null) {
-              placed = new Site(equals + 1, range[1], " " + expression, owner);
-              break;
-            }
-          }
-        }
+      // The pool names the prefix owners in source order, and one constant-field initializer may
+      // name several of them: `Tag.TAG_BYTE + Byte.SIZE`. The run stops at a name that already
+      // has a site, at the class itself (whose own naming is a separate rule), and at an owner
+      // whose name cannot be written here.
+      List<List<SourceConstant>> run = new ArrayList<>();
+      List<SourceConstant> sources = sourceConstants(owner, own, imports, packageName);
+      if (sources.isEmpty()) {
+        return; // this owner's naming cannot be written, and a later one would move into its slot
       }
+      run.add(sources);
+      int end = k;
+      while (end + 1 < owners.size() && !owners.get(end + 1).equals(own.qualifiedName)
+          && firstInitializerSite(sites, owners.get(end + 1), spans, initializers) == null) {
+        List<SourceConstant> next = sourceConstants(owners.get(end + 1), own, imports, packageName);
+        if (next.isEmpty()) {
+          break;
+        }
+        run.add(next);
+        end++;
+      }
+      int[] used = new int[1];
+      Site placed = placeChain(owner, constants, run, initializers, text, sites, last, limit, used);
       if (placed == null) {
         return;
       }
       addSiteOnce(sites, placed);
       last = placed.start();
+      k = end + 1;
     }
+  }
+
+  /** The site naming the class's own constant in an initializer, or null when none fits. */
+  private static Site placeOwnConstant(String owner, List<FieldConstant> constants,
+                                       Map<String, List<int[]>> initializers, String text,
+                                       List<Site> sites, int last, int limit) {
+    for (int i = 1; i < constants.size(); i++) {
+      FieldConstant target = constants.get(i);
+      List<int[]> ranges = initializers.get(target.field().getName());
+      if (ranges == null || ranges.isEmpty()) {
+        continue;
+      }
+      int[] range = ranges.get(0);
+      if (range[0] <= last || (limit >= 0 && range[0] >= limit) || occupied(sites, range)) {
+        continue; // outside the interval the pool order leaves, or already rewritten
+      }
+      int equals = text.indexOf('=', range[0]);
+      if (equals < 0 || equals >= range[1]) {
+        continue;
+      }
+      for (int j = 0; j < i; j++) {
+        FieldConstant source = constants.get(j);
+        String expression = constantExpression(target, source.kind(), source.value(),
+          source.field().getName());
+        if (expression != null) {
+          return new Site(equals + 1, range[1], " " + expression, owner);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The first initializer that can name a run of prefix owners in pool order, or null.
+   *
+   * <p>The fields are scanned in source order, and the longest run that an expression can name is
+   * preferred: a later owner the run names needs no initializer of its own, and every prefix
+   * owner's first naming must appear before the next one's. {@code used} reports how many owners
+   * the chosen expression named.
+   */
+  private static Site placeChain(String firstOwner, List<FieldConstant> constants,
+                                 List<List<SourceConstant>> run,
+                                 Map<String, List<int[]>> initializers, String text,
+                                 List<Site> sites, int last, int limit, int[] used) {
+    for (FieldConstant target : constants) {
+      List<int[]> ranges = initializers.get(target.field().getName());
+      if (ranges == null || ranges.isEmpty()) {
+        continue;
+      }
+      int[] range = ranges.get(0);
+      if (range[0] <= last || (limit >= 0 && range[0] >= limit) || occupied(sites, range)) {
+        continue;
+      }
+      int equals = text.indexOf('=', range[0]);
+      if (equals < 0 || equals >= range[1]) {
+        continue;
+      }
+      for (int count = run.size(); count >= 1; count--) {
+        String expression = chainExpression(target, run.subList(0, count), null);
+        if (expression != null) {
+          used[0] = count;
+          return new Site(equals + 1, range[1], " " + expression, firstOwner);
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * An expression naming every owner of the run in order and folding to the target value.
+   *
+   * <p>In a method body the expression's literals must enter nothing the pair did not have, so
+   * {@code pooledBefore} is the value set already in the pool; a null set accepts any literal,
+   * which is right in a constant field initializer, where the whole expression is folded at
+   * attribution and never reaches the pool.
+   */
+  private static String chainExpression(FieldConstant target, List<List<SourceConstant>> run,
+                                        Set<String> pooledBefore) {
+    if (run.size() == 1) {
+      for (SourceConstant source : run.get(0)) {
+        String expression = constantExpression(target, source.kind(), source.value(), source.name());
+        if (expression != null) {
+          return expression;
+        }
+      }
+      return null;
+    }
+    int[] budget = new int[]{200000};
+    for (SourceConstant first : run.get(0)) {
+      String found = chainCombine(target, run, 1, first.kind(), first.value(), first.name(),
+        pooledBefore, budget);
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /** The binary operators a chain may combine constants with, in preference order. */
+  private static final List<Op> CHAIN_OPS = List.of(Op.ADD, Op.SUB, Op.OR, Op.XOR, Op.AND,
+    Op.MUL, Op.DIV);
+
+  private static String chainCombine(FieldConstant target, List<List<SourceConstant>> run,
+                                     int index, VariableType kind, Object value, String text,
+                                     Set<String> pooledBefore, int[] budget) {
+    if (budget[0]-- <= 0) {
+      return null;
+    }
+    if (index == run.size()) {
+      if (foldsTo(value, kind, target)) {
+        return text;
+      }
+      // The chain keeps its own precedence: a compound left operand is parenthesised before the
+      // solver appends its literal.
+      String literal = binaryExpression(target, kind, value, "(" + text + ")");
+      return literal != null && poolFree(literal, pooledBefore) ? literal : null;
+    }
+    for (SourceConstant term : run.get(index)) {
+      VariableType p = promote(kind, term.kind());
+      if (p == null) {
+        continue;
+      }
+      Object left = convert(value, kind, p);
+      Object right = convert(term.value(), term.kind(), p);
+      if (left == null || right == null) {
+        continue;
+      }
+      for (Op op : CHAIN_OPS) {
+        Object combined = combineValues(op, left, right, p);
+        if (combined == null) {
+          continue;
+        }
+        String next = index == 1 ? text + " " + symbol(op) + " " + term.name()
+          : "(" + text + ") " + symbol(op) + " " + term.name();
+        String found = chainCombine(target, run, index + 1, p, combined, next, pooledBefore, budget);
+        if (found != null) {
+          return found;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** The value of a binary operation over converted operands, or null when it cannot fold. */
+  private static Object combineValues(Op op, Object left, Object right, VariableType p) {
+    try {
+      if (p == VariableType.INT) {
+        int a = ((Number) left).intValue();
+        int b = ((Number) right).intValue();
+        return switch (op) {
+          case ADD -> Integer.valueOf(a + b);
+          case SUB -> Integer.valueOf(a - b);
+          case MUL -> Integer.valueOf(a * b);
+          case DIV -> Integer.valueOf(a / b);
+          case AND -> Integer.valueOf(a & b);
+          case OR -> Integer.valueOf(a | b);
+          case XOR -> Integer.valueOf(a ^ b);
+          default -> null;
+        };
+      }
+      if (p == VariableType.LONG) {
+        long a = ((Number) left).longValue();
+        long b = ((Number) right).longValue();
+        return switch (op) {
+          case ADD -> Long.valueOf(a + b);
+          case SUB -> Long.valueOf(a - b);
+          case MUL -> Long.valueOf(a * b);
+          case DIV -> Long.valueOf(a / b);
+          case AND -> Long.valueOf(a & b);
+          case OR -> Long.valueOf(a | b);
+          case XOR -> Long.valueOf(a ^ b);
+          default -> null;
+        };
+      }
+      if (p == VariableType.FLOAT) {
+        float a = ((Number) left).floatValue();
+        float b = ((Number) right).floatValue();
+        float result = switch (op) {
+          case ADD -> a + b;
+          case SUB -> a - b;
+          case MUL -> a * b;
+          case DIV -> a / b;
+          default -> Float.NaN;
+        };
+        return Float.isFinite(result) ? Float.valueOf(result) : null;
+      }
+      if (p == VariableType.DOUBLE) {
+        double a = ((Number) left).doubleValue();
+        double b = ((Number) right).doubleValue();
+        double result = switch (op) {
+          case ADD -> a + b;
+          case SUB -> a - b;
+          case MUL -> a * b;
+          case DIV -> a / b;
+          default -> Double.NaN;
+        };
+        return Double.isFinite(result) ? Double.valueOf(result) : null;
+      }
+    }
+    catch (ArithmeticException e) {
+      return null;
+    }
+    return null;
   }
 
   /**
@@ -3871,7 +4175,9 @@ public final class ConstantNames {
       case DIV -> "/";
       case SHL -> "<<";
       case SHR -> ">>";
-      default -> "";
+      case AND -> "&";
+      case OR -> "|";
+      case XOR -> "^";
     };
   }
 
@@ -4005,7 +4311,12 @@ public final class ConstantNames {
     }
   }
 
-  /** Whether every literal of the solved expression enters no pool entry the pair did not have. */
+  /**
+   * Whether every literal of the solved expression enters no pool entry the pair did not have.
+   *
+   * <p>A null set accepts any literal: a constant field initializer is folded at attribution, so
+   * none of its literals reaches the pool.
+   */
   private static boolean poolFree(String expression, Set<String> pooledBefore) {
     for (int i = 0; i < expression.length(); i++) {
       char c = expression.charAt(i);
@@ -4033,7 +4344,7 @@ public final class ConstantNames {
         break;
       }
       String key = literalKey(expression.substring(i, end));
-      if (key != null && !immediateKey(key) && (pooledBefore == null || !pooledBefore.contains(key))) {
+      if (key != null && !immediateKey(key) && pooledBefore != null && !pooledBefore.contains(key)) {
         return false;
       }
       i = end - 1;
