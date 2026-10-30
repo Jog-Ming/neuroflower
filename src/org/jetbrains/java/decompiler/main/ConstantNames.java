@@ -222,7 +222,7 @@ public final class ConstantNames {
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
                            Set<String> bares, Set<String> earlyOwners, boolean ownEarly,
-                           boolean ownProven, StructClass cls) {
+                           boolean ownProven, StructClass cls, String text) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -351,7 +351,7 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false, null);
+      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false, null, "");
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -927,7 +927,7 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
         namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, bares, earlyOwners, ownEarly, ownProven, own),
+        activeValues, bares, earlyOwners, ownEarly, ownProven, own, text),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -1895,7 +1895,8 @@ public final class ConstantNames {
       // expression, so its folded value is the whole expression's, not this owner's own constant.
       boolean continuation = i - 2 >= 1 && anotherNaming(pool, i - 2);
       if (successorKey != null && successorKey.startsWith(VariableType.STRING.name() + "|")
-          && !continuation && !ownerDeclares(owner, successorKey)) {
+          && !continuation && !ownerDeclares(owner, successorKey)
+          && !ownerTilesString(owner, successorKey)) {
         // A numeric value after the pair may be the fold of an expression over the owner's
         // constants, so it can never be refuted. A string cannot be built from an int constant,
         // and a string value no constant of the owner holds is not the value the naming folded to:
@@ -1914,6 +1915,41 @@ public final class ConstantNames {
         lowerAt == null ? -1 : lowerAt, nextClass));
     }
     return pairs;
+  }
+
+  /**
+   * Whether one of the owner's string constants is a segment of this pooled value.
+   *
+   * <p>A concatenation's folded value contains each named constant verbatim, so a string value one
+   * of the owner's constants sits inside is not refuted by the owner's declaration alone.
+   */
+  private static boolean ownerTilesString(String owner, String key) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    if (cls == null) {
+      return true; // an owner off the classpath cannot be refuted
+    }
+    String value = key.substring(VariableType.STRING.name().length() + 1);
+    return tilesString(cls, value, 0);
+  }
+
+  private static boolean tilesString(StructClass cls, String value, int depth) {
+    if (cls == null || depth > 8) {
+      return false;
+    }
+    for (StructField field : cls.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant constant = constantValue(cls, field);
+      if (constant != null && constant.value instanceof String text && !text.isEmpty()
+          && value.contains(text)) {
+        return true;
+      }
+    }
+    String superName = cls.superClass == null ? null : cls.superClass.getString();
+    return superName != null
+      && tilesString(DecompilerContext.getStructContext().getClass(superName), value, depth + 1);
   }
 
   /** Whether the pool entry is a {@code Class} entry followed by its own name: another naming. */
@@ -2525,6 +2561,12 @@ public final class ConstantNames {
     }
   }
 
+  /** Whether the pair's folded successor is a string value. */
+  private static boolean stringSuccessor(PairSite pair) {
+    return pair.successorKey() != null
+      && pair.successorKey().startsWith(VariableType.STRING.name() + "|");
+  }
+
   /**
    * Whether a chain's naming site lies where the pool order puts it.
    *
@@ -2568,7 +2610,7 @@ public final class ConstantNames {
   private static Set<String> chainSites(String text, List<int[]> spans, Rules rules, List<Site> sites) {
     Map<String, PairSite> pairs = rules.placement().pairs();
     Set<String> claimed = new HashSet<>();
-    if (pairs == null || pairs.size() < 2) {
+    if (pairs == null || pairs.isEmpty()) {
       return claimed;
     }
     Map<Integer, String> byIndex = new HashMap<>();
@@ -2597,7 +2639,8 @@ public final class ConstantNames {
         pair = next == null ? null : pairs.get(next);
         owner = next;
       }
-      if (run.size() >= 2) {
+      if (run.size() >= 2 || (run.size() == 1
+          && stringSuccessor(pairs.get(run.get(0))))) {
         runs.add(run);
       }
     }
@@ -2642,6 +2685,27 @@ public final class ConstantNames {
               continue;
             }
             found = new Site(literal[0], literal[1], expression, run.get(0));
+            break;
+          }
+        }
+      }
+      else if (successorKey != null && variableType(
+          successorKey.substring(0, successorKey.indexOf('|'))) != null) {
+        VariableType kind = variableType(successorKey.substring(0, successorKey.indexOf('|')));
+        Object value = kindValue(kind, successorKey);
+        if (value != null) {
+          Set<String> pooledBefore = pooledKeys(cls, first.classIndex());
+          for (int[] literal : literalSpansFor(text, spans, successorKey)) {
+            if (hasSiteAt(sites, literal[0])
+                || !chainProves(first, last, successorKey, literal[0], rules.placement())) {
+              continue;
+            }
+            String expression = chainExpression(new FieldConstant(null, kind, value), sources,
+              pooledBefore);
+            if (expression == null) {
+              continue;
+            }
+            found = new Site(literal[0], literal[1], "(" + expression + ")", run.get(0));
             break;
           }
         }
@@ -3252,7 +3316,12 @@ public final class ConstantNames {
   private static boolean pairProvesBounds(PairSite pair, int position, Placement placement) {
     long coordinate = siteCoordinate(placement.spaces(), position);
     if (coordinate == NO_COORDINATE) {
-      return false;
+      // A field initializer's folded literal is printed at its declaration, where the printer maps
+      // no instruction point. A value successor's printed point lying in the same initializer is
+      // the record that this literal is the one the naming produced.
+      return pair.successorKey() != null && pair.member() == null
+        && pairedInitializer(placement.text(), placement.spaces(), placement.spans(), position,
+        pair.successorAt());
     }
     long offset = coordinate & 0xffffffffL;
     long successorOffset = pair.successor() & 0xffffffffL;
@@ -3564,6 +3633,85 @@ public final class ConstantNames {
     return parts.isEmpty() ? null : String.join(" + ", parts);
   }
 
+  /** The value a literal key names, in its own kind, or null. */
+  private static Object kindValue(VariableType kind, String key) {
+    int bar = key.indexOf('|');
+    if (bar < 0) {
+      return null;
+    }
+    String text = key.substring(bar + 1);
+    try {
+      return switch (kind) {
+        case INT -> Integer.valueOf(Integer.parseInt(text));
+        case LONG -> Long.valueOf(Long.parseLong(text));
+        case FLOAT -> Float.valueOf(Float.parseFloat(text));
+        case DOUBLE -> Double.valueOf(Double.parseDouble(text));
+        case BOOLEAN -> Boolean.valueOf(text);
+        case STRING -> text;
+        case CHAR -> Integer.valueOf(Integer.parseInt(text));
+        default -> null;
+      };
+    }
+    catch (NumberFormatException e) {
+      return null;
+    }
+  }
+
+  /** The spans of the numeric literals whose key is {@code key}. */
+  private static List<int[]> literalSpansFor(String text, List<int[]> spans, String key) {
+    List<int[]> found = new ArrayList<>();
+    for (int[] span : spans) {
+      int i = span[0];
+      while (i < span[1]) {
+        char c = text.charAt(i);
+        char next = i + 1 < text.length() ? text.charAt(i + 1) : '\0';
+        if (c == '/' && next == '/') {
+          int newline = text.indexOf('\n', i);
+          i = newline < 0 ? span[1] : newline;
+          continue;
+        }
+        if (c == '/' && next == '*') {
+          int end = text.indexOf("*/", i + 2);
+          i = end < 0 ? span[1] : end + 2;
+          continue;
+        }
+        if (c == '"' || c == '\'') {
+          i = skipQuoted(text, i, c);
+          continue;
+        }
+        if (Character.isDigit(c) && (i == span[0] || !isIdentifierPart(text.charAt(i - 1)))) {
+          int end = i;
+          boolean dot = false;
+          while (end < span[1]) {
+            char d = text.charAt(end);
+            if (Character.isLetterOrDigit(d) || d == '_') {
+              end++;
+              continue;
+            }
+            if (d == '.' && !dot) {
+              dot = true;
+              end++;
+              continue;
+            }
+            if ((d == '+' || d == '-') && end > i
+                && (text.charAt(end - 1) == 'e' || text.charAt(end - 1) == 'E')) {
+              end++;
+              continue;
+            }
+            break;
+          }
+          if (key.equals(literalKey(text.substring(i, end)))) {
+            found.add(new int[]{i, end});
+          }
+          i = end;
+          continue;
+        }
+        i++;
+      }
+    }
+    return found;
+  }
+
   /** The spans of the string literals whose value is {@code value}, quotes included. */
   private static List<int[]> stringLiteralSpans(String text, List<int[]> spans, String value) {
     List<int[]> found = new ArrayList<>();
@@ -3673,8 +3821,17 @@ public final class ConstantNames {
       return null;
     }
     if (index == run.size()) {
-      if (foldsTo(value, kind, target)) {
+      // The expression stands where the literal stood, so its static type must be the literal's
+      // own: a chain of int constants inside a float division would otherwise make it integer
+      // arithmetic. A cast bridges the kinds, exactly as the original's cast did.
+      if (kind == target.kind() && foldsTo(value, kind, target)) {
         return text;
+      }
+      // A chain of int constants written where a float or double literal stands needs the cast the
+      // original wrote: `(float)(Owner.A * Other.B)`. The cast folds away at compile time.
+      Object cast = kind == target.kind() ? null : castValue(value, kind, target.kind());
+      if (cast != null && foldsTo(cast, target.kind(), target)) {
+        return "(" + javaName(target.kind()) + ")(" + text + ")";
       }
       // The chain keeps its own precedence: a compound left operand is parenthesised before the
       // solver appends its literal.
@@ -4422,9 +4579,15 @@ public final class ConstantNames {
       case INT -> from == VariableType.LONG ? Integer.valueOf((int) number.longValue())
         : from == VariableType.FLOAT ? Integer.valueOf((int) number.floatValue())
         : from == VariableType.DOUBLE ? Integer.valueOf((int) number.doubleValue()) : null;
-      case LONG -> from == VariableType.FLOAT ? Long.valueOf((long) number.floatValue())
+      case LONG -> from == VariableType.INT ? Long.valueOf((long) number.intValue())
+        : from == VariableType.FLOAT ? Long.valueOf((long) number.floatValue())
         : from == VariableType.DOUBLE ? Long.valueOf((long) number.doubleValue()) : null;
-      case FLOAT -> from == VariableType.DOUBLE ? Float.valueOf((float) number.doubleValue()) : null;
+      case FLOAT -> from == VariableType.INT ? Float.valueOf((float) number.intValue())
+        : from == VariableType.LONG ? Float.valueOf((float) number.longValue())
+        : from == VariableType.DOUBLE ? Float.valueOf((float) number.doubleValue()) : null;
+      case DOUBLE -> from == VariableType.INT ? Double.valueOf((double) number.intValue())
+        : from == VariableType.LONG ? Double.valueOf((double) number.longValue())
+        : from == VariableType.FLOAT ? Double.valueOf((double) number.floatValue()) : null;
       default -> null;
     };
   }
@@ -6508,10 +6671,6 @@ public final class ConstantNames {
         placement, conditions, added);
     }
     conditions.sort(Map.Entry.comparingByKey());
-    if (System.getenv("NF_CONST_TRACE") != null) {
-      System.err.println("[dead] " + own.qualifiedName + " conds=" + conditions.size()
-        + " anon=" + anonymous + " prefix=" + prefix);
-    }
     if (conditions.isEmpty() && anonymous <= 0) {
       return;
     }
