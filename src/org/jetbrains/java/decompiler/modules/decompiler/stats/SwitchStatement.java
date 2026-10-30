@@ -352,9 +352,27 @@ public class SwitchStatement extends Statement {
     boolean defaultPrinted = false;
     boolean defaultBreakPrinted = false;
     boolean lastJoins = false;
+    // The method's final return when several pattern arms jump to it instead of returning
+    // themselves: javac gives every arm that ends at the switch's join one jump to a shared
+    // return, and the source wrote `break;` in those arms and the return once after the switch.
+    // The return exprent those arms carry ends at the method's last instruction; printing it
+    // inside each arm would put a return where the class file has a jump.
+    Exprent[] joinedReturns = joinedFinalReturns();
+    // Labels that share an empty arm still stand at their own table positions. A type-pattern
+    // switch keys its table by the source order of the labels, and javac writes one block per
+    // source group; when two groups' bodies are empty the structurer merges the two blocks that
+    // jump straight to the join into one arm, and printing both labels together would renumber
+    // the typeSwitch labels and change the dispatch. Spill each such label back to the block its
+    // own table entry points at.
+    List<int[]> spilled = spilledCaseLabels();
+    int spilledAt = 0;
     for (int i : order) {
 
       Statement stat = caseStatements.get(i);
+      spilledAt = printSpilledLabels(buf, spilled, spilledAt, entryOffset(i), indent, switch_type);
+      if (isSpilledArm(spilled, i)) {
+        continue;
+      }
       if (skipMatch && RoundTrip.synthesizedMatchThrow(stat)) {
         continue;
       }
@@ -375,8 +393,33 @@ public class SwitchStatement extends Statement {
         continue;
       }
 
+      // A pattern arm with several labels is one case group with alternatives, not a fall-through:
+      // javac keyed the whole group with one run of typeSwitch labels and picks the alternative
+      // inside the arm, and a fall-through of pattern labels either does not compile (a written
+      // name) or loses that selection (an unnamed one). Print the alternatives on one `case` line.
+      boolean patternLabels = isPattern() && guard == null && values.size() > 1
+        && edges.size() == values.size()
+        && edges.stream().noneMatch(edge -> edge == defaultEdge)
+        && values.stream().anyMatch(value -> value instanceof FunctionExprent function
+          && function.getFuncType() == FunctionType.INSTANCEOF);
+
       boolean anyLabel = false;
-      for (int j = 0; j < edges.size(); j++) {
+      if (patternLabels) {
+        anyLabel = true;
+        buf.appendIndent(indent + 1).append("case ");
+        for (int j = 0; j < values.size(); j++) {
+          if (j > 0) {
+            buf.append(", ");
+          }
+          printCaseLabelValue(buf, values.get(j), stat, indent, switch_type);
+        }
+        buf.append(":");
+        if (braced.contains(stat)) {
+          buf.append(" {");
+        }
+        buf.appendLineSeparator();
+      }
+      for (int j = 0; j < edges.size() && !patternLabels; j++) {
         if (edges.get(j) == defaultEdge) {
           if (defaultIsJoin || stat == joinArm || stat == updateArm) {
             continue;
@@ -391,47 +434,7 @@ public class SwitchStatement extends Statement {
           buf.appendLineSeparator();
         } else {
           anyLabel = true;
-          Exprent value = values.get(j);
-
-          buf.appendIndent(indent + 1).append("case ");
-
-          if (value instanceof ConstExprent && !value.getExprType().equals(VarType.VARTYPE_NULL)) {
-            value = value.copy();
-            ((ConstExprent)value).setConstType(switch_type);
-          } if (value instanceof FieldExprent field && field.isStatic() && (!getTopParent().mt.getBytecodeVersion().hasSwitchPatternMatch() || switch_type.equals(field.getExprType()))) { // enum values
-            buf.appendField(field.getName(), false, field.getClassname(), field.getName(), field.getDescriptor());
-          } else if (value instanceof FieldExprent field) {
-            buf.append(field.toJava(indent, false));
-          } else if (value instanceof FunctionExprent && ((FunctionExprent) value).getFuncType() == FunctionType.INSTANCEOF) {
-            // Pattern matching variables
-
-            Pattern pattern = (Pattern) value.getAllExprents().get(2);
-            for (VarExprent var : pattern.getPatternVars()) {
-              var.setWritingPattern();
-            }
-
-            // Java 25's unnamed pattern: the class file has no binding for the label — no slot, no
-            // table row, no load — so the source wrote `_`, not a name.
-            String unnamed = pattern instanceof VarExprent var && RoundTrip.unnamedPatternVariable(stat, var)
-              ? var.getDefinitionType() : null;
-            if (unnamed != null && !unnamed.equals("var")) {
-              buf.append(unnamed).append(" _");
-            } else if (pattern instanceof PatternExprent deconstruction) {
-              // A record pattern's components take the same evidence one level down: an unbound
-              // component has no table row and the arm never reads it, so it printed `_` too.
-              buf.append(deconstruction.toJava(indent, stat));
-            } else {
-              buf.append(value.getAllExprents().get(2).toJava(indent));
-            }
-          } else {
-            buf.append(value.toJava(indent));
-          }
-
-          if (guard != null) {
-            buf.append(" when ").append(guard.toJava());
-          }
-
-          buf.append(":");
+          printCaseLabel(buf, values.get(j), stat, guard, indent, switch_type);
           if (braced.contains(stat) && j == edges.size() - 1) {
             buf.append(" {");
           }
@@ -502,10 +505,22 @@ public class SwitchStatement extends Statement {
         && RoundTrip.blockEnd(stat) == defaultTargetOffset();
       Statement previousJump = breakOutside || fallsIntoDefault ? RoundTrip.suppressJump(stat) : null;
       Statement previousDefer = deferredBreak > 0 ? RoundTrip.deferBreakTo(this) : null;
+      // A shared join return is not this arm's statement: the arm's jump is, and it prints as the
+      // `break;` below. Keep the return out of the page while the arm prints.
+      Exprent joinedReturn = i < joinedReturns.length ? joinedReturns[i] : null;
+      boolean returnSuppressed = false;
+      if (joinedReturn != null && stat.getExprents() != null && !stat.getExprents().isEmpty()
+          && stat.getExprents().get(stat.getExprents().size() - 1) == joinedReturn) {
+        stat.getExprents().remove(stat.getExprents().size() - 1);
+        returnSuppressed = true;
+      }
       TextBuffer armBuf;
       try {
         armBuf = ExprProcessor.jmpWrapper(stat, indent + 2, false);
       } finally {
+        if (returnSuppressed) {
+          stat.getExprents().add(joinedReturn);
+        }
         if (deferredBreak > 0) {
           RoundTrip.restoreDeferredBreak(previousDefer);
         }
@@ -514,6 +529,10 @@ public class SwitchStatement extends Statement {
         }
       }
       buf.append(armBuf);
+      if (joinedReturn != null) {
+        buf.append(breakLine(indent + 2, joinedReturn.bytecode == null ? -1
+          : joinedReturn.bytecode.previousSetBit(Integer.MAX_VALUE)));
+      }
       // What the arm actually printed decides whether it still needs a `break;`. The tree's own
       // edge is not enough evidence: an explicit break edge can hang off a statement the printer
       // renders without one, which is exactly the arm that falls through on the page.
@@ -629,6 +648,10 @@ public class SwitchStatement extends Statement {
       buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
       buf.appendIndent(indent + 2).append("break;").appendLineSeparator();
     }
+
+    // A spilled label whose table target stands after every arm's block still has to print, in
+    // its own group, before the closing brace.
+    printSpilledLabels(buf, spilled, spilledAt, Integer.MAX_VALUE, indent, switch_type);
 
     buf.appendIndent(indent).append("}").appendLineSeparator();
 
@@ -983,6 +1006,178 @@ public class SwitchStatement extends Statement {
       return instruction;
     }
     return null;
+  }
+
+  /**
+   * Prints one `case <label>` prefix, ending at the colon: the value as the source wrote it,
+   * plus the guard a pattern-match switch recovered.
+   */
+  private void printCaseLabel(TextBuffer buf, Exprent value, Statement stat, Exprent guard, int indent, VarType switchType) {
+    buf.appendIndent(indent + 1).append("case ");
+    printCaseLabelValue(buf, value, stat, indent, switchType);
+    if (guard != null) {
+      buf.append(" when ").append(guard.toJava());
+    }
+    buf.append(":");
+  }
+
+  /** Prints one case label's value, without the `case` keyword or the colon. */
+  private void printCaseLabelValue(TextBuffer buf, Exprent value, Statement stat, int indent, VarType switchType) {
+    if (value instanceof ConstExprent && !value.getExprType().equals(VarType.VARTYPE_NULL)) {
+      value = value.copy();
+      ((ConstExprent)value).setConstType(switchType);
+    } if (value instanceof FieldExprent field && field.isStatic() && (!getTopParent().mt.getBytecodeVersion().hasSwitchPatternMatch() || switchType.equals(field.getExprType()))) { // enum values
+      buf.appendField(field.getName(), false, field.getClassname(), field.getName(), field.getDescriptor());
+    } else if (value instanceof FieldExprent field) {
+      buf.append(field.toJava(indent, false));
+    } else if (value instanceof FunctionExprent && ((FunctionExprent) value).getFuncType() == FunctionType.INSTANCEOF) {
+      // Pattern matching variables
+
+      Pattern pattern = (Pattern) value.getAllExprents().get(2);
+      for (VarExprent var : pattern.getPatternVars()) {
+        var.setWritingPattern();
+      }
+
+      // Java 25's unnamed pattern: the class file has no binding for the label — no slot, no
+      // table row, no load — so the source wrote `_`, not a name.
+      String unnamed = pattern instanceof VarExprent var && RoundTrip.unnamedPatternVariable(stat, var)
+        ? var.getDefinitionType() : null;
+      if (unnamed != null && !unnamed.equals("var")) {
+        buf.append(unnamed).append(" _");
+      } else if (pattern instanceof PatternExprent deconstruction) {
+        // A record pattern's components take the same evidence one level down: an unbound
+        // component has no table row and the arm never reads it, so it printed `_` too.
+        buf.append(deconstruction.toJava(indent, stat));
+      } else {
+        buf.append(value.getAllExprents().get(2).toJava(indent));
+      }
+    } else {
+      buf.append(value.toJava(indent));
+    }
+  }
+
+  /**
+   * Labels that share an empty arm and still stand at their own table positions. A type-pattern
+   * switch keys its table by the source order of its labels, so the typeSwitch bootstrap
+   * arguments and the table keys follow the order the labels were written in. Two source groups
+   * whose bodies are empty compile to two blocks that only jump to the join, and the structurer
+   * merges both into one arm. Printing them together would renumber the labels and change the
+   * dispatch, so each label has to print where its own table entry points. The group's own jump
+   * is the `break;` printed with it; an arm that holds instructions of its own is one real group
+   * and stays whole.
+   */
+  private List<int[]> spilledCaseLabels() {
+    if (!isPattern()) {
+      return Collections.emptyList();
+    }
+    SwitchInstruction instruction = switchInstruction();
+    int[] targets = instruction == null ? null : RoundTrip.switchTargetsAt(instruction.startOffset);
+    if (targets == null) {
+      return Collections.emptyList();
+    }
+    List<StatEdge> successors = first.getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+    List<int[]> spilled = new ArrayList<>();
+    for (int i = 0; i < caseStatements.size(); i++) {
+      Statement stat = caseStatements.get(i);
+      List<Exprent> values = caseValues.get(i);
+      List<StatEdge> edges = i < caseEdges.size() ? caseEdges.get(i) : Collections.emptyList();
+      if (stat == null || values.size() < 2 || edges.size() != values.size()) {
+        continue;
+      }
+      if (RoundTrip.firstOffset(stat) >= 0) {
+        continue;
+      }
+      if (caseGuards.size() > i && caseGuards.get(i) != null) {
+        continue;
+      }
+      int[] labelTargets = new int[values.size()];
+      boolean known = true;
+      boolean distinct = false;
+      for (int j = 0; j < edges.size(); j++) {
+        int at = successors.indexOf(edges.get(j));
+        if (at < 0 || at >= targets.length) {
+          known = false;
+          break;
+        }
+        labelTargets[j] = targets[at];
+        if (j > 0 && labelTargets[j] != labelTargets[0]) {
+          distinct = true;
+        }
+      }
+      if (!known || !distinct) {
+        continue;
+      }
+      for (int j = 0; j < values.size(); j++) {
+        spilled.add(new int[]{i, j, labelTargets[j]});
+      }
+    }
+    spilled.sort(Comparator.comparingInt(label -> label[2]));
+    return spilled;
+  }
+
+  /**
+   * The bare void return each pattern arm prints as `break;`, one entry per arm, or all nulls
+   * when the shape is not the shared join. Two or more arms have to end with a return whose
+   * bytecode is the method's very last instruction; a single arm ending in a return is the
+   * source's own early return, which prints as a return. The switch has to be the method's last
+   * statement as well, or the jump printed in place of the return would run into what follows.
+   */
+  private Exprent[] joinedFinalReturns() {
+    Exprent[] returns = new Exprent[caseStatements.size()];
+    if (!isPattern()) {
+      return returns;
+    }
+    int found = 0;
+    for (int i = 0; i < caseStatements.size(); i++) {
+      Statement arm = caseStatements.get(i);
+      if (arm == null || arm.getExprents() == null || arm.getExprents().isEmpty()) {
+        continue;
+      }
+      List<Exprent> exprents = arm.getExprents();
+      Exprent last = exprents.get(exprents.size() - 1);
+      if (last instanceof ExitExprent exit && exit.getExitType() == ExitExprent.Type.RETURN
+          && exit.getValue() == null && RoundTrip.isMethodFinalReturn(exit)) {
+        returns[i] = last;
+        found++;
+      }
+    }
+    if (found < 2) {
+      return new Exprent[caseStatements.size()];
+    }
+    Statement stat = this;
+    while (stat.getParent() != null) {
+      List<Statement> siblings = stat.getParent().getStats();
+      if (!siblings.isEmpty() && siblings.get(siblings.size() - 1) != stat) {
+        return new Exprent[caseStatements.size()];
+      }
+      stat = stat.getParent();
+    }
+    return returns;
+  }
+
+  private static boolean isSpilledArm(List<int[]> spilled, int arm) {
+    for (int[] label : spilled) {
+      if (label[0] == arm) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Prints the spilled labels whose table target stands at or before the arm block about to
+   * print, each as its own group: the label, then the jump to the join printed as its `break;`.
+   */
+  private int printSpilledLabels(TextBuffer buf, List<int[]> spilled, int cursor, int before, int indent, VarType switchType) {
+    while (cursor < spilled.size() && spilled.get(cursor)[2] <= before) {
+      int[] label = spilled.get(cursor++);
+      Statement stat = caseStatements.get(label[0]);
+      Exprent value = caseValues.get(label[0]).get(label[1]);
+      printCaseLabel(buf, value, stat, null, indent, switchType);
+      buf.appendLineSeparator();
+      buf.append(breakLine(indent + 2, label[2]));
+    }
+    return cursor;
   }
 
   /** The offset a value matching no case jumps to, or -1. */

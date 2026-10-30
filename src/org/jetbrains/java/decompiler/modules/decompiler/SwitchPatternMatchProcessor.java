@@ -256,12 +256,19 @@ public final class SwitchPatternMatchProcessor {
     for (int i = 0; i < value.getBootstrapArguments().size(); i++) {
       PooledConstant bsa = value.getBootstrapArguments().get(i);
       // replace the constant with the value of i, which may not be at index i
-      int replaceIndex = i;
+      // The label can sit anywhere in a case's value list: labels that share an arm share one
+      // list, and the earlier label of the pair has already been replaced with its pattern by the
+      // time the later one is read. Look at every element, not just the first.
+      int replaceIndex = -1;
       for (List<Exprent> caseValueSet : stat.getCaseValues()) {
-        if (caseValueSet.get(0) instanceof ConstExprent constExpr) {
-          if (constExpr.getValue() instanceof Integer && (Integer) constExpr.getValue() == i) {
+        for (Exprent label : caseValueSet) {
+          if (label instanceof ConstExprent constExpr && constExpr.getValue() instanceof Integer && (Integer) constExpr.getValue() == i) {
             replaceIndex = stat.getCaseValues().indexOf(caseValueSet);
+            break;
           }
+        }
+        if (replaceIndex >= 0) {
+          break;
         }
       }
 
@@ -287,7 +294,9 @@ public final class SwitchPatternMatchProcessor {
             break;
           case CodeConstants.CONSTANT_Class:
             // may happen if the switch head is a supertype of the pattern
-            if (stat.getCaseValues().get(replaceIndex).stream().allMatch(x -> x instanceof ConstExprent)) {
+            // The group holds the label just found; it need not be all constants, because an
+            // earlier label of the same arm may already be a pattern of its own.
+            if (replaceIndex >= 0) {
               VarType castType = new VarType(CodeType.OBJECT, 0, (String) p.value);
               List<Exprent> operands = new ArrayList<>();
               operands.add(realSelector); // checking var
@@ -311,7 +320,7 @@ public final class SwitchPatternMatchProcessor {
         }
       }
 
-      if (newValue != null) {
+      if (newValue != null && replaceIndex >= 0) {
         int ix = i;
         Exprent nvx = newValue;
         // make sure we replace the right constant, null can be shared with anything
@@ -320,6 +329,19 @@ public final class SwitchPatternMatchProcessor {
             && ((ConstExprent) u).getIntValue() == ix
                 ? nvx
                 : u);
+      }
+    }
+
+    // A group of alternative patterns re-checks its own alternatives inside the arm to pick which
+    // binding to establish, and restarts the dispatch when none of them holds. That retry is not
+    // a source guard: it runs only when the group's own patterns did not match, so the condition
+    // guard elimination recovers from it is the group's own match condition — `instanceof` tests
+    // on the selector against the very types the labels carry. Printing it as `when` would add a
+    // guard the source never wrote and keep the selector in a local instead of switching on it
+    // directly.
+    for (int i = 0; i < stat.getCaseGuards().size(); i++) {
+      if (isSelfMatchGuard(stat.getCaseGuards().get(i), stat.getCaseValues().get(i), realSelector)) {
+        stat.getCaseGuards().set(i, null);
       }
     }
 
@@ -601,6 +623,51 @@ public final class SwitchPatternMatchProcessor {
       head.getExprents().remove(0);
     }
     return pattern;
+  }
+
+  /**
+   * Whether a recovered guard is the arm's own match condition: a disjunction of `instanceof`
+   * tests on the switch selector, each against one of the types the arm's labels carry.
+   */
+  private static boolean isSelfMatchGuard(Exprent guard, List<Exprent> values, Exprent selector) {
+    if (guard == null || values == null || values.size() < 2) {
+      return false;
+    }
+    List<VarType> types = new ArrayList<>();
+    for (Exprent value : values) {
+      if (value instanceof FunctionExprent function && function.getFuncType() == FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 1 && function.getLstOperands().get(1) instanceof ConstExprent type) {
+        types.add(type.getExprType());
+      }
+    }
+    if (types.isEmpty()) {
+      return false;
+    }
+    List<Exprent> atoms = new ArrayList<>();
+    flattenDisjunction(guard, atoms);
+    for (Exprent atom : atoms) {
+      if (!(atom instanceof FunctionExprent function) || function.getFuncType() != FunctionType.INSTANCEOF) {
+        return false;
+      }
+      List<Exprent> operands = function.getLstOperands();
+      if (operands.size() < 2 || !(operands.get(0) instanceof VarExprent checked) || !checked.equals(selector)) {
+        return false;
+      }
+      if (!(operands.get(1) instanceof ConstExprent type) || !types.contains(type.getExprType())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static void flattenDisjunction(Exprent exprent, List<Exprent> out) {
+    if (exprent instanceof FunctionExprent function && function.getFuncType() == FunctionType.BOOLEAN_OR) {
+      for (Exprent operand : function.getLstOperands()) {
+        flattenDisjunction(operand, out);
+      }
+    } else {
+      out.add(exprent);
+    }
   }
 
   private static boolean isSwitchPatternMatch(SwitchHeadExprent head) {
