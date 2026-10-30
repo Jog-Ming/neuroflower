@@ -57,10 +57,14 @@ public final class ReferenceReceiverTemp {
   }
 
   public static boolean fold(Statement root, StructMethod method) {
-    // The fold exists to feed the bridge printer: with that printer off, the marker would have
-    // no reader and the deleted store would leave the lambda's body dangling.
-    if (method == null || !RoundTrip.enabled() || !RoundTrip.selector("reftemp")
-        || !RoundTrip.selector("methodrefbridge")) {
+    // The reference fold exists to feed the bridge printer: with that printer off, the marker
+    // would have no reader and the deleted store would leave the lambda's body dangling. The
+    // lambda's `this` capture has no such reader and stands on its own selector.
+    if (method == null || !RoundTrip.enabled()) {
+      return false;
+    }
+    boolean reference = RoundTrip.selector("reftemp") && RoundTrip.selector("methodrefbridge");
+    if (!reference && !RoundTrip.selector("lambdathis")) {
       return false;
     }
 
@@ -191,8 +195,8 @@ public final class ReferenceReceiverTemp {
       return null;
     }
     Bridge bridge = boundBridge(site);
-    if (bridge == null) {
-      return null;
+    if (bridge == null || !RoundTrip.selector("reftemp") || !RoundTrip.selector("methodrefbridge")) {
+      return matchLambdaThis(site, method, store, ambiguous, occurrences, capture);
     }
     // The receiver temp must be untabled and appear exactly twice: its store and this capture.
     // A table row is allowed only when it is the `rec$` row this javac puts on the hidden slot at
@@ -221,6 +225,65 @@ public final class ReferenceReceiverTemp {
     // printed lambda body referring to a local that no longer exists.
     if (store.value() instanceof InvocationExprent invocation
         && !printableForward(bridge, invocation)) {
+      return null;
+    }
+    return new Fold(site, store);
+  }
+
+  /**
+   * A lambda that captures the enclosing {@code this} parks it in the same kind of hidden slot:
+   * {@code aload_0; astore T; aload T; invokedynamic}, with a static synthetic content method
+   * whose first parameter is the receiver. The source wrote {@code this} in the body, not a local
+   * it stored first, and javac writes no table row for the slot. The capture becomes the enclosing
+   * {@code this} and the store goes away; setLambdaVars then sees a captured {@code this} and
+   * records the parameter as one of the lambda's own, so the body prints it unqualified.
+   */
+  private static Fold matchLambdaThis(NewExprent site, StructMethod method, Store store,
+                                      Set<Integer> ambiguous, Map<Integer, List<VarExprent>> occurrences,
+                                      VarExprent capture) {
+    if (!RoundTrip.selector("lambdathis")) {
+      return null;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(site.getNewType().value);
+    if (node == null || node.lambdaInformation == null || !node.lambdaInformation.is_content_method_static) {
+      return null;
+    }
+    StructClass content = DecompilerContext.getStructContext().getClass(node.lambdaInformation.content_class_name);
+    if (content == null) {
+      return null;
+    }
+    StructMethod target = content.getMethod(node.lambdaInformation.content_method_name,
+      node.lambdaInformation.content_method_descriptor);
+    if (target == null || !target.hasModifier(CodeConstants.ACC_STATIC)
+        || !target.hasModifier(CodeConstants.ACC_SYNTHETIC)) {
+      return null;
+    }
+    // The captured value has to be the enclosing method's own `this`: slot 0 under its `this`
+    // name. A local the source stored `this` into keeps a table row and stays a declared local.
+    if (!(store.value() instanceof VarExprent source) || source.getIndex() != 0 || source.isStack()
+        || !"this".equals(source.getName())) {
+      return null;
+    }
+    int slot = capture.getIndex();
+    if (ambiguous.contains(slot)) {
+      return null;
+    }
+    int captureOffset = capture.bytecode == null || capture.bytecode.isEmpty()
+      ? -1 : capture.bytecode.nextSetBit(0);
+    if (!receiverNamed(method, slot, store.temp(), captureOffset)
+        || !receiverNamed(method, slot, capture, captureOffset)) {
+      return null;
+    }
+    List<VarExprent> uses = occurrences.get(slot);
+    if (uses == null || uses.size() != 2) {
+      return null;
+    }
+    Set<VarExprent> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+    seen.addAll(uses);
+    if (!seen.contains(store.temp()) || !seen.contains(capture)) {
+      return null;
+    }
+    if (!immediatelyBefore(method, store.assignment(), capture)) {
       return null;
     }
     return new Fold(site, store);
@@ -391,8 +454,9 @@ public final class ReferenceReceiverTemp {
     }
     Instruction load = seq.getInstr(loadIndex);
     Instruction store = seq.getInstr(loadIndex - 1);
-    return isLoad(load.opcode) && slotOf(load) == capture.getIndex()
-      && isStore(store.opcode) && slotOf(store) == capture.getIndex()
+    // The decompiler may have renumbered the variable, so the pair is read from the target: the
+    // load the invocation captures and the store right before it name the same slot.
+    return isLoad(load.opcode) && isStore(store.opcode) && slotOf(load) == slotOf(store)
       && definition.bytecode.get(store.startOffset);
   }
 
