@@ -1760,6 +1760,13 @@ public final class RoundTrip {
     if (lastBranchTargetIn(head.bytecode, ends, targets) != runStart) {
       return false;
     }
+    // A branch inside the arm that lands on the rest proves the rest is not an else: the source
+    // cannot jump into an else arm from the then, so the code after the if was shared with the
+    // arm by a second statement. The arm's own continue can land on the run's end by coincidence
+    // when the run ends at the loop's continue point, so the destination alone is no proof.
+    if (branchInto(armStart, runStart, runStart)) {
+      return false;
+    }
     int armEnd = lastEndWithin(arm, ends);
     if (armEnd < 0) {
       return false;
@@ -5899,6 +5906,32 @@ public final class RoundTrip {
   }
 
   /**
+   * True when a conditional branch whose own instruction starts in {@code [from, before)} lands on
+   * {@code target}. The code in that range tests its way into the statement at {@code target}, so
+   * the two cannot be exclusive arms of one if/else: a then arm never branches into its own else.
+   * This is what separates `if (C) { … } T` from `if (C) { … } else { T }` when a jump inside the
+   * arm skips past T — the skip alone looks like an else, but a branch from the arm to T's start
+   * proves the arm also runs T, so the source wrote a second statement and not an else.
+   */
+  public static boolean branchInto(int from, int before, int target) {
+    StructMethod method = currentMethod();
+    if (method == null || from < 0 || before < 0 || target < 0) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> branches = BRANCH_STARTS.get(method);
+    if (branches == null) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, Integer> entry : branches.entrySet()) {
+      if (entry.getValue() == target && entry.getValue() > entry.getKey()
+          && entry.getKey() >= from && entry.getKey() < before) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * True when the target's then-arm ends with a jump over the returning block our sequence prints
    * as the statement after the if: the source wrote {@code if (C) { A } else { return X; }} and the
    * arm's fall-through reaches the rest instead. The jump has to sit immediately after the arm's
@@ -8127,6 +8160,11 @@ public final class RoundTrip {
     }
     // The branch lands on the else arm, and the else arm ends the path.
     if (lastBranchTargetIn(offsets, ends, targets) != runStart) {
+      return false;
+    }
+    // A branch inside the arm that lands on the run proves the run is not an else arm: no then
+    // arm can jump into its else, so the source wrote a second statement the arm also reaches.
+    if (branchInto(armStart, runStart, runStart)) {
       return false;
     }
     Integer lastRun = byEnd.get(runEnd);

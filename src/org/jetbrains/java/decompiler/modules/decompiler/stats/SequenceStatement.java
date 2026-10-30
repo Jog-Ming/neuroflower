@@ -646,7 +646,10 @@ public class SequenceStatement extends Statement {
           && RoundTrip.lastBranchTarget(ifStatement.getHeadexprent()) >= 0
           && RoundTrip.lastBranchTarget(ifStatement.getHeadexprent()) <= RoundTrip.statementStart(stats.get(i + 1))) {
         Statement arm = ifStatement.getIfstat();
-        int from = i > 0 ? RoundTrip.lastEnd(stats.get(i - 1)) : RoundTrip.statementStart(ifStatement);
+        // The proof has to lie inside this if: a jump in the statement before it is that
+        // statement's own exit (a `continue`), and the join it lands on says nothing about an
+        // else this if might have written.
+        int from = RoundTrip.statementStart(ifStatement);
         int elseStart = RoundTrip.lastBranchTarget(ifStatement.getHeadexprent());
         int elseEnd = -1;
         int previousEnd = -1;
@@ -743,7 +746,11 @@ public class SequenceStatement extends Statement {
             && (bodyEnd > 0 || joinExprents != null)
             && (!ifStatement.isPatternMatched() || joinExprents != null)
             && !fallsInto(arm, elseStart, elseStop)
-            && !breaksOut(arm, elseStop);
+            && !breaksOut(arm, elseStop)
+            // A branch inside the arm that lands on the code after the if proves that code is
+            // shared with the arm, so the source wrote a second statement, not an else. The arm's
+            // terminal continue is a goto, not a branch: only a test inside the arm enters T.
+            && !RoundTrip.branchInto(RoundTrip.statementStart(arm), elseStart, elseStart);
         if (printElseOver && joinExprents != null
             && !RoundTrip.hoistJoinDeclarations(ifStatement, arm, joinExprents)) {
           // A local the moved code reads is declared where the arm held it and cannot move:
