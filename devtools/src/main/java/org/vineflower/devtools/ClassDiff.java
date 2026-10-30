@@ -48,20 +48,25 @@ import java.util.Objects;
 public final class ClassDiff {
   public static final List<String> ATTRIBUTES = List.of(
     "bytes", "members", "code", "lnt", "lvt", "params", "annotations", "signature", "inner", "frames");
+  /** Not an attribute table column: byte equality after every LineNumberTable is stripped. */
+  public static final String NOLNT = "nolnt";
 
   public final String name;
   public final Map<String, Boolean> matches = new LinkedHashMap<>();
   public final List<String> details = new ArrayList<>();
+  /** True when the two class files are identical after every LineNumberTable is removed. */
+  public boolean noLnt = true;
 
   private ClassDiff(String name) {
     this.name = name;
     for (String attribute : ATTRIBUTES) {
       matches.put(attribute, true);
     }
+    matches.put(NOLNT, true);
   }
 
   public boolean all() {
-    return matches.values().stream().allMatch(Boolean::booleanValue);
+    return ATTRIBUTES.stream().allMatch(attribute -> matches.getOrDefault(attribute, true));
   }
 
   public static ClassDiff compare(byte[] originalBytes, byte[] recompiledBytes) {
@@ -74,6 +79,11 @@ public final class ClassDiff {
       return diff;
     }
     diff.fail("bytes", "raw bytes differ");
+    diff.noLnt = java.util.Arrays.equals(stripLineNumbers(originalBytes), stripLineNumbers(recompiledBytes));
+    diff.matches.put(NOLNT, diff.noLnt);
+    if (!diff.noLnt) {
+      diff.details.add("nolnt: bytes differ outside the line table");
+    }
 
     ClassNode original = parse(originalBytes);
     ClassNode recompiled = parse(recompiledBytes);
@@ -137,6 +147,188 @@ public final class ClassDiff {
       }
     }
     return diff;
+  }
+
+  /**
+   * The class file with every LineNumberTable removed and every other byte -- the constant pool
+   * and its order included -- copied verbatim. Comparison only: nothing here is ever written back
+   * as a class; it exists so "identical except for the line table" is a measurable statement.
+   */
+  static byte[] stripLineNumbers(byte[] bytes) {
+    Reader in = new Reader(bytes);
+    Writer out = new Writer(bytes.length);
+    in.copy(4, out);                                   // magic
+    in.copy(4, out);                                   // minor, major
+    int poolCount = in.u2();
+    out.u2(poolCount);
+    String[] utf8 = new String[poolCount];
+    for (int i = 1; i < poolCount; i++) {
+      int tag = in.u1();
+      out.u1(tag);
+      switch (tag) {
+        case 1 -> {
+          int length = in.u2();
+          out.u2(length);
+          byte[] text = in.copy(length, out);
+          utf8[i] = new String(text, java.nio.charset.StandardCharsets.UTF_8);
+        }
+        case 7, 8, 16, 19, 20 -> in.copy(2, out);
+        case 15 -> in.copy(3, out);
+        case 3, 4, 9, 10, 11, 12, 17, 18 -> in.copy(4, out);
+        case 5, 6 -> {
+          in.copy(8, out);
+          i++;
+        }
+        default -> throw new IllegalStateException("constant pool tag " + tag);
+      }
+    }
+    in.copy(6, out);                                   // access, this, super
+    int interfaces = in.u2();
+    out.u2(interfaces);
+    in.copy(interfaces * 2, out);
+    int fields = in.u2();
+    out.u2(fields);
+    for (int i = 0; i < fields; i++) {
+      copyMember(in, out, utf8, false);
+    }
+    int methods = in.u2();
+    out.u2(methods);
+    for (int i = 0; i < methods; i++) {
+      copyMember(in, out, utf8, true);
+    }
+    int attributes = in.u2();
+    out.u2(attributes);
+    for (int i = 0; i < attributes; i++) {
+      copyAttribute(in, out);
+    }
+    return out.toByteArray();
+  }
+
+  private static void copyMember(Reader in, Writer out, String[] utf8, boolean method) {
+    in.copy(6, out);                                   // access, name, descriptor
+    int attributes = in.u2();
+    out.u2(attributes);
+    for (int i = 0; i < attributes; i++) {
+      int nameIndex = in.peekU2();
+      if (method && "Code".equals(utf8[nameIndex])) {
+        in.u2();
+        in.u4();
+        byte[] body = stripCode(in, utf8);
+        out.u2(nameIndex);
+        out.u4(body.length);
+        out.copy(body, null);
+      } else {
+        copyAttribute(in, out);
+      }
+    }
+  }
+
+  private static byte[] stripCode(Reader in, String[] utf8) {
+    Writer body = new Writer(256);
+    int maxStack = in.u2();
+    int maxLocals = in.u2();
+    body.u2(maxStack);
+    body.u2(maxLocals);
+    int codeLength = in.u4();
+    body.u4(codeLength);
+    in.copy(codeLength, body);
+    int handlers = in.u2();
+    body.u2(handlers);
+    in.copy(handlers * 8, body);
+    int attributes = in.u2();
+    Writer kept = new Writer(64);
+    int keptCount = 0;
+    for (int i = 0; i < attributes; i++) {
+      int nameIndex = in.u2();
+      int length = in.u4();
+      byte[] content = in.copy(length, null);
+      if ("LineNumberTable".equals(utf8[nameIndex])) {
+        continue;
+      }
+      keptCount++;
+      kept.u2(nameIndex);
+      kept.u4(length);
+      kept.copy(content, null);
+    }
+    body.u2(keptCount);
+    byte[] keptBytes = kept.toByteArray();
+    body.copy(keptBytes, null);
+    return body.toByteArray();
+  }
+
+  private static void copyAttribute(Reader in, Writer out) {
+    int nameIndex = in.u2();
+    int length = in.u4();
+    out.u2(nameIndex);
+    out.u4(length);
+    in.copy(length, out);
+  }
+
+  private static final class Reader {
+    private final byte[] bytes;
+    private int at;
+
+    Reader(byte[] bytes) {
+      this.bytes = bytes;
+    }
+
+    int u1() {
+      return bytes[at++] & 0xff;
+    }
+
+    int u2() {
+      return (bytes[at++] & 0xff) << 8 | (bytes[at++] & 0xff);
+    }
+
+    int u4() {
+      return (bytes[at++] & 0xff) << 24 | (bytes[at++] & 0xff) << 16
+        | (bytes[at++] & 0xff) << 8 | (bytes[at++] & 0xff);
+    }
+
+    int peekU2() {
+      return (bytes[at] & 0xff) << 8 | (bytes[at + 1] & 0xff);
+    }
+
+    byte[] copy(int length, Writer out) {
+      byte[] slice = java.util.Arrays.copyOfRange(bytes, at, at + length);
+      at += length;
+      if (out != null) {
+        out.copy(slice, null);
+      }
+      return slice;
+    }
+  }
+
+  private static final class Writer {
+    private final java.io.ByteArrayOutputStream bytes;
+
+    Writer(int hint) {
+      this.bytes = new java.io.ByteArrayOutputStream(hint);
+    }
+
+    void u1(int value) {
+      bytes.write(value & 0xff);
+    }
+
+    void u2(int value) {
+      bytes.write(value >>> 8 & 0xff);
+      bytes.write(value & 0xff);
+    }
+
+    void u4(int value) {
+      bytes.write(value >>> 24 & 0xff);
+      bytes.write(value >>> 16 & 0xff);
+      bytes.write(value >>> 8 & 0xff);
+      bytes.write(value & 0xff);
+    }
+
+    void copy(byte[] slice, Writer ignored) {
+      bytes.writeBytes(slice);
+    }
+
+    byte[] toByteArray() {
+      return bytes.toByteArray();
+    }
   }
 
   private void fail(String attribute, String detail) {

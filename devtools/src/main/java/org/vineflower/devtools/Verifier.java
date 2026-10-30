@@ -74,7 +74,7 @@ public final class Verifier {
     COMPILER.get().getStandardFileManager(null, Locale.ROOT, StandardCharsets.UTF_8));
 
   /** Bump when the comparison changes: it is part of the cache key, not of the source hash. */
-  private static final String COMPARATOR_VERSION = "9";
+  private static final String COMPARATOR_VERSION = "10";
 
   private final Workspace workspace;
   private final Minecraft minecraft;
@@ -516,6 +516,7 @@ public final class Verifier {
       matches.put(attribute, 0);
     }
     int fully = 0;
+    int nonLnt = 0;
     int extras = 0;
     int failingFiles = 0;
     Metrics totals = Metrics.ZERO;
@@ -543,6 +544,9 @@ public final class Verifier {
           } else {
             all = false;
           }
+        }
+        if (cls.flags().getOrDefault(ClassDiff.NOLNT, true)) {
+          nonLnt++;
         }
         if (all) {
           fully++;
@@ -584,6 +588,8 @@ public final class Verifier {
         classes == 0 ? 0.0 : 100.0 * count / classes);
     }
 
+    System.out.printf(Locale.ROOT, "non-lnt identical %d/%d (%.1f%%)%n",
+      nonLnt, classes, classes == 0 ? 0.0 : 100.0 * nonLnt / classes);
     System.out.printf(Locale.ROOT, "metrics raw %d  cast %d  double %d  unchecked %d%n",
       totals.raw(), totals.redundantCasts(), totals.doubleCasts(), totals.unchecked());
     if (failingFiles > 0) {
