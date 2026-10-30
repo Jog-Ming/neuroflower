@@ -489,6 +489,29 @@ public class IfStatement extends Statement {
         }
         return buf;
       }
+      // The jump after the branch lands on a break's destination instead of past the arm: the
+      // empty arm the source wrote held the break, and the tree's arm is its else. Printing the
+      // plain empty then arm would drop the jump and fall through to the join.
+      java.util.List<StatEdge> emptyExits = getSuccessorEdges(Statement.STATEDGE_DIRECT_ALL);
+      if (emptyExits.size() == 1 && emptyExits.get(0).getType() == StatEdge.TYPE_BREAK
+          && emptyExits.get(0).explicit && !emptyExits.get(0).labeled
+          && RoundTrip.breakGuardEntersArm(ifHead, ifstat, emptyExits.get(0).getDestination())) {
+        Exprent printed = ifHead.getCondition();
+        Exprent source = printed instanceof FunctionExprent not
+            && not.getFuncType() == FunctionType.BOOL_NOT
+            && not.getLstOperands().size() == 1
+          ? not.getLstOperands().get(0)
+          : RoundTrip.negateCondition(printed);
+        IfExprent guard = (IfExprent) ifHead.copy();
+        guard.setCondition(source);
+        buf.appendIndent(indent).append(guard.toJava(indent)).append(" {").appendLineSeparator();
+        buf.appendIndent(indent + 1).append("break;").appendLineSeparator();
+        buf.appendIndent(indent).append("} else {").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        RoundTrip.markBreakPrinted(this);
+        return buf;
+      }
       IfExprent head = (IfExprent) ifHead.copy();
       head.setCondition(RoundTrip.negateCondition(head.getCondition()));
       buf.appendIndent(indent).append(head.toJava(indent)).append(" {").appendLineSeparator();
