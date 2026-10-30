@@ -454,24 +454,6 @@ public final class ReferenceReceiverTemp {
     return "rec$".equals(row.getName()) && captureOffset >= 0 && row.getStart() == captureOffset;
   }
 
-  /** Whether a table row for {@code slot} covers the instruction at {@code offset}. */
-  private static boolean named(StructMethod method, int slot, VarExprent var) {
-    if (var.getLVT() != null) {
-      return true;
-    }
-    StructLocalVariableTableAttribute table = method.getLocalVariableAttr();
-    if (table == null || var.bytecode == null || var.bytecode.isEmpty()) {
-      return false;
-    }
-    int offset = var.bytecode.nextSetBit(0);
-    for (LocalVariable row : table.getVariables().toList()) {
-      if (row.getIndex() == slot && row.getStart() <= offset && row.getEnd() > offset) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private static void collectVars(Exprent exprent, Map<Integer, List<VarExprent>> out) {
     if (exprent instanceof VarExprent var) {
       out.computeIfAbsent(var.getIndex(), key -> new ArrayList<>()).add(var);
