@@ -204,7 +204,8 @@ public final class Verifier {
    * failure. This is what a per-class A/B needs, in one process instead of a decompile, a compile
    * and two {@code javap} runs.
    */
-  public boolean diff(String version, Path tree, List<String> classes, int threads) throws Exception {
+  public boolean diff(String version, Path tree, List<String> classes, int threads,
+                      boolean dumpBytes) throws Exception {
     Path client = minecraft.clientJar(version, false);
     Path originalClasses = minecraft.extractedClasses(version, false);
     List<Path> classpath = minecraft.classpath(version, false);
@@ -264,7 +265,7 @@ public final class Verifier {
             for (String line : ClassDiff.byteDifference(Files.readAllBytes(originalFile), ours)) {
               System.out.println("    " + line);
             }
-            if (System.getenv("NEUROFLOWER_DIFF_BYTES") != null) {
+            if (dumpBytes) {
               Path dumped = workspace.tmp.resolve("compiled").resolve(cls.name() + ".class");
               Files.createDirectories(dumped.getParent());
               Workspace.write(dumped, ours);
@@ -289,7 +290,7 @@ public final class Verifier {
     // name compiles to different bytes.
     String key = Workspace.sha256(Workspace.sha256(bytes) + "|" + source.getFileName() + "|" + stamp);
     Path cached = compileCache.resolve(key.substring(0, 2)).resolve(key + ".json");
-    if (Files.exists(cached) && System.getenv("NEUROFLOWER_DIFF_DUMP") == null) {
+    if (Files.exists(cached) && !ClassDiff.dump) {
       Files.setLastModifiedTime(cached, java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis()));
       return readCache(source, cached);
     }

@@ -121,7 +121,10 @@ devtools/cli versions [--no-cache]                    list Mojang's versions
 devtools/cli decompile <version> [--no-cache] [--threads N] [--only Class] [--options "..."] [--timeout minutes]
 devtools/cli tree      <version> [--only Class]       print the cached tree path
 devtools/cli score     <version> [<version>...] [--no-cache] [--only Class] [--threads N] [--json] [--options "..."] [--timeout minutes] [--since Tree]
-devtools/cli diff      <version> <Class> [<Class>...]  verify classes and explain every failing attribute
+devtools/cli diff      <version> <Class> [<Class>...] [--dump] [--dump-bytes]
+                                             verify classes and explain every failing attribute;
+                                             --dump prints instruction windows and LVT rows,
+                                             --dump-bytes writes the compiled classes under .dev/tmp/compiled
 devtools/cli compile   <version> <Class>             compile that one class like the verifier does
 devtools/cli corpus    <version> --ground-truth <dir> write the class-to-ground-truth corpus
 devtools/cli dataset   <version>                      export per-instruction line alignment for the model

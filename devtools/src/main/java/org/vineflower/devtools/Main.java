@@ -111,14 +111,17 @@ public final class Main {
         List<String> positional = positionals(rest);
         if (positional.size() < 2) {
           throw new IllegalArgumentException(
-            "usage: diff <version> <Class> [<Class>...] [--no-cache] [--options \"...\"]");
+            "usage: diff <version> <Class> [<Class>...] [--no-cache] [--options \"...\"]"
+              + " [--dump] [--dump-bytes]");
         }
         String version = positional.get(0);
         List<String> classes = List.copyOf(positional.subList(1, positional.size()));
         boolean noCache = rest.contains("--no-cache");
         int threads = intFlag(rest, "--threads", threadsDefault());
+        ClassDiff.dump = rest.contains("--dump");
+        boolean dumpBytes = rest.contains("--dump-bytes");
         Path tree = decompiler.tree(version, threads, noCache, classes, optionsFlag(rest));
-        boolean ok = new Verifier(workspace, minecraft).diff(version, tree, classes, threads);
+        boolean ok = new Verifier(workspace, minecraft).diff(version, tree, classes, threads, dumpBytes);
         if (!ok) {
           System.exit(1);
         }

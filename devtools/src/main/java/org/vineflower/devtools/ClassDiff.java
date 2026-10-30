@@ -51,6 +51,9 @@ public final class ClassDiff {
   /** Not an attribute table column: byte equality after every LineNumberTable is stripped. */
   public static final String NOLNT = "nolnt";
 
+  /** Set by the diff command's --dump flag: print instruction windows and LVT rows. */
+  public static boolean dump;
+
   public final String name;
   public final Map<String, Boolean> matches = new LinkedHashMap<>();
   public final List<String> details = new ArrayList<>();
@@ -141,7 +144,7 @@ public final class ClassDiff {
       }
       if (!lvt(theirs).equals(lvt(ours))) {
         diff.fail("lvt", entry.getKey());
-        if (System.getenv("NEUROFLOWER_DIFF_DUMP") != null) {
+        if (dump) {
           System.err.println("LVT " + entry.getKey());
           System.err.println("LVT jar " + localRows(theirs));
           System.err.println("LVT our " + localRows(ours));
@@ -825,7 +828,7 @@ public final class ClassDiff {
   private static String firstInstructionDifference(MethodNode original, MethodNode recompiled) {
     List<String> a = renderedInstructions(original);
     List<String> b = renderedInstructions(recompiled);
-    if (System.getenv("NEUROFLOWER_DIFF_DUMP") != null) {
+    if (dump) {
       int limit = Math.min(a.size(), b.size());
       int at = -1;
       for (int i = 0; i < limit; i++) {
