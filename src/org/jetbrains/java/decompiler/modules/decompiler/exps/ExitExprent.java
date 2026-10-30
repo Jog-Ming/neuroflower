@@ -159,7 +159,19 @@ public class ExitExprent extends Exprent {
           buf.append(' ');
         }
 
-        ExprProcessor.getCastedExprent(value, ret, buf, indent, ExprProcessor.NullCastType.DONT_CAST_AT_ALL, false, false, false);
+        if (value instanceof SwitchExprent switchValue && RoundTrip.selector("switchpoly")
+            && !RoundTrip.isTypeVariableTarget(ret)) {
+          // A switch expression in a return is target-typed: javac checks every yield against
+          // the return type and emits no cast after the merge. The switch's own type is the
+          // common supertype of the yields, which the printer would turn into a cast (and,
+          // inside the arms, casts the target does not carry); print it against the return.
+          // A type-variable target is left alone: there javac infers the switch from the
+          // variable's upper bound, and an arm may need the spelled-out cast to conform.
+          switchValue.setPrintTarget(ret);
+          buf.append(switchValue.toJava(indent));
+        } else {
+          ExprProcessor.getCastedExprent(value, ret, buf, indent, ExprProcessor.NullCastType.DONT_CAST_AT_ALL, false, false, false);
+        }
       }
 
       return buf;
