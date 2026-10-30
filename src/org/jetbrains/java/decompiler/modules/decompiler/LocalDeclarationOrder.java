@@ -439,6 +439,12 @@ public final class LocalDeclarationOrder {
         // in scope there, so the source declared it before the try.
         java.util.List<Integer> handlerSlots = child instanceof CatchStatement catchStatement
           ? catchParameterSlots(catchStatement) : java.util.Collections.emptyList();
+        // A try-with-resources' resources are declared in its header, before the body, and javac
+        // hands each one the lowest slot free there: a resource above the local's whole range
+        // means the local's slot was already taken when the header ran, so the source declared
+        // the local above the whole try, bare, and assigned it inside.
+        java.util.List<Integer> resourceHeaders = child instanceof CatchStatement tryStatement
+          ? resourceSlots(tryStatement) : java.util.Collections.emptyList();
         for (Exprent exprent : candidates) {
           VarExprent var = definedVar(exprent);
           if (var == null || !isRealDefinition(var) || var.getLVT() == null) {
@@ -451,7 +457,8 @@ public final class LocalDeclarationOrder {
           // try's own body, which is not declared at this level.
           boolean belowPrinted = slot >= 0 && slot < maxSlot && !(child instanceof CatchStatement);
           boolean reservedAtHandler = slot >= 0 && belowHandlerSlot(handlerSlots, var);
-          if (!belowPrinted && !reservedAtHandler) {
+          boolean reservedAtResource = slot >= 0 && belowHandlerSlot(resourceHeaders, var);
+          if (!belowPrinted && !reservedAtHandler && !reservedAtResource) {
             continue;
           }
           // A discontinuous table row of the same name and slot is the same source variable, so
@@ -462,7 +469,8 @@ public final class LocalDeclarationOrder {
           }
           debug(method, var, (belowPrinted
             ? "hoisted out of a nested block: slot " + slot + " below " + maxSlot
-            : "hoisted out of a try: slot " + slot + " still reserved at a handler"));
+            : "hoisted out of a try: slot " + slot + " still reserved at a "
+              + (reservedAtHandler ? "handler" : "resource header")));
           Exprent declaration;
           if (exprent == var) {
             removeIdentity(body.getVarDefinitions(), exprent);
@@ -996,6 +1004,22 @@ public final class LocalDeclarationOrder {
     return slots;
   }
 
+  /** The slots the target gives a try-with-resources statement's resource variables. */
+  private static List<Integer> resourceSlots(CatchStatement tryStatement) {
+    List<Integer> slots = new ArrayList<>();
+    for (Exprent resource : tryStatement.getResources()) {
+      if (resource == null) {
+        continue;
+      }
+      for (Exprent inner : resource.getAllExprents(true, true)) {
+        if (inner instanceof VarExprent var && var.getLVT() != null && var.getLVT().getIndex() >= 0) {
+          slots.add(var.getLVT().getIndex());
+        }
+      }
+    }
+    return slots;
+  }
+
   /** True when a handler slot lies above the local's whole slot range, so it was still reserved. */
   private static boolean belowHandlerSlot(List<Integer> handlerSlots, VarExprent var) {
     VarType type = var.getVarType();
@@ -1036,6 +1060,11 @@ public final class LocalDeclarationOrder {
     if (stat.type == Statement.StatementType.SEQUENCE
         || (stat.type == Statement.StatementType.ROOT && onlyBasicBlocks(stat))) {
       hoistInSequence(stat, varproc, names, method);
+    } else if (stat.type == Statement.StatementType.ROOT) {
+      // A method body that is one control statement prints that statement under the root's own
+      // declarations: a try there is the root's child, not a sequence's, and a body local the
+      // target allocated below a handler's or resource's slot was declared above the whole try.
+      hoistNestedOut(stat, varproc, names, method);
     }
     for (Statement child : stat.getStats()) {
       hoistAcrossStatements(child, varproc, names, method);
