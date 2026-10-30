@@ -400,10 +400,17 @@ public class StackVarsProcessor {
         setRet(ret, index + 1, 1);
         return;
       } else if (right instanceof VarExprent) {
-        onDeletedVar(stat, left, right, lvts, ssau);
+        // A declaration store the decompiler restored from the target's own instructions is not
+        // a stack copy: javac emitted it, and dropping it loses an instruction. Only stack
+        // temporaries and unmarked copies are the decompiler's to remove.
+        if (left.isStack() || !left.isDefinition()) {
+          onDeletedVar(stat, left, right, lvts, ssau);
 
-        lstExprents.remove(index);
-        setRet(ret, index, 1);
+          lstExprents.remove(index);
+          setRet(ret, index, 1);
+        } else {
+          setRet(ret, -1, changed);
+        }
         return;
       } else if (left.isStack() && right instanceof FunctionExprent) {
         FunctionExprent func = (FunctionExprent) right;

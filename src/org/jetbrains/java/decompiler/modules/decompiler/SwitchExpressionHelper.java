@@ -1,10 +1,16 @@
 package org.jetbrains.java.decompiler.modules.decompiler;
 
+import org.jetbrains.java.decompiler.code.CodeConstants;
+import org.jetbrains.java.decompiler.code.FullInstructionSequence;
+import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
+import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
+import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.util.Pair;
 
 import java.util.*;
@@ -223,11 +229,35 @@ public final class SwitchExpressionHelper {
 
       List<Exprent> exprents = suc.getExprents();
 
+      // A source variable declared just before the switch — `BlockPos targetPos = zeroPos;` —
+      // whose only other store is the switch expression's result. The stack-variable pass drops
+      // the declaration as an unused assignment (nothing reads the value before the switch
+      // overwrites it), but the target still runs it before the selector and the variable's
+      // local row opens right after its store, so the source declared it there. Print it back
+      // before the switch-expression assignment.
+      int[] prelude = RoundTrip.selector("switchjoin") ? switchPrelude(stat, exprents) : null;
+
       VarExprent vExpr = new VarExprent(relevantVar.getIndex(), relevantVar.getVarType(), relevantVar.getProcessor());
       vExpr.setStack(true); // We want to inline
       AssignmentExprent toAdd = new AssignmentExprent(vExpr, new SwitchExprent(stat, relevantVar.getExprType(), false, false), null);
 
       exprents.add(0, toAdd);
+
+      if (prelude != null) {
+        VarExprent joinVar = firstJoinVar(exprents, prelude[0]);
+        VarExprent preExpr = joinVar == null
+          ? new VarExprent(prelude[0], relevantVar.getVarType(), relevantVar.getProcessor())
+          : (VarExprent) joinVar.copy();
+        preExpr.setDefinition(true);
+        VarType valueType = preludeValueType(RoundTrip.currentMethod(), prelude[1], prelude[2]);
+        VarExprent value = new VarExprent(prelude[1], valueType == null ? VarType.VARTYPE_OBJECT : valueType,
+          relevantVar.getProcessor());
+        AssignmentExprent pre = new AssignmentExprent(preExpr, value, null);
+        java.util.BitSet offsets = new java.util.BitSet();
+        offsets.set(prelude[2], prelude[3]);
+        pre.addBytecodeOffsets(offsets);
+        exprents.add(0, pre);
+      }
 
       // move exprents from switch head to successor
       List<Exprent> firstExprents = stat.getFirst().getExprents();
@@ -424,5 +454,108 @@ public final class SwitchExpressionHelper {
 
   public static boolean hasSwitchExpressions(RootStatement statement) {
     return statement.mt.getBytecodeVersion().hasSwitchExpressions() && DecompilerContext.getOption(IFernflowerPreferences.SWITCH_EXPRESSIONS);
+  }
+
+  /** The real-variable assignment in the successor's exprents that stores the switch's value. */
+  private static VarExprent firstJoinVar(List<Exprent> exprents, int slot) {
+    for (Exprent ex : exprents) {
+      if (ex instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent left
+          && left.getIndex() == slot && !left.isStack()) {
+        return left;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The declaration store the target runs just before a switch expression's selector, as
+   * {@code {slot, loaded slot, load offset, store end}}, or null. The stack-variable pass removes
+   * an assignment to a source-named local whose value is a plain variable and whose version is
+   * never read again, which is exactly the initial value a switch expression then overwrites. The
+   * target ties the store to the switch: the stored slot's local row opens at the instruction
+   * after the store, so the source declared the variable with that store, and the store sits
+   * before the selector's own instructions.
+   */
+  private static int[] switchPrelude(SwitchStatement stat, List<Exprent> successor) {
+    StructMethod method = RoundTrip.currentMethod();
+    if (method == null || successor == null || successor.isEmpty() || stat.getHeadexprent() == null) {
+      return null;
+    }
+    int joinSlot = -1;
+    for (Exprent ex : successor) {
+      if (ex instanceof AssignmentExprent assign && assign.getLeft() instanceof VarExprent left
+          && !left.isStack()) {
+        joinSlot = left.getIndex();
+        break;
+      }
+    }
+    if (joinSlot < 0) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table = method.getLocalVariableAttr();
+    FullInstructionSequence seq = method.getInstructionSequence();
+    if (table == null || seq == null) {
+      return null;
+    }
+    int rowStart = -1;
+    for (StructLocalVariableTableAttribute.LocalVariable row : table.getVariables().toList()) {
+      if (row.getIndex() == joinSlot) {
+        rowStart = row.getStart();
+        break;
+      }
+    }
+    int selectorStart = RoundTrip.firstExprentOffset(stat.getHeadexprent());
+    if (rowStart < 0 || selectorStart < 0) {
+      return null;
+    }
+    for (int i = 1; i < seq.length(); i++) {
+      Instruction store = seq.getInstr(i);
+      int storeEnd = store.startOffset + store.length;
+      // The store has to be the instruction right before the selector's own code: a store
+      // elsewhere before the switch (a loop-local initializer, say) is not the declaration
+      // the selector overwrites.
+      if (storeEnd != rowStart || storeEnd != selectorStart
+          || RoundTrip.storeSlotAt(method, store.startOffset) != joinSlot) {
+        continue;
+      }
+      Instruction load = seq.getInstr(i - 1);
+      int slot = loadSlot(load);
+      if (slot < 0 || slot == joinSlot) {
+        return null;
+      }
+      return new int[]{joinSlot, slot, load.startOffset, storeEnd};
+    }
+    return null;
+  }
+
+  /** The slot a plain local load reads, or -1 when the instruction is not one. */
+  private static int loadSlot(Instruction instr) {
+    int opcode = instr.opcode;
+    if (opcode == CodeConstants.opc_iload || opcode == CodeConstants.opc_lload
+        || opcode == CodeConstants.opc_fload || opcode == CodeConstants.opc_dload
+        || opcode == CodeConstants.opc_aload) {
+      return instr.operand(0);
+    }
+    if (opcode >= CodeConstants.opc_iload_0 && opcode <= CodeConstants.opc_aload_3) {
+      return (opcode - CodeConstants.opc_iload_0) % 4;
+    }
+    return -1;
+  }
+
+  /** The declared type of the local a load reads, from the table row covering the instruction. */
+  private static VarType preludeValueType(StructMethod method, int slot, int offset) {
+    if (method == null) {
+      return null;
+    }
+    StructLocalVariableTableAttribute table = method.getLocalVariableAttr();
+    if (table == null) {
+      return null;
+    }
+    for (StructLocalVariableTableAttribute.LocalVariable row : table.getVariables().toList()) {
+      if (row.getIndex() == slot && row.getStart() <= offset && row.getEnd() > offset) {
+        return row.getVarType();
+      }
+    }
+    return null;
   }
 }

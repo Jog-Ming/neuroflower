@@ -62,9 +62,21 @@ public final class ReturnedVariable {
         if (slot < 0) {
           continue;
         }
-        VarExprent variable = findVariable(exit.getValue(), slot);
-        if (variable == null || exit.getValue() instanceof VarExprent) {
+        if (exit.getValue() instanceof VarExprent) {
           continue;
+        }
+        VarExprent variable = findVariable(exit.getValue(), slot);
+        if (variable == null) {
+          // The expression does not read the slot: the source assigned the value to a variable
+          // and returned it, which the target's `store N; load N; return` still shows (a switch
+          // expression's result, for one). The table names the variable; without a row it has no
+          // printable name.
+          LocalVariable lvt = exit.bytecode == null ? null : localOf(slot, exit.bytecode.nextSetBit(0));
+          if (lvt == null) {
+            continue;
+          }
+          variable = new VarExprent(slot, lvt.getVarType(), null);
+          variable.setLVT(lvt);
         }
         VarProcessor processor = variable.getProcessor();
         if (processor != null && processor.getVarFinal(variable.getVarVersionPair()) == FinalType.EXPLICIT_FINAL) {
