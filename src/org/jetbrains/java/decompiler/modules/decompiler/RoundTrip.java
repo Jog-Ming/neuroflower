@@ -7315,6 +7315,94 @@ public final class RoundTrip {
   }
 
   /**
+   * True when the instruction ending exactly at the else arm's first offset is a goto to the
+   * join: the target's then ended where the test's false path skipped the else, so the rest of
+   * the arm the tree absorbed was the source's code after the if.
+   */
+  public static boolean mergeJumpsTo(int elseStart, int join) {
+    if (!selector("elsepost") || elseStart < 0 || join <= elseStart) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, Integer> byEnd = method == null ? null : INSTRUCTION_BY_END.get(method);
+    java.util.Map<Integer, Integer> gotos = method == null ? null : GOTO_TARGETS.get(method);
+    if (byEnd == null || gotos == null) {
+      return false;
+    }
+    Integer merge = byEnd.get(elseStart);
+    Integer target = merge == null ? null : gotos.get(merge);
+    return target != null && target == join;
+  }
+
+  /**
+   * True when the target's table starts a second row for this slot exactly at the join: a local
+   * declared before the test and assigned inside the arm, which javac splits into one row per
+   * assignment path. There is no store at the second row's start — the variable is already
+   * assigned on every path that reaches it.
+   */
+  public static boolean joinSecondRange(int slot, int join) {
+    if (!selector("elsepost") || slot < 0 || join < 0) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    StructLocalVariableTableAttribute table = method == null ? null : method.getLocalVariableAttr();
+    if (table == null) {
+      return false;
+    }
+    for (LocalVariable row : table.getVariables().toList()) {
+      if (row.getIndex() == slot && row.getStart() == join && row.getEnd() > row.getStart()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when this if's trailing `continue` is really the loop's own back edge, not a written
+   * statement: the last branch of its condition lands on a {@code goto} to the loop's head, so
+   * the branch skipped only the arm and fell into the latch. A written {@code continue} branches
+   * straight to the head — there is no goto for the branch to land on — which is the shape
+   * {@code CONTINUE_GUARDS} records.
+   */
+  public static boolean landsOnLoopLatch(Statement stat) {
+    if (!selector("loopjump")
+        || !(stat instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement ifstat)) {
+      return false;
+    }
+    StructMethod method = currentMethod();
+    Exprent head = ifstat.getHeadexprent();
+    if (method == null || head == null || head.bytecode == null || head.bytecode.isEmpty()) {
+      return false;
+    }
+    java.util.Map<Integer, Integer> branchStarts = BRANCH_STARTS.get(method);
+    java.util.Map<Integer, Integer> gotos = GOTO_TARGETS.get(method);
+    if (branchStarts == null || gotos == null) {
+      return false;
+    }
+    int start = head.bytecode.nextSetBit(0);
+    int end = head.bytecode.length();
+    int lastStart = -1;
+    int lastTarget = -1;
+    for (java.util.Map.Entry<Integer, Integer> branch : branchStarts.entrySet()) {
+      int at = branch.getKey();
+      if (at >= start && at < end && at > lastStart) {
+        lastStart = at;
+        lastTarget = branch.getValue();
+      }
+    }
+    Integer latch = lastTarget < 0 ? null : gotos.get(lastTarget);
+    if (latch == null) {
+      return false;
+    }
+    Statement loop = stat.getParent();
+    while (loop != null && !(loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement)) {
+      loop = loop.getParent();
+    }
+    return loop instanceof org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement doStatement
+      && isLoopHeadTarget(doStatement, latch);
+  }
+
+  /**
    * True when this bare void return is the method's exit that the block merely falls out of: the
    * target's jump from inside the block lands on the return, so the source let the block complete.
    * Printing a `return;` inside the braces compiles to `monitorexit; return` instead.

@@ -1280,6 +1280,20 @@ public class SequenceStatement extends Statement {
         }
       }
 
+      // `if (C) { a; b; } throw; tail…`: the target's merge goto lands on the throw's end, and
+      // the locals the tail reads have a second table row starting exactly there — javac's
+      // definite-assignment split of a local declared above the test. The source assigned them
+      // inside the arm, wrote the throw as its else, and the tail after the if/else.
+      if (i + 2 == stats.size() && st instanceof IfStatement ifStatement
+          && ifStatement.iftype == IfStatement.IFTYPE_IF && ifStatement.getElsestat() == null
+          && !ifStatement.isLabeled() && !stats.get(i + 1).isLabeled()
+          && ifStatement.getIfstat() instanceof SequenceStatement arm
+          && RoundTrip.selector("elsepost")
+          && printSplitJoinElse(buf, indent, ifStatement, arm, stats.get(i + 1))) {
+        notempty = true;
+        break;
+      }
+
       // `if (C) { A } rest…` where the target's branch lands on the first statement after the
       // guard and A ends with a join jump over all of them: the source wrote `if (C) { A }
       // else { rest… }`. A written guard has no such jump: its branch skips the arm.
@@ -2792,6 +2806,125 @@ public class SequenceStatement extends Statement {
     List<Exprent> exprents = block.getExprents();
     return exprents != null && exprents.size() == 1 && exprents.get(0) instanceof ExitExprent exit
       && exit.getExitType() == ExitExprent.Type.THROW;
+  }
+
+  /**
+   * Prints the guard whose arm the target closed at the join: the throw after the test is the
+   * source's else, the locals the tail reads were declared above the test and assigned inside
+   * the arm, and the tail prints after the if/else. False, printing nothing, unless the class
+   * file proves each step: the goto ending at the throw's first offset lands on its end, and each
+   * moved local starts a second table row exactly there.
+   */
+  private static boolean printSplitJoinElse(TextBuffer buf, int indent, IfStatement ifStatement,
+                                            SequenceStatement arm, Statement abrupt) {
+    if (!isLoneThrow(abrupt) || arm.getStats().size() < 2) {
+      return false;
+    }
+    Statement first = arm.getStats().get(0);
+    List<Exprent> exprents = first.getExprents();
+    if (exprents == null || exprents.size() < 2) {
+      return false;
+    }
+    int elseStart = RoundTrip.firstOffset(abrupt);
+    int join = RoundTrip.lastEnd(abrupt);
+    if (elseStart < 0 || !RoundTrip.mergeJumpsTo(elseStart, join)) {
+      return false;
+    }
+    int split = -1;
+    for (int k = 0; k < exprents.size(); k++) {
+      int start = RoundTrip.exprentStart(exprents.get(k));
+      if (start < 0) {
+        return false;
+      }
+      if (start >= join) {
+        split = k;
+        break;
+      }
+    }
+    if (split <= 0) {
+      return false;
+    }
+    List<Exprent> kept = exprents.subList(0, split);
+    List<Exprent> moved = new ArrayList<>(exprents.subList(split, exprents.size()));
+    java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> reads =
+      new java.util.HashSet<>();
+    for (Exprent exprent : moved) {
+      collectReads(exprent, reads);
+    }
+    for (int k = 1; k < arm.getStats().size(); k++) {
+      collectReads(arm.getStats().get(k), reads);
+    }
+    List<Exprent> declarations = new ArrayList<>();
+    for (Exprent exprent : kept) {
+      VarExprent definition = definedVar(exprent);
+      if (definition == null || !reads.contains(
+          new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(definition))) {
+        continue;
+      }
+      int slot = definition.getLVT() == null ? -1 : definition.getLVT().getIndex();
+      if (slot < 0 || !RoundTrip.joinSecondRange(slot, join)) {
+        return false;
+      }
+      VarExprent bare = (VarExprent) definition.copy();
+      bare.setDefinition(true);
+      bare.bytecode = null;
+      declarations.add(bare);
+      definition.setDefinition(false);
+    }
+    if (declarations.isEmpty()) {
+      return false;
+    }
+    buf.append(ExprProcessor.listToJava(declarations, indent));
+    buf.append(ExprProcessor.listToJava(ifStatement.getVarDefinitions(), indent));
+    buf.append(ifStatement.getFirst().toJava(indent));
+    buf.appendIndent(indent).append(ifStatement.getHeadexprent().toJava(indent)).append(" {").appendLineSeparator();
+    buf.append(ExprProcessor.listToJava(kept, indent + 1));
+    buf.appendIndent(indent).append("} else {").appendLineSeparator();
+    buf.append(ExprProcessor.jmpWrapper(abrupt, indent + 1, false));
+    buf.appendIndent(indent).append("}").appendLineSeparator();
+    buf.append(ExprProcessor.listToJava(moved, indent));
+    for (int k = 1; k < arm.getStats().size(); k++) {
+      buf.append(ExprProcessor.jmpWrapper(arm.getStats().get(k), indent, k == 1));
+    }
+    return true;
+  }
+
+  /** The variable an exprent defines — a bare declaration or an assignment's left side. */
+  private static VarExprent definedVar(Exprent exprent) {
+    if (exprent instanceof VarExprent var) {
+      return var;
+    }
+    if (exprent instanceof AssignmentExprent assignment && assignment.getLeft() instanceof VarExprent var) {
+      return var;
+    }
+    return null;
+  }
+
+  /** Every variable the expression tree reads, keyed the way the SSA pairs name it. */
+  private static void collectReads(Exprent exprent,
+                                   java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> reads) {
+    for (Exprent part : exprent.getAllExprents(true, true)) {
+      if (part instanceof VarExprent var && !var.isDefinition()) {
+        reads.add(new org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair(var));
+      }
+    }
+  }
+
+  /** Every variable the statement's subtree reads. */
+  private static void collectReads(Statement stat,
+                                   java.util.Set<org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair> reads) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        collectReads(exprent, reads);
+      }
+    }
+    for (Exprent definition : stat.getVarDefinitions()) {
+      collectReads(definition, reads);
+    }
+    for (Statement child : stat.getStats()) {
+      collectReads(child, reads);
+    }
   }
 
   /**

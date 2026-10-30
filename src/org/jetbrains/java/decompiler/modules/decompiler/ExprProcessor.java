@@ -1316,7 +1316,12 @@ public class ExprProcessor implements CodeConstants {
       StatEdge edge = lstSuccs.get(0);
       if (edge.getType() != StatEdge.TYPE_REGULAR && edge.explicit && !(edge.getDestination() instanceof DummyExitStatement)
         && !yieldsFromBlock(stat) && !RoundTrip.isJumpSuppressed(stat) && !RoundTrip.isClosureHidden(edge)
-        && !RoundTrip.printedBreak(stat) && !RoundTrip.isDeferredBreak(edge)) {
+        && !RoundTrip.printedBreak(stat) && !RoundTrip.isDeferredBreak(edge)
+        // The edge is the loop's own back edge: the target's branch lands on a goto to the head,
+        // so the source wrote no continue and the branch falls into the latch instead. A labelled
+        // continue is a source statement of its own and keeps its printed jump.
+        && !(edge.getType() == StatEdge.TYPE_CONTINUE && !edge.labeled
+             && RoundTrip.landsOnLoopLatch(stat))) {
         int jumpOffset = addDeletedGotoInstructionMapping(stat, buf);
         // The target starts no line at the jump when the source ended the previous statement with
         // `break;`/`continue;` on the same line; keep it there.
