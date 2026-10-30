@@ -228,6 +228,12 @@ public class ExprProcessor implements CodeConstants {
     Exprent pendingFieldAccess = null;
     int pendingFieldIndex = -1;
 
+    // The value a `pop` discarded, waiting for the static call whose arguments start at the stack
+    // depth it was popped from: that value is the source's qualifier of a static member access
+    // written through an expression, and javac evaluates it only for its side effects.
+    Exprent pendingStaticQualifier = null;
+    int pendingStaticDepth = -1;
+
     for (int i = 0; i < seq.length(); i++) {
 
       Instruction instr = seq.getInstr(i);
@@ -523,6 +529,14 @@ public class ExprProcessor implements CodeConstants {
             }
 
             InvocationExprent exprinv = new InvocationExprent(instr.opcode, invoke_constant, bootstrapMethod, bootstrap_arguments, stack, bytecode_offsets);
+            if (instr.opcode == opc_invokestatic && pendingStaticQualifier != null
+                && stack.size() == pendingStaticDepth) {
+              // This call's arguments start at the depth the discarded value was popped from:
+              // the value is the call's qualifier, evaluated by javac only for its side effects.
+              exprinv.setStaticQualifier(pendingStaticQualifier);
+              pendingStaticQualifier = null;
+              pendingStaticDepth = -1;
+            }
             if (exprinv.getDescriptor().ret.type == CodeType.VOID) {
               exprlist.add(exprinv);
             }
@@ -601,7 +615,12 @@ public class ExprProcessor implements CodeConstants {
           stack.pop();
           break;
         case opc_pop:
+          Exprent discarded = staticQualifierValue(exprlist, stack);
           stack.pop();
+          if (discarded != null) {
+            pendingStaticQualifier = discarded;
+            pendingStaticDepth = stack.size();
+          }
           // check for synthetic getClass and requireNonNull calls added by the compiler
           // see https://stackoverflow.com/a/20130641
           if (!exprlist.isEmpty()) {
@@ -655,6 +674,77 @@ public class ExprProcessor implements CodeConstants {
           break;
       }
     }
+  }
+
+  /**
+   * The value a {@code pop} discards when it can be the qualifier of a static member access
+   * written through an expression, or null. Only a field access or a plain variable load
+   * qualifies: javac evaluates such a qualifier and drops the value, while a discarded call is
+   * an expression statement of its own and prints where it stands.
+   */
+  private static Exprent staticQualifierValue(List<Exprent> exprlist, ListStack<Exprent> stack) {
+    if (!RoundTrip.selector("staticexpr") || exprlist.isEmpty() || stack.isEmpty()) {
+      return null;
+    }
+    Exprent top = stack.getByOffset(-1);
+    Exprent last = exprlist.get(exprlist.size() - 1);
+    if (!(top instanceof VarExprent topVar) || !topVar.isStack()
+        || !(last instanceof AssignmentExprent assign)
+        || !(assign.getLeft() instanceof VarExprent target) || !target.isStack()
+        || target.getIndex() != topVar.getIndex()) {
+      return null;
+    }
+    Exprent value = assign.getRight();
+    if (value instanceof FieldExprent) {
+      return resolveStackVars(value, exprlist, exprlist.size() - 1, 0);
+    }
+    if (value instanceof VarExprent variable && !variable.isStack()) {
+      return value.copy();
+    }
+    return null;
+  }
+
+  /**
+   * A deep copy of a value with every stack temporary replaced by what it was assigned before it
+   * was popped. The copy is printed inside a later exprent, where the stack simplifier would bind
+   * the temporary to the last assignment at that depth instead of the one the pop discarded —
+   * in {@code this.gameRenderer.preloadUiShader(x)} the same depth later holds the argument. Only
+   * the assignments before {@code limit} may define a temporary: a getfield's result sits at the
+   * same depth as its own receiver, so its own assignment would answer for the receiver.
+   */
+  private static Exprent resolveStackVars(Exprent value, List<Exprent> exprlist, int limit, int depth) {
+    if (depth > 8) {
+      return value.copy();
+    }
+    if (value instanceof VarExprent var && var.isStack()) {
+      for (int i = Math.min(limit, exprlist.size()) - 1; i >= 0; i--) {
+        if (exprlist.get(i) instanceof AssignmentExprent assign
+            && assign.getLeft() instanceof VarExprent left && left.isStack()
+            && left.getIndex() == var.getIndex()) {
+          return resolveStackVars(assign.getRight(), exprlist, i, depth + 1);
+        }
+      }
+      return value.copy();
+    }
+    if (value instanceof FieldExprent field) {
+      FieldExprent copy = (FieldExprent) field.copy();
+      if (field.getInstance() != null) {
+        copy.setInstance(resolveStackVars(field.getInstance(), exprlist, limit, depth + 1));
+      }
+      return copy;
+    }
+    if (value instanceof InvocationExprent invocation) {
+      InvocationExprent copy = (InvocationExprent) invocation.copy();
+      if (invocation.getInstance() != null) {
+        copy.setInstance(resolveStackVars(invocation.getInstance(), exprlist, limit, depth + 1));
+      }
+      List<Exprent> parameters = copy.getLstParameters();
+      for (int i = 0; i < parameters.size(); i++) {
+        parameters.set(i, resolveStackVars(parameters.get(i), exprlist, limit, depth + 1));
+      }
+      return copy;
+    }
+    return value.copy();
   }
 
   private void pushEx(ListStack<Exprent> stack, List<Exprent> exprlist, Exprent exprent) {

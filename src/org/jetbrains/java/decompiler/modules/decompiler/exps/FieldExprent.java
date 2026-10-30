@@ -275,6 +275,10 @@ public class FieldExprent extends Exprent {
     return instance;
   }
 
+  public void setInstance(Exprent instance) {
+    this.instance = instance;
+  }
+
   public boolean isStatic() {
     return isStatic;
   }

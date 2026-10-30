@@ -73,6 +73,12 @@ public class InvocationExprent extends Exprent {
   private boolean canIgnoreBoxing = true;
   private Type functype = Type.GENERAL;
   private Exprent instance;
+  /**
+   * The expression the target evaluated and discarded right before a static call's arguments:
+   * the source's qualifier of a static member access written through an expression
+   * ({@code this.gameRenderer.preloadUiShader(x)}). Null for the usual unqualified call.
+   */
+  private Exprent staticQualifier;
   private StructMethod desc = null;
   private MethodDescriptor descriptor;
   private String stringDescriptor;
@@ -116,6 +122,15 @@ public class InvocationExprent extends Exprent {
 
   public void setQualifierBreak(boolean qualifierBreak) {
     this.qualifierBreak = qualifierBreak;
+  }
+
+  /** The discarded qualifier of a static member access, or null for an unqualified call. */
+  public Exprent getStaticQualifier() {
+    return staticQualifier;
+  }
+
+  public void setStaticQualifier(Exprent staticQualifier) {
+    this.staticQualifier = staticQualifier;
   }
   /** While printing a `new T(...) { ... }` creation's arguments, a chain break is not a source break. */
   private static final ThreadLocal<Boolean> ANONYMOUS_CREATION = ThreadLocal.withInitial(() -> Boolean.FALSE);
@@ -257,6 +272,10 @@ public class InvocationExprent extends Exprent {
     instance = expr.getInstance();
     if (instance != null) {
       instance = instance.copy();
+    }
+    staticQualifier = expr.getStaticQualifier();
+    if (staticQualifier != null) {
+      staticQualifier = staticQualifier.copy();
     }
     invocationType = expr.getInvocationType();
     invokeDynamicClassSuffix = expr.getInvokeDynamicClassSuffix();
@@ -1110,6 +1129,9 @@ public class InvocationExprent extends Exprent {
     if (instance != null) {
       lst.add(instance);
     }
+    if (staticQualifier != null) {
+      lst.add(staticQualifier);
+    }
     lst.addAll(lstParameters);
     return lst;
   }
@@ -1141,7 +1163,7 @@ public class InvocationExprent extends Exprent {
     boolean pushedCallChainGroup = false;
 
     if (isStatic || invocationType == InvocationType.DYNAMIC || invocationType == InvocationType.CONSTANT_DYNAMIC) {
-      if (isBoxingCall() && canIgnoreBoxing && !boxing.forceBoxing) {
+      if (staticQualifier == null && isBoxingCall() && canIgnoreBoxing && !boxing.forceBoxing) {
         // process general "boxing" calls, e.g. 'Object[] data = { true }' or 'Byte b = 123'
         // here 'byte' and 'short' values do not need an explicit narrowing type cast
         ExprProcessor.getCastedExprent(lstParameters.get(0), descriptor.params[0], buf, indent, ExprProcessor.NullCastType.DONT_CAST, false, true, false);
@@ -1153,11 +1175,19 @@ public class InvocationExprent extends Exprent {
         buf.append('(').appendCastTypeName(descriptor.ret).append(')');
       }
 
-      ClassNode node = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
-      if (node == null || !classname.equals(node.classStruct.qualifiedName)
-        || (witnessQualifier && !genericArgs.isEmpty())) {
-        // An unqualified call has no place for a witness: `.m()` is not valid Java.
-        buf.appendAllClasses(DecompilerContext.getImportCollector().getShortNameInClassContext(ExprProcessor.buildJavaClassName(classname)), classname);
+      if (staticQualifier != null) {
+        // The source wrote the call through an expression (`this.gameRenderer.preloadUiShader(x)`):
+        // javac evaluates that qualifier and discards it, which is the push/pop pair the class
+        // file records right before the call's arguments.
+        buf.append(staticQualifier.toJava(indent));
+      }
+      else {
+        ClassNode node = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+        if (node == null || !classname.equals(node.classStruct.qualifiedName)
+          || (witnessQualifier && !genericArgs.isEmpty())) {
+          // An unqualified call has no place for a witness: `.m()` is not valid Java.
+          buf.appendAllClasses(DecompilerContext.getImportCollector().getShortNameInClassContext(ExprProcessor.buildJavaClassName(classname)), classname);
+        }
       }
     }
     else {
