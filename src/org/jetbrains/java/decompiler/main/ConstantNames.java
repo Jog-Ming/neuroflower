@@ -244,6 +244,23 @@ public final class ConstantNames {
       if (!existsAt(owner, start)) {
         return false;
       }
+      // The pair's own record is the exact placement; a printed-line window only approximates it.
+      // Where the site has a generation point, the pair's bracket decides and the window cannot
+      // admit a literal it rejects (an unplaceable site, such as a field initializer's, has no
+      // generation point and is left to the window).
+      PairSite pair = pairs == null ? null : pairs.get(owner);
+      if (pair != null) {
+        long coordinate = siteCoordinate(spaces, start);
+        if (coordinate != NO_COORDINATE) {
+          if (pair.successorKey() != null && !pairProvesBounds(pair, start, this)) {
+            return false; // a folded value's own instruction is the only place its naming stood
+          }
+          if (pair.successorKey() == null
+              && (coordinate <= pair.lower() || coordinate >= pair.successor())) {
+            return false; // outside the generation gap the pair leaves for its reference
+          }
+        }
+      }
       int[] window = windows == null ? null : windows.get(owner);
       if (window != null && start >= window[0] && start < window[1]) {
         return true;
@@ -5678,7 +5695,8 @@ public final class ConstantNames {
         int end = skipQuoted(text, i, '"');
         if (!text.startsWith("\"\"\"", i) && end - 1 > i) {
           String value = unescape(text.substring(i + 1, end - 1));
-          if (value != null && !value.isEmpty()) {
+          if (value != null) {
+            // The empty string is a value a string constant can hold and a naming can fold to.
             addSite(sites, i, end, VariableType.STRING + "|" + value, "", candidates, imports, packageName, own, ownInitializers,
               placement, deferred, inWindow, invented);
           }
