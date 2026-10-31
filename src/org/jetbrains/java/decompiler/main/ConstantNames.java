@@ -3799,6 +3799,14 @@ public final class ConstantNames {
     if (initializerProof(pair, owner, position, placement)) {
       return true;
     }
+    String declared = declaredInitializer(placement, position);
+    if (declared != null && constantField(placement.cls(), declared)) {
+      // A compile-time constant initializer generates no code, so the printer records no point of
+      // its own for the literal; whatever instruction precedes it in the class's <clinit> text is
+      // not the literal's generation point. Such a site stands only on the initializer proof
+      // (the phase rule), never on the printed-position bracket.
+      return false;
+    }
     long coordinate = siteCoordinate(placement.spaces(), position);
     if (coordinate == NO_COORDINATE) {
       // A field initializer's folded literal is printed at its declaration, where the printer maps
