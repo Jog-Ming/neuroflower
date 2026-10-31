@@ -2931,6 +2931,13 @@ public final class ConstantNames {
       for (long[] literal : literals) {
         int start = (int) literal[0];
         long raw = literal[2];
+        // A negative constant is printed as a unary minus before a non-negative literal, and the
+        // whole expression is the naming's site: the owner's constant holds the signed value.
+        int minus = unaryMinusAt(text, start);
+        if (minus >= 0) {
+          start = minus;
+          raw = -raw;
+        }
         if (raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE || hasSiteAt(sites, start)) {
           continue;
         }
