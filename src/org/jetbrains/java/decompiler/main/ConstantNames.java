@@ -224,8 +224,8 @@ public final class ConstantNames {
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
-                           Set<String> bares, Set<String> earlyOwners, boolean ownEarly,
-                           boolean ownProven, StructClass cls, String text) {
+                           Set<String> valueRecords, Set<String> bares, Set<String> earlyOwners,
+                           boolean ownEarly, boolean ownProven, StructClass cls, String text) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -390,8 +390,8 @@ public final class ConstantNames {
 
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), Map.of(),
-      Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false,
-      null, "");
+      Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), false,
+      false, null, "");
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -827,6 +827,23 @@ public final class ConstantNames {
       }
       activeValues.put(owner, entry.getValue());
     }
+    // A value successor no constant of its owner produces was not entered by a naming of one of
+    // that owner's constants: the value after the pair belongs to whatever was entered next, and
+    // the record proves no value site. Only a record some constant really folds to restricts the
+    // owner's other sites to that value's literal.
+    Set<String> valueRecords = new HashSet<>();
+    for (Map.Entry<String, PairSite> entry : activePairs.entrySet()) {
+      String successorKey = entry.getValue().successorKey();
+      if (successorKey != null
+          && valueSolvable(entry.getKey(), successorKey, own, imports, packageName)) {
+        valueRecords.add(entry.getKey());
+      }
+    }
+    for (Map.Entry<String, ValueSite> entry : activeValues.entrySet()) {
+      if (valueSolvable(entry.getKey(), entry.getValue().poolKey(), own, imports, packageName)) {
+        valueRecords.add(entry.getKey());
+      }
+    }
     Set<String> inheritedNames = new HashSet<>();
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
@@ -1016,8 +1033,8 @@ public final class ConstantNames {
     return new Rules(candidates,
       new Placement(windows, coordinates, spaces(own, positions), strict, anchored, direct,
         folded, internedAt, namingAt, lexical, spans, new HashSet<>(prefixOwners(own)),
-        inheritedNames, activePairs, activeValues, bares, earlyOwners, ownEarly, ownProven, own,
-        text),
+        inheritedNames, activePairs, activeValues, valueRecords, bares, earlyOwners, ownEarly,
+        ownProven, own, text),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -2291,14 +2308,87 @@ public final class ConstantNames {
   private record ValueSite(int classIndex, long naming, String poolKey) {
     /** Whether this literal would fold to the very value the pool entered with the pair. */
     boolean accepts(String key) {
-      if (key.equals(poolKey)) {
+      return sameFoldedValue(poolKey, key);
+    }
+  }
+
+  /**
+   * Whether a literal with this key folds to the recorded value.
+   *
+   * <p>A char constant folds to the same int value, and javac enters the same Integer entry, so
+   * the two keys name one value. A constant of a narrower numeric kind used where a wider literal
+   * stands folds through the widening conversion as well: {@code Short.BYTES} (int 2) is the
+   * naming of a long 2 where the use wants a long, and enters the pool's Long entry.
+   */
+  private static boolean sameFoldedValue(String recorded, String key) {
+    if (recorded.equals(key)) {
+      return true;
+    }
+    int recordedBar = recorded.indexOf('|');
+    int keyBar = key.indexOf('|');
+    if (recordedBar < 0 || keyBar < 0) {
+      return false;
+    }
+    VariableType recordedKind = variableType(recorded.substring(0, recordedBar));
+    VariableType keyKind = variableType(key.substring(0, keyBar));
+    if (recordedKind == null || keyKind == null || !numeric(recordedKind)
+        || !numeric(keyKind)) {
+      return false;
+    }
+    Object recordedNumber = kindValue(recordedKind, recorded);
+    Object keyNumber = kindValue(keyKind, key);
+    if (recordedNumber == null || keyNumber == null) {
+      return false;
+    }
+    // A constant of the literal's kind widens at the use: `Short.BYTES` (int 2) is the naming of
+    // a long 2 where the use wants a long, and the pool holds the widened value. A char constant
+    // folds to its int code the same way. The reverse is not allowed: javac never narrows a
+    // constant implicitly.
+    Object widened = convert(keyNumber, keyKind, recordedKind);
+    return widened != null && widened.equals(recordedNumber);
+  }
+
+  /**
+   * Whether a value successor is the folded value of a naming of its owner.
+   *
+   * <p>Some constant the owner declares must produce exactly that value through
+   * {@link #constantExpression}, under the same kind rules a solved site uses. A pair whose
+   * successor no constant can produce was not entered by a naming of one of the owner's
+   * constants -- the value after the pair belongs to whatever was entered next -- so the record
+   * proves no value site and must not restrict the owner's other sites.
+   */
+  private static boolean valueSolvable(String owner, String key, StructClass site,
+                                       List<String> imports, String packageName) {
+    int bar = key.indexOf('|');
+    if (bar < 0) {
+      return false;
+    }
+    VariableType kind = variableType(key.substring(0, bar));
+    Object value = kindValue(kind, key);
+    if (kind == null || value == null) {
+      return false;
+    }
+    for (SourceConstant source : sourceConstants(owner, site, imports, packageName)) {
+      if (kind == VariableType.BOOLEAN) {
+        if (source.kind() != VariableType.BOOLEAN) {
+          continue;
+        }
+      }
+      else if (kind == VariableType.STRING) {
+        if (source.kind() != VariableType.STRING) {
+          continue;
+        }
+      }
+      else if (!numeric(source.kind())
+          || (promote(source.kind(), kind) != kind && !castable(source.kind(), kind))) {
+        continue;
+      }
+      if (constantExpression(new FieldConstant(null, kind, value), source.kind(), source.value(),
+          source.name()) != null) {
         return true;
       }
-      // A char constant folds to the same int value; javac enters the same Integer entry.
-      return poolKey.startsWith(VariableType.INT.name() + "|")
-        && key.startsWith(VariableType.CHAR.name() + "|")
-        && key.substring(key.indexOf('|') + 1).equals(poolKey.substring(poolKey.indexOf('|') + 1));
     }
+    return false;
   }
 
   /**
@@ -6400,6 +6490,17 @@ public final class ConstantNames {
     // order (nothing is entered between it and the reference).
     ValueSite valueSite = placement == null || placement.values() == null
       ? null : placement.values().get(constant.owner());
+    PairSite pair = placement == null || placement.pairs() == null
+      ? null : placement.pairs().get(constant.owner());
+    // A record whose successor some constant of the owner genuinely produces is the folded value
+    // the naming entered; only a literal folding to that value can be the naming, so the record
+    // restricts every other placement of the owner. A record whose successor no constant can
+    // produce was not entered by a naming of one of its constants, so it restricts nothing.
+    boolean valueRecord = placement != null && placement.valueRecords() != null
+      && placement.valueRecords().contains(constant.owner());
+    boolean atRecordedValue = !valueRecord || (valueSite != null
+      ? valueSite.accepts(key)
+      : pair != null && pair.successorKey() != null && sameFoldedValue(pair.successorKey(), key));
     if (!lexical && valueSite != null && window == null && !placed) {
       // The value the pool entered at the naming is this literal's: only a literal that folds to
       // it (and hence names a constant of that value) reproduces the entry.
@@ -6409,13 +6510,17 @@ public final class ConstantNames {
       }
       return;
     }
-    PairSite pair = placement == null || placement.pairs() == null
-      ? null : placement.pairs().get(constant.owner());
     if (!lexical && pair != null && window == null && !placed) {
       if (pair.valueAvailable(key) && deferred != null) {
         deferred.computeIfAbsent(constant.owner(), k -> new ArrayList<>())
           .add(new Site(start, end, printed, constant.owner()));
       }
+      return;
+    }
+    if (!lexical && valueRecord && !atRecordedValue) {
+      // The source named the owner at the literal that folds to the recorded value and nowhere
+      // else: a site an uncovered printed window admits, or one whose initializer carries no
+      // generation point, is not that naming and stays as the printer wrote it.
       return;
     }
     // A foreign owner's naming site is bounded by where the original interned the owner's Class
