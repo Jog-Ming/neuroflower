@@ -707,7 +707,7 @@ public final class RoundTrip {
       return -1;
     }
     Statement firstStat = children.get(i);
-    LocalVariable first = firstPrefixLocal(firstStat);
+    LocalVariable first = closingRange(table.getVariables().toList(), firstPrefixLocal(firstStat));
     int childStart = firstOffset(firstStat);
     int close = lastEnd(owner);
     if (first == null || first.getStart() <= 0 || childStart < 0 || close < 0
@@ -9582,6 +9582,26 @@ public final class RoundTrip {
       }
     }
     return max;
+  }
+
+  /**
+   * The last recorded range of a local's table entry, or null. javac splits one variable's
+   * lifetime into a row per range, and the declaration exprent carries only the first row; a
+   * range that ends with the enclosing scope is the one the declaration's scope closed in.
+   */
+  private static LocalVariable closingRange(List<LocalVariable> rows, LocalVariable first) {
+    if (first == null) {
+      return null;
+    }
+    LocalVariable best = null;
+    for (LocalVariable row : rows) {
+      if (row.getIndex() == first.getIndex() && row.getName().equals(first.getName())
+          && row.getDescriptor().equals(first.getDescriptor())
+          && (best == null || row.getEnd() > best.getEnd())) {
+        best = row;
+      }
+    }
+    return best;
   }
 
   /**
