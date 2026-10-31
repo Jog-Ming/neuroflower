@@ -9635,6 +9635,35 @@ public final class RoundTrip {
   }
 
   /**
+   * The first continue-test operand the line table puts on a later line than its predecessor,
+   * when the body after the merged guard sat in a block of its own: the source wrote the leading
+   * tests as one enclosing if and the later ones as a nested guard around the body. The line
+   * table marks the nested statement's own line, and the table's rows prove the body's block
+   * closed before the enclosing block's; without both, the merged guard stays one statement.
+   */
+  public static int guardArmSplit(List<Exprent> operands, Statement body) {
+    if (!selector("guardarm") || operands == null || operands.size() < 2 || body == null) {
+      return -1;
+    }
+    int end = lastEnd(body);
+    if (end < 0 || !runWasBraced(body, end)) {
+      return -1;
+    }
+    int previous = -1;
+    for (int i = 0; i < operands.size(); i++) {
+      int line = sourceLineDeep(operands.get(i));
+      if (line < 0) {
+        return -1;
+      }
+      if (i > 0 && line > previous) {
+        return i;
+      }
+      previous = line;
+    }
+    return -1;
+  }
+
+  /**
    * Whether the run opening at this statement sat in a block of its own that closes with the
    * enclosing sequence: the run's first local closes there, and every row that opened before the
    * run was written after it. A flat run shares the enclosing block's close event, whose

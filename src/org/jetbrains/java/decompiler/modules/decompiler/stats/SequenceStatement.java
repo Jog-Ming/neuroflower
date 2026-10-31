@@ -478,6 +478,32 @@ public class SequenceStatement extends Statement {
         if (groups == null) {
           groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
         }
+        // A merged run of continue tests whose body the table proves sat in a block of its own:
+        // the source wrote the leading tests as one enclosing if and the tests the line table
+        // puts on a later line as a nested guard, with the body inside.
+        int armSplit = groups.size() == 1 ? RoundTrip.guardArmSplit(ors, ifStatement.getIfstat()) : -1;
+        if (armSplit > 0) {
+          buf.append(ExprProcessor.listToJava(ifStatement.varDefinitions, indent));
+          buf.append(ifStatement.getFirst().toJava(indent));
+          IfExprent enclosing = (IfExprent) ifStatement.getHeadexprent().copy();
+          enclosing.setCondition(RoundTrip.negateCondition(IfStatement.orOf(ors.subList(0, armSplit))));
+          buf.appendIndent(indent).append(enclosing.toJava(indent)).append(" {").appendLineSeparator();
+          IfExprent guard = (IfExprent) ifStatement.getHeadexprent().copy();
+          guard.setCondition(IfStatement.orOf(ors.subList(armSplit, ors.size())));
+          buf.appendIndent(indent + 1).append(guard.toJava(indent + 1)).append(" {").appendLineSeparator();
+          TextBuffer continueLine = new TextBuffer();
+          continueLine.appendIndent(indent + 2).append("continue;").appendLineSeparator();
+          int gotoOffset = RoundTrip.continueGoto(ifStatement.getHeadexprent());
+          if (gotoOffset >= 0) {
+            continueLine.addStartBytecodeMapping(gotoOffset);
+          }
+          buf.append(continueLine);
+          buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+          buf.append(ExprProcessor.jmpWrapper(ifStatement.getIfstat(), indent + 1, false));
+          buf.appendIndent(indent).append("}").appendLineSeparator();
+          notempty = true;
+          continue;
+        }
         // Each guard compiles the printed `continue;` to the goto the target's table puts on the
         // line the source wrote it on; the line alignment has to see that jump to place it. A
         // cut-out group's jump sits right before the next group's first instruction, and the

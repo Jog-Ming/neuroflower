@@ -351,6 +351,29 @@ public class IfStatement extends Statement {
       if (groups == null) {
         groups = java.util.Collections.singletonList(java.util.Collections.singletonList(source));
       }
+      // A merged run of continue tests whose body the table proves sat in a block of its own:
+      // the source wrote the leading tests as one enclosing if and the tests the line table puts
+      // on a later line as a nested guard, with the body inside.
+      int armSplit = groups.size() == 1 ? RoundTrip.guardArmSplit(ors, ifstat) : -1;
+      if (armSplit > 0) {
+        IfExprent enclosing = (IfExprent) ifHead.copy();
+        enclosing.setCondition(RoundTrip.negateCondition(orOf(ors.subList(0, armSplit))));
+        buf.appendIndent(indent).append(enclosing.toJava(indent)).append(" {").appendLineSeparator();
+        IfExprent guard = (IfExprent) ifHead.copy();
+        guard.setCondition(orOf(ors.subList(armSplit, ors.size())));
+        buf.appendIndent(indent + 1).append(guard.toJava(indent + 1)).append(" {").appendLineSeparator();
+        TextBuffer continueLine = new TextBuffer();
+        continueLine.appendIndent(indent + 2).append("continue;").appendLineSeparator();
+        int innerGoto = RoundTrip.continueGoto(ifHead);
+        if (innerGoto >= 0) {
+          continueLine.addStartBytecodeMapping(innerGoto);
+        }
+        buf.append(continueLine);
+        buf.appendIndent(indent + 1).append("}").appendLineSeparator();
+        buf.append(ExprProcessor.jmpWrapper(ifstat, indent + 1, false));
+        buf.appendIndent(indent).append("}").appendLineSeparator();
+        return buf;
+      }
       // A single guard compiles the printed `continue;` to the goto the target's table puts on the
       // line the source wrote it on; the line alignment has to see that jump to place it.
       int gotoOffset = groups.size() == 1 ? RoundTrip.continueGoto(ifHead) : -1;
