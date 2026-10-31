@@ -3738,8 +3738,51 @@ public final class ConstantNames {
           return new Site(equals + 1, range[1], " " + expression, owner);
         }
       }
+      // A string constant whose value extends another own constant's value was written as a
+      // concatenation. Naming the shorter constant in this initializer is what enters the
+      // class's own Class entry into the pool before any code, and the pool's opening pair is
+      // the record. The decomposition must be unique: two own constants that both begin the
+      // value cannot be told apart, and naming the wrong one would compile to another constant.
+      if (target.kind() != VariableType.STRING
+          || !(target.value() instanceof String value)
+          || !keyNamesValue(literalKey(text.substring(equals + 1, range[1]).trim()), target)) {
+        continue;
+      }
+      String prefix = null;
+      int prefixes = 0;
+      for (int j = 0; j < i; j++) {
+        String expression = stringPrefixExpression(value, constants.get(j));
+        if (expression != null) {
+          prefixes++;
+          prefix = expression;
+        }
+      }
+      if (prefixes == 1) {
+        return new Site(equals + 1, range[1], " " + prefix, owner);
+      }
+      if (prefixes > 1) {
+        return null; // the value decomposes into more than one own constant; no guess
+      }
     }
     return null;
+  }
+
+  /** Whether the printed initializer literal is exactly this field's constant value. */
+  private static boolean keyNamesValue(String key, FieldConstant target) {
+    String expected = target.kind().name() + "|" + target.value();
+    return key != null && canonicalKey(key).equals(canonicalKey(expected));
+  }
+
+  /**
+   * {@code NAME + "rest"} when this string constant's value begins with the source constant's
+   * value, or null when it does not extend it.
+   */
+  private static String stringPrefixExpression(String value, FieldConstant source) {
+    if (source.kind() != VariableType.STRING || !(source.value() instanceof String prefix)
+        || prefix.isEmpty() || prefix.length() >= value.length() || !value.startsWith(prefix)) {
+      return null;
+    }
+    return source.field().getName() + " + " + quote(value.substring(prefix.length()));
   }
 
   /**
