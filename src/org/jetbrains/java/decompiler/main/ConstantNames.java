@@ -228,7 +228,8 @@ public final class ConstantNames {
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
                            Set<String> valueRecords, Set<String> bares, Set<String> earlyOwners,
                            boolean ownEarly, boolean ownProven, StructClass cls, String text,
-                           Set<String> bare, boolean codeEntry) {
+                           Set<String> bare, boolean codeEntry,
+                           Map<String, List<int[]>> declarations) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -264,7 +265,7 @@ public final class ConstantNames {
       if (pair != null) {
         long coordinate = siteCoordinate(spaces, start);
         if (coordinate != NO_COORDINATE) {
-          if (pair.successorKey() != null && !pairProvesBounds(pair, start, this)) {
+          if (pair.successorKey() != null && !pairProvesBounds(pair, owner, start, this)) {
             return false; // a folded value's own instruction is the only place its naming stood
           }
           if (pair.successorKey() == null
@@ -400,7 +401,7 @@ public final class ConstantNames {
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), Map.of(),
       Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), false,
-      false, null, "", Set.of(), false);
+      false, null, "", Set.of(), false, Map.of());
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -884,8 +885,17 @@ public final class ConstantNames {
       }
     }
     Set<String> inheritedNames = new HashSet<>();
+    Set<Integer> prefixIndices = prefixClassIndices(own);
     for (String owner : missing) {
       if (isBootstrapOwner(owner)) {
+        continue;
+      }
+      Integer prefixIndex = classIndices.get(owner);
+      if (prefixIndex != null && prefixIndices.contains(prefixIndex)) {
+        // A Class pair the pool opens with was entered while the class body was attributed: its
+        // naming site is a constant initializer, and the ordered initializer chain places it. A
+        // printed-line window would admit any same-valued literal in the class body, moving the
+        // pair ahead of the namings the pool orders below it.
         continue;
       }
       if (candidateOwners.add(owner)) {
@@ -1073,7 +1083,7 @@ public final class ConstantNames {
       new Placement(windows, coordinates, spaces(own, positions), strict, anchored, direct,
         folded, internedAt, namingAt, lexical, spans, new HashSet<>(prefixOwners(own)),
         inheritedNames, activePairs, activeValues, valueRecords, bares, earlyOwners, ownEarly,
-        ownProven, own, text, bare, !firstUses.isEmpty()),
+        ownProven, own, text, bare, !firstUses.isEmpty(), fieldDeclarations(text, spans, own)),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -1872,7 +1882,7 @@ public final class ConstantNames {
    */
   private record PairSite(int classIndex, long successor, long lower, long after, int open, int close,
                           String member, String successorKey, Set<String> pooled, int successorAt,
-                          int lowerAt, int nextClass) {
+                          int lowerAt, int nextClass, boolean ownMember) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.equals(successorKey)) {
@@ -2009,6 +2019,11 @@ public final class ConstantNames {
       }
       long[] bounds = pairBounds(cls, firstUses, i, early, indices);
       if (bounds[1] != point) {
+        for (Map.Entry<Integer, FirstUse> higher : firstUses.entrySet()) {
+          if (higher.getKey() > i && coordinate(higher.getValue().order(), higher.getValue().offset())
+              == bounds[1]) {
+          }
+        }
         continue; // a higher entry was created before this reference; the pair is not its naming
       }
       int open = -1;
@@ -2059,9 +2074,16 @@ public final class ConstantNames {
       // A pair whose successor is another naming's Class entry records that the two names were
       // written in one expression, in pool order: the source named this owner, then the next.
       int nextClass = anotherNaming(pool, i + 2) ? i + 2 : -1;
+      for (Map.Entry<Integer, FirstUse> lowerEntry : firstUses.entrySet()) {
+        if (lowerEntry.getKey() < i && coordinate(lowerEntry.getValue().order(),
+            lowerEntry.getValue().offset()) == bounds[0]) {
+        }
+      }
       pairs.putIfAbsent(owner, new PairSite(i, point, bounds[0], lastPoolUse(firstUses, use),
         open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at,
-        lowerAt == null ? -1 : lowerAt, nextClass));
+        lowerAt == null ? -1 : lowerAt, nextClass,
+        link != null && link.type == CodeConstants.CONSTANT_Fieldref
+          && cls.qualifiedName.equals(link.classname)));
     }
     return pairs;
   }
@@ -2636,7 +2658,7 @@ public final class ConstantNames {
     if (rules.placement().pairs() != null) {
       for (Map.Entry<String, PairSite> entry : rules.placement().pairs().entrySet()) {
         PairSite pair = entry.getValue();
-        if (hasSiteFor(sites, entry.getKey()) || chained.contains(entry.getKey())) {
+        if (siteIn(sites, entry.getKey(), spans) || chained.contains(entry.getKey())) {
           continue; // one naming per class reproduces the pair; later names enter nothing
         }
         List<Site> candidates = deferred.get(entry.getKey());
@@ -3011,7 +3033,7 @@ public final class ConstantNames {
   private static boolean chainProves(PairSite first, PairSite last, String key, int position,
                                      Placement placement) {
     if (last.successorKey() == null) {
-      return pairProvesSite(first, key, position, placement);
+      return pairProvesSite(first, null, key, position, placement);
     }
     if (!key.equals(last.successorKey())) {
       return false;
@@ -3582,11 +3604,20 @@ public final class ConstantNames {
     Site invented = null;
     for (Map.Entry<String, PairSite> entry : placement.pairs().entrySet()) {
       PairSite pair = entry.getValue();
-      if (!pairProvesSite(pair, key, start, placement)) {
+      if (placement.prefix() != null && placement.prefix().contains(entry.getKey())
+          && declaredInitializer(placement, start) != null) {
+        // A pool-prefix owner named in a constant initializer is placed by the ordered
+        // initializer chain: that chain is the only record of the order among the namings the
+        // pool opens with. A prefix owner named in a method body (a value pair created by the
+        // first generated code) has no initializer order to keep and is solved here.
+        continue;
+      }
+      if (!pairProvesSite(pair, entry.getKey(), key, start, placement)) {
         continue;
       }
       boolean referenceSuccessor = pair.successorKey() == null;
-      if (referenceSuccessor) {
+      boolean initializerProof = initializerProof(pair, entry.getKey(), start, placement);
+      if (referenceSuccessor && !initializerProof) {
         boolean inArgs = pair.open() >= 0 && start > pair.open() && start < pair.close();
         if (inArgs) {
           // Inside the call's own argument list the naming must come after the last entry the
@@ -3741,11 +3772,12 @@ public final class ConstantNames {
   }
 
   /** Whether the pair's own record places a naming at this literal, for that literal's value. */
-  private static boolean pairProvesSite(PairSite pair, String key, int position, Placement placement) {
+  private static boolean pairProvesSite(PairSite pair, String owner, String key, int position,
+                                        Placement placement) {
     if (pair.successorKey() != null && !key.equals(pair.successorKey())) {
       return false; // the value the naming entered is not this literal's
     }
-    return pair.valueAvailable(key) && pairProvesBounds(pair, position, placement);
+    return pair.valueAvailable(key) && pairProvesBounds(pair, owner, position, placement);
   }
 
   /**
@@ -3755,7 +3787,16 @@ public final class ConstantNames {
    * apply; only the generation-order bracket does. A value successor's point is the value's own
    * first use, which {@link #chainProves} compares against the last pair instead.
    */
-  private static boolean pairProvesBounds(PairSite pair, int position, Placement placement) {
+  private static boolean pairProvesBounds(PairSite pair, String owner, int position,
+                                          Placement placement) {
+    // The successor field reference is the write to a field of this class: a folded naming inside
+    // that field's own initializer is the last pool-entering event before the write, whatever the
+    // printed position map says. A parse-time constant field is folded while the class body is
+    // attributed, before any generated code, so a literal in its initializer is the naming of a
+    // pair whose successor the code generation created afterwards.
+    if (initializerProof(pair, owner, position, placement)) {
+      return true;
+    }
     long coordinate = siteCoordinate(placement.spaces(), position);
     if (coordinate == NO_COORDINATE) {
       // A field initializer's folded literal is printed at its declaration, where the printer maps
@@ -6494,6 +6535,98 @@ public final class ConstantNames {
     return ownInitializers(text, List.of(new int[]{0, text.length()}), own);
   }
 
+  /**
+   * Every field's declaration initializer, keyed by the field's name.
+   *
+   * <p>The ranges come from the printed text, not the pool: any field's initializer is read the
+   * same way, constant or not. Only a range in declaration position counts; an assignment of the
+   * same name inside a method body is preceded by a dot or an operator and is left out.
+   */
+  private static Map<String, List<int[]>> fieldDeclarations(String text, List<int[]> spans,
+                                                            StructClass own) {
+    Map<String, List<int[]>> declarations = new HashMap<>();
+    if (own == null) {
+      return declarations;
+    }
+    for (StructField field : own.getFields()) {
+      for (int[] range : initializerRanges(text, spans, field.getName())) {
+        if (!declarationPosition(text, range[0])) {
+          continue;
+        }
+        declarations.computeIfAbsent(field.getName(), k -> new ArrayList<>()).add(range);
+      }
+    }
+    return declarations;
+  }
+
+  /** Whether the field name at this offset is a declaration's, not a member assignment's. */
+  private static boolean declarationPosition(String text, int start) {
+    int before = start - 1;
+    while (before >= 0 && (text.charAt(before) == ' ' || text.charAt(before) == '\t')) {
+      before--;
+    }
+    if (before < 0) {
+      return false;
+    }
+    char c = text.charAt(before);
+    return Character.isJavaIdentifierPart(c) || c == '>' || c == ']';
+  }
+
+  /** The declared field whose initializer contains this position, or null. */
+  private static String declaredInitializer(Placement placement, int position) {
+    if (placement == null || placement.declarations() == null) {
+      return null;
+    }
+    for (Map.Entry<String, List<int[]>> entry : placement.declarations().entrySet()) {
+      for (int[] range : entry.getValue()) {
+        if (position > range[0] && position < range[1]) {
+          return entry.getKey();
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Whether the pool pair's naming is the literal in a declaration initializer this class prints.
+   *
+   * <p>The successor field reference is the write to this class's own field and the pair's owner
+   * is named inside that field's initializer; or the pair's owner is named in a compile-time
+   * constant field, whose initializer is folded while the class body is attributed, before any
+   * generated code. Either way the pool order around the naming is decided by the initializer, not
+   * by the printed position of a folded literal.
+   */
+  private static boolean initializerProof(PairSite pair, String owner, int position,
+                                          Placement placement) {
+    String declared = declaredInitializer(placement, position);
+    if (declared == null) {
+      return false;
+    }
+    if (pair.ownMember() && declared.equals(pair.member())) {
+      return true;
+    }
+    // A compile-time constant field is folded while the class body is attributed, before any
+    // generated code. A pair that far up the pool was entered at that same phase; a deeper pair
+    // was entered by the code generation, and a naming here would move it ahead of every entry
+    // the pool has below it. That is the phase rule: never cross the attribution/code boundary.
+    return pair.member() == null && constantField(placement.cls(), declared)
+      && owner != null && placement.prefix() != null && placement.prefix().contains(owner);
+  }
+
+  /** Whether the class declares this field as a compile-time constant variable. */
+  private static boolean constantField(StructClass own, String name) {
+    if (own == null || name == null) {
+      return false;
+    }
+    for (StructField field : own.getFields()) {
+      if (field.getName().equals(name)) {
+        return (field.getAccessFlags() & CodeConstants.ACC_STATIC) != 0
+          && constantValue(own, field) != null;
+      }
+    }
+    return false;
+  }
+
   private static Map<String, List<int[]>> ownInitializers(String text, List<int[]> spans, StructClass own) {
     Map<String, List<int[]>> ranges = new HashMap<>();
     for (StructField field : own.getFields()) {
@@ -7933,7 +8066,7 @@ public final class ConstantNames {
       ? null : placement.pairs().get(owner);
     if (pair != null && !explained) {
       for (Site site : sites) {
-        if (owner.equals(site.owner()) && pairProvesBounds(pair, site.start(), placement)) {
+        if (owner.equals(site.owner()) && pairProvesBounds(pair, owner, site.start(), placement)) {
           explained = true;
           break;
         }
