@@ -4887,25 +4887,6 @@ public final class ConstantNames {
       || kind == VariableType.FLOAT || kind == VariableType.DOUBLE;
   }
 
-  /** Whether naming this constant enters no value into the pool: it compiles to an immediate. */
-  private static boolean immediateConstant(SourceConstant source) {
-    if (source.kind() == VariableType.BOOLEAN) {
-      return true; // a boolean folds to iconst_0/iconst_1
-    }
-    if (source.value() instanceof Character value) {
-      return value <= Short.MAX_VALUE;
-    }
-    return source.kind() == VariableType.INT && source.value() instanceof Integer value
-      && value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
-  }
-
-  /** The pool key a constant's own value would occupy, matching {@link #pooledKeys}. */
-  private static String constantKey(SourceConstant source) {
-    return source.value() instanceof Character value
-      ? VariableType.CHAR.name() + "|" + (int) value
-      : source.kind() + "|" + source.value();
-  }
-
   /**
    * Whether naming the constant leaves the pool untouched.
    *
