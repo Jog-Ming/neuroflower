@@ -5236,6 +5236,14 @@ public final class ConstantNames {
     if (!pair && first > classIndex && pool.get(classIndex + 2) instanceof PrimitiveConstant value) {
       int width = value.type == CodeConstants.CONSTANT_Long
         || value.type == CodeConstants.CONSTANT_Double ? 4 : 3;
+      if (value.type == CodeConstants.CONSTANT_String && value.value instanceof String string
+          && classIndex + 3 < pool.size()
+          && pool.get(classIndex + 3) instanceof PrimitiveConstant name
+          && name.type == CodeConstants.CONSTANT_Utf8 && string.equals(name.getString())) {
+        // A string value's own name Utf8 is entered right after the CONSTANT_String unless the
+        // pool already holds it; it sits between the value and the assignment's field reference.
+        width++;
+      }
       boolean numericOrString = value.type == CodeConstants.CONSTANT_Integer
         || value.type == CodeConstants.CONSTANT_Long || value.type == CodeConstants.CONSTANT_Float
         || value.type == CodeConstants.CONSTANT_Double
