@@ -226,7 +226,7 @@ public final class ConstantNames {
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
                            Set<String> valueRecords, Set<String> bares, Set<String> earlyOwners,
                            boolean ownEarly, boolean ownProven, StructClass cls, String text,
-                           boolean codeEntry) {
+                           Set<String> bare, boolean codeEntry) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -240,6 +240,12 @@ public final class ConstantNames {
      * arguments, although they are generated first.
      */
     boolean proves(String owner, int start) {
+      if (bare != null && bare.contains(owner)) {
+        // The pair was entered by a bare constant naming that the lowering prunes to this
+        // literal, so every method-body position is before the first code generation and the
+        // ordering among such names is settled by the scan's reverse order, not by this site.
+        return existsAt(owner, start);
+      }
       if (lexical != null && lexical.contains(owner)) {
         // The enclosing Class entry was interned while the class's names were resolved, before
         // any generated code and independently of where the source put the name.
@@ -392,7 +398,7 @@ public final class ConstantNames {
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), Map.of(),
       Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), false,
-      false, null, "", false);
+      false, null, "", Set.of(), false);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -783,6 +789,36 @@ public final class ConstantNames {
     Set<String> lexical = new HashSet<>();
     Set<String> claimed = new HashSet<>(); // owners another rule already places sites for
     Set<String> candidateOwners = new HashSet<>();
+    // A leading Class pair whose owner this class names with a bare name -- an enclosing class, or
+    // a constant such a class inherits -- was entered by the pruned access that replaces the name
+    // with its value. Every pruned-tree scan runs before the first code generation, so the pair can
+    // open the pool; the naming itself stays a method-body literal. The scan is last-pruned-first,
+    // so the last matching literal is the one that enters the pair, and earlier matches are left
+    // as the printer wrote them. A protected constant of a remote superclass keeps the qualified
+    // form the early rule writes; only a name resolved through the class's own lexical scope is
+    // written bare.
+    Set<String> bare = new LinkedHashSet<>();
+    if (!firstUses.isEmpty()) {
+      for (String owner : prefixOwners(own)) {
+        Integer index = classIndices.get(owner);
+        if (index == null || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)
+            || setup.contains(index) || usedBelow(firstUses, index)) {
+          continue;
+        }
+        boolean enclosing = own.qualifiedName.startsWith(owner + "$");
+        if (!enclosing && earlyOwners.contains(owner)) {
+          continue; // a remote-super naming keeps the qualified site the early rule places
+        }
+        if (!barelyResolvable(own, owner)) {
+          continue;
+        }
+        bare.add(owner);
+        claimed.add(owner);
+        if (candidateOwners.add(owner)) {
+          addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
+        }
+      }
+    }
     // An enclosing class whose Class entry opens the pool was named with the simple name while
     // the class's names were resolved, before any generated code. The nesting attributes explain
     // that Class entry, so the missing and referenced tests never see the owner; visit every
@@ -1035,7 +1071,7 @@ public final class ConstantNames {
       new Placement(windows, coordinates, spaces(own, positions), strict, anchored, direct,
         folded, internedAt, namingAt, lexical, spans, new HashSet<>(prefixOwners(own)),
         inheritedNames, activePairs, activeValues, valueRecords, bares, earlyOwners, ownEarly,
-        ownProven, own, text, !firstUses.isEmpty()),
+        ownProven, own, text, bare, !firstUses.isEmpty()),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -2515,6 +2551,9 @@ public final class ConstantNames {
     // only its owner order. It is solved before the single-pair rules so no one of its owners is
     // placed on its own.
     Set<String> chained = chainSites(text, spans, rules, sites);
+    // A bare naming is not a chain: the access is a single constant, and the pruned scan's order
+    // decides which of its occurrences enters the pair.
+    barePrefixSites(text, spans, rules, chained, sites);
     Map<String, List<Site>> deferred = new HashMap<>();
     // Sites the expression solver invented: it admits any literal of a reference successor's
     // generation gap, so a direct naming found later in the same gap withdraws the guess.
@@ -2765,6 +2804,160 @@ public final class ConstantNames {
         addSiteOnce(sites, found);
       }
     }
+  }
+
+  /**
+   * Names a prefix-pair owner this class writes without a qualifier.
+   *
+   * <p>An enclosing class's constant, and one an enclosing class inherits from an interface or a
+   * superclass, is in scope by its simple name. Resolved through a bare access, javac replaces it
+   * with its value while the method bodies are lowered, and that pruned scan runs before the first
+   * code generation -- which is why the owner's Class pair can open the pool. The scan is
+   * last-pruned-first, so the last matching literal is the naming that enters the pair; earlier
+   * occurrences are scanned after it and add nothing.
+   */
+  private static void barePrefixSites(String text, List<int[]> spans, Rules rules,
+                                      Set<String> chained, List<Site> sites) {
+    Set<String> bare = rules.placement().bare();
+    StructClass cls = rules.placement().cls();
+    if (bare == null || bare.isEmpty() || cls == null) {
+      return;
+    }
+    for (String owner : bare) {
+      if (chained.contains(owner) || siteIn(sites, owner, spans)) {
+        continue;
+      }
+      Site found = barePrefixSite(text, spans, owner, rules, cls);
+      if (found != null) {
+        addSiteOnce(sites, found);
+      }
+    }
+  }
+
+  /**
+   * The owner's method-body literal a bare naming replaces, or null.
+   *
+   * <p>Which occurrence matters follows the pool: the first prefix pair is entered by the scan's
+   * first event, which is the last-pruned naming, so its literal is the last match; a later pair
+   * is entered after an earlier one and needs the first match. Choosing by rank keeps the pair
+   * order of both shapes.
+   */
+  private static Site barePrefixSite(String text, List<int[]> spans, String owner, Rules rules,
+                                     StructClass cls) {
+    boolean last = bareRank(cls, owner) == 0;
+    int best = -1;
+    int bestEnd = -1;
+    String bestName = null;
+    for (Map.Entry<String, List<Constant>> entry : rules.candidates().entrySet()) {
+      int bar = entry.getKey().indexOf('|');
+      if (bar < 0) {
+        continue;
+      }
+      VariableType sourceKind;
+      try {
+        sourceKind = VariableType.valueOf(entry.getKey().substring(0, bar));
+      }
+      catch (IllegalArgumentException e) {
+        continue;
+      }
+      String value = entry.getKey().substring(bar + 1);
+      for (Constant constant : entry.getValue()) {
+        if (!constant.owner().equals(owner) || !integralKind(constant.kind())) {
+          continue;
+        }
+        for (Map.Entry<String, Boolean> literal : bareLiteralKeys(sourceKind, value).entrySet()) {
+          for (int[] span : literalSpansFor(text, spans, literal.getKey())) {
+            if (last ? span[0] <= best : best >= 0 && span[0] >= best) {
+              continue; // an earlier match, or a later one than the first already found
+            }
+            if (insideInitializer(rules.ownInitializers(), span[0])
+                || !bareSiteSafe(text, span, sourceKind, constant, literal.getValue(), rules)) {
+              continue;
+            }
+            best = span[0];
+            bestEnd = span[1];
+            bestName = constant.name();
+          }
+        }
+      }
+    }
+    if (best < 0 || bestName == null || !resolvesBarely(cls, owner, bestName)) {
+      return null;
+    }
+    return new Site(best, bestEnd, bestName, owner);
+  }
+
+  /** The position of this owner among the pool's leading pairs, or -1. */
+  private static int bareRank(StructClass cls, String owner) {
+    if (cls == null) {
+      return -1;
+    }
+    List<String> owners = prefixOwners(cls);
+    for (int i = 0; i < owners.size(); i++) {
+      if (owners.get(i).equals(owner)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** Whether the kind is an integer constant type a bare naming can safely replace. */
+  private static boolean integralKind(VariableType kind) {
+    return kind == VariableType.INT || kind == VariableType.LONG || kind == VariableType.BYTE
+      || kind == VariableType.SHORT || kind == VariableType.CHAR;
+  }
+
+  /**
+   * The literal keys a bare naming of this kind of constant can be written as, with whether the
+   * naming needs a comparison context to keep the literal's expression type.
+   */
+  private static Map<String, Boolean> bareLiteralKeys(VariableType sourceKind, String value) {
+    Map<String, Boolean> keys = new LinkedHashMap<>();
+    switch (sourceKind) {
+      case INT -> {
+        keys.put(VariableType.INT.name() + "|" + value, false);
+        keys.put(VariableType.LONG.name() + "|" + value, false); // widening checked at the site
+      }
+      case LONG -> keys.put(VariableType.LONG.name() + "|" + value, false);
+      case BYTE, SHORT, CHAR -> keys.put(VariableType.INT.name() + "|" + value, true);
+      default -> {
+      }
+    }
+    return keys;
+  }
+
+  /** Whether the literal at this span can take this bare constant without changing its type. */
+  private static boolean bareSiteSafe(String text, int[] span, VariableType sourceKind,
+                                       Constant constant, boolean needsComparison, Rules rules) {
+    if (needsComparison) {
+      // A narrower constant keeps a comparison's int type under binary numeric promotion; in an
+      // argument or assignment it could change an overload or the assigned expression's type.
+      return comparisonSite(text, span[0], span[1]);
+    }
+    if (sourceKind == VariableType.INT && constant.kind() == VariableType.INT) {
+      String key = literalKey(text.substring(span[0], span[1]));
+      if (key == null) {
+        return false;
+      }
+      if (key.startsWith(VariableType.LONG.name() + "|")) {
+        // An int constant written at a long literal widens; where the literal itself decides the
+        // operation's type, an int name would have made the original int arithmetic.
+        long value = Long.parseLong(key.substring(key.indexOf('|') + 1));
+        return !drivesLongType(rules.placement(), span[0], value);
+      }
+      return key.startsWith(VariableType.INT.name() + "|");
+    }
+    return constant.kind() == sourceKind;
+  }
+
+  /** Whether any instruction references a pool entry below this one. */
+  private static boolean usedBelow(Map<Integer, FirstUse> uses, int index) {
+    for (int key : uses.keySet()) {
+      if (key < index) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Whether the pair's folded successor is a string value. */
@@ -5734,6 +5927,84 @@ public final class ConstantNames {
     return false;
   }
 
+  /**
+   * Whether this class's body can name one of the owner's constants without a qualifier.
+   *
+   * <p>An enclosing class's constant is in scope by its simple name, and so is a constant an
+   * enclosing class inherits from an interface or a superclass. The candidate pass only offers
+   * static final fields with a constant value, so a declaration of the owner is all that is asked.
+   */
+  private static boolean barelyResolvable(StructClass site, String owner) {
+    StructContext context = DecompilerContext.getStructContext();
+    // The site class's own hierarchy is excluded: a constant its own type inherits is a member of
+    // it, so a bare name there is not resolved by the pruned access this rule reproduces.
+    String current = site.qualifiedName;
+    int dollar = current.lastIndexOf('$');
+    if (dollar < 0) {
+      return false;
+    }
+    current = current.substring(0, dollar);
+    while (true) {
+      StructClass cls = context.getClass(current);
+      if (cls != null) {
+        for (InheritedConstant inherited : inheritedConstants(cls)) {
+          if (inherited.declaring().qualifiedName.equals(owner)) {
+            return true;
+          }
+        }
+      }
+      int outer = current.lastIndexOf('$');
+      if (outer < 0) {
+        return false;
+      }
+      current = current.substring(0, outer);
+    }
+  }
+
+  /**
+   * Whether the bare name at this site denotes the owner's static field and nothing nearer.
+   *
+   * <p>The innermost scope that holds the name decides: a field declared by the class itself, a
+   * supertype of it, or a closer enclosing class hides the owner's constant, and only the owner's
+   * own declaration is the constant this name must denote.
+   */
+  private static boolean resolvesBarely(StructClass site, String owner, String name) {
+    StructContext context = DecompilerContext.getStructContext();
+    String current = site.qualifiedName;
+    while (true) {
+      StructClass cls = context.getClass(current);
+      if (cls != null) {
+        for (InheritedConstant inherited : inheritedConstants(cls)) {
+          if (!inherited.field().getName().equals(name)) {
+            continue;
+          }
+          return inherited.declaring().qualifiedName.equals(owner) && !declaresLocal(site, name);
+        }
+      }
+      int dollar = current.lastIndexOf('$');
+      if (dollar < 0) {
+        return false;
+      }
+      current = current.substring(0, dollar);
+    }
+  }
+
+  /** Whether an earlier pool-prefix pair than this owner was entered by a bare naming. */
+  private static boolean earlierBarePrefix(StructClass cls, String owner, Set<String> bare) {
+    if (cls == null || bare == null || bare.isEmpty()) {
+      return false;
+    }
+    for (String prefixOwner : prefixOwners(cls)) {
+      if (prefixOwner.equals(owner)) {
+        return false;
+      }
+      if (bare.contains(prefixOwner)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Whether a simple name in this class's body resolves to the enclosing owner's constant. */
   private static boolean resolvesTo(StructClass site, String owner, String name) {
     StructContext context = DecompilerContext.getStructContext();
@@ -6417,14 +6688,24 @@ public final class ConstantNames {
     boolean foreign = !constant.owner().equals(own);
     boolean lexical = foreign && placement != null && placement.lexical() != null
       && placement.lexical().contains(constant.owner());
-    if (foreign && !lexical && placement != null && placement.prefix() != null
-        && !placement.prefix().contains(constant.owner())
-        && insideInitializer(ownInitializers, anchor)) {
-      // A naming in a constant field initializer is resolved before any code is generated, so the
-      // owner's Class entry and its name would open the pool, right after the earlier namings. A
-      // pool without that pair means the source did not name a constant here; the window only
-      // found a literal on a line the owner happens to touch.
-      return;
+    boolean bareOwner = !lexical && placement != null && placement.bare() != null
+      && placement.bare().contains(constant.owner());
+    if (foreign && placement != null && insideInitializer(ownInitializers, anchor)) {
+      if (bareOwner) {
+        // A bare naming is resolved while the method bodies are lowered; a constant field
+        // initializer is resolved before that, so it cannot be the pool's naming site.
+        return;
+      }
+      if (!lexical && placement.prefix() != null
+          && (!placement.prefix().contains(constant.owner())
+              || earlierBarePrefix(placement.cls(), constant.owner(), placement.bare()))) {
+        // A naming in a constant field initializer is resolved before any code is generated, so
+        // the owner's Class entry and its name would open the pool, right after the earlier
+        // namings. A pool without that pair -- or one whose earlier pair was entered by a bare
+        // method-body naming -- means the source did not name a constant here; the window only
+        // found a literal on a line the owner happens to touch.
+        return;
+      }
     }
     if (lexical) {
       // Names are resolved in source order, so a simple name printed earlier in this class would
@@ -6499,7 +6780,19 @@ public final class ConstantNames {
     }
     String name = simpleName(constant.owner());
     String printed;
-    if (placement != null && placement.lexical() != null
+    if (bareOwner) {
+      // A bare name was resolved while the method bodies were lowered; it must still denote the
+      // owner's field here, not one declared by a closer scope.
+      if (placement.cls() == null
+          || !resolvesBarely(placement.cls(), constant.owner(), constant.name())) {
+        return;
+      }
+      printed = prefix + constant.name();
+      if (key.startsWith("FLOATCAST|")) {
+        printed = "(float) " + printed;
+      }
+    }
+    else if (placement != null && placement.lexical() != null
         && placement.lexical().contains(constant.owner())) {
       // The pool proves the enclosing class was named in a field initializer, and javac enters
       // the enclosing Class only for the simple name there. The name must resolve to that owner
@@ -6617,6 +6910,24 @@ public final class ConstantNames {
       }
       if (inWindow != null) {
         inWindow.add(constant.owner());
+      }
+    }
+    if (bareOwner) {
+      // The pruned scan is last-pruned-first. The first pool pair is entered by the last matching
+      // literal; a later pair must be entered after the earlier ones, so its first match is the
+      // naming and a later occurrence would move it ahead of them.
+      boolean firstMatch = bareRank(placement.cls(), constant.owner()) > 0;
+      for (int i = sites.size() - 1; i >= 0; i--) {
+        Site earlier = sites.get(i);
+        if (!earlier.owner().equals(constant.owner()) || !inside(placement.spans(), earlier.start())) {
+          continue;
+        }
+        if (firstMatch) {
+          return;
+        }
+        if (earlier.start() < start) {
+          sites.remove(i);
+        }
       }
     }
     addSiteOnce(sites, new Site(start, end, printed, constant.owner()));
