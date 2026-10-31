@@ -8165,6 +8165,11 @@ public final class ConstantNames {
           placement, conditions, added);
       }
     }
+    // A folded condition inside a method body enters the owner's Class pair at that method's
+    // generation point, which is not the pool front: the pair sits between the entries generated
+    // before the condition and the condition's own (folded) value. The class body's dead block
+    // cannot reproduce it; the printed condition itself must carry the naming.
+    deepConditionSites(text, spans, rules, own, packageName, sites);
     // The pruned-tree scan runs last-pruned-first, so the pool's pair order is the reverse of the
     // source order. Writing the conditions by descending pool index puts them back in source
     // order, which is what makes the class entries land where the pool records them.
@@ -8395,6 +8400,142 @@ public final class ConstantNames {
       : access == CodeConstants.ACC_PROTECTED ? "protected "
       : access == CodeConstants.ACC_PRIVATE ? "private " : "";
     return modifier + simple + "()";
+  }
+
+  /**
+   * Names a deep pair's owner in the dead condition the folded conjunction left behind.
+   *
+   * <p>A constant conjunction such as {@code !ioException && Owner.SNAPSHOT} folds to a constant
+   * false while leaving the non-constant operand's branch in the code, so the decompiler prints an
+   * if with an empty arm. The owner's {@code Class} pair sits immediately before the value entry
+   * the next statement interns, which is the condition's generation point. Writing the naming back
+   * into that condition reproduces both the branch and the pool order; a class-body dead condition
+   * would enter the pair too early, and the printed literal the printer kept is the very point the
+   * pair is read against.
+   */
+  private static void deepConditionSites(String text, List<int[]> spans, Rules rules,
+                                         StructClass own, String packageName, List<Site> sites) {
+    Placement placement = rules == null ? null : rules.placement();
+    if (placement == null || placement.pairs() == null || placement.pairs().isEmpty()) {
+      return;
+    }
+    List<PooledConstant> pool = own.getPool().getPool();
+    Set<Integer> prefix = prefixClassIndices(own);
+    for (Map.Entry<String, PairSite> entry : placement.pairs().entrySet()) {
+      String owner = entry.getKey();
+      PairSite pair = entry.getValue();
+      if (owner.equals(own.qualifiedName) || isBootstrapOwner(owner)
+          || prefix.contains(pair.classIndex()) || siteIn(sites, owner, spans)) {
+        continue;
+      }
+      int successor = pair.classIndex() + 2;
+      if (successor >= pool.size() || !(pool.get(successor) instanceof PrimitiveConstant value)
+          || (value.type != CodeConstants.CONSTANT_String && value.type != CodeConstants.CONSTANT_Integer
+          && value.type != CodeConstants.CONSTANT_Long && value.type != CodeConstants.CONSTANT_Float
+          && value.type != CodeConstants.CONSTANT_Double)) {
+        continue; // the pair's neighbour is a reference, which the pair rules read exactly
+      }
+      String naming = foldedConditionNaming(owner, packageName);
+      if (naming == null) {
+        continue;
+      }
+      Site site = deadConditionInsertion(text, spans, pair.successorAt(), owner, naming);
+      if (site != null) {
+        addSiteOnce(sites, site);
+      }
+    }
+  }
+
+  /**
+   * The insertion that adds a false boolean constant to the dead empty condition before a point.
+   *
+   * <p>The folded conjunction leaves an if whose arm prints nothing. That if is the last test
+   * printed before the value the naming entered; appending the constant to its condition makes the
+   * whole test constant-false exactly as the original did.
+   */
+  private static Site deadConditionInsertion(String text, List<int[]> spans, int at, String owner,
+                                             String naming) {
+    if (at <= 0 || !inside(spans, at)) {
+      return null;
+    }
+    int start = text.lastIndexOf("if (", at);
+    if (start < 0) {
+      return null;
+    }
+    int open = start + 3;
+    int close = matchingParen(text, open);
+    if (close < 0 || close > at) {
+      return null;
+    }
+    int brace = close + 1;
+    while (brace < text.length() && Character.isWhitespace(text.charAt(brace))) {
+      brace++;
+    }
+    if (brace >= text.length() || text.charAt(brace) != '{') {
+      return null;
+    }
+    int bodyEnd = matchingBrace(text, brace);
+    if (bodyEnd < 0 || bodyEnd > at || !printsNothing(text, brace + 1, bodyEnd)) {
+      return null;
+    }
+    return new Site(close, close, " && " + naming, owner);
+  }
+
+  /** The position of the brace closing the one opened at {@code open}, or -1. */
+  private static int matchingBrace(String text, int open) {
+    int depth = 0;
+    for (int i = open; i < text.length(); i++) {
+      char c = text.charAt(i);
+      if (c == '{') {
+        depth++;
+      }
+      else if (c == '}') {
+        depth--;
+        if (depth == 0) {
+          return i;
+        }
+      }
+      else if (c == '"' || c == '\'') {
+        i = skipQuoted(text, i, c) - 1;
+      }
+    }
+    return -1;
+  }
+
+  /** Whether the text range holds nothing but whitespace and empty statements. */
+  private static boolean printsNothing(String text, int from, int to) {
+    for (int i = from; i < to; i++) {
+      char c = text.charAt(i);
+      if (!Character.isWhitespace(c) && c != ';') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** The qualified name of the owner's first false boolean constant, or null. */
+  private static String foldedConditionNaming(String owner, String packageName) {
+    StructClass cls = DecompilerContext.getStructContext().getClass(owner);
+    if (cls == null) {
+      return null;
+    }
+    String qualifier = solverQualifier(owner, packageName);
+    if (qualifier == null) {
+      return null;
+    }
+    for (StructField field : cls.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant value = constantValue(cls, field);
+      if (value == null || kind(field.getDescriptor()) != VariableType.BOOLEAN
+          || !(value.value instanceof Integer flag) || flag != 0) {
+        continue;
+      }
+      return qualifier + "." + field.getName();
+    }
+    return null;
   }
 
   /**
