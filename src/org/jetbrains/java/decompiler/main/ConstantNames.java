@@ -692,9 +692,16 @@ public final class ConstantNames {
       long point = coordinate(use.order(), use.offset());
       upper.merge(operand, point, Math::min);
     }
+    // A lower entry's first use can fall after the pair's successor: the entry was created
+    // before the pair (its index is lower), but its first instruction use may come later -- a
+    // value pooled by a naming, a reference in a synthetic method whose class-file position is
+    // not its generation point. Such a point cannot bound the naming from below: any site the
+    // pair admits lies before the successor, and so after every lower entry's creation.
     long pred = Long.MIN_VALUE;
     for (long point : upper.values()) {
-      pred = Math.max(pred, point);
+      if (point < succ) {
+        pred = Math.max(pred, point);
+      }
     }
     return new long[]{pred, succ};
   }
@@ -2272,9 +2279,16 @@ public final class ConstantNames {
       }
       upper.merge(operand, coordinate(use.order(), use.offset()), Math::min);
     }
+    // A lower entry's first use can fall after the pair's successor: the entry was created
+    // before the pair (its index is lower), but its first instruction use may come later -- a
+    // value pooled by a naming, a reference in a synthetic method whose class-file position is
+    // not its generation point. Such a point cannot bound the naming from below: any site the
+    // pair admits lies before the successor, and so after every lower entry's creation.
     long pred = Long.MIN_VALUE;
     for (long point : upper.values()) {
-      pred = Math.max(pred, point);
+      if (point < succ) {
+        pred = Math.max(pred, point);
+      }
     }
     return new long[]{pred, succ};
   }
