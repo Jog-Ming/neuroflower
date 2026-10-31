@@ -93,7 +93,9 @@ public final class LocalDeclarationOrder {
     if (stat instanceof DoStatement loop) {
       placeAboveLoop(loop, names, method);
     } else if (stat instanceof IfStatement ifStatement) {
-      mergeArmDeclarations(ifStatement, names, method);
+      if (!mergeChainDeclarations(ifStatement, names, method)) {
+        mergeArmDeclarations(ifStatement, names, method);
+      }
     } else if (stat instanceof CatchAllStatement tryStatement) {
       placeInsideFinally(tryStatement, names, method);
     }
@@ -238,6 +240,113 @@ public final class LocalDeclarationOrder {
     elseVar.setDefinition(false);
     insertByTargetSlot(ifStatement.getVarDefinitions(), declaration);
     debug(method, thenVar, "merged the arm declarations above the if: a row ends past it");
+  }
+
+  /**
+   * Merges every arm definition of an else-if chain into one declaration above the first if.
+   *
+   * <p>An arm declares its own local at the arm's first statement, and javac closes that local's
+   * row at the arm's own last instruction. A variable declared above the test outlives each arm:
+   * its range stays live across the arm's terminating jump and closes at the first instruction of
+   * the next condition. A row that both ends at the next condition's start and reaches past the
+   * arm's own last instruction therefore names a declaration written outside the chain, and a
+   * variable declared there is in scope in every arm and cannot be redeclared inside one, so every
+   * arm's matching first definition is the same source variable.
+   */
+  private static boolean mergeChainDeclarations(IfStatement first, NameTable names, String method) {
+    List<IfStatement> links = new ArrayList<>();
+    List<PrefixDef> defs = new ArrayList<>();
+    List<VarExprent> vars = new ArrayList<>();
+    List<LocalVariable> rows = new ArrayList<>();
+    IfStatement current = first;
+    while (true) {
+      PrefixDef def = firstPrefixDefinition(current.getIfstat());
+      VarExprent var = def == null ? null : definedVar(def.exprent());
+      if (var == null || var.getLVT() == null || !isRealDefinition(var)) {
+        return false;
+      }
+      links.add(current);
+      defs.add(def);
+      vars.add(var);
+      rows.add(var.getLVT());
+      Statement els = current.getElsestat();
+      if (els == null) {
+        break;
+      }
+      if (els instanceof IfStatement nested) {
+        current = nested;
+        continue;
+      }
+      // A final else arm joins the chain like the else-if links: its definition is the same
+      // variable by the same argument, and no condition follows it.
+      PrefixDef last = firstPrefixDefinition(els);
+      VarExprent lastVar = last == null ? null : definedVar(last.exprent());
+      if (lastVar == null || lastVar.getLVT() == null || !isRealDefinition(lastVar)) {
+        return false;
+      }
+      defs.add(last);
+      vars.add(lastVar);
+      rows.add(lastVar.getLVT());
+      break;
+    }
+    if (links.size() < 2) {
+      return false;
+    }
+    LocalVariable reference = rows.get(0);
+    for (LocalVariable row : rows) {
+      if (!row.getName().equals(reference.getName()) || row.getIndex() != reference.getIndex()
+          || !row.getDescriptor().equals(reference.getDescriptor())) {
+        return false;
+      }
+    }
+    for (int i = 0; i < links.size(); i++) {
+      Statement arm = links.get(i).getIfstat();
+      int armEnd = RoundTrip.lastEnd(arm);
+      if (i + 1 < links.size()) {
+        int nextCondition = RoundTrip.statementOffset(links.get(i).getElsestat());
+        if (armEnd < 0 || nextCondition < 0 || rows.get(i).getEnd() != nextCondition
+            || rows.get(i).getEnd() <= armEnd) {
+          return false;
+        }
+      }
+    }
+    VarExprent merged = vars.get(0);
+    if ((!names.uniqueName(merged) && !names.sameSlotName(merged)) || mentionsField(first, merged.getName())) {
+      debug(method, merged, "rejected: chain-merged declaration would capture a name");
+      return false;
+    }
+    Exprent declaration;
+    if (defs.get(0).exprent() == merged) {
+      // A bare declaration has no other exprent to keep: the statement it printed as moves up.
+      removeIdentity(defs.get(0).list(), merged);
+      merged.bytecode = null;
+      declaration = merged;
+    } else {
+      declaration = merged.copy();
+      declaration.bytecode = null;
+      merged.setDefinition(false);
+    }
+    for (int i = 1; i < defs.size(); i++) {
+      VarExprent var = vars.get(i);
+      if (defs.get(i).exprent() == var) {
+        removeIdentity(defs.get(i).list(), var);
+      } else {
+        var.setDefinition(false);
+      }
+    }
+    // The printer merges the arm's preceding statements into the if's head block, and prints that
+    // block after the head's varDefinitions: the declaration belongs at the end of the head's
+    // exprents, after those statements and before the test. A head with no exprents prints the
+    // declaration from the if's own varDefinitions, right where the test begins.
+    Statement head = first.getFirst();
+    List<Exprent> headExprents = head == null ? null : head.getExprents();
+    if (headExprents != null && !headExprents.isEmpty()) {
+      headExprents.add(declaration);
+    } else {
+      insertByTargetSlot(first.getVarDefinitions(), declaration);
+    }
+    debug(method, merged, "merged " + vars.size() + " arm declarations above the chain");
+    return true;
   }
 
   /**
