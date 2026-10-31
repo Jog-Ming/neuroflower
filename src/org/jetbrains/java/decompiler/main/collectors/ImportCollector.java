@@ -186,6 +186,61 @@ public class ImportCollector {
     return result == null ? shortName : result;
   }
 
+  /**
+   * The simple name a single-type import ({@code import a.b.Outer.Inner;}) can bring into this
+   * class's scope for an own nested class, registering that import; null when the bare name would
+   * be shadowed or is already taken by another class. A caller needs it where a type-use
+   * annotation must lead its type: a qualified name would put the annotation in type position.
+   */
+  public String getNestedImportName(String fullName) {
+    if (fullName == null || fullName.indexOf('$') < 0) {
+      return null;
+    }
+    ClassNode node = DecompilerContext.getClassProcessor().getMapRootClasses().get(fullName.replace('.', '/'));
+    if (node == null || node.classStruct == null || !node.classStruct.isOwn()
+        || node.type != ClassNode.Type.MEMBER || node.simpleName == null) {
+      return null;
+    }
+    String shortName = node.simpleName;
+    if (setFieldNames.contains(shortName)) {
+      return null;
+    }
+    // The caller passes the internal name (slashes, `$` before the member), so the import's
+    // owner is everything before the last `$` in dotted form.
+    int lastDollar = fullName.lastIndexOf('$');
+    if (lastDollar <= 0) {
+      return null;
+    }
+    String packageName = fullName.substring(0, lastDollar).replace('/', '.').replace('$', '.');
+    if (packageName.equals(currentPackagePoint)) {
+      // The import of a same-package class is dropped from the import list, and a nested type's
+      // simple name is not in scope through its package alone.
+      return null;
+    }
+    StructContext context = DecompilerContext.getStructContext();
+    if (context.getClass(currentPackageSlash + shortName) != null && !packageName.equals(currentPackagePoint)) {
+      return null; // a class of the current package with this short name shadows the import
+    }
+    if (context.getClass(shortName) != null && !currentPackagePoint.isEmpty()) {
+      return null; // a default-package class with this short name shadows the import
+    }
+    ClassNode currCls = (ClassNode)DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_NODE);
+    String mapKey = currCls == null ? "" : currCls.classStruct.qualifiedName;
+    Map<String, String> innerClassNames = mapInnerClassNames.getOrDefault(mapKey, new HashMap<>());
+    String dotted = fullName.replace('/', '.').replace('$', '.');
+    if (innerClassNames.containsKey(shortName) && !innerClassNames.get(shortName).equals(dotted)) {
+      return null; // an inherited or enclosing nested class claims the short name
+    }
+    String existing = mapSimpleNames.get(shortName);
+    if (existing != null && !existing.equals(packageName)) {
+      return null; // another class already owns this short name
+    }
+    if (!mapSimpleNames.containsKey(shortName) && !writeLocked) {
+      mapSimpleNames.put(shortName, packageName);
+    }
+    return shortName;
+  }
+
   public void writeImports(TextBuffer buffer, boolean addSeparator) {
     if (DecompilerContext.getOption(IFernflowerPreferences.REMOVE_IMPORTS)) {
       return;

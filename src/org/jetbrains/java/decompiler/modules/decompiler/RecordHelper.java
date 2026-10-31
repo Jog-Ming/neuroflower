@@ -2,6 +2,7 @@ package org.jetbrains.java.decompiler.modules.decompiler;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.main.ClassWriter;
+import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectGraph;
@@ -14,11 +15,15 @@ import org.jetbrains.java.decompiler.struct.attr.StructAnnotationAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructAnnotationParameterAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructMethodParametersAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructTypeAnnotationAttribute;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
+import org.jetbrains.java.decompiler.struct.gen.CodeType;
 import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericFieldDescriptor;
+import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 import org.jetbrains.java.decompiler.util.Key;
+import org.jetbrains.java.decompiler.util.Pair;
 import org.jetbrains.java.decompiler.util.TextBuffer;
 
 import java.util.*;
@@ -234,6 +239,52 @@ public final class RecordHelper {
     return simple.indexOf('$') < 0 ? simple : null;
   }
 
+  /** Whether every type annotation sits at the type itself, not inside a generic or nested segment. */
+  private static boolean topLevelOnly(List<Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent>> annos) {
+    for (Pair<Queue<TypeAnnotation.PathValue>, AnnotationExprent> anno : annos) {
+      if (!anno.a.isEmpty()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Whether the canonical constructor records its parameter type annotations as one ascending run.
+   *
+   * <p>javac appends a declaration-position annotation to the method while walking the parameters,
+   * and a type-position one afterwards while scanning the types, so an annotation written before
+   * the component's type reproduces the table only when the table is one ascending run. A fall
+   * means a later parameter's annotation was written inside its type, beside the nested name.
+   */
+  private static boolean declarationPositionConstructor(StructClass cl) {
+    StructMethod canonical = getCanonicalConstructor(cl);
+    if (canonical == null) {
+      return false;
+    }
+    int previous = -1;
+    boolean any = false;
+    for (Key<?> key : ClassWriter.TYPE_ANNOTATION_ATTRIBUTES) {
+      StructTypeAnnotationAttribute attribute =
+        canonical.getAttribute((Key<StructTypeAnnotationAttribute>)key);
+      if (attribute == null) {
+        continue;
+      }
+      for (TypeAnnotation annotation : attribute.getAnnotations()) {
+        if (annotation.getTargetType() != TypeAnnotation.METHOD_PARAMETER) {
+          continue;
+        }
+        int index = annotation.getIndex();
+        if (any && index < previous) {
+          return false; // a fall: the table is not one declaration-position run
+        }
+        any = true;
+        previous = index;
+      }
+    }
+    return any;
+  }
+
   private static void recordComponentToJava(TextBuffer buffer, StructClass cl, StructRecordComponent cd, int param, boolean varArgComponent) {
     Set<TextBuffer> annotations = getRecordComponentAnnotations(cl, cd, param);
     Set<String> writtenAnnotations = new HashSet<>();
@@ -257,6 +308,16 @@ public final class RecordHelper {
       // written against the qualified name javac records it while the canonical constructor's
       // annotations are laid down, which reorders RuntimeVisibleTypeAnnotations.
       String memberName = RoundTrip.selector("recsimplename") ? directMemberType(cl, fieldType) : null;
+      if (memberName == null && RoundTrip.selector("typeuse") && topLevelOnly(annos)
+          && declarationPositionConstructor(cl)
+          && fieldType.type == CodeType.OBJECT && fieldType.arrayDim == 0
+          && !(fieldType instanceof GenericType)) {
+        // The same rule reaches a nested type of another class: `Owner.@Nullable Inner` puts the
+        // annotation in type position of the synthesized canonical constructor, so a header whose
+        // table is one declaration-position run must name the member with the import that leads
+        // its annotation.
+        memberName = DecompilerContext.getImportCollector().getNestedImportName(fieldType.value);
+      }
       VarType annotatedType = memberName == null ? fieldType
         : new VarType(fieldType.type, fieldType.arrayDim, memberName);
       buffer.appendCastTypeName(varArgComponent ? annotatedType.decreaseArrayDim() : annotatedType, annos, writtenAnnotations);
