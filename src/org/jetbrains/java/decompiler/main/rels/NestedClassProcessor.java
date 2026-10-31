@@ -698,6 +698,13 @@ public class NestedClassProcessor {
     return null;
   }
 
+  /** Adds a name to the reserved set, ignoring an unnamed inherited value. */
+  private static void addOuterName(Set<String> names, String name) {
+    if (name != null) {
+      names.add(name);
+    }
+  }
+
   private static void insertLocalVars(ClassNode parent, ClassNode child) {
     // enclosing method, is null iff member class
     MethodWrapper enclosingMethod = findEnclosingMethod(child);
@@ -808,7 +815,29 @@ public class NestedClassProcessor {
           }
         }
 
-        Set<String> setNewOuterNames = new HashSet<>(mapNewNames.values());
+        // Only a captured field this method actually names has to keep its printed name: an
+        // unreferenced capture never appears in the method, and reserving its name only forces
+        // the method's own locals away from the names the target records for them — a lambda's
+        // parameters are named by the table, not by the capture.
+        Set<String> referencedFields = new HashSet<>();
+        if (!mapFieldsToNewVars.isEmpty()) {
+          method.getOrBuildGraph().iterateExprentsDeep(exprent -> {
+            if (exprent instanceof FieldExprent field) {
+              referencedFields.add(InterpreterUtil.makeUniqueKey(field.getClassname(), field.getName(),
+                field.getDescriptor().descriptorString));
+            }
+            return 0;
+          });
+        }
+        Set<String> setNewOuterNames = new HashSet<>();
+        for (Entry<String, VarVersionPair> entry : mapFieldsToNewVars.entrySet()) {
+          if (referencedFields.contains(entry.getKey())) {
+            addOuterName(setNewOuterNames, mapNewNames.get(entry.getValue()));
+          }
+        }
+        for (VarVersionPair parameter : mapParamsToNewVars.values()) {
+          addOuterName(setNewOuterNames, mapNewNames.get(parameter));
+        }
         setNewOuterNames.removeAll(method.setOuterVarNames);
 
         method.varproc.refreshVarNames(new VarNamesCollector(setNewOuterNames));
