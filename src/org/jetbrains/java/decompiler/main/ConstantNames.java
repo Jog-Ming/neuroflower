@@ -6808,9 +6808,6 @@ public final class ConstantNames {
     if (raw == null || raw.length != 2 || raw[0] != 0) {
       return null;
     }
-    if (System.getenv("NEUROFLOWER_DEADCTOR_DEBUG") != null) {
-      System.err.println("deadctor " + own.qualifiedName + " raw " + java.util.Arrays.toString(raw));
-    }
     int access = constructor.getAccessFlags() & (CodeConstants.ACC_PUBLIC
       | CodeConstants.ACC_PROTECTED | CodeConstants.ACC_PRIVATE);
     String modifier = access == CodeConstants.ACC_PUBLIC ? "public "
