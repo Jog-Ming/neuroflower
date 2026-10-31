@@ -175,6 +175,7 @@ public final class ConstantNames {
     expressionSites(text, rootSpans, root, sites);
     initializerSites(text, rootSpans, root, sites);
     foldedArgumentSites(text, rootSpans, root, sites);
+    interfaceStringSites(text, rootSpans, root, sites);
     nanSites(text, rootSpans, root, imports, packageName, sites);
     deadNamings(text, rootSpans, rootRules, root.classStruct, packageName, sites,
       anonymousPadding(root.classStruct));
@@ -190,6 +191,7 @@ public final class ConstantNames {
       expressionSites(text, entry.getValue(), node, sites);
       initializerSites(text, entry.getValue(), node, sites);
       foldedArgumentSites(text, entry.getValue(), node, sites);
+      interfaceStringSites(text, entry.getValue(), node, sites);
       nanSites(text, entry.getValue(), node, imports, packageName, sites);
       deadNamings(text, entry.getValue(), classRules, node.classStruct, packageName, sites, 0);
     }
@@ -4299,6 +4301,101 @@ public final class ConstantNames {
       return null;
     }
     return source.field().getName() + " + " + quote(value.substring(prefix.length()));
+  }
+
+  /**
+   * Restores an interface constant's initializer that was written as a concatenation naming
+   * another of the interface's own constants.
+   *
+   * <p>An interface has no initializer block, and a String constant cannot sit in a dead
+   * condition, so a folded naming of one of its own constants can only have stood in a constant
+   * field initializer. That initializer is attributed before any code and therefore enters the
+   * interface's own {@code Class} entry at the very front of the pool: the opening own-Class pair
+   * is the record. The printed value keeps no other trace, so the decomposition must name exactly
+   * one earlier own constant, and the whole interface must offer exactly one such initializer --
+   * two of them would need the pool order among their namings, which the pair cannot show.
+   */
+  private static void interfaceStringSites(String text, List<int[]> spans, ClassNode node,
+                                           List<Site> sites) {
+    StructClass own = node == null ? null : node.classStruct;
+    if (own == null || (own.getAccessFlags() & CodeConstants.ACC_INTERFACE) == 0) {
+      return;
+    }
+    List<String> prefix = prefixOwners(own);
+    if (prefix.size() != 1 || !prefix.get(0).equals(own.qualifiedName)) {
+      return; // the own pair is not the pool's only opening pair, so its order is not settled
+    }
+    List<FieldConstant> constants = new ArrayList<>();
+    for (StructField field : own.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant constant = constantValue(own, field);
+      VariableType kind = constant == null ? null : kind(field.getDescriptor());
+      if (constant == null || kind == null || constant.value == null) {
+        continue;
+      }
+      constants.add(new FieldConstant(field, kind, constant.value));
+    }
+    Site found = null;
+    for (int i = 1; i < constants.size(); i++) {
+      FieldConstant target = constants.get(i);
+      if (target.kind() != VariableType.STRING || !(target.value() instanceof String value)) {
+        continue;
+      }
+      for (int[] range : initializerRanges(text, spans, target.field().getName())) {
+        int equals = text.indexOf('=', range[0]);
+        if (equals < 0 || equals >= range[1] || occupied(sites, range)) {
+          continue;
+        }
+        if (!keyNamesValue(literalKey(text.substring(equals + 1, range[1]).trim()), target)) {
+          continue;
+        }
+        String expression = null;
+        int matches = 0;
+        for (int j = 0; j < i; j++) {
+          FieldConstant source = constants.get(j);
+          String candidate = stringConcatExpression(value, source);
+          if (candidate != null) {
+            matches++;
+            expression = candidate;
+          }
+        }
+        if (matches == 1) {
+          if (found != null) {
+            return; // more than one initializer needs the naming; the pool cannot order them
+          }
+          found = new Site(equals + 1, range[1], " " + expression, own.qualifiedName);
+        }
+        break;
+      }
+    }
+    if (found != null) {
+      addSiteOnce(sites, found);
+    }
+  }
+
+  /** {@code NAME}, {@code NAME + "tail"} or {@code "head" + NAME} folding to this value, or null. */
+  private static String stringConcatExpression(String value, FieldConstant source) {
+    if (source.kind() != VariableType.STRING || !(source.value() instanceof String piece)
+        || piece.isEmpty()) {
+      return null;
+    }
+    if (value.equals(piece)) {
+      return source.field().getName();
+    }
+    if (piece.length() >= value.length()) {
+      return null;
+    }
+    if (value.startsWith(piece)) {
+      return source.field().getName() + " + " + quote(value.substring(piece.length()));
+    }
+    if (value.endsWith(piece)) {
+      return quote(value.substring(0, value.length() - piece.length())) + " + "
+        + source.field().getName();
+    }
+    return null;
   }
 
   /**
