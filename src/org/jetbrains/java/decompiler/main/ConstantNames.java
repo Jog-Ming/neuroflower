@@ -4078,8 +4078,8 @@ public final class ConstantNames {
   private static void foldedArgumentSites(String text, List<int[]> spans, ClassNode node,
                                           List<Site> sites) {
     StructClass own = node == null ? null : node.classStruct;
-    if (own == null || siteIn(sites, own.qualifiedName, spans)) {
-      return; // a naming already placed in this text puts the own Class entry at another point
+    if (own == null) {
+      return;
     }
     List<PooledConstant> pool = own.getPool().getPool();
     Integer classIndex = classIndices(own).get(own.qualifiedName);
@@ -4097,7 +4097,7 @@ public final class ConstantNames {
         && link.classname != null && !own.qualifiedName.equals(link.classname)
         && link.elementname != null) {
       Site site = callArgumentSite(text, spans, own, link);
-      if (site != null) {
+      if (site != null && ownNamingPrecedes(site, own, spans, sites)) {
         addSiteOnce(sites, site);
       }
       return;
@@ -4113,6 +4113,27 @@ public final class ConstantNames {
         addSiteOnce(sites, site);
       }
     }
+  }
+
+  /**
+   * Whether this call-site naming can be the one that entered the own {@code Class} pair.
+   *
+   * <p>The pair sits immediately before the call's reference, so the naming was the last
+   * pool-entering event before it. A naming of the same class placed earlier in the text would
+   * have entered the own entry at its own generation point, ahead of this call, and the pool's
+   * pair would then belong to that naming; a later one leaves this call's naming first.
+   */
+  private static boolean ownNamingPrecedes(Site site, StructClass own, List<int[]> spans,
+                                           List<Site> sites) {
+    for (Site existing : sites) {
+      if (!own.qualifiedName.equals(existing.owner()) || !inside(spans, existing.start())) {
+        continue;
+      }
+      if (existing.start() < site.start()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
