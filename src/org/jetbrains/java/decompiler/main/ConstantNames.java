@@ -533,6 +533,61 @@ public final class ConstantNames {
   }
 
   /**
+   * The method keys whose class-file position is not their code-generation position.
+   *
+   * <p>javac generates a synthetic lambda's body with the method that creates it, not at the
+   * synthetic method's place at the end of the class, and a record's compiler-generated
+   * {@code equals}, {@code hashCode} and {@code toString} after every source method although they
+   * are written early in the class file. A first use in one of these methods cannot bound a
+   * naming; only uses in ordinary methods, whose positions are the generation order, can.
+   */
+  private static Set<String> untrustedMethodKeys(StructClass cls) {
+    Set<String> keys = new HashSet<>();
+    boolean record = cls.getRecordComponents() != null;
+    for (StructMethod method : cls.getMethods()) {
+      if ((method.getAccessFlags() & CodeConstants.ACC_SYNTHETIC) != 0) {
+        keys.add(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
+        continue;
+      }
+      if (record && generatedRecordMethod(cls, method)) {
+        keys.add(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
+      }
+    }
+    return keys;
+  }
+
+  /** Whether this is a record's compiler-generated equals, hashCode or toString. */
+  private static boolean generatedRecordMethod(StructClass cls, StructMethod method) {
+    String name = method.getName();
+    String descriptor = method.getDescriptor();
+    boolean shape = name.equals("toString") && descriptor.equals("()Ljava/lang/String;")
+      || name.equals("hashCode") && descriptor.equals("()I")
+      || name.equals("equals") && descriptor.equals("(Ljava/lang/Object;)Z");
+    if (!shape || (method.getAccessFlags() & (CodeConstants.ACC_PUBLIC | CodeConstants.ACC_FINAL))
+        != (CodeConstants.ACC_PUBLIC | CodeConstants.ACC_FINAL)) {
+      return false;
+    }
+    if (method.getInstructionSequence() == null) {
+      try {
+        method.expandData(cls);
+      }
+      catch (Exception e) {
+        return false;
+      }
+    }
+    FullInstructionSequence code = method.getInstructionSequence();
+    if (code == null) {
+      return false;
+    }
+    for (Instruction instruction : code) {
+      if (instruction.opcode == CodeConstants.opc_invokedynamic) {
+        return true; // the ObjectMethods bootstrap call the compiler emits
+      }
+    }
+    return false;
+  }
+
+  /**
    * The generation-order bounds of a naming site for a foreign owner's pool entry {@code index},
    * with a lower {@code Class} entry capped at the reference that created it.
    *
@@ -841,8 +896,9 @@ public final class ConstantNames {
     // The pool's own record of a naming -- the Class pair and the folded value entered with it --
     // places the site exactly, so it is read before the looser windows and takes precedence over
     // them: an owner the pool records this way is not offered to the window rules at all.
+    Set<String> untrusted = untrustedMethodKeys(own);
     Map<String, PairSite> pairs = pairSites(own, text, firstUses, catchTypes, setup, early, positions,
-      ownProven);
+      ownProven, untrusted);
     Map<String, PairSite> activePairs = new HashMap<>();
     Map<String, ValueSite> values = valueSites(own, firstUses, catchTypes, setup, early, positions);
     Map<String, ValueSite> activeValues = new HashMap<>();
@@ -1925,7 +1981,7 @@ public final class ConstantNames {
                                                  Set<String> catchTypes,
                                                  Set<Integer> setup, Set<Integer> early,
                                                  Map<Pair<String, String>, Map<Integer, Integer>> positions,
-                                                 boolean ownProven) {
+                                                 boolean ownProven, Set<String> untrusted) {
     Map<String, PairSite> pairs = new HashMap<>();
     List<PooledConstant> pool = cls.getPool().getPool();
     Map<String, Integer> indices = classIndices(cls);
@@ -1985,7 +2041,7 @@ public final class ConstantNames {
         // does not bound this naming: the pool still says this pair precedes the next naming, so
         // the first higher entry an instruction uses is the upper bound on the generation point
         // the naming occupies, and the pair is placed from that generation gap.
-        long[] until = pairBounds(cls, firstUses, i, early, indices);
+        long[] until = pairBounds(cls, firstUses, i, early, indices, untrusted);
         if (until[1] == Long.MAX_VALUE) {
           continue;
         }
@@ -2019,7 +2075,7 @@ public final class ConstantNames {
       if (direct != null && coordinate(direct.order(), direct.offset()) <= point) {
         continue;
       }
-      long[] bounds = pairBounds(cls, firstUses, i, early, indices);
+      long[] bounds = pairBounds(cls, firstUses, i, early, indices, untrusted);
       if (bounds[1] != point) {
         for (Map.Entry<Integer, FirstUse> higher : firstUses.entrySet()) {
           if (higher.getKey() > i && coordinate(higher.getValue().order(), higher.getValue().offset())
@@ -2149,7 +2205,8 @@ public final class ConstantNames {
    * still admits.
    */
   private static long[] pairBounds(StructClass cls, Map<Integer, FirstUse> firstUses, int index,
-                                   Set<Integer> early, Map<String, Integer> classIndices) {
+                                   Set<Integer> early, Map<String, Integer> classIndices,
+                                   Set<String> untrusted) {
     Map<Integer, Long> upper = new HashMap<>();
     long succ = Long.MAX_VALUE;
     List<PooledConstant> entries = cls.getPool().getPool();
@@ -2167,6 +2224,13 @@ public final class ConstantNames {
         // below. Only an entry a reference entered as its operand has its creation pinned; the cap
         // loop adds those. The upper bound keeps every entry: the pair's successor may itself be
         // the next naming's Class entry, and its first use is the point that places the pair.
+        continue;
+      }
+      if (key > index && key != index + 2 && untrusted.contains(entry.getValue().methodKey())) {
+        // The method's class-file position is not where it was generated (a synthetic lambda is
+        // generated with its enclosing method, a record's generated methods after every source
+        // method), so its first use says nothing about when this entry was created. The pair's
+        // own successor is the anchor and always counts.
         continue;
       }
       long point = coordinate(entry.getValue().order(), entry.getValue().offset());
