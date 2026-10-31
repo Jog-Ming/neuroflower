@@ -174,6 +174,7 @@ public final class ConstantNames {
     }
     expressionSites(text, rootSpans, root, sites);
     initializerSites(text, rootSpans, root, sites);
+    foldedArgumentSites(text, rootSpans, root, sites);
     deadNamings(text, rootSpans, rootRules, root.classStruct, packageName, sites,
       anonymousPadding(root.classStruct));
     for (Map.Entry<String, List<int[]>> entry : spansByClass.entrySet()) {
@@ -187,6 +188,7 @@ public final class ConstantNames {
       }
       expressionSites(text, entry.getValue(), node, sites);
       initializerSites(text, entry.getValue(), node, sites);
+      foldedArgumentSites(text, entry.getValue(), node, sites);
       deadNamings(text, entry.getValue(), classRules, node.classStruct, packageName, sites, 0);
     }
     if (sites.isEmpty()) {
@@ -3977,6 +3979,374 @@ public final class ConstantNames {
       return null;
     }
     return source.field().getName() + " + " + quote(value.substring(prefix.length()));
+  }
+
+  /**
+   * Names an own constant the code generation folded into a call argument or an array dimension.
+   *
+   * <p>A constant of the class itself, named in a method body, is resolved while its expression is
+   * generated, and javac interns the class's own {@code Class} entry there. The pool records the
+   * point: the own pair sits immediately before the member reference of the call whose argument
+   * named it, or before the component {@code Class} of the array it sized. The folded value is all
+   * the text keeps, so any own constant -- or arithmetic over own constants -- that folds to the
+   * printed literal reproduces the entry.
+   */
+  private static void foldedArgumentSites(String text, List<int[]> spans, ClassNode node,
+                                          List<Site> sites) {
+    StructClass own = node == null ? null : node.classStruct;
+    if (own == null || siteIn(sites, own.qualifiedName, spans)) {
+      return; // a naming already placed in this text puts the own Class entry at another point
+    }
+    List<PooledConstant> pool = own.getPool().getPool();
+    Integer classIndex = classIndices(own).get(own.qualifiedName);
+    if (classIndex == null || classIndex + 2 >= pool.size()) {
+      return;
+    }
+    if (!(pool.get(classIndex) instanceof PrimitiveConstant entry)
+        || entry.type != CodeConstants.CONSTANT_Class || entry.index != classIndex + 1
+        || !(pool.get(classIndex + 1) instanceof PrimitiveConstant name)
+        || name.type != CodeConstants.CONSTANT_Utf8) {
+      return;
+    }
+    PooledConstant next = pool.get(classIndex + 2);
+    if (next instanceof LinkConstant link && link.type == CodeConstants.CONSTANT_Methodref
+        && link.classname != null && !own.qualifiedName.equals(link.classname)
+        && link.elementname != null) {
+      Site site = callArgumentSite(text, spans, own, link);
+      if (site != null) {
+        addSiteOnce(sites, site);
+      }
+      return;
+    }
+    if (next instanceof PrimitiveConstant component
+        && component.type == CodeConstants.CONSTANT_Class && component.getString() != null
+        && classIndex + 3 < pool.size()
+        && pool.get(classIndex + 3) instanceof PrimitiveConstant componentName
+        && componentName.type == CodeConstants.CONSTANT_Utf8
+        && component.getString().equals(componentName.getString())) {
+      Site site = arrayDimensionSite(text, spans, own, component.getString());
+      if (site != null) {
+        addSiteOnce(sites, site);
+      }
+    }
+  }
+
+  /**
+   * The rightmost whole-argument literal of the call whose reference follows the own pair.
+   *
+   * <p>The arguments are generated left to right, so the naming recorded immediately before the
+   * call's reference is the last argument expression that names a constant. Only a literal that is
+   * the entire argument is used: the recorded descriptor then fixes the parameter's own type, and a
+   * name of another kind can widen into it exactly. A same-arity overload that takes the
+   * constant's own type exactly would be preferred instead, so the naming is refused there.
+   */
+  private static Site callArgumentSite(String text, List<int[]> spans, StructClass own,
+                                       LinkConstant link) {
+    java.util.regex.Pattern pattern = java.util.regex.Pattern
+      .compile("\\." + java.util.regex.Pattern.quote(link.elementname) + "\\s*\\(");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      if (!matcher.find()) {
+        continue;
+      }
+      int open = matcher.end() - 1;
+      int close = parameterListEnd(text, open, span[1]);
+      if (close < 0) {
+        return null;
+      }
+      List<String> parameters = parameterTypes(link.descriptor);
+      List<int[]> arguments = argumentSpans(text, open + 1, close);
+      for (int i = arguments.size() - 1; i >= 0; i--) {
+        int[] argument = arguments.get(i);
+        String key = literalKey(text.substring(argument[0], argument[1]));
+        VariableType literalKind = literalKeyKind(key);
+        Constant constant = ownConstantForKey(own, key, literalKind);
+        if (constant == null || !parameterAccepts(link, parameters, i, literalKind, constant)) {
+          continue;
+        }
+        return new Site(argument[0], argument[1], constant.name(), own.qualifiedName);
+      }
+      return null;
+    }
+    return null;
+  }
+
+  /** The top-level argument ranges of a call, trimmed to their content. */
+  private static List<int[]> argumentSpans(String text, int from, int to) {
+    List<int[]> arguments = new ArrayList<>();
+    int depth = 0;
+    int start = from;
+    for (int i = from; i <= to; i++) {
+      char c = i < to ? text.charAt(i) : ',';
+      if (c == '(' || c == '[' || c == '{') {
+        depth++;
+      }
+      else if (c == ')' || c == ']' || c == '}') {
+        depth--;
+      }
+      else if (c == ',' && depth == 0) {
+        int begin = start;
+        int end = i;
+        while (begin < end && Character.isWhitespace(text.charAt(begin))) {
+          begin++;
+        }
+        while (end > begin && Character.isWhitespace(text.charAt(end - 1))) {
+          end--;
+        }
+        if (begin < end) {
+          arguments.add(new int[]{begin, end});
+        }
+        start = i + 1;
+      }
+    }
+    return arguments;
+  }
+
+  /** The parameter type descriptors of a method descriptor, in order. */
+  private static List<String> parameterTypes(String descriptor) {
+    List<String> types = new ArrayList<>();
+    if (descriptor == null || descriptor.isEmpty() || descriptor.charAt(0) != '(') {
+      return types;
+    }
+    int i = 1;
+    while (i < descriptor.length() && descriptor.charAt(i) != ')') {
+      int start = i;
+      while (i < descriptor.length() && descriptor.charAt(i) == '[') {
+        i++;
+      }
+      if (i >= descriptor.length()) {
+        return types;
+      }
+      if (descriptor.charAt(i) == 'L') {
+        int semi = descriptor.indexOf(';', i);
+        if (semi < 0) {
+          return types;
+        }
+        i = semi + 1;
+      }
+      else {
+        i++;
+      }
+      types.add(descriptor.substring(start, i));
+    }
+    return types;
+  }
+
+  /** The primitive descriptor of a kind, or null for a reference kind. */
+  private static String primitiveDescriptor(VariableType kind) {
+    return switch (kind) {
+      case INT -> "I";
+      case LONG -> "J";
+      case FLOAT -> "F";
+      case DOUBLE -> "D";
+      case BYTE -> "B";
+      case SHORT -> "S";
+      case CHAR -> "C";
+      case BOOLEAN -> "Z";
+      default -> null;
+    };
+  }
+
+  /**
+   * Whether the constant can replace this whole literal without changing the chosen method.
+   *
+   * <p>The parameter must be the literal's own type, or the literal would not have selected this
+   * overload. A constant of another type widens into it, but then a same-arity overload taking the
+   * constant's own type exactly would win instead, so such an overload refuses the naming.
+   */
+  private static boolean parameterAccepts(LinkConstant link, List<String> parameters, int index,
+                                          VariableType literalKind, Constant constant) {
+    if (index < 0 || index >= parameters.size()) {
+      return false;
+    }
+    String parameter = parameters.get(index);
+    if (!parameter.equals(primitiveDescriptor(literalKind))) {
+      return false; // the literal's own type is what selected this overload
+    }
+    String exact = primitiveDescriptor(constant.kind());
+    if (parameter.equals(exact)) {
+      return true; // the constant's own type is the parameter's
+    }
+    return !overloadTakes(link.classname, link.elementname, link.descriptor, index, exact);
+  }
+
+  /** The kind of a literal key, or null when the key names no primitive literal. */
+  private static VariableType literalKeyKind(String key) {
+    if (key == null) {
+      return null;
+    }
+    int bar = key.indexOf('|');
+    if (bar < 0) {
+      return null;
+    }
+    try {
+      return VariableType.valueOf(key.substring(0, bar));
+    }
+    catch (IllegalArgumentException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Whether a same-arity method of that name takes this parameter type exactly.
+   *
+   * <p>Such an overload would be preferred over the recorded one once the source names a constant
+   * of that type, so the naming would compile to a different call.
+   */
+  private static boolean overloadTakes(String owner, String member, String descriptor, int index,
+                                       String exact) {
+    if (owner == null || exact == null) {
+      return true;
+    }
+    int arity = parameterTypes(descriptor).size();
+    StructContext context = DecompilerContext.getStructContext();
+    StructClass cls = context.getClass(owner);
+    for (int depth = 0; depth < 32 && cls != null; depth++) {
+      for (StructMethod method : cls.getMethods()) {
+        if (!method.getName().equals(member)) {
+          continue;
+        }
+        List<String> parameters = parameterTypes(method.getDescriptor());
+        if (parameters.size() == arity && index < parameters.size()
+            && parameters.get(index).equals(exact)) {
+          return true;
+        }
+      }
+      String superName = cls.superClass == null ? null : cls.superClass.getString();
+      cls = superName == null ? null : context.getClass(superName);
+    }
+    return false;
+  }
+
+  /**
+   * The own constant this literal can be replaced by, or null when none reproduces it.
+   *
+   * <p>The naming must fold to the very literal: the same value in the same kind, or an int
+   * constant at the double literal a widening argument took.
+   */
+  private static Constant ownConstantForKey(StructClass own, String key, VariableType literalKind) {
+    if (key == null || literalKind == null || !numeric(literalKind)) {
+      return null;
+    }
+    String printed = key.substring(key.indexOf('|') + 1);
+    for (StructField field : own.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant constant = constantValue(own, field);
+      VariableType kind = constant == null ? null : kind(field.getDescriptor());
+      if (constant == null || kind == null || constant.value == null || !integralKind(kind)) {
+        continue;
+      }
+      if (reproduces(literalKind, printed, kind, constant.value)) {
+        return new Constant(own.qualifiedName, field.getName(), kind);
+      }
+    }
+    return null;
+  }
+
+  /** Whether this constant folds to the printed literal under javac's widening. */
+  private static boolean reproduces(VariableType literalKind, String printed,
+                                    VariableType constantKind, Object value) {
+    if (!(value instanceof Number number)) {
+      return false;
+    }
+    try {
+      return switch (literalKind) {
+        case INT -> constantKind == VariableType.INT && number.intValue() == Integer.parseInt(printed);
+        case LONG -> constantKind == VariableType.LONG && number.longValue() == Long.parseLong(printed);
+        case FLOAT -> constantKind == VariableType.FLOAT
+          && number.floatValue() == Float.parseFloat(printed);
+        case DOUBLE -> constantKind == VariableType.DOUBLE
+          ? number.doubleValue() == Double.parseDouble(printed)
+          : constantKind == VariableType.FLOAT
+          ? (double) number.floatValue() == Double.parseDouble(printed)
+          : constantKind == VariableType.INT
+          && (double) number.intValue() == Double.parseDouble(printed);
+        default -> false;
+      };
+    }
+    catch (NumberFormatException e) {
+      return false;
+    }
+  }
+
+  /**
+   * The own-constant expression an array dimension folds, when the own pair precedes the array's
+   * component {@code Class} entry: the dimension is generated before the component is interned, so
+   * that component is the pool's record of the naming site.
+   */
+  private static Site arrayDimensionSite(String text, List<int[]> spans, StructClass own,
+                                         String component) {
+    String simple = simpleName(component);
+    if (simple.isEmpty()) {
+      return null;
+    }
+    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+      "\\bnew\\s+(?:[A-Za-z_$][A-Za-z0-9_$.]*\\.)?" + java.util.regex.Pattern.quote(simple)
+        + "\\s*\\[");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      while (matcher.find()) {
+        int open = matcher.end() - 1;
+        int close = text.indexOf(']', open + 1);
+        if (close < 0 || close >= span[1]) {
+          continue;
+        }
+        if (close + 1 < span[1] && text.charAt(close + 1) == '[') {
+          continue; // several dimensions: the component pair sizes another one
+        }
+        String key = literalKey(text.substring(open + 1, close).trim());
+        if (key == null || !key.startsWith(VariableType.INT.name() + "|")) {
+          continue;
+        }
+        int value;
+        try {
+          value = Integer.parseInt(key.substring(key.indexOf('|') + 1));
+        }
+        catch (NumberFormatException e) {
+          continue;
+        }
+        String expression = ownConstantExpression(own, value);
+        if (expression == null) {
+          continue;
+        }
+        int start = open + 1;
+        while (start < close && Character.isWhitespace(text.charAt(start))) {
+          start++;
+        }
+        int end = close;
+        while (end > start && Character.isWhitespace(text.charAt(end - 1))) {
+          end--;
+        }
+        return new Site(start, end, expression, own.qualifiedName);
+      }
+    }
+    return null;
+  }
+
+  /** An expression over the class's own integral constants that folds to this value, or null. */
+  private static String ownConstantExpression(StructClass own, int value) {
+    FieldConstant target = new FieldConstant(null, VariableType.INT, value);
+    for (StructField field : own.getFields()) {
+      if ((field.getAccessFlags() & (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL))
+          != (CodeConstants.ACC_STATIC | CodeConstants.ACC_FINAL)) {
+        continue;
+      }
+      PrimitiveConstant constant = constantValue(own, field);
+      VariableType kind = constant == null ? null : kind(field.getDescriptor());
+      if (constant == null || kind == null || constant.value == null || !integralKind(kind)) {
+        continue;
+      }
+      String expression = constantExpression(target, kind, constant.value, field.getName());
+      if (expression != null) {
+        return expression;
+      }
+    }
+    return null;
   }
 
   /**
