@@ -6,6 +6,7 @@ import org.jetbrains.java.decompiler.code.ExceptionHandler;
 import org.jetbrains.java.decompiler.code.FullInstructionSequence;
 import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
+import org.jetbrains.java.decompiler.modules.decompiler.RoundTrip;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructField;
 import org.jetbrains.java.decompiler.struct.StructContext;
@@ -3250,9 +3251,16 @@ public final class ConstantNames {
           // of the preceding operand cannot tell the two apart, while the character offsets can:
           // the arguments are printed in the order they are generated. When that last use has no
           // printed position nothing can place it, and the pool-free expression rule below is the
-          // only evidence left.
+          // only evidence left. A site the printer did place carries its exact generation point,
+          // which the pair's bracket must admit just as it does outside an argument list.
           if (pair.lowerAt() >= 0 && start <= pair.lowerAt()) {
             continue;
+          }
+          if (RoundTrip.selector("argorder")) {
+            long sitePoint = siteCoordinate(placement.spaces(), start);
+            if (sitePoint != NO_COORDINATE && sitePoint <= pair.after()) {
+              continue;
+            }
           }
         }
         else {
@@ -3431,6 +3439,14 @@ public final class ConstantNames {
     long lower = sameRank && pair.successorKey() == null ? pair.after() : pair.lower();
     if (pair.open() >= 0 && sameRank) {
       boolean inArgs = position > pair.open() && position < pair.close();
+      if (inArgs && RoundTrip.selector("argorder")) {
+        // Arguments are generated left to right, so the last lower entry's use bounds a site in
+        // the call's own argument list exactly as it bounds one before the call: a naming ahead
+        // of that use would enter the owner's Class ahead of an entry the pair follows. The
+        // printed argument order alone cannot see this: the call's name is printed before its
+        // arguments although the arguments are generated first.
+        return coordinate > lower;
+      }
       return inArgs || before && coordinate > lower;
     }
     return before && coordinate > lower;
