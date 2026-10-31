@@ -862,7 +862,7 @@ public final class ConstantNames {
       for (String owner : prefixOwners(own)) {
         Integer index = classIndices.get(owner);
         if (index == null || owner.equals(own.qualifiedName) || isBootstrapOwner(owner)
-            || setup.contains(index) || usedBelow(firstUses, index)) {
+            || setup.contains(index) || usedBelow(own, classIndices, firstUses, index, bare, setup)) {
           continue;
         }
         boolean enclosing = own.qualifiedName.startsWith(owner + "$");
@@ -2972,6 +2972,7 @@ public final class ConstantNames {
     int best = -1;
     int bestEnd = -1;
     String bestName = null;
+    String bestReplacement = null;
     for (Map.Entry<String, List<Constant>> entry : rules.candidates().entrySet()) {
       int bar = entry.getKey().indexOf('|');
       if (bar < 0) {
@@ -2994,21 +2995,63 @@ public final class ConstantNames {
             if (last ? span[0] <= best : best >= 0 && span[0] >= best) {
               continue; // an earlier match, or a later one than the first already found
             }
-            if (insideInitializer(rules.ownInitializers(), span[0])
-                || !bareSiteSafe(text, span, sourceKind, constant, literal.getValue(), rules)) {
+            if (!bareSiteSafe(text, span, sourceKind, constant, literal.getValue(), rules)) {
               continue;
             }
             best = span[0];
             bestEnd = span[1];
             bestName = constant.name();
+            bestReplacement = constant.name();
           }
         }
       }
     }
-    if (best < 0 || bestName == null || !resolvesBarely(cls, owner, bestName)) {
+    if (best < 0 || bestName == null) {
+      // An arithmetic expression over the owner's int constants can reproduce a literal no single
+      // constant holds (`MAX_SIZE - 1`); the naming is the constant, the arithmetic is the
+      // source's. The expression's type is the literal's own, so no overload can change, and the
+      // parentheses keep it one operand where the literal stood.
+      for (Map.Entry<String, List<Constant>> entry : rules.candidates().entrySet()) {
+        if (!entry.getKey().startsWith(VariableType.INT.name() + "|")) {
+          continue;
+        }
+        long sourceValue;
+        try {
+          sourceValue = Long.parseLong(entry.getKey().substring(entry.getKey().indexOf('|') + 1));
+        }
+        catch (NumberFormatException e) {
+          continue;
+        }
+        for (Constant constant : entry.getValue()) {
+          if (!constant.owner().equals(owner) || constant.kind() != VariableType.INT) {
+            continue;
+          }
+          for (long[] literal : intLiterals(text, spans)) {
+            int start = (int) literal[0];
+            long raw = literal[2];
+            if (raw < Integer.MIN_VALUE || raw > Integer.MAX_VALUE
+                || (last ? start <= best : best >= 0 && start >= best)) {
+              continue;
+            }
+            String expression = constantExpression(
+              new FieldConstant(null, VariableType.INT, (int) raw), VariableType.INT, sourceValue,
+              constant.name());
+            if (expression == null || expression.equals(constant.name())) {
+              continue; // the constant's own value, which the direct-name loop already read
+            }
+            best = start;
+            bestEnd = (int) literal[1];
+            bestName = constant.name();
+            bestReplacement = "(" + expression + ")";
+          }
+        }
+      }
+    }
+    if (best < 0 || bestName == null || bestReplacement == null
+        || !resolvesBarely(cls, owner, bestName)) {
       return null;
     }
-    return new Site(best, bestEnd, bestName, owner);
+    return new Site(best, bestEnd, bestReplacement, owner);
   }
 
   /** The position of this owner among the pool's leading pairs, or -1. */
@@ -3054,9 +3097,11 @@ public final class ConstantNames {
   private static boolean bareSiteSafe(String text, int[] span, VariableType sourceKind,
                                        Constant constant, boolean needsComparison, Rules rules) {
     if (needsComparison) {
-      // A narrower constant keeps a comparison's int type under binary numeric promotion; in an
-      // argument or assignment it could change an overload or the assigned expression's type.
-      return comparisonSite(text, span[0], span[1]);
+      // A narrower constant keeps the expression's int type where binary numeric promotion applies:
+      // a comparison, an operand of an arithmetic or bitwise operator, or a branch of a
+      // conditional. Anywhere else (an argument, an assignment) it could change an overload or
+      // the assigned expression's type.
+      return comparisonSite(text, span[0], span[1]) || promotingSite(text, span[0], span[1]);
     }
     if (sourceKind == VariableType.INT && constant.kind() == VariableType.INT) {
       String key = literalKey(text.substring(span[0], span[1]));
@@ -3074,12 +3119,33 @@ public final class ConstantNames {
     return constant.kind() == sourceKind;
   }
 
-  /** Whether any instruction references a pool entry below this one. */
-  private static boolean usedBelow(Map<Integer, FirstUse> uses, int index) {
+  /**
+   * Whether any instruction references an entry below this pair that the pair cannot explain.
+   *
+   * <p>An instruction use below the pair is a code-generation event, but a leading pair's Class
+   * entry may have been interned before any code by a bare naming and merely reused by the
+   * instruction. A Class entry whose owner is this class, one of its setup entries, or another
+   * leading bare naming has exactly that explanation, so its use says nothing about when the pair
+   * was created.
+   */
+  private static boolean usedBelow(StructClass cls, Map<String, Integer> classIndices,
+                                   Map<Integer, FirstUse> uses, int index, Set<String> bare,
+                                   Set<Integer> setup) {
+    List<PooledConstant> pool = cls.getPool().getPool();
     for (int key : uses.keySet()) {
-      if (key < index) {
-        return true;
+      if (key >= index) {
+        continue;
       }
+      if (key > 0 && key < pool.size() && pool.get(key) instanceof PrimitiveConstant primitive
+          && primitive.type == CodeConstants.CONSTANT_Class && primitive.getString() != null) {
+        String owner = primitive.getString();
+        Integer classIndex = classIndices.get(owner);
+        if (owner.equals(cls.qualifiedName) || bare.contains(owner)
+            || (classIndex != null && setup.contains(classIndex))) {
+          continue; // a leading pair's entry, reused by the instruction
+        }
+      }
+      return true;
     }
     return false;
   }
@@ -4026,6 +4092,13 @@ public final class ConstantNames {
         }
         Site placed = placeOwnConstant(owner, constants, initializers, text, sites, last, limit);
         if (placed == null) {
+          // A bare foreign naming may already occupy the initializer an own constant would be
+          // written in. The pool's own pair still opens it before that foreign pair, so an
+          // earlier own initializer must name the class: a qualified forward reference is legal
+          // and folds to the same constant.
+          placed = placeOwnBeforeBare(owner, constants, initializers, text, sites, own);
+        }
+        if (placed == null) {
           return;
         }
         addSiteOnce(sites, placed);
@@ -4064,6 +4137,63 @@ public final class ConstantNames {
       // site of their own, after this one.
       k += used[0];
     }
+  }
+
+  /**
+   * The earliest own initializer before a bare foreign naming that can name the class itself.
+   *
+   * <p>The pool's own pair opens before the bare owner's pair, so the class's own entry must be
+   * interned while an initializer before the foreign naming is attributed. The own constant named
+   * there is a later declaration, so it needs the simple class name as its qualifier; a qualified
+   * forward reference is legal and both names are compile-time constants.
+   */
+  private static Site placeOwnBeforeBare(String owner, List<FieldConstant> constants,
+                                         Map<String, List<int[]>> initializers, String text,
+                                         List<Site> sites, StructClass own) {
+    if (bareRank(own, owner) != 0) {
+      return null; // another prefix pair opens the pool; an earlier own naming would reorder it
+    }
+    int bare = -1;
+    for (Site site : sites) {
+      if (!owner.equals(site.owner())) {
+        bare = site.start();
+        break;
+      }
+    }
+    if (bare < 0) {
+      return null;
+    }
+    String simple = sourceSimpleName(own);
+    if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))) {
+      return null;
+    }
+    for (int i = 0; i < constants.size(); i++) {
+      FieldConstant target = constants.get(i);
+      List<int[]> ranges = initializers.get(target.field().getName());
+      if (ranges == null || ranges.isEmpty()) {
+        continue;
+      }
+      int[] range = ranges.get(0);
+      if (range[1] > bare || occupied(sites, range)) {
+        continue; // the naming must be attributed before the bare one
+      }
+      int equals = text.indexOf('=', range[0]);
+      if (equals < 0 || equals >= range[1]) {
+        continue;
+      }
+      for (int j = 0; j < constants.size(); j++) {
+        if (j == i) {
+          continue;
+        }
+        FieldConstant source = constants.get(j);
+        String expression = constantExpression(target, source.kind(), source.value(),
+          simple + "." + source.field().getName());
+        if (expression != null) {
+          return new Site(equals + 1, range[1], " " + expression, owner);
+        }
+      }
+    }
+    return null;
   }
 
   /** The site naming the class's own constant in an initializer, or null when none fits. */
@@ -7008,6 +7138,37 @@ public final class ConstantNames {
       return KEYWORDS.contains(word) ? i : -1;
     }
     return Character.isDigit(c) || c == 41 || c == 93 || c == 34 || c == 39 ? -1 : i;
+  }
+
+  /**
+   * Whether binary numeric promotion keeps this literal's own type around it.
+   *
+   * <p>An operand of an arithmetic or bitwise operator promotes to int exactly as the literal did,
+   * and so does either branch of a conditional whose other branch is an int. A binary minus is
+   * not offered: a unary minus would keep the narrower constant's own type.
+   */
+  private static boolean promotingSite(String text, int start, int end) {
+    int i = start - 1;
+    while (i >= 0 && Character.isWhitespace(text.charAt(i))) {
+      i--;
+    }
+    if (i >= 0) {
+      char c = text.charAt(i);
+      if (c == '?' || c == '&' || c == '|' || c == '^' || c == '+' || c == '*' || c == '/'
+          || c == '%') {
+        return true;
+      }
+    }
+    int j = end;
+    while (j < text.length() && Character.isWhitespace(text.charAt(j))) {
+      j++;
+    }
+    if (j < text.length()) {
+      char d = text.charAt(j);
+      return d == '?' || d == ':' || d == '&' || d == '|' || d == '^' || d == '+' || d == '*'
+        || d == '/' || d == '%';
+    }
+    return false;
   }
 
   /**
