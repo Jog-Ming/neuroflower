@@ -5629,7 +5629,7 @@ public final class ConstantNames {
   private static String binaryExpression(FieldConstant target, VariableType sourceKind,
                                          Object sourceValue, String name) {
     VariableType p = promote(sourceKind, target.kind());
-    if (p == null || !assignmentAllowed(p, target.kind())) {
+    if (p == null || (!assignmentAllowed(p, target.kind()) && !constantNarrowing(p, target))) {
       return null;
     }
     Object converted = convert(sourceValue, sourceKind, p);
@@ -5855,7 +5855,8 @@ public final class ConstantNames {
 
   /** Whether the value folds, through the assignment conversion, to the target's exact value. */
   private static boolean foldsTo(Object value, VariableType from, FieldConstant target) {
-    if (value == null || !assignmentAllowed(from, target.kind())) {
+    if (value == null || (!assignmentAllowed(from, target.kind())
+        && !constantNarrowing(from, target))) {
       return false;
     }
     Object converted = convert(value, from, target.kind());
@@ -5864,7 +5865,8 @@ public final class ConstantNames {
 
   private static boolean numeric(VariableType kind) {
     return kind == VariableType.INT || kind == VariableType.CHAR || kind == VariableType.LONG
-      || kind == VariableType.FLOAT || kind == VariableType.DOUBLE;
+      || kind == VariableType.FLOAT || kind == VariableType.DOUBLE
+      || kind == VariableType.BYTE || kind == VariableType.SHORT;
   }
 
   /**
@@ -5937,8 +5939,11 @@ public final class ConstantNames {
     if (!numeric(a) || !numeric(b)) {
       return null;
     }
-    VariableType left = a == VariableType.CHAR ? VariableType.INT : a;
-    VariableType right = b == VariableType.CHAR ? VariableType.INT : b;
+    // Binary numeric promotion: byte, short and char operands widen to int before arithmetic.
+    VariableType left = a == VariableType.CHAR || a == VariableType.BYTE || a == VariableType.SHORT
+      ? VariableType.INT : a;
+    VariableType right = b == VariableType.CHAR || b == VariableType.BYTE || b == VariableType.SHORT
+      ? VariableType.INT : b;
     return rank(left) >= rank(right) ? left : right;
   }
 
@@ -5949,6 +5954,26 @@ public final class ConstantNames {
       case FLOAT -> 2;
       case DOUBLE -> 3;
       default -> -1;
+    };
+  }
+
+  /**
+   * Whether an int-typed constant expression may initialize a narrower constant field.
+   *
+   * <p>JLS 5.2 allows a constant expression of type {@code int} to narrow to {@code byte},
+   * {@code short} or {@code char} when its value is representable. Every expression this solver
+   * builds is a compile-time constant, so the assignment compiles and folds to the same value.
+   */
+  private static boolean constantNarrowing(VariableType promoted, FieldConstant target) {
+    if (promoted != VariableType.INT || !(target.value() instanceof Number number)) {
+      return false;
+    }
+    long value = number.longValue();
+    return switch (target.kind()) {
+      case BYTE -> value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE;
+      case SHORT -> value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
+      case CHAR -> value >= Character.MIN_VALUE && value <= Character.MAX_VALUE;
+      default -> false;
     };
   }
 
@@ -5976,15 +6001,22 @@ public final class ConstantNames {
     if (from == VariableType.FLOAT) {
       return to == VariableType.DOUBLE ? Double.valueOf(((Float) value).doubleValue()) : null;
     }
-    if (from != VariableType.INT && from != VariableType.CHAR && from != VariableType.LONG) {
+    if (from != VariableType.INT && from != VariableType.CHAR && from != VariableType.LONG
+        && from != VariableType.BYTE && from != VariableType.SHORT) {
       return null;
     }
     long integral = ((Number) value).longValue();
     if (to == VariableType.CHAR && (integral < Character.MIN_VALUE || integral > Character.MAX_VALUE)) {
       return null;
     }
+    if (to == VariableType.BYTE && (integral < Byte.MIN_VALUE || integral > Byte.MAX_VALUE)) {
+      return null;
+    }
+    if (to == VariableType.SHORT && (integral < Short.MIN_VALUE || integral > Short.MAX_VALUE)) {
+      return null;
+    }
     return switch (to) {
-      case INT, CHAR -> Integer.valueOf((int) integral);
+      case INT, CHAR, BYTE, SHORT -> Integer.valueOf((int) integral);
       case LONG -> Long.valueOf(integral);
       case FLOAT -> Float.valueOf((float) integral);
       case DOUBLE -> Double.valueOf((double) integral);
