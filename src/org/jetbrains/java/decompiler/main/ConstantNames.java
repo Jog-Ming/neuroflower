@@ -1884,7 +1884,7 @@ public final class ConstantNames {
    */
   private record PairSite(int classIndex, long successor, long lower, long after, int open, int close,
                           String member, String successorKey, Set<String> pooled, int successorAt,
-                          int lowerAt, int nextClass, boolean ownMember) {
+                          int lowerAt, int nextClass, boolean ownMember, boolean unprintedCall) {
     /** Whether naming a constant of this value enters no pool entry the original did not have. */
     boolean valueAvailable(String key) {
       if (key.equals(successorKey)) {
@@ -2050,12 +2050,10 @@ public final class ConstantNames {
           }
         }
       }
-      if (call && open < 0 && !CodeConstants.INIT_NAME.equals(methodName)) {
-        // A call whose invoke was never printed cannot place a site, and recording the pair would
-        // keep the window rules from placing one through the deferred fallback. Constructor calls
-        // are the exception: their argument list is bounded by the new instruction and the invoke.
-        continue;
-      }
+      // A call whose invoke was never printed (a synthetic bridge, say) still records the pair:
+      // the generation gap between the neighbouring entries' first uses places the naming without
+      // its argument list. The deferred fallback below is left free for such a pair, because the
+      // record may find no site at all.
       String successorKey = pool.get(i + 2) instanceof PrimitiveConstant pv ? valueKey(pv) : null;
       // A pair whose Class entry directly follows another naming's pair belongs to that one
       // expression, so its folded value is the whole expression's, not this owner's own constant.
@@ -2085,7 +2083,8 @@ public final class ConstantNames {
         open, close, member, successorKey, pooledKeys(cls, i), at == null ? -1 : at,
         lowerAt == null ? -1 : lowerAt, nextClass,
         link != null && link.type == CodeConstants.CONSTANT_Fieldref
-          && cls.qualifiedName.equals(link.classname)));
+          && cls.qualifiedName.equals(link.classname),
+        call && open < 0 && !CodeConstants.INIT_NAME.equals(methodName)));
     }
     return pairs;
   }
@@ -2758,7 +2757,9 @@ public final class ConstantNames {
       if (hasSiteFor(sites, entry.getKey())) {
         continue; // the naming is already placed
       }
-      if ((rules.placement().pairs() != null && rules.placement().pairs().containsKey(entry.getKey()))
+      PairSite record = rules.placement().pairs() == null ? null
+        : rules.placement().pairs().get(entry.getKey());
+      if ((record != null && !record.unprintedCall())
           || (rules.placement().values() != null && rules.placement().values().containsKey(entry.getKey()))) {
         continue; // the pool record is the only evidence of the site; it found none, so place none
       }
