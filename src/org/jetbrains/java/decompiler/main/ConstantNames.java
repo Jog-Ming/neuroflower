@@ -2976,7 +2976,8 @@ public final class ConstantNames {
           i = skipQuoted(text, i, c);
           continue;
         }
-        if (Character.isDigit(c) && (i == span[0] || !isIdentifierPart(text.charAt(i - 1)))) {
+        if (Character.isDigit(c) && (i == span[0]
+            || (!isIdentifierPart(text.charAt(i - 1)) && text.charAt(i - 1) != '.'))) {
           long[] value = new long[1];
           int end = intLiteral(text, i, span[1], value);
           if (end > 0) {
@@ -3696,7 +3697,8 @@ public final class ConstantNames {
           i = skipQuoted(text, i, c);
           continue;
         }
-        if (Character.isDigit(c) && (i == span[0] || !isIdentifierPart(text.charAt(i - 1)))) {
+        if (Character.isDigit(c) && (i == span[0]
+            || (!isIdentifierPart(text.charAt(i - 1)) && text.charAt(i - 1) != '.'))) {
           int end = i;
           boolean dot = false;
           while (end < span[1]) {
@@ -5729,7 +5731,8 @@ public final class ConstantNames {
         i = end;
         continue;
       }
-      if (Character.isDigit(c) && (i == 0 || !isIdentifierPart(text.charAt(i - 1)))) {
+      if (Character.isDigit(c) && (i == 0
+          || (!isIdentifierPart(text.charAt(i - 1)) && text.charAt(i - 1) != '.'))) {
         i = scanNumber(text, i, sites, candidates, imports, packageName, own, ownInitializers,
           placement, deferred, inWindow, invented);
         continue;
