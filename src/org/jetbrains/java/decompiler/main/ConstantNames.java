@@ -225,7 +225,8 @@ public final class ConstantNames {
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
                            Map<String, PairSite> pairs, Map<String, ValueSite> values,
                            Set<String> valueRecords, Set<String> bares, Set<String> earlyOwners,
-                           boolean ownEarly, boolean ownProven, StructClass cls, String text) {
+                           boolean ownEarly, boolean ownProven, StructClass cls, String text,
+                           boolean codeEntry) {
     /**
      * Whether this text position lies where the pool order proves the owner was named.
      *
@@ -391,7 +392,7 @@ public final class ConstantNames {
   private static final Placement NO_PLACEMENT =
     new Placement(null, null, List.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), Map.of(),
       Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), false,
-      false, null, "");
+      false, null, "", false);
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -1034,7 +1035,7 @@ public final class ConstantNames {
       new Placement(windows, coordinates, spaces(own, positions), strict, anchored, direct,
         folded, internedAt, namingAt, lexical, spans, new HashSet<>(prefixOwners(own)),
         inheritedNames, activePairs, activeValues, valueRecords, bares, earlyOwners, ownEarly,
-        ownProven, own, text),
+        ownProven, own, text, !firstUses.isEmpty()),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
@@ -6920,9 +6921,9 @@ public final class ConstantNames {
       return;
     }
     if (own.getRecordComponents() != null
-        || (own.getAccessFlags() & (CodeConstants.ACC_INTERFACE | CodeConstants.ACC_ANNOTATION
+        || (own.getAccessFlags() & (CodeConstants.ACC_ANNOTATION
         | CodeConstants.ACC_ENUM)) != 0) {
-      return; // this body has no instance initializer block
+      return; // this body has no initializer block to carry the dead conditions
     }
     List<Map.Entry<Integer, String>> conditions = new ArrayList<>();
     // A name whose Class entry opens the pool was written while the class body was attributed,
@@ -6934,39 +6935,51 @@ public final class ConstantNames {
     Set<Integer> prefix = prefixClassIndices(own);
     Set<Integer> added = new HashSet<>();
     Map<String, List<int[]>> constantInitializers = ownInitializers(text, own);
-    if (rules != null) {
+    Placement placement = rules == null ? null : rules.placement();
+    // With no instruction-referenced entry at all, the leading Class pairs are exactly the
+    // class-file writer's own, superclass and interface entries: nothing they name was folded
+    // away, so the pool records no naming site for them.
+    boolean codeEntries = placement != null ? placement.codeEntry() : !firstUses(own).isEmpty();
+    if (codeEntries && rules != null) {
       for (String owner : rules.missing()) {
         addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
-          rules.placement(), conditions, added);
+          placement, conditions, added);
       }
     }
-    Placement placement = rules == null ? null : rules.placement();
-    for (String owner : prefixOwners(own)) {
-      addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
-        placement, conditions, added);
+    if (codeEntries) {
+      for (String owner : prefixOwners(own)) {
+        addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
+          placement, conditions, added);
+      }
     }
-    conditions.sort(Map.Entry.comparingByKey());
+    // The pruned-tree scan runs last-pruned-first, so the pool's pair order is the reverse of the
+    // source order. Writing the conditions by descending pool index puts them back in source
+    // order, which is what makes the class entries land where the pool records them.
+    conditions.sort((a, b) -> Integer.compare(b.getKey(), a.getKey()));
     if (conditions.isEmpty() && anonymous <= 0) {
+      return;
+    }
+    if ((own.getAccessFlags() & CodeConstants.ACC_INTERFACE) != 0) {
+      // An interface has no initializer block. A folded-away condition is legal only inside a
+      // method body, and the first method with code is where a statement can be written without
+      // changing any line table the dead statement does not touch. The anonymous padding is not
+      // moved: its position decides the anonymous classes' numbers, and a method body would
+      // renumber every class the interface declares after it.
+      if (anonymous > 0) {
+        return;
+      }
+      int at = firstMethodBodyOpen(text, spans, own);
+      if (at < 0) {
+        return;
+      }
+      addSiteOnce(sites, new Site(at, at, deadBlock(conditions, anonymous), "@dead"));
       return;
     }
     int at = classBodyOpen(text, spans.get(0), own);
     if (at < 0) {
       return;
     }
-    StringBuilder block = new StringBuilder(" {");
-    for (int i = 0; i < conditions.size(); i++) {
-      block.append(" if (").append(conditions.get(i).getValue()).append(") {");
-      if (i == 0) {
-        appendAnonymous(block, anonymous);
-      }
-      block.append(" }");
-    }
-    if (conditions.isEmpty()) {
-      block.append(" if (false) {");
-      appendAnonymous(block, anonymous);
-      block.append(" }");
-    }
-    block.append(" }");
+    StringBuilder block = new StringBuilder(deadBlock(conditions, anonymous));
     // An instance initializer alone gives javac's synthesized default constructor a body whose
     // end position is the TreeMaker's stale position, not the class line: the implicit return
     // then carries a second LineNumberTable entry (Gen.normalizeMethod only fills a constructor
@@ -6980,6 +6993,89 @@ public final class ConstantNames {
     }
     addSiteOnce(sites, new Site(at, at, constructor == null ? block.toString()
       : " " + constructor + block, "@dead"));
+  }
+
+  /** A braced block holding one dead constant condition per entry, plus any anonymous padding. */
+  private static String deadBlock(List<Map.Entry<Integer, String>> conditions, int anonymous) {
+    StringBuilder block = new StringBuilder(" {");
+    for (int i = 0; i < conditions.size(); i++) {
+      block.append(" if (").append(conditions.get(i).getValue()).append(") {");
+      if (i == 0) {
+        appendAnonymous(block, anonymous);
+      }
+      block.append(" }");
+    }
+    if (conditions.isEmpty()) {
+      block.append(" if (false) {");
+      appendAnonymous(block, anonymous);
+      block.append(" }");
+    }
+    return block.append(" }").toString();
+  }
+
+  /**
+   * The text position after the opening brace of the first method body, or -1.
+   *
+   * <p>An interface has no initializer block, so its dead conditions must be written inside a
+   * method. The first method in class-file order that carries code is picked: the conditions are
+   * constant expressions, so the method they sit in changes no instruction and no line entry of
+   * its own, and the alignment pass restores the following statement's original line.
+   */
+  private static int firstMethodBodyOpen(String text, List<int[]> spans, StructClass own) {
+    for (StructMethod method : own.getMethods()) {
+      String name = method.getName();
+      if (name.equals(CodeConstants.INIT_NAME) || name.equals(CodeConstants.CLINIT_NAME)
+          || !method.containsCode()) {
+        continue;
+      }
+      java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+        "\\b" + java.util.regex.Pattern.quote(name) + "\\s*\\(");
+      java.util.regex.Matcher matcher = pattern.matcher(text);
+      for (int[] span : spans) {
+        matcher.region(span[0], span[1]);
+        while (matcher.find()) {
+          int before = matcher.start() - 1;
+          while (before >= span[0] && Character.isWhitespace(text.charAt(before))) {
+            before--;
+          }
+          if (before >= span[0] && text.charAt(before) == '.') {
+            continue; // a call of a method that happens to share the name
+          }
+          int close = parameterListEnd(text, matcher.end() - 1, span[1]);
+          if (close < 0) {
+            continue;
+          }
+          int brace = text.indexOf('{', close + 1);
+          if (brace < 0 || brace >= span[1]) {
+            continue;
+          }
+          int semi = text.indexOf(';', close + 1);
+          if (semi >= 0 && semi < brace) {
+            continue; // an abstract or native declaration: its body is elsewhere
+          }
+          return brace + 1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** The position of the parenthesis closing the list opened at {@code open}, or -1. */
+  private static int parameterListEnd(String text, int open, int limit) {
+    int depth = 0;
+    for (int i = open; i < limit; i++) {
+      char c = text.charAt(i);
+      if (c == '(') {
+        depth++;
+      }
+      else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
   }
 
   /** The source-level simple name the printer writes for this class's declaration. */
@@ -7098,8 +7194,14 @@ public final class ConstantNames {
                                        Placement placement,
                                        List<Map.Entry<Integer, String>> conditions,
                                        Set<Integer> added) {
-    if (own.superClass != null && owner.equals(own.superClass.getString())) {
-      return; // the superclass's entry is class setup, not a naming; a dead name would move it
+    Integer ownIndex = indices.get(own.qualifiedName);
+    if (own.superClass != null && owner.equals(own.superClass.getString())
+        && (ownIndex == null || ownIndex != 1)) {
+      // The superclass's Class entry is entered when the class is set up, before any folded
+      // naming, and a constant use the generation resolves enters it at that code point; neither
+      // is a dead condition. Only a class whose own Class pair opens the pool proves that setup
+      // happened before the first naming, which leaves a later superclass pair to a folded name.
+      return;
     }
     Integer index = indices.get(owner);
     // Only a naming attributed with a constant field initializer enters the pair before any code
@@ -7170,6 +7272,10 @@ public final class ConstantNames {
       }
       boolean accessible = (access & CodeConstants.ACC_PUBLIC) != 0
         || ((access & CodeConstants.ACC_PRIVATE) == 0 && packageName.equals(packageOf(owner)))
+        // A protected constant of a superclass in another package is writable through the
+        // subclass's body, and resolving it is exactly the access Lower prunes, so the naming
+        // enters the pool before any code.
+        || ((access & CodeConstants.ACC_PROTECTED) != 0 && extendsClass(nestOf(ownName), owner))
         || ((access & CodeConstants.ACC_PRIVATE) != 0 && nestOf(owner).equals(nestOf(ownName)));
       if (!accessible) {
         continue;
