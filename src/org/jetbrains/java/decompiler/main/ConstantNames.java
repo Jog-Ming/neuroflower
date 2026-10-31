@@ -6518,11 +6518,15 @@ public final class ConstantNames {
     PairSite pair = placement == null || placement.pairs() == null
       ? null : placement.pairs().get(constant.owner());
     if (!lexical && RoundTrip.selector("fieldchain") && pair != null && pair.nextClass() >= 0
-        && placement.prefix() != null && placement.prefix().contains(constant.owner())) {
+        && placement.prefix() != null && placement.prefix().contains(constant.owner())
+        && !placement.earlyOwners().contains(constant.owner())) {
       // The pool opens with adjacent Class pairs, so javac entered this owner's name and the next
       // naming while it attributed the class body: the source wrote one constant expression that
       // named both. Naming this owner alone would leave the following pair to a separate site and
-      // refute the pool; the chain pass writes the expression over every owner of the run.
+      // refute the pool; the chain pass writes the expression over every owner of the run. An
+      // early owner's entry comes from name resolution instead -- an unqualified constant of the
+      // enclosing class, or a protected constant of a superclass in another package -- and pairs
+      // adjacent to those prove nothing about one expression.
       return;
     }
     // A record whose successor some constant of the owner genuinely produces is the folded value
