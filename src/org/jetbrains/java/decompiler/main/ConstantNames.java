@@ -15,6 +15,7 @@ import org.jetbrains.java.decompiler.struct.attr.StructEnclosingMethodAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructExceptionsAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructGeneralAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructInnerClassesAttribute;
+import org.jetbrains.java.decompiler.struct.attr.StructLineNumberTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructNestHostAttribute;
 import org.jetbrains.java.decompiler.struct.attr.StructNestMembersAttribute;
@@ -6694,7 +6695,128 @@ public final class ConstantNames {
       block.append(" }");
     }
     block.append(" }");
-    addSiteOnce(sites, new Site(at, at, block.toString(), "@dead"));
+    // An instance initializer alone gives javac's synthesized default constructor a body whose
+    // end position is the TreeMaker's stale position, not the class line: the implicit return
+    // then carries a second LineNumberTable entry (Gen.normalizeMethod only fills a constructor
+    // body's NOPOS end position from the last initializer when instance initializers exist). The
+    // original class file has the hidden default constructor's single entry at the class line, so
+    // a class whose constructor the printer hid gets an explicit empty one written on that same
+    // line: its body end is the closing brace there, and super() and return share the line.
+    String constructor = null;
+    if (!printsConstructor(text, at, spans, sourceSimpleName(own))) {
+      constructor = hiddenConstructorPrefix(own);
+    }
+    addSiteOnce(sites, new Site(at, at, constructor == null ? block.toString()
+      : " " + constructor + block, "@dead"));
+  }
+
+  /** The source-level simple name the printer writes for this class's declaration. */
+  private static String sourceSimpleName(StructClass own) {
+    String qualified = own.qualifiedName;
+    String simple = qualified.substring(qualified.lastIndexOf('/') + 1);
+    int dollar = simple.lastIndexOf('$');
+    return dollar >= 0 ? simple.substring(dollar + 1) : simple;
+  }
+
+  /**
+   * Whether the class's own text already declares a constructor, which the printer only does for
+   * a constructor whose body is not empty or whose line table proves it was written explicitly.
+   * A declaration's name follows a member boundary or modifiers; a construction ({@code new X(})
+   * and a member call ({@code .X(}) do not.
+   */
+  private static boolean printsConstructor(String text, int from, List<int[]> spans,
+                                           String simple) {
+    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+      java.util.regex.Pattern.quote(simple) + "\\s*\\(");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    for (int[] span : spans) {
+      matcher.region(Math.max(from, span[0]), span[1]);
+      while (matcher.find()) {
+        int i = matcher.start() - 1;
+        while (i >= span[0] && Character.isWhitespace(text.charAt(i))) {
+          i--;
+        }
+        if (i < span[0]) {
+          continue;
+        }
+        char before = text.charAt(i);
+        if (before == '.') {
+          continue; // a member of another expression
+        }
+        if (Character.isJavaIdentifierPart(before)) {
+          int end = i + 1;
+          while (i >= span[0] && Character.isJavaIdentifierPart(text.charAt(i))) {
+            i--;
+          }
+          String word = text.substring(i + 1, end);
+          if (!MODIFIERS.contains(word) && (i < span[0] || text.charAt(i) != '@')) {
+            continue; // part of a longer name, a construction, or a called method
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static final java.util.Set<String> MODIFIERS = java.util.Set.of(
+    "public", "protected", "private", "static", "final", "abstract", "native", "synchronized",
+    "strictfp", "transient", "volatile", "default");
+
+  /**
+   * The declaration prefix of an explicit empty constructor with the access flags of the class
+   * file's hidden default one, or null when writing one cannot reproduce the target.
+   *
+   * <p>Only a target whose constructor line table has a single entry starting at the super call
+   * gets one: that is the constructor compiled without any instance initializer, so the target's
+   * return carries the class line rather than the line of a later field initializer. A target
+   * with several entries already compiled its initializers into the constructor, and javac
+   * derives the return's line from them, which the dead block alone reproduces. The explicit
+   * source form otherwise compiles back to the same constructor: javac adds a member class's
+   * enclosing-instance parameter on its own, and the body carries no instruction.
+   */
+  private static String hiddenConstructorPrefix(StructClass own) {
+    String simple = sourceSimpleName(own);
+    if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))) {
+      return null;
+    }
+    StructMethod constructor = null;
+    for (StructMethod method : own.getMethods()) {
+      if (!"<init>".equals(method.getName())) {
+        continue;
+      }
+      if (constructor != null) {
+        return null; // more than one constructor: the printer could not have hidden it
+      }
+      constructor = method;
+    }
+    // A member class's descriptor carries the enclosing instance, which the source constructor
+    // declares implicitly; only a parameterless descriptor can be written as the bare name.
+    if (constructor == null || !"()V".equals(constructor.getDescriptor())) {
+      return null;
+    }
+    StructLineNumberTableAttribute lines =
+      constructor.getAttribute(StructGeneralAttribute.ATTRIBUTE_LINE_NUMBER_TABLE);
+    if (lines == null) {
+      return null;
+    }
+    // One entry starting at the super call: the target compiled this constructor without any
+    // instance initializer, so javac never replaced its body end position and its return sits on
+    // the class line. Several entries mean initializer code was compiled into it, and the printed
+    // block's own initializer reproduces the target's line for the return.
+    int[] raw = lines.getRawData();
+    if (raw == null || raw.length != 2 || raw[0] != 0) {
+      return null;
+    }
+    if (System.getenv("NEUROFLOWER_DEADCTOR_DEBUG") != null) {
+      System.err.println("deadctor " + own.qualifiedName + " raw " + java.util.Arrays.toString(raw));
+    }
+    int access = constructor.getAccessFlags() & (CodeConstants.ACC_PUBLIC
+      | CodeConstants.ACC_PROTECTED | CodeConstants.ACC_PRIVATE);
+    String modifier = access == CodeConstants.ACC_PUBLIC ? "public "
+      : access == CodeConstants.ACC_PROTECTED ? "protected "
+      : access == CodeConstants.ACC_PRIVATE ? "private " : "";
+    return modifier + simple + "()";
   }
 
   /**
@@ -6850,12 +6972,7 @@ public final class ConstantNames {
   }
 
   private static int classBodyOpen(String text, int[] span, StructClass own) {
-    String qualified = own.qualifiedName;
-    String simple = qualified.substring(qualified.lastIndexOf('/') + 1);
-    int dollar = simple.lastIndexOf('$');
-    if (dollar >= 0) {
-      simple = simple.substring(dollar + 1);
-    }
+    String simple = sourceSimpleName(own);
     if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))) {
       return -1; // an anonymous or local class has no declaration to add a block to
     }
