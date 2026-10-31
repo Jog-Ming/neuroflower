@@ -7966,7 +7966,12 @@ public final class ConstantNames {
         return;
       }
       if (inWindow != null) {
-        inWindow.add(constant.owner());
+        if (!inWindow.add(constant.owner())) {
+          // An earlier literal already carries this owner's naming in the same window. The
+          // owner's Class entry is entered once; a second site inside the window adds nothing
+          // and can move the entry to the wrong printed line.
+          return;
+        }
       }
     }
     if (bareOwner) {
