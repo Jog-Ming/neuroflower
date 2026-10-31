@@ -2305,7 +2305,7 @@ public final class ConstantNames {
   }
 
   /** A folded-constant naming whose value the pool entered right after the Class and name. */
-  private record ValueSite(int classIndex, long naming, String poolKey) {
+  private record ValueSite(int classIndex, long naming, String poolKey, int at) {
     /** Whether this literal would fold to the very value the pool entered with the pair. */
     boolean accepts(String key) {
       return sameFoldedValue(poolKey, key);
@@ -2434,7 +2434,8 @@ public final class ConstantNames {
         continue;
       }
       FirstUse use = firstUses.get(i + 2);
-      if (use == null || position(cls, use, positions) == null) {
+      Integer at = use == null ? null : position(cls, use, positions);
+      if (use == null || at == null) {
         continue;
       }
       FirstUse direct = firstUses.get(i);
@@ -2443,7 +2444,7 @@ public final class ConstantNames {
         continue; // an earlier instruction explains the Class entry; the triplet proves nothing
       }
       sites.putIfAbsent(owner, new ValueSite(i, coordinate(use.order(), use.offset()),
-        kind + "|" + value.value));
+        kind + "|" + value.value, at));
     }
     return sites;
   }
@@ -2537,7 +2538,20 @@ public final class ConstantNames {
         }
         for (Site site : candidates) {
           // The value's first use is the literal itself, so the site must sit at that very point.
-          if (siteCoordinate(rules.placement().spaces(), site.start()) == valueSite.naming()) {
+          // The printer maps a quoted literal's content, one past the opening quote it adds, and
+          // a constant initializer generates no code at all: such a literal may carry no point,
+          // leaving the successor's printed point in the same initializer as the only record.
+          int anchor = RoundTrip.selector("valsite") && quoted(text, site.start())
+            ? site.start() + 1 : site.start();
+          long coordinate = siteCoordinate(rules.placement().spaces(), anchor);
+          boolean atValue = coordinate == valueSite.naming();
+          if (!atValue && RoundTrip.selector("valsite") && coordinate == NO_COORDINATE
+              && rules.placement().valueRecords().contains(entry.getKey())
+              && pairedInitializer(text, rules.placement().spaces(), rules.placement().spans(),
+              site.start(), valueSite.at())) {
+            atValue = true;
+          }
+          if (atValue) {
             addSiteOnce(sites, site);
             break;
           }
@@ -2609,6 +2623,17 @@ public final class ConstantNames {
                 && coordinate <= (pair.successorKey() == null ? pair.after() : pair.lower())) {
               continue; // before the previous entry's first use; the naming would move it
             }
+          }
+          else if (RoundTrip.selector("valsite") && pair.successorKey() != null
+              && rules.placement().valueRecords().contains(entry.getKey())
+              && pairedInitializer(text, rules.placement().spaces(), rules.placement().spans(),
+              site.start(), pair.successorAt())) {
+            // The value successor's printed point lies in this same field initializer, but the
+            // literal's own position maps into an enclosing buffer: a folded constant initializer
+            // generates no code, so the initializer is the only place its naming can sit.
+            fieldBest = site;
+            fieldMatches++;
+            continue;
           }
           else if (pair.successorKey() != null
               || !(coordinate < pair.successor() && coordinate > pair.lower())) {
