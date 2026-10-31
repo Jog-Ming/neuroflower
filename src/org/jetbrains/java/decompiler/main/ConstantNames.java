@@ -175,6 +175,7 @@ public final class ConstantNames {
     expressionSites(text, rootSpans, root, sites);
     initializerSites(text, rootSpans, root, sites);
     foldedArgumentSites(text, rootSpans, root, sites);
+    nanSites(text, rootSpans, root, imports, packageName, sites);
     deadNamings(text, rootSpans, rootRules, root.classStruct, packageName, sites,
       anonymousPadding(root.classStruct));
     for (Map.Entry<String, List<int[]>> entry : spansByClass.entrySet()) {
@@ -189,6 +190,7 @@ public final class ConstantNames {
       expressionSites(text, entry.getValue(), node, sites);
       initializerSites(text, entry.getValue(), node, sites);
       foldedArgumentSites(text, entry.getValue(), node, sites);
+      nanSites(text, entry.getValue(), node, imports, packageName, sites);
       deadNamings(text, entry.getValue(), classRules, node.classStruct, packageName, sites, 0);
     }
     if (sites.isEmpty()) {
@@ -6611,6 +6613,69 @@ public final class ConstantNames {
     // the pool has below it. That is the phase rule: never cross the attribution/code boundary.
     return pair.member() == null && constantField(placement.cls(), declared)
       && owner != null && placement.prefix() != null && placement.prefix().contains(owner);
+  }
+
+  /**
+   * Prints a foreign {@code float} NaN constant where the printer wrote {@code 0.0 / 0.0}.
+   *
+   * <p>{@code Float.NaN} is a constant variable, and javac folds the widening to a double while it
+   * reads the name: the pool enters the owner's {@code Class} and name and the widened
+   * {@code Double NaN} value right after them. The printer writes the folded value back as
+   * the division token {@code 0.0 / 0.0}, which is the same constant expression but names another
+   * owner. The triplet is the pool's record that the source named a float NaN constant; the token
+   * is the only place it can have stood.
+   */
+  private static void nanSites(String text, List<int[]> spans, ClassNode node, List<String> imports,
+                               String packageName, List<Site> sites) {
+    StructClass own = node == null ? null : node.classStruct;
+    if (own == null) {
+      return;
+    }
+    List<PooledConstant> pool = own.getPool().getPool();
+    String replacement = null;
+    for (int i = 1; i + 2 < pool.size(); i++) {
+      if (!(pool.get(i) instanceof PrimitiveConstant entry)
+          || entry.type != CodeConstants.CONSTANT_Class || entry.getString() == null
+          || entry.index != i + 1
+          || !(pool.get(i + 1) instanceof PrimitiveConstant name)
+          || name.type != CodeConstants.CONSTANT_Utf8 || !entry.getString().equals(name.getString())
+          || !(pool.get(i + 2) instanceof PrimitiveConstant value)
+          || value.type != CodeConstants.CONSTANT_Double
+          || !(value.value instanceof Double number) || !Double.isNaN(number)) {
+        continue;
+      }
+      String owner = entry.getString();
+      if (owner.equals(own.qualifiedName) || isBootstrapOwner(owner)) {
+        continue;
+      }
+      for (SourceConstant source : sourceConstants(owner, own, imports, packageName)) {
+        if (source.kind() == VariableType.FLOAT && source.value() instanceof Float declared
+            && Float.isNaN(declared)) {
+          if (replacement != null) {
+            return; // two owners declare a float NaN; the pool does not record which one
+          }
+          replacement = source.name();
+        }
+      }
+    }
+    if (replacement == null) {
+      return;
+    }
+    // The printer writes a double NaN as the division token `0.0 / 0.0`, which is the same
+    // constant expression.
+    java.util.regex.Matcher matcher = java.util.regex.Pattern
+      .compile("(?<![\\w.])0\\.0\\s*/\\s*0\\.0(?![\\w.])").matcher(text);
+    List<int[]> found = new ArrayList<>();
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      while (matcher.find()) {
+        found.add(new int[]{matcher.start(), matcher.end()});
+      }
+    }
+    if (found.size() != 1 || hasSiteAt(sites, found.get(0)[0])) {
+      return;
+    }
+    addSiteOnce(sites, new Site(found.get(0)[0], found.get(0)[1], replacement, "java/lang/Float"));
   }
 
   /** Whether the class declares this field as a compile-time constant variable. */
