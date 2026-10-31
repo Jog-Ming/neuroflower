@@ -545,7 +545,10 @@ public final class ConstantNames {
     Set<String> keys = new HashSet<>();
     boolean record = cls.getRecordComponents() != null;
     for (StructMethod method : cls.getMethods()) {
-      if ((method.getAccessFlags() & CodeConstants.ACC_SYNTHETIC) != 0) {
+      // An access method's rank is corrected in methodRanks (javac generates its body first), so
+      // its class-file position is not a lie here; every other synthetic method has no single
+      // generation point and stays out of the bounds.
+      if ((method.getAccessFlags() & CodeConstants.ACC_SYNTHETIC) != 0 && !accessMethod(method)) {
         keys.add(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
         continue;
       }
@@ -1225,12 +1228,39 @@ public final class ConstantNames {
     Map<String, Integer> ranks = new HashMap<>();
     VBStyleCollection<StructMethod, String> methods = cls.getMethods();
     int count = methods.size();
+    // javac generates the synthetic access methods before every source method: the class file
+    // lists them last, but the pool opens with the references their bodies create, before even
+    // the super constructor call. Their bodies keep their class-file order among themselves, so
+    // they take the first ranks and the source methods follow in class-file order.
+    int access = 0;
+    for (int i = 0; i < count; i++) {
+      if (accessMethod(methods.get(i))) {
+        access++;
+      }
+    }
+    int nextAccess = 0;
+    int nextSource = access;
     for (int i = 0; i < count; i++) {
       StructMethod method = methods.get(i);
-      int rank = CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i : i;
+      int rank;
+      if (CodeConstants.CLINIT_NAME.equals(method.getName())) {
+        rank = 2 * count + i;
+      }
+      else if (accessMethod(method)) {
+        rank = nextAccess++;
+      }
+      else {
+        rank = nextSource++;
+      }
       ranks.put(InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()), rank);
     }
     return ranks;
+  }
+
+  /** Whether this is a javac synthetic access method ({@code access$NNN}). */
+  private static boolean accessMethod(StructMethod method) {
+    return (method.getAccessFlags() & CodeConstants.ACC_SYNTHETIC) != 0
+      && method.getName().startsWith("access$");
   }
 
   /**
@@ -1451,9 +1481,14 @@ public final class ConstantNames {
     Map<Integer, FirstUse> first = new HashMap<>();
     VBStyleCollection<StructMethod, String> methods = cls.getMethods();
     int count = methods.size();
+    Map<String, Integer> ranks = methodRanks(cls);
     for (int i = 0; i < count; i++) {
       StructMethod method = methods.get(i);
-      int rank = CodeConstants.CLINIT_NAME.equals(method.getName()) ? 2 * count + i : i;
+      String methodKey = InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor());
+      Integer rank = ranks.get(methodKey);
+      if (rank == null) {
+        continue;
+      }
       if (method.getInstructionSequence() == null) {
         try {
           method.expandData(cls); // released after decompilation; reparse for the pool order
@@ -1472,7 +1507,6 @@ public final class ConstantNames {
           }
         }
       }
-      String methodKey = InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor());
       for (Instruction instruction : code) {
         int index = poolReference(instruction);
         if (index <= 0) {
@@ -7628,6 +7662,7 @@ public final class ConstantNames {
     // coordinate check places the site by the positions the printer recorded for its method, which
     // also covers a static field initializer generated in <clinit> but printed at its declaration.
     boolean placed = foreign && placement != null && placement.proves(constant.owner(), anchor);
+
     // The pool enters the owner's Class at its first field or method reference and at its first
     // constant naming; a site printed before those points would move the entry earlier.
     if (foreign && placement != null && !placement.existsAt(constant.owner(), anchor)) {
