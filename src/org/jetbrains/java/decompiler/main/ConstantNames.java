@@ -1980,23 +1980,7 @@ public final class ConstantNames {
       if (key.equals(successorKey)) {
         return true; // the naming entered this very value; the pair's neighbour is it
       }
-      if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
-        return true; // a boolean folds to an immediate
-      }
-      try {
-        if (key.startsWith(VariableType.INT.name() + "|")) {
-          long value = Long.parseLong(key.substring(VariableType.INT.name().length() + 1));
-          return (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) || pooled.contains(key);
-        }
-        if (key.startsWith(VariableType.CHAR.name() + "|")) {
-          long value = Long.parseLong(key.substring(VariableType.CHAR.name().length() + 1));
-          return (value >= 0 && value <= Short.MAX_VALUE) || pooled.contains(key);
-        }
-      }
-      catch (NumberFormatException e) {
-        return false;
-      }
-      return pooled.contains(key);
+      return immediateKey(key) || pooled.contains(key);
     }
   }
 
@@ -6053,12 +6037,21 @@ public final class ConstantNames {
     if (key.startsWith(VariableType.BOOLEAN.name() + "|")) {
       return true;
     }
-    if (!key.startsWith(VariableType.INT.name() + "|")
-        && !key.startsWith(VariableType.CHAR.name() + "|")) {
+    int bar = key.indexOf('|');
+    if (bar < 0) {
       return false;
     }
     try {
-      long value = Long.parseLong(key.substring(key.indexOf('|') + 1));
+      if (key.startsWith(VariableType.LONG.name() + "|")) {
+        // javac has lconst_0 and lconst_1 only; every other long is an ldc2_w value.
+        long value = Long.parseLong(key.substring(bar + 1));
+        return value == 0L || value == 1L;
+      }
+      if (!key.startsWith(VariableType.INT.name() + "|")
+          && !key.startsWith(VariableType.CHAR.name() + "|")) {
+        return false;
+      }
+      long value = Long.parseLong(key.substring(bar + 1));
       return value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
     }
     catch (NumberFormatException e) {
