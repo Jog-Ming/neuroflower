@@ -8397,6 +8397,42 @@ public final class ConstantNames {
     // before the condition and the condition's own (folded) value. The class body's dead block
     // cannot reproduce it; the printed condition itself must carry the naming.
     deepConditionSites(text, spans, rules, own, packageName, sites);
+    // A bare naming inside a member is replaced by its value while that member is lowered, which
+    // happens after the class body itself; the scan is last-pruned-first, so that naming is
+    // visited before every dead condition written at the body's front. A bare owner whose pair the
+    // pool places after a pair a dead condition explains is therefore contradicted: the scan
+    // would have entered it first. Withdraw its bare site -- the literal it replaced is what the
+    // printer wrote -- and let the dead-condition pass explain that pair instead.
+    if (!conditions.isEmpty() && placement != null && placement.bare() != null) {
+      int lowest = Integer.MAX_VALUE;
+      for (Map.Entry<Integer, String> condition : conditions) {
+        lowest = Math.min(lowest, condition.getKey());
+      }
+      for (String owner : placement.bare()) {
+        Integer index = indices.get(owner);
+        // A pair that already has a condition of its own is explained; the bare naming of the
+        // same owner only duplicates its Class entry and is left standing.
+        boolean conditioned = false;
+        for (Map.Entry<Integer, String> condition : conditions) {
+          if (condition.getKey().equals(index)) {
+            conditioned = true;
+            break;
+          }
+        }
+        if (index == null || index <= lowest || conditioned) {
+          continue;
+        }
+        if (withdrawBareSites(sites, owner, spans)) {
+          // The pair is a scan prune like the conditions already found, and only a dead
+          // condition is left to explain it: a qualified site is generated with the code and
+          // cannot enter a pair at the pool's front.
+          String condition = deadCondition(owner, own.qualifiedName, packageName, recordBody);
+          if (condition != null) {
+            conditions.add(Map.entry(index, condition));
+          }
+        }
+      }
+    }
     // The pruned-tree scan runs last-pruned-first, so the pool's pair order is the reverse of the
     // source order. Writing the conditions by descending pool index puts them back in source
     // order, which is what makes the class entries land where the pool records them.
@@ -8973,6 +9009,34 @@ public final class ConstantNames {
       }
     }
     return false;
+  }
+
+  /**
+   * Withdraws the bare naming sites of one owner whose pair the pool places behind a dead
+   * condition.
+   *
+   * <p>A name without a qualifier is resolved through the owner's lexical scope and the lowering
+   * replaces it with its value while the member that holds it is translated, after the class body;
+   * the last-pruned-first scan visits it before every dead condition the body's front holds, so
+   * only the leading pairs can be its. A pair the pool puts lower cannot be that naming, which
+   * leaves the literal the printer wrote: it compiles to the same value, and the dead-condition
+   * pass then explains the pair instead. A qualified name is not replaced by the lowering at all
+   * (it is generated with the code), so it is left standing.
+   *
+   * <p>Only sites in this class's own text are touched: a sibling class's pool is built from its
+   * own text, so a naming there says nothing about this pool.
+   */
+  private static boolean withdrawBareSites(List<Site> sites, String owner, List<int[]> spans) {
+    boolean withdrawn = false;
+    for (int i = sites.size() - 1; i >= 0; i--) {
+      Site site = sites.get(i);
+      if (owner.equals(site.owner()) && inside(spans, site.start())
+          && !site.replacement().contains(".")) {
+        sites.remove(i);
+        withdrawn = true;
+      }
+    }
+    return withdrawn;
   }
 
   private static void appendAnonymous(StringBuilder block, int count) {
