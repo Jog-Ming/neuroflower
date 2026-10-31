@@ -7666,8 +7666,16 @@ public final class ConstantNames {
     // for the own entry's position): the foreign pair is the only evidence left, so it decides.
     boolean ownUnusable = ownCandidate && tooCommon(key) && placement != null
       && !placement.ownEarly() && !placement.ownProven();
+    // A pair that proves this site is a naming the source must have: its Class entry has no
+    // reference below it and no direct instruction use before the pair, so only a folded naming
+    // can have entered it. Keeping the class's own constant here would drop that pair from the
+    // pool entirely. The own name only keeps precedence where the pool itself pins its entry
+    // (an opening pair or a proven folded own naming) or the value is common enough that the
+    // pair is the only evidence left.
+    boolean pairNeedsNaming = solved != null && placement != null
+      && !placement.ownEarly() && !placement.ownProven();
     if (solved != null && (exactProof[0] || exactProof[1] || !ownCandidate
-        || ownUnusable)) {
+        || ownUnusable || pairNeedsNaming)) {
       // A reference successor's pair records only that some naming entered the owner before the
       // reference: an invented expression is admitted at any literal of the pair's generation gap,
       // so that literal alone does not prove it is where the pool's one naming stood. A direct
