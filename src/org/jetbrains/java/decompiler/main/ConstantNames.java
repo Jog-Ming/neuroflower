@@ -1936,6 +1936,9 @@ public final class ConstantNames {
       // it, and a pair there records that naming like any other.
       boolean ownNaming = owner.equals(cls.qualifiedName) && i < writeStart
         && (ownProven || ownChain);
+      if (classOperand(cls, indices, i)) {
+        continue; // a reference below the pair entered this Class entry as its operand
+      }
       if (catchTypes.contains(owner) || (setup.contains(i) && !ownNaming)
           || (owner.equals(cls.qualifiedName) && !ownNaming)) {
         continue; // the class is entered as itself, a catch type or a class-setup entry
@@ -2126,9 +2129,21 @@ public final class ConstantNames {
                                    Set<Integer> early, Map<String, Integer> classIndices) {
     Map<Integer, Long> upper = new HashMap<>();
     long succ = Long.MAX_VALUE;
+    List<PooledConstant> entries = cls.getPool().getPool();
     for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
       int key = entry.getKey();
       if (key == index || early.contains(key)) {
+        continue;
+      }
+      if (key < index && entries.get(key) instanceof PrimitiveConstant primitive
+          && primitive.type == CodeConstants.CONSTANT_Class
+          && !classOperand(cls, classIndices, key)) {
+        // A bare Class entry below the pair may have been interned by a constant naming long
+        // before the instruction that first uses it (`instanceof Player` in a late method says
+        // nothing about when the entry was created). Its first use does not bound the naming from
+        // below. Only an entry a reference entered as its operand has its creation pinned; the cap
+        // loop adds those. The upper bound keeps every entry: the pair's successor may itself be
+        // the next naming's Class entry, and its first use is the point that places the pair.
         continue;
       }
       long point = coordinate(entry.getValue().order(), entry.getValue().offset());
@@ -2157,6 +2172,24 @@ public final class ConstantNames {
       pred = Math.max(pred, point);
     }
     return new long[]{pred, succ};
+  }
+
+  /**
+   * Whether a reference below this {@code Class} entry names the class as its operand.
+   *
+   * <p>A reference and its operand are numbered together, the reference first, so a Class entry
+   * above every reference that names it was not entered as an operand: a folded constant naming
+   * interned it, possibly long before any instruction uses the class.
+   */
+  private static boolean classOperand(StructClass cls, Map<String, Integer> classIndices, int key) {
+    List<PooledConstant> pool = cls.getPool().getPool();
+    for (int i = 1; i < key && i < pool.size(); i++) {
+      if (pool.get(i) instanceof LinkConstant link && link.classname != null
+          && Integer.valueOf(key).equals(classIndices.get(link.classname))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -6984,7 +7017,7 @@ public final class ConstantNames {
     // name (not an expression the solver built from one of its constants).
     boolean[] exactProof = new boolean[2];
     Site solved = allowSolved && placement != null && placement.pairs() != null
-      && !placement.pairs().isEmpty() && prefix.isEmpty()
+      && !placement.pairs().isEmpty()
       ? solvedSite(key, start, end, own, imports, packageName, placement, exactProof) : null;
     // The class's own constant keeps precedence over a naming placed by the generation gap: its
     // Class entry is in the pool regardless, so the gap proves less about it. A value successor
@@ -7014,7 +7047,12 @@ public final class ConstantNames {
       else if (invented != null) {
         invented.computeIfAbsent(solved.owner(), k -> new ArrayList<>()).add(solved);
       }
-      addSiteOnce(sites, solved);
+      // A negative literal's magnitude was solved; the site starts at the unary minus, which the
+      // expression has to carry too or the value would flip sign.
+      Site placed = "-".equals(prefix)
+        ? new Site(solved.start(), solved.end(), "-" + solved.replacement(), solved.owner())
+        : solved;
+      addSiteOnce(sites, placed);
       return;
     }
     if (constants == null || constants.isEmpty()) {
