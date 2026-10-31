@@ -9530,6 +9530,11 @@ public final class RoundTrip {
       return null;
     }
     List<LocalVariable> rows = table.getVariables().toList();
+    // The block around this list closes at its own last instruction. A run that ends earlier
+    // closed a block of its own; the enclosing block's rows (including the method's parameters)
+    // close later and were written after it, which is the proof. The end has to come from the
+    // whole list: a segment boundary the printer planned is not the scope's end.
+    int enclosingEnd = blockPrintEnd(exprents);
     for (int a = from; a < to; a++) {
       int s1 = lastEndOf(exprents.get(a));
       if (s1 < 0) {
@@ -9544,7 +9549,7 @@ public final class RoundTrip {
         // where this run ends, while every row that opened before it was written after it, was
         // inside a block that closed first; a flat run shares the enclosing close pass, where the
         // earlier-allocated row precedes it in rising-slot order.
-        boolean rowOrder = rowOrderProvesBlock(rows, row, s1, e1, e1 + 8, null);
+        boolean rowOrder = rowOrderProvesBlock(rows, row, s1, e1, enclosingEnd, null);
         if (!rowOrder && slotHandover(row.getIndex(), s1, e1) == null) {
           continue;
         }
@@ -9565,6 +9570,18 @@ public final class RoundTrip {
       }
     }
     return null;
+  }
+
+  /** The last instruction the whole list prints, ignoring declarations hoisted to its head. */
+  private static int blockPrintEnd(List<Exprent> exprents) {
+    int max = -1;
+    for (Exprent exprent : exprents) {
+      int end = printedEnd(exprent);
+      if (end > max) {
+        max = end;
+      }
+    }
+    return max;
   }
 
   /**
