@@ -3755,18 +3755,27 @@ public final class ConstantNames {
         if (solved == null) {
           continue;
         }
+        String castPrefix = "(" + javaName(kind) + ") ";
         if (source.kind() != kind && (solved.equals(name) || solved.equals("-" + name)
             || solved.equals("~" + name))) {
           // A bare constant keeps its own type: an int constant where a float literal stood would
-          // turn a division or multiplication into integer arithmetic.
-          continue;
+          // turn a division or multiplication into integer arithmetic. An explicit widening cast
+          // keeps the literal's own type; a cast of a constant variable is a constant expression
+          // and folds to the same value, so the naming site is unchanged. A narrowing cast could
+          // change the value and is not offered.
+          Object cast = convert(source.value(), source.kind(), kind);
+          if (promote(source.kind(), kind) != kind || cast == null
+              || !foldsTo(cast, kind, new FieldConstant(null, kind, value))) {
+            continue; // the cast is not a widening that reproduces the printed literal
+          }
+          solved = castPrefix + solved;
         }
         if (first == null) {
           // A value successor is the folded value itself, so any expression that folds to it
           // enters the same value at the pair; the first declared constant reproduces the bytes.
           first = solved;
         }
-        if (direct == null && solved.equals(name)) {
+        if (direct == null && (solved.equals(name) || solved.equals(castPrefix + name))) {
           direct = solved;
         }
         if (expression == null && (immediateKey(key) || pooledBefore.contains(key))
