@@ -218,6 +218,7 @@ public final class ConstantNames {
    */
   private record Placement(Map<String, int[]> windows, Map<String, long[]> coordinates,
                            List<SiteSpace> spaces, Set<String> strict,
+                           Set<String> anchored, Set<String> direct,
                            Map<String, Double> folded, Map<String, Long> internedAt,
                            Map<String, Long> namingAt, Set<String> lexical,
                            List<int[]> spans, Set<String> prefix, Set<String> inherited,
@@ -262,8 +263,27 @@ public final class ConstantNames {
           }
         }
       }
+      // The window widens the generation order to whole printed lines. Within one body the offsets
+      // order the pool exactly, so a site before a lower entry's use cannot be the naming: it would
+      // intern the Class before an entry the pool has below it, moving it earlier than the original
+      // did. Across bodies the method ranks only approximate javac's generation order -- a lower
+      // entry's first use can follow the site's body while the entry itself was interned before it
+      // -- unless the pool pins the owner: a Class entry an instruction uses as its operand, or one
+      // that sits above every instruction-referenced entry, fixes the bracket regardless of the
+      // body. A site without a generation point (a field initializer's folded literal) is left to
+      // the window.
       int[] window = windows == null ? null : windows.get(owner);
       if (window != null && start >= window[0] && start < window[1]) {
+        long coordinate = siteCoordinate(spaces, start);
+        if (coordinate != NO_COORDINATE && coordinates != null) {
+          long[] bounds = coordinates.get(owner);
+          if (bounds != null && coordinate <= bounds[0]
+              && ((coordinate >>> 32) == (bounds[0] >>> 32)
+              || (direct != null && direct.contains(owner))
+              || (anchored != null && anchored.contains(owner)))) {
+            return false;
+          }
+        }
         return true;
       }
       return byCoordinate(owner, start);
@@ -368,8 +388,9 @@ public final class ConstantNames {
   }
 
   private static final Placement NO_PLACEMENT =
-    new Placement(null, null, List.of(), Set.of(), Map.of(), Map.of(), Map.of(), Set.of(),
-      List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false, null, "");
+    new Placement(null, null, List.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of(), Map.of(),
+      Set.of(), List.of(), null, Set.of(), Map.of(), Map.of(), Set.of(), Set.of(), false, false,
+      null, "");
 
   /** One method's printed positions: bytecode offset to character offset, and the method's rank. */
   private record SiteSpace(int rank, Map<Integer, Integer> positions, int min, int max, String key) {
@@ -499,9 +520,15 @@ public final class ConstantNames {
   }
 
   /**
-   * The exact generation-order bounds of a naming site for pool entry {@code index}: every lower
-   * entry's first use precedes the site and every higher entry's first use follows it. Entries with
-   * no instruction use are absent from {@code firstUses}; they cannot bound anything.
+   * The generation-order bounds of a naming site for a foreign owner's pool entry {@code index},
+   * with a lower {@code Class} entry capped at the reference that created it.
+   *
+   * <p>A lower entry's first use is usually the point javac entered it, but a {@code Class} entry
+   * that is the operand of a field or method reference was entered with that reference, which
+   * precedes it; its own first direct use may come much later. Ordering the naming against that
+   * later use would reject a site the pool admits, so each such entry is capped at the first use of
+   * the earliest reference that names it. This is the same cap {@link #ownBounds} applies to the
+   * class's own entry.
    *
    * <p>The class's own, superclass and interface {@code Class} entries are interned when the class
    * is entered, before any body is generated, so an instruction that uses one says nothing about
@@ -509,10 +536,26 @@ public final class ConstantNames {
    * together with this {@code Class} entry; its first use is the naming site itself, so it cannot
    * bound the site from above.
    */
-  private static long[] coordinates(Map<Integer, FirstUse> firstUses, int index, Set<Integer> early,
-                                    int folded) {
+  private static long[] namingBounds(StructClass cls, Map<String, Integer> classIndices,
+                                     Map<Integer, FirstUse> firstUses, int index, Set<Integer> early,
+                                     int folded, boolean cap) {
     long pred = Long.MIN_VALUE;
     long succ = Long.MAX_VALUE;
+    Map<Integer, Long> createdWith = new HashMap<>();
+    if (cap) {
+      List<PooledConstant> pool = cls.getPool().getPool();
+      for (int i = 1; i < pool.size(); i++) {
+        if (!(pool.get(i) instanceof LinkConstant link) || link.classname == null) {
+          continue;
+        }
+        Integer operand = classIndices.get(link.classname);
+        FirstUse use = firstUses.get(i);
+        if (operand == null || use == null || i >= operand || operand >= index) {
+          continue; // the reference does not create a Class entry below this naming
+        }
+        createdWith.merge(operand, coordinate(use.order(), use.offset()), Math::min);
+      }
+    }
     for (Map.Entry<Integer, FirstUse> entry : firstUses.entrySet()) {
       int key = entry.getKey();
       if (key == index || key == folded || early.contains(key)) {
@@ -520,6 +563,10 @@ public final class ConstantNames {
       }
       long point = coordinate(entry.getValue().order(), entry.getValue().offset());
       if (key < index) {
+        Long created = createdWith.get(key);
+        if (created != null) {
+          point = Math.min(point, created);
+        }
         pred = Math.max(pred, point);
       }
       else {
@@ -661,6 +708,25 @@ public final class ConstantNames {
     Map<String, Integer> classIndices = classIndices(own);
     Set<Integer> early = earlyClassEntries(own, classIndices);
     Set<Integer> setup = setupClassEntries(own, classIndices);
+    // The owners whose pool position pins a naming across methods: an owner whose Class entry an
+    // instruction uses as its operand, and one whose Class entry sits above every
+    // instruction-referenced entry (entered by the last code generation that created a pool
+    // operand). For both, a lower entry's use in another body still orders the site; other owners
+    // are only bounded by their own body.
+    int maxUseIndex = 0;
+    for (int key : firstUses.keySet()) {
+      maxUseIndex = Math.max(maxUseIndex, key);
+    }
+    Set<String> anchored = new HashSet<>();
+    Set<String> direct = new HashSet<>();
+    for (Map.Entry<String, Integer> entry : classIndices.entrySet()) {
+      if (entry.getValue() > maxUseIndex) {
+        anchored.add(entry.getKey());
+      }
+      if (firstUses.containsKey(entry.getValue())) {
+        direct.add(entry.getKey());
+      }
+    }
     Set<String> earlyOwners = earlyOwners(own, classIndices, setup, firstUses);
     boolean ownEarly = false;
     boolean ownProven = false;
@@ -785,7 +851,8 @@ public final class ConstantNames {
         // This owner's Class entry exists only because the source named one of its constants
         // (nothing else in the class file explains it), and javac entered the folded value right
         // after the Class and its name. That value's use is the naming site, so it cannot bound it.
-        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+        coordinates.put(owner, namingBounds(own, classIndices, firstUses, index, early,
+          foldedNeighbor(own, index), !anchored.contains(owner)));
         Long naming = namingPoint(own, index, firstUses, positions);
         if (naming != null) {
           namingAt.put(owner, naming);
@@ -808,7 +875,8 @@ public final class ConstantNames {
         continue;
       }
       if (!missing.contains(owner)) {
-        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+        coordinates.put(owner, namingBounds(own, classIndices, firstUses, index, early,
+          foldedNeighbor(own, index), !anchored.contains(owner)));
         Long naming = namingPoint(own, index, firstUses, positions);
         if (naming != null) {
           namingAt.put(owner, naming);
@@ -863,7 +931,8 @@ public final class ConstantNames {
       }
       claimed.add(owner);
       windows.put(owner, window);
-      coordinates.put(owner, coordinates(firstUses, index, early, -1));
+      coordinates.put(owner, namingBounds(own, classIndices, firstUses, index, early, -1,
+        !anchored.contains(owner)));
       strict.add(owner);
     }
     // A Class entry that follows its own first field or method reference was entered as that
@@ -936,16 +1005,18 @@ public final class ConstantNames {
     for (String owner : bares) {
       Integer index = classIndices.get(owner);
       if (index != null && !coordinates.containsKey(owner) && !activePairs.containsKey(owner)) {
-        coordinates.put(owner, coordinates(firstUses, index, early, foldedNeighbor(own, index)));
+        coordinates.put(owner, namingBounds(own, classIndices, firstUses, index, early,
+          foldedNeighbor(own, index), !anchored.contains(owner)));
       }
     }
     if (candidates.isEmpty() && bares.isEmpty()) {
       return null;
     }
     return new Rules(candidates,
-      new Placement(windows, coordinates, spaces(own, positions), strict, folded, internedAt,
-        namingAt, lexical, spans, new HashSet<>(prefixOwners(own)), inheritedNames, activePairs,
-        activeValues, bares, earlyOwners, ownEarly, ownProven, own, text),
+      new Placement(windows, coordinates, spaces(own, positions), strict, anchored, direct,
+        folded, internedAt, namingAt, lexical, spans, new HashSet<>(prefixOwners(own)),
+        inheritedNames, activePairs, activeValues, bares, earlyOwners, ownEarly, ownProven, own,
+        text),
       strict, missing, compositeCandidates, compositeOwners, own.qualifiedName,
       ownInitializers(text, spans, own), imports, packageName);
   }
