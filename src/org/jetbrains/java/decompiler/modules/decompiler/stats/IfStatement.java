@@ -1083,6 +1083,12 @@ public class IfStatement extends Statement {
     List<Integer> groups = new ArrayList<>();
     groups.add(0);
     for (int i = 1; i < operands.size(); i++) {
+      // A pattern operand the table records after the earlier operands' last binding in the same
+      // scope and pass was written in the same condition: a nested source writes the inner
+      // block's binding first. Keep it in the condition whatever the line marks say.
+      if (RoundTrip.patternBindingFollows(andOf(operands, 0, i), operands.get(i))) {
+        continue;
+      }
       int afterStart = RoundTrip.exprentStart(operands.get(i));
       int afterEnd = i + 1 < operands.size() ? RoundTrip.exprentStart(operands.get(i + 1))
         : head.bytecode == null ? -1 : head.bytecode.length();

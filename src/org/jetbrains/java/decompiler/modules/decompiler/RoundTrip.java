@@ -1021,11 +1021,41 @@ public final class RoundTrip {
 
   /** The pattern variable the if's condition declares, or null. */
   private static LocalVariable conditionPatternLocal(IfStatement ifstat) {
-    Exprent head = ifstat.getHeadexprent();
-    if (head == null) {
+    return conditionPatternLocal(ifstat.getHeadexprent());
+  }
+
+  /**
+   * True when this operand's pattern binding follows the last binding the earlier operands
+   * declare in one table pass and scope: a conjoined test declares its bindings in source order
+   * in one scope, while a source that wrote the second test nested writes the inner block's
+   * binding first, when that block closes. The earlier operands stay in one condition.
+   */
+  public static boolean patternBindingFollows(Exprent earlier, Exprent operand) {
+    if (!selector("patternand") || earlier == null || operand == null) {
+      return false;
+    }
+    LocalVariable previous = null;
+    for (Exprent part : earlier.getAllExprents(true, true)) {
+      if (part instanceof FunctionExprent function
+          && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
+          && function.getLstOperands().size() > 2) {
+        LocalVariable binding = patternBindingLocal(function.getLstOperands().get(2));
+        if (binding != null) {
+          previous = binding;
+        }
+      }
+    }
+    LocalVariable binding = conditionPatternLocal(operand);
+    return previous != null && binding != null && previous.getOrder() >= 0 && binding.getOrder() >= 0
+      && previous.getEnd() == binding.getEnd() && previous.getOrder() < binding.getOrder();
+  }
+
+  /** The pattern variable this condition declares, or null. */
+  private static LocalVariable conditionPatternLocal(Exprent condition) {
+    if (condition == null) {
       return null;
     }
-    for (Exprent part : head.getAllExprents(true, true)) {
+    for (Exprent part : condition.getAllExprents(true, true)) {
       if (part instanceof FunctionExprent function
           && function.getFuncType() == FunctionExprent.FunctionType.INSTANCEOF
           && function.getLstOperands().size() > 2) {
