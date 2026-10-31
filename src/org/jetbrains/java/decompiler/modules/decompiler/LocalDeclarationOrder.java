@@ -98,6 +98,8 @@ public final class LocalDeclarationOrder {
       }
     } else if (stat instanceof CatchAllStatement tryStatement) {
       placeInsideFinally(tryStatement, names, method);
+    } else if (stat instanceof SwitchStatement switchStatement) {
+      hoistSwitchArmDeclarations(switchStatement, names, method);
     }
     for (Statement child : stat.getStats()) {
       placeByScope(child, names, method);
@@ -347,6 +349,129 @@ public final class LocalDeclarationOrder {
     }
     debug(method, merged, "merged " + vars.size() + " arm declarations above the chain");
     return true;
+  }
+
+  /**
+   * Hoists a declaration printed inside a switch arm to the statement's prefix, where the source
+   * declared it before the switch.
+   *
+   * <p>An arm declaration's row ends where the arm's own block does. A variable whose row runs
+   * past that block to the end of the switch, and whose table position falls among the
+   * declarations the switch's prefix prints, was declared in the source's enclosing block: javac
+   * writes that block's rows in declaration order when it closes, so the position relative to the
+   * prefix's declarations names the place the source wrote it.
+   */
+  private static boolean hoistSwitchArmDeclarations(SwitchStatement switchStatement, NameTable names,
+                                                    String method) {
+    if (!RoundTrip.selector("switcharm")) {
+      return false;
+    }
+    List<Statement> stats = switchStatement.getStats();
+    if (stats.size() < 2) {
+      return false;
+    }
+    Statement prefix = stats.get(0);
+    List<Exprent> prefixExprents = prefix.getExprents();
+    int end = RoundTrip.lastEnd(switchStatement);
+    if (prefixExprents == null || prefixExprents.isEmpty() || end < 0) {
+      return false;
+    }
+    boolean changed = false;
+    for (int i = 1; i < stats.size(); i++) {
+      // An arm whose table order proves it was written in the enclosing block (a default the
+      // source continued after the switch) already prints flat: the declaration already stands
+      // where the source wrote it.
+      Statement arm = stats.get(i);
+      if (RoundTrip.sharesEnclosingScope(arm, RoundTrip.firstOffset(arm))) {
+        continue;
+      }
+      List<LocatedDef> candidates = new ArrayList<>();
+      collectDefinitions(stats.get(i), candidates);
+      for (LocatedDef candidate : candidates) {
+        VarExprent var = definedVar(candidate.exprent());
+        if (var == null || var.getLVT() == null || !isRealDefinition(var)) {
+          continue;
+        }
+        LocalVariable row = var.getLVT();
+        Statement owner = candidate.owner();
+        if (row.getEnd() != end || owner == null || RoundTrip.lastEnd(owner) < 0
+            || row.getEnd() <= RoundTrip.lastEnd(owner)) {
+          continue;
+        }
+        Exprent anchor = rowOrderAnchor(prefixExprents, row);
+        if (anchor == null) {
+          continue;
+        }
+        if ((!names.uniqueName(var) && !names.sameSlotName(var)) || mentionsField(switchStatement, var.getName())) {
+          debug(method, var, "rejected: switch-hoisted declaration would capture a name");
+          continue;
+        }
+        Exprent declaration;
+        if (candidate.exprent() == var) {
+          removeIdentity(candidate.list(), var);
+          var.bytecode = null;
+          declaration = var;
+        } else {
+          declaration = var.copy();
+          declaration.bytecode = null;
+          var.setDefinition(false);
+        }
+        insertAt(prefixExprents, anchor, declaration);
+        changed = true;
+        debug(method, var, "hoisted to the switch prefix: its row closes with the switch");
+      }
+    }
+    return changed;
+  }
+
+  /** A definition exprent, its list, and the statement that prints the list. */
+  private record LocatedDef(Exprent exprent, List<Exprent> list, Statement owner) {
+  }
+
+  private static void collectDefinitions(Statement stat, List<LocatedDef> out) {
+    List<Exprent> exprents = stat.getExprents();
+    if (exprents != null) {
+      for (Exprent exprent : exprents) {
+        if (definedVar(exprent) != null && definedVar(exprent).isDefinition()) {
+          out.add(new LocatedDef(exprent, exprents, stat));
+        }
+      }
+    }
+    for (Statement child : stat.getStats()) {
+      collectDefinitions(child, out);
+    }
+  }
+
+  /**
+   * The declaration in the prefix written just before the hoisted local in the same scope. A row
+   * of a nested block is written before every row of the block around it, so a prefix row that
+   * precedes this one proves both declarations closed in the same pass; a scope-local alone
+   * (written after it, or with no predecessor) is no evidence that the source declared it here.
+   */
+  private static Exprent rowOrderAnchor(List<Exprent> prefixExprents, LocalVariable row) {
+    Exprent before = null;
+    int beforeOrder = -1;
+    for (Exprent exprent : prefixExprents) {
+      VarExprent var = definedVar(exprent);
+      if (var == null || var.getLVT() == null || !isRealDefinition(var)) {
+        continue;
+      }
+      LocalVariable other = var.getLVT();
+      if (other.getEnd() != row.getEnd() || other.getOrder() < 0) {
+        continue;
+      }
+      if (other.getOrder() < row.getOrder() && other.getOrder() > beforeOrder) {
+        before = exprent;
+        beforeOrder = other.getOrder();
+      }
+    }
+    return before;
+  }
+
+  /** Inserts the declaration after the anchor, its row's immediate predecessor. */
+  private static void insertAt(List<Exprent> list, Exprent anchor, Exprent declaration) {
+    int at = list.indexOf(anchor);
+    list.add(at < 0 ? list.size() : at + 1, declaration);
   }
 
   /**
