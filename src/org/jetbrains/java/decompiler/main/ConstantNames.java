@@ -922,7 +922,7 @@ public final class ConstantNames {
       // A pair of the class's own entry exists only when the pool proved a folded naming created
       // it; the class's own constants are already candidates through ownCandidates.
       if (!owner.equals(own.qualifiedName) && candidateOwners.add(owner)) {
-        addOwnerCandidates(candidates, owner, nest, packageName, imports, true);
+        addOwnerCandidates(candidates, owner, nest, packageName, imports, true, own);
       }
       activePairs.put(owner, entry.getValue());
     }
@@ -6483,7 +6483,14 @@ public final class ConstantNames {
   /** The accessible static final fields of one missing owner, as candidates for a literal value. */
   private static void addOwnerCandidates(Map<String, List<Constant>> candidates, String owner,
                                          String nest, String packageName, List<String> imports) {
-    addOwnerCandidates(candidates, owner, nest, packageName, imports, false);
+    addOwnerCandidates(candidates, owner, nest, packageName, imports, false, null);
+  }
+
+  /** The same, resolving a constant this site inherits from the owner through its supertypes. */
+  private static void addOwnerCandidates(Map<String, List<Constant>> candidates, String owner,
+                                         String nest, String packageName, List<String> imports,
+                                         boolean missingOwner) {
+    addOwnerCandidates(candidates, owner, nest, packageName, imports, missingOwner, null);
   }
 
   /**
@@ -6495,15 +6502,18 @@ public final class ConstantNames {
    */
   private static void addOwnerCandidates(Map<String, List<Constant>> candidates, String owner,
                                          String nest, String packageName, List<String> imports,
-                                         boolean missingOwner) {
+                                         boolean missingOwner, StructClass site) {
     StructClass cls = DecompilerContext.getStructContext().getClass(owner);
     if (cls == null) {
       return;
     }
     boolean samePackage = packageName.equals(packageOf(owner));
     boolean imported = imports.contains(simpleName(owner));
+    // A constant the site's class inherits from this owner is in scope by its bare name even when
+    // the owner itself is not nameable there (a protected nested entry class).
+    boolean inheritedForSite = site != null && hasInheritedConstant(site, owner);
     if (!samePackage && !imported && owner.contains("$")
-        && !(missingOwner && publiclyNameable(owner, packageName))) {
+        && !(missingOwner && (publiclyNameable(owner, packageName) || inheritedForSite))) {
       // A nested class's binary name cannot be written in source, but its dotted source name can
       // whenever every class of the chain is public: the site printer falls back to that form.
       // Only an owner the pool alone explains may use it; an owner the text already names has its
@@ -6518,7 +6528,8 @@ public final class ConstantNames {
       int access = field.getAccessFlags();
       boolean accessible = (access & CodeConstants.ACC_PUBLIC) != 0
         || ((access & CodeConstants.ACC_PRIVATE) == 0 && samePackage)
-        || ((access & CodeConstants.ACC_PROTECTED) != 0 && missingOwner && extendsClass(nest, owner))
+        || ((access & CodeConstants.ACC_PROTECTED) != 0 && missingOwner
+            && (extendsClass(nest, owner) || inheritedInto(site, owner, field.getName())))
         || ((access & CodeConstants.ACC_PRIVATE) != 0 && nestOf(owner).equals(nest));
       if (!accessible) {
         continue;
@@ -6596,6 +6607,43 @@ public final class ConstantNames {
       return kind == VariableType.BOOLEAN && value instanceof Integer flag
         ? Boolean.toString(flag != 0) : String.valueOf(value);
     }
+  }
+
+  /** Whether any constant {@code site} inherits was declared by {@code owner} itself. */
+  private static boolean hasInheritedConstant(StructClass site, String owner) {
+    if (site == null || owner.equals(site.qualifiedName)) {
+      return false;
+    }
+    for (InheritedConstant inherited : inheritedConstants(site)) {
+      if (inherited.declaring().qualifiedName.equals(owner)
+          && (inherited.field().getAccessFlags()
+          & (CodeConstants.ACC_PUBLIC | CodeConstants.ACC_PROTECTED)) != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether a bare reference in {@code site}'s scope resolves to this constant of {@code owner}:
+   * the field is inherited from a supertype of the site's class and no nearer declaration hides
+   * it. A public or protected constant is writable this way from another package; a package
+   * constant only from its own.
+   */
+  private static boolean inheritedInto(StructClass site, String owner, String name) {
+    if (site == null || owner.equals(site.qualifiedName)) {
+      return false;
+    }
+    for (InheritedConstant inherited : inheritedConstants(site)) {
+      if (!inherited.field().getName().equals(name)
+          || !inherited.declaring().qualifiedName.equals(owner)) {
+        continue;
+      }
+      int access = inherited.field().getAccessFlags();
+      return (access & (CodeConstants.ACC_PUBLIC | CodeConstants.ACC_PROTECTED)) != 0
+        || packageOf(owner).equals(packageOf(site.qualifiedName));
+    }
+    return false;
   }
 
   /**
@@ -7886,9 +7934,17 @@ public final class ConstantNames {
       boolean inScope = nestOf(constant.owner()).equals(nestOf(own))
         || imports.contains(constant.owner().replace('/', '.'))
         || (!nested && packageName.equals(packageOf(constant.owner())));
+      boolean inherited = nested && !inScope
+        && inheritedInto(placement == null ? null : placement.cls(),
+          constant.owner(), constant.name());
+      // A constant inherited from a supertype is in scope by its bare name, and resolving it
+      // interns the declaring type's Class entry: the pair the pool records at the literal.
       String qualifier;
       if (inScope) {
         qualifier = name;
+      }
+      else if (inherited) {
+        qualifier = null;
       }
       else if (nested) {
         if (anonymous(constant.owner()) || !publiclyNameable(constant.owner(), packageName)) {
@@ -7899,7 +7955,8 @@ public final class ConstantNames {
       else {
         qualifier = constant.owner().replace('/', '.');
       }
-      printed = prefix + qualifier + "." + constant.name();
+      printed = qualifier == null ? prefix + constant.name()
+        : prefix + qualifier + "." + constant.name();
       if (key.startsWith("FLOATCAST|")) {
         printed = "(float) " + printed;
       }
