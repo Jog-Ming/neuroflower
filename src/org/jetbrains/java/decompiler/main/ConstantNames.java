@@ -8293,8 +8293,7 @@ public final class ConstantNames {
     if (own == null || spans.isEmpty()) {
       return;
     }
-    if (own.getRecordComponents() != null
-        || (own.getAccessFlags() & (CodeConstants.ACC_ANNOTATION
+    if ((own.getAccessFlags() & (CodeConstants.ACC_ANNOTATION
         | CodeConstants.ACC_ENUM)) != 0) {
       return; // this body has no initializer block to carry the dead conditions
     }
@@ -8313,16 +8312,20 @@ public final class ConstantNames {
     // class-file writer's own, superclass and interface entries: nothing they name was folded
     // away, so the pool records no naming site for them.
     boolean codeEntries = placement != null ? placement.codeEntry() : !firstUses(own).isEmpty();
+    // A record carries the conditions in a constructor; the target's constructors hold true
+    // constant conditions there (the record's components are assigned after them), and the form
+    // decides when javac enters the owner's Class entry.
+    boolean recordBody = own.getRecordComponents() != null;
     if (codeEntries && rules != null) {
       for (String owner : rules.missing()) {
-        addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
-          placement, conditions, added);
+        addDeadCondition(text, indices, prefix, owner, own, packageName, sites, constantInitializers,
+          placement, conditions, added, recordBody);
       }
     }
     if (codeEntries) {
       for (String owner : prefixOwners(own)) {
-        addDeadCondition(indices, prefix, owner, own, packageName, sites, constantInitializers,
-          placement, conditions, added);
+        addDeadCondition(text, indices, prefix, owner, own, packageName, sites, constantInitializers,
+          placement, conditions, added, recordBody);
       }
     }
     // A folded condition inside a method body enters the owner's Class pair at that method's
@@ -8335,6 +8338,22 @@ public final class ConstantNames {
     // order, which is what makes the class entries land where the pool records them.
     conditions.sort((a, b) -> Integer.compare(b.getKey(), a.getKey()));
     if (conditions.isEmpty() && anonymous <= 0) {
+      return;
+    }
+    if (own.getRecordComponents() != null) {
+      // A record has no instance initializer block: the header's components and the canonical
+      // constructor are the only body a dead condition can be written in. The printer hides the
+      // implicit canonical constructor, so the conditions are carried by an explicit one that
+      // assigns every component; its code is the target's, and the folded conditions leave the
+      // owners' Class entries at the pool's front. The target's text names them in descending
+      // pool order, which is the order javac recorded them from the source.
+      conditions.sort((a, b) -> Integer.compare(b.getKey(), a.getKey()));
+      String constructor = recordCanonicalConstructor(text, spans, own, conditions, anonymous);
+      int at = classBodyOpen(text, spans.get(0), own);
+      if (constructor == null || at < 0) {
+        return;
+      }
+      addSiteOnce(sites, new Site(at, at, " " + constructor, "@dead"));
       return;
     }
     if ((own.getAccessFlags() & CodeConstants.ACC_INTERFACE) != 0) {
@@ -8371,6 +8390,102 @@ public final class ConstantNames {
     }
     addSiteOnce(sites, new Site(at, at, constructor == null ? block.toString()
       : " " + constructor + block, "@dead"));
+  }
+
+  /**
+   * The explicit canonical constructor a record's dead conditions are written in, or null when
+   * the printer already emits one. Every component is assigned from its parameter, which is the
+   * implicit constructor's code; the conditions fold away but leave their owners' Class entries
+   * where the pool records them. The parameters are the record header's own component text, so
+   * the constructor repeats exactly the types the header printed.
+   */
+  private static String recordCanonicalConstructor(String text, List<int[]> spans, StructClass own,
+                                                   List<Map.Entry<Integer, String>> conditions,
+                                                   int anonymous) {
+    List<? extends StructField> components = own.getRecordComponents();
+    if (components == null || components.isEmpty() || anonymous > 0) {
+      return null; // the anonymous padding has no initializer block here that provably matches
+    }
+    String simple = sourceSimpleName(own);
+    if (simple.isEmpty() || !Character.isJavaIdentifierStart(simple.charAt(0))
+        || printsConstructor(text, spans.get(0)[0], spans, simple)
+        || printsCompactConstructor(text, spans, simple)) {
+      return null;
+    }
+    String params = recordHeaderParameters(text, spans.get(0), simple);
+    if (params == null) {
+      return null;
+    }
+    StringBuilder descriptor = new StringBuilder("(");
+    for (StructField component : components) {
+      descriptor.append(component.getDescriptor());
+    }
+    StructMethod canonical = own.getMethod(CodeConstants.INIT_NAME, descriptor.append(")V").toString());
+    if (canonical == null) {
+      return null;
+    }
+    int access = canonical.getAccessFlags() & (CodeConstants.ACC_PUBLIC
+      | CodeConstants.ACC_PROTECTED | CodeConstants.ACC_PRIVATE);
+    String modifier = access == CodeConstants.ACC_PUBLIC ? "public "
+      : access == CodeConstants.ACC_PROTECTED ? "protected "
+      : access == CodeConstants.ACC_PRIVATE ? "private " : "";
+    StringBuilder body = new StringBuilder();
+    for (Map.Entry<Integer, String> condition : conditions) {
+      body.append(" if (").append(condition.getValue()).append(") { }");
+    }
+    for (StructField component : components) {
+      body.append(" this.").append(component.getName()).append(" = ")
+        .append(component.getName()).append(';');
+    }
+    return modifier + simple + "(" + params + ") {" + body + " }";
+  }
+
+  /**
+   * True when the record body already prints a compact canonical constructor: {@code public Name { } }.
+   * It has no parameter list, so {@code printsConstructor} does not see it, and a second canonical
+   * constructor written beside it would not compile.
+   */
+  private static boolean printsCompactConstructor(String text, List<int[]> spans, String simple) {
+    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+      "\\b" + java.util.regex.Pattern.quote(simple) + "\\s*\\{");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    for (int[] span : spans) {
+      matcher.region(span[0], span[1]);
+      // The record declaration's own name is followed by the component parentheses, not a brace.
+      if (matcher.find()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** The component list the record header printed, between its own parentheses, or null. */
+  private static String recordHeaderParameters(String text, int[] span, String simple) {
+    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+      "\\brecord\\s+" + java.util.regex.Pattern.quote(simple) + "\\s*\\(");
+    java.util.regex.Matcher matcher = pattern.matcher(text);
+    matcher.region(span[0], span[1]);
+    if (!matcher.find()) {
+      return null;
+    }
+    int open = text.indexOf('(', matcher.start());
+    if (open < 0) {
+      return null;
+    }
+    int depth = 0;
+    for (int i = open; i < span[1]; i++) {
+      char c = text.charAt(i);
+      if (c == '(') {
+        depth++;
+      }
+      else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          return text.substring(open + 1, i);
+        }
+      }
+    }
+    return null;
   }
 
   /** A braced block holding one dead constant condition per entry, plus any anonymous padding. */
@@ -8702,12 +8817,12 @@ public final class ConstantNames {
    * Adds the dead condition for one prefix-pair owner, when the pool and the text make it the
    * only possible source of that pair.
    */
-  private static void addDeadCondition(Map<String, Integer> indices, Set<Integer> prefix,
+  private static void addDeadCondition(String text, Map<String, Integer> indices, Set<Integer> prefix,
                                        String owner, StructClass own, String packageName,
                                        List<Site> sites, Map<String, List<int[]>> constantInitializers,
                                        Placement placement,
                                        List<Map.Entry<Integer, String>> conditions,
-                                       Set<Integer> added) {
+                                       Set<Integer> added, boolean recordBody) {
     Integer ownIndex = indices.get(own.qualifiedName);
     if (own.superClass != null && owner.equals(own.superClass.getString())
         && (ownIndex == null || ownIndex != 1)) {
@@ -8721,7 +8836,9 @@ public final class ConstantNames {
     // Only a naming attributed with a constant field initializer enters the pair before any code
     // was generated; a method-body site or a non-constant initializer is compiled into <clinit>
     // or a constructor and reuses the pair there, not at the pool's front.
-    boolean explained = siteInConstantInitializer(sites, owner, constantInitializers);
+    boolean explained = siteInConstantInitializer(sites, owner, constantInitializers)
+      || recordBody && (mentionedInConstantInitializer(text, owner, constantInitializers)
+          || namesOwnerInSites(sites, owner));
     // A site the pair's own generation bracket proves is compiled where the pool wants the pair;
     // a dead condition folds earlier and would move it ahead of that code's entries.
     PairSite pair = placement == null || placement.pairs() == null
@@ -8737,7 +8854,7 @@ public final class ConstantNames {
     if (index == null || !prefix.contains(index) || !added.add(index) || explained) {
       return;
     }
-    String condition = deadCondition(owner, own.qualifiedName, packageName);
+    String condition = deadCondition(owner, own.qualifiedName, packageName, recordBody);
     if (condition != null) {
       conditions.add(Map.entry(index, condition));
     }
@@ -8761,6 +8878,39 @@ public final class ConstantNames {
     return false;
   }
 
+  /**
+   * Whether the class's text already names this owner inside one of its constant field
+   * initializers. Such a naming is attributed with the field, before any method body, so it
+   * explains the pool's front pair and a dead condition would only duplicate it.
+   */
+  private static boolean mentionedInConstantInitializer(String text, String owner,
+                                                        Map<String, List<int[]>> initializers) {
+    String simple = simpleName(owner);
+    if (simple.isEmpty()) {
+      return false;
+    }
+    for (List<int[]> ranges : initializers.values()) {
+      for (int[] range : ranges) {
+        int from = Math.max(0, range[0]);
+        int to = Math.min(text.length(), range[1]);
+        if (from < to && mentions(text.substring(from, to), simple)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Whether a constant site already names this owner; its Class entry is explained by that use. */
+  private static boolean namesOwnerInSites(List<Site> sites, String owner) {
+    for (Site site : sites) {
+      if (owner.equals(site.owner())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private static void appendAnonymous(StringBuilder block, int count) {
     for (int i = 0; i < count; i++) {
       block.append(" java.lang.Runnable drop").append(i)
@@ -8768,8 +8918,13 @@ public final class ConstantNames {
     }
   }
 
-  /** A condition over one of the owner's constants that is false where javac folds it. */
-  private static String deadCondition(String owner, String ownName, String packageName) {
+  /**
+   * A condition over one of the owner's constants that javac folds. A class body's dead block
+   * wants it false; a record's canonical constructor, whose target conditions are true, gets the
+   * constant's own value back so the folded=true path is the one that enters the Class entry.
+   */
+  private static String deadCondition(String owner, String ownName, String packageName,
+                                      boolean trueForm) {
     StructClass cls = DecompilerContext.getStructContext().getClass(owner);
     if (cls == null) {
       return null;
@@ -8794,6 +8949,11 @@ public final class ConstantNames {
       if (!accessible) {
         continue;
       }
+      // The target's constructor conditions name public constants; a private constant resolved
+      // through the nest is attributable at a different point and would reorder the pool.
+      if (trueForm && (access & CodeConstants.ACC_PUBLIC) == 0) {
+        continue;
+      }
       StructConstantValueAttribute attribute =
         field.getAttribute(StructGeneralAttribute.ATTRIBUTE_CONSTANT_VALUE);
       if (attribute == null) {
@@ -8813,16 +8973,22 @@ public final class ConstantNames {
       String name = owner.equals(ownName) ? field.getName() : qualifier + "." + field.getName();
       switch (kind) {
         case BOOLEAN:
-          return number.intValue() != 0 ? "!" + name : name;
+          return trueForm ? name : number.intValue() != 0 ? "!" + name : name;
         case INT:
         case BYTE:
         case SHORT:
         case CHAR: {
           long integral = number.longValue();
+          if (trueForm) {
+            return name + " == " + integral;
+          }
           return name + " == " + (integral == Integer.MAX_VALUE ? integral - 1 : integral + 1);
         }
         case LONG: {
           long integral = number.longValue();
+          if (trueForm) {
+            return name + " == " + integral + "L";
+          }
           return name + " == " + (integral == Long.MAX_VALUE ? integral - 1 : integral + 1) + "L";
         }
         default:
