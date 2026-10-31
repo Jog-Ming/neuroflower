@@ -152,8 +152,9 @@ public class SequenceStatement extends Statement {
       Statement st = stats.get(i);
 
       // The caller printed this statement already as part of a wider shape; it is one
-      // instruction and must not print twice.
-      if (RoundTrip.isStatementSkipped(st)) {
+      // instruction and must not print twice. A statement a construct took over (a switch's
+      // default arm standing after it) is the same: its content is already on the page.
+      if (RoundTrip.isStatementSkipped(st) || RoundTrip.isConsumedStatement(st)) {
         continue;
       }
 
@@ -339,7 +340,18 @@ public class SequenceStatement extends Statement {
         int windowEnd = i + 1 < stats.size()
           ? Math.max(RoundTrip.blockEnd(st), RoundTrip.firstOffset(stats.get(i + 1)) - 1)
           : RoundTrip.blockEnd(st);
-        int[] scope = RoundTrip.nestedBlockScope(st, windowEnd, RoundTrip.blockEnd(this));
+        // A statement's recorded extent ends at its last exprent's instruction. A method body can
+        // end with instructions no exprent records -- a loop's back edge and the silent return --
+        // so its block's true end is the method's code end, and a row ending between the two
+        // closed a block of its own in front of them.
+        int enclosingEnd = RoundTrip.blockEnd(this);
+        if (getParent() instanceof RootStatement && RoundTrip.methodEndsWithSilentReturn()) {
+          int codeEnd = RoundTrip.methodCodeEnd();
+          if (codeEnd > enclosingEnd) {
+            enclosingEnd = codeEnd;
+          }
+        }
+        int[] scope = RoundTrip.nestedBlockScope(st, windowEnd, enclosingEnd);
         // The local has to be declared by this statement itself, and the block it lived in has to
         // reach past it; otherwise the run is just this statement and the braces buy nothing.
         if (scope != null && scope[0] <= RoundTrip.blockEnd(st)) {
@@ -367,8 +379,17 @@ public class SequenceStatement extends Statement {
           if (!exact && basicBlock) {
             for (int j = i; j < stats.size(); j++) {
               int end = RoundTrip.blockEnd(stats.get(j));
-              boolean atBoundary = j + 1 >= stats.size()
-                || RoundTrip.statementStart(stats.get(j + 1)) >= scope[1];
+              // The next statement that prints anything is the boundary; one that prints nothing
+              // (a hidden final return) leaves the run to the end of the enclosing block.
+              boolean atBoundary = true;
+              for (int k = j + 1; k < stats.size(); k++) {
+                int next = RoundTrip.statementStart(stats.get(k));
+                if (next < 0) {
+                  continue;
+                }
+                atBoundary = next >= scope[1];
+                break;
+              }
               if (end <= scope[1] + 5 && atBoundary) {
                 close = j;
                 break;

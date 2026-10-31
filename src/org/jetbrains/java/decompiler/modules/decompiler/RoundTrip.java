@@ -4069,6 +4069,148 @@ public final class RoundTrip {
    * own conditional branch targets the exit rather than the body's start, and an unconditional
    * goto inside the body jumps back to that start -- while (true) { ... if (!cond) break; }.
    */
+  /**
+   * True when the conditional branch ending at this offset is followed by a goto: a written
+   * {@code if (C) break/continue;} leaves that branch-then-goto pair, where a fused {@code &&}
+   * test branches straight out of the loop and leaves no goto behind.
+   */
+  public static boolean branchFollowedByGoto(int branchEnd) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, int[]> sites = method == null ? null : CONTINUE_SITES.get(method);
+    return sites != null && sites.containsKey(branchEnd);
+  }
+
+  /**
+   * True when a local the table names nowhere, stored between {@code from} and {@code to}, is
+   * still held at {@code offset} according to the target's stack map. javac scopes such a
+   * synthetic local to the construct that created it, so its liveness at an offset proves the
+   * source's scope reached there — a string switch's hash and index slots are the common case.
+   */
+  public static boolean syntheticLocalLiveAt(int offset, int from, int to) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, java.util.List<int[]>> stores = method == null ? null : TEMP_STORES.get(method);
+    java.util.BitSet live = frameLiveLocals(offset);
+    if (stores == null || live == null || live.isEmpty()) {
+      return false;
+    }
+    for (java.util.Map.Entry<Integer, java.util.List<int[]>> entry : stores.entrySet()) {
+      if (!live.get(entry.getKey())) {
+        continue;
+      }
+      for (int[] store : entry.getValue()) {
+        if (store[0] >= from && store[0] < to) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The slots the target's stack map holds at this offset, or null when it records no frame. */
+  public static java.util.BitSet frameLiveLocals(int offset) {
+    StructMethod method = currentMethod();
+    org.jetbrains.java.decompiler.struct.attr.StructStackMapTableAttribute table = method == null
+      ? null : method.getAttribute(StructGeneralAttribute.ATTRIBUTE_STACK_MAP_TABLE);
+    return table == null ? null : table.liveLocals(offset, initialLocalSlots(method));
+  }
+
+  /** The implicit first frame's length: the method's parameters, counting long and double twice. */
+  private static int initialLocalSlots(StructMethod method) {
+    org.jetbrains.java.decompiler.struct.gen.MethodDescriptor descriptor =
+      org.jetbrains.java.decompiler.struct.gen.MethodDescriptor.parseDescriptor(method.getDescriptor());
+    int slots = method.hasModifier(CodeConstants.ACC_STATIC) ? 0 : 1;
+    for (VarType param : descriptor.params) {
+      slots += param.stackSize;
+    }
+    return slots;
+  }
+
+  /**
+   * The first frame offset after {@code offset} where none of the construct's synthetic locals —
+   * slots stored without a name in {@code [from, offset)} and still held at {@code offset} — is
+   * held any more: the target's proof that its block closed by then. -1 when the construct owns
+   * no such local or the table records no later frame without it.
+   */
+  public static int tempScopeEnd(int from, int offset) {
+    StructMethod method = currentMethod();
+    java.util.Map<Integer, java.util.List<int[]>> stores = method == null ? null : TEMP_STORES.get(method);
+    java.util.BitSet live = frameLiveLocals(offset);
+    if (stores == null || live == null || live.isEmpty()) {
+      return -1;
+    }
+    // TEMP_STORES also holds a named local's store when its row opens exactly at the store's end
+    // (a declaration); that local is not synthetic, so a row reaching the store excludes the slot.
+    StructLocalVariableTableAttribute named =
+      method.getAttribute(StructGeneralAttribute.ATTRIBUTE_LOCAL_VARIABLE_TABLE);
+    java.util.Map<Integer, Integer> instructionEnds = INSTRUCTION_ENDS.get(method);
+    java.util.Set<Integer> temps = new java.util.HashSet<>();
+    for (java.util.Map.Entry<Integer, java.util.List<int[]>> entry : stores.entrySet()) {
+      if (!live.get(entry.getKey())) {
+        continue;
+      }
+      for (int[] store : entry.getValue()) {
+        if (store[0] < from || store[0] >= offset) {
+          continue;
+        }
+        Integer end = instructionEnds == null ? null : instructionEnds.get(store[0]);
+        int storeEnd = end == null ? store[0] + 1 : end;
+        boolean declared = named != null && named.getVariables().anyMatch(row ->
+          row.getIndex() == entry.getKey() && row.getStart() <= storeEnd && row.getEnd() > store[0]);
+        if (!declared) {
+          temps.add(entry.getKey());
+          break;
+        }
+      }
+    }
+    if (temps.isEmpty()) {
+      return -1;
+    }
+    org.jetbrains.java.decompiler.struct.attr.StructStackMapTableAttribute table = method.getAttribute(
+      StructGeneralAttribute.ATTRIBUTE_STACK_MAP_TABLE);
+    int slots = initialLocalSlots(method);
+    for (int at : table.offsets()) {
+      if (at <= offset) {
+        continue;
+      }
+      java.util.BitSet later = table.liveLocals(at, slots);
+      if (later == null) {
+        continue;
+      }
+      boolean held = false;
+      for (int slot : temps) {
+        if (later.get(slot)) {
+          held = true;
+          break;
+        }
+      }
+      if (!held) {
+        return at;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * A statement whose content an enclosing construct has printed itself; the sequence holding it
+   * must not print it again. The marker lives until the method's print ends.
+   */
+  private static final ThreadLocal<java.util.Set<Statement>> CONSUMED_STATEMENTS =
+    ThreadLocal.withInitial(java.util.HashSet::new);
+
+  public static void markConsumedStatement(Statement stat) {
+    if (stat != null) {
+      CONSUMED_STATEMENTS.get().add(stat);
+    }
+  }
+
+  public static boolean isConsumedStatement(Statement stat) {
+    return stat != null && CONSUMED_STATEMENTS.get().contains(stat);
+  }
+
+  public static void clearConsumedStatements() {
+    CONSUMED_STATEMENTS.remove();
+  }
+
   public static boolean loopGuardInsideBody(Exprent condition, Statement body) {
     StructMethod method = currentMethod();
     if (method == null || condition == null || condition.bytecode == null || body == null) {
@@ -4910,6 +5052,18 @@ public final class RoundTrip {
     }
     java.util.Set<Statement> set = PRINTED_IN_BRANCH.get().get(method);
     return set != null && set.contains(stat);
+  }
+
+  /**
+   * True when the method's last instruction is the silent void return the printer hides: the code
+   * after the method body's last statement is exactly that return, so a local the source declared
+   * in the method block ends one instruction before the code end. A synthetic construct handler
+   * emitted after the body (a record pattern's MatchException catch) is no such gap.
+   */
+  public static boolean methodEndsWithSilentReturn() {
+    StructMethod method = currentMethod();
+    Integer last = method == null ? null : LAST_INSTRUCTION.get(method);
+    return last != null && last >= 0 && isVoidReturn(last);
   }
 
   /** The end of the method's last instruction, or -1. */
@@ -9580,7 +9734,16 @@ public final class RoundTrip {
         // inside a block that closed first; a flat run shares the enclosing close pass, where the
         // earlier-allocated row precedes it in rising-slot order.
         boolean rowOrder = rowOrderProvesBlock(rows, row, s1, e1, enclosingEnd, null);
-        if (!rowOrder && slotHandover(row.getIndex(), s1, e1) == null) {
+        LocalVariable handover = rowOrder ? null : slotHandover(row.getIndex(), s1, e1);
+        // A row that ends strictly inside this list, at an exprent's own last instruction, with no
+        // row taking its slot over, closed a source block of its own: javac ends a block's locals
+        // where the source's closing brace stood, and a local declared in the enclosing block
+        // would reach that block's end. Only a run whose other locals all close with it is a
+        // block the printer can stand for; one outliving the brace would be declared inside it
+        // and read outside, and one dying earlier closed an inner block the brace cannot show.
+        boolean closedScope = !rowOrder && handover == null && e1 < enclosingEnd
+          && runScopeAligns(rows, s1, e1) && closesCleanly(s1, e1);
+        if (!rowOrder && handover == null && !closedScope) {
           continue;
         }
         for (int b = a + 1; b < to; b++) {
@@ -9590,7 +9753,11 @@ public final class RoundTrip {
             if (b == to - 1) {
               // Nothing after this run proves the boundary: the next row's store has to sit behind
               // the declaration on every path, which a row that merely reuses the slot does not.
-              if (!closeAtEnd || (!rowOrder && slotHandoverAcrossPaths(row.getIndex(), s1, e1) == null)) {
+              // A scope the table closed early is its own proof, but only where the list's brace
+              // is the method's or another construct's; otherwise the run ends with the list and
+              // that construct already prints the brace.
+              if (!closeAtEnd || (!rowOrder && !closedScope
+                  && slotHandoverAcrossPaths(row.getIndex(), s1, e1) == null)) {
                 continue;
               }
             }
@@ -9600,6 +9767,25 @@ public final class RoundTrip {
       }
     }
     return null;
+  }
+
+  /**
+   * True when every local the run declares is out of scope at its close and none dies inside it:
+   * a row opening inside {@code (s1, e1)} has to end exactly at {@code e1} (a local declared in
+   * the run that outlives it, or one that closed an inner block, is not a block this brace can
+   * print), and a row that opened earlier may not die between the declaration and the close.
+   */
+  private static boolean runScopeAligns(List<LocalVariable> rows, int s1, int e1) {
+    for (LocalVariable row : rows) {
+      boolean startsInside = row.getStart() > s1 && row.getStart() < e1;
+      if (startsInside && row.getEnd() != e1) {
+        return false;
+      }
+      if (row.getStart() <= s1 && row.getEnd() > s1 && row.getEnd() < e1) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** The last instruction the whole list prints, ignoring declarations hoisted to its head. */

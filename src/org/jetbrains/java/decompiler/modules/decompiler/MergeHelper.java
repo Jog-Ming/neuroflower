@@ -66,12 +66,71 @@ public class MergeHelper {
 
         break;
       case WHILE:
+        matchWhileGuard(stat);
         if (!matchForEach(stat)) {
           matchFor(stat);
         }
     }
 
     return (stat.getLooptype() != oldloop);
+  }
+
+  /**
+   * Folds a test the source fused into the loop header back into the condition. The tree split
+   * {@code while (A && B)} into a loop on A whose body opens with {@code if (!B) break;}, but the
+   * target proves the source's fused form: the guard's own branch lands on the loop's exit and no
+   * goto follows it, where a written guard would branch to the body and then jump out. Replacing
+   * the guard by {@code A && !guard} restores the header the source wrote.
+   */
+  private static boolean matchWhileGuard(DoStatement stat) {
+    if (!RoundTrip.selector("loopguard") || stat.getConditionExprent() == null) {
+      return false;
+    }
+    Statement first = stat.getFirst();
+    while (first instanceof SequenceStatement) {
+      first = first.getFirst();
+    }
+    if (!(first instanceof IfStatement firstif) || firstif.iftype != IfStatement.IFTYPE_IF
+        || firstif.getIfstat() != null || firstif.getElsestat() != null
+        || firstif.getHeadexprent() == null || !firstif.getFirst().getExprents().isEmpty()) {
+      return false;
+    }
+    StatEdge ifedge = firstif.getIfEdge();
+    if (ifedge == null || ifedge.getType() != StatEdge.TYPE_BREAK || ifedge.closure != stat) {
+      return false;
+    }
+    Statement exit = ifedge.getDestination();
+    int exitStart = exit == null ? -1 : RoundTrip.firstOffset(exit);
+    int headEnd = firstif.getHeadexprent().bytecode == null ? -1
+      : firstif.getHeadexprent().bytecode.length();
+    if (exitStart < 0 || headEnd < 0 || !isDirectPath(stat, exit)
+        || RoundTrip.branchTargetInRange(firstif.getHeadexprent().getCondition(), 0, -1) != exitStart
+        || RoundTrip.branchFollowedByGoto(headEnd)) {
+      return false;
+    }
+    Exprent guard = RoundTrip.negateCondition(firstif.getHeadexprent().getCondition());
+    FunctionExprent condition = new FunctionExprent(FunctionType.BOOLEAN_AND,
+      new ArrayList<>(Arrays.asList(stat.getConditionExprent(), guard)),
+      stat.getConditionExprent().bytecode);
+    condition.addBytecodeOffsets(firstif.getHeadexprent().bytecode);
+    stat.setConditionExprent(condition);
+
+    firstif.getFirst().removeSuccessor(ifedge);
+    firstif.removeSuccessor(firstif.getAllSuccessorEdges().get(0));
+    if (firstif == stat.getFirst()) {
+      BasicBlockStatement bstat = BasicBlockStatement.create();
+      stat.replaceStatement(firstif, bstat);
+      bstat.addSuccessor(new StatEdge(StatEdge.TYPE_CONTINUE, bstat, stat, stat));
+    } else {
+      Statement sequence = firstif.getParent();
+      sequence.getStats().removeWithKey(firstif.id);
+      if (!sequence.getStats().isEmpty()) {
+        sequence.setFirst(sequence.getStats().get(0));
+      } else {
+        SequenceHelper.destroyAndFlattenStatement(sequence);
+      }
+    }
+    return true;
   }
 
   private static void matchDoWhile(DoStatement stat) {

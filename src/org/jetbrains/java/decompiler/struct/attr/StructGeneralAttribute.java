@@ -32,6 +32,7 @@ public class StructGeneralAttribute {
   public static final Key<StructTypeAnnotationAttribute> ATTRIBUTE_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS = Key.of("RuntimeInvisibleTypeAnnotations");
   public static final Key<StructLocalVariableTableAttribute> ATTRIBUTE_LOCAL_VARIABLE_TABLE = Key.of("LocalVariableTable");
   public static final Key<StructLocalVariableTypeTableAttribute> ATTRIBUTE_LOCAL_VARIABLE_TYPE_TABLE = Key.of("LocalVariableTypeTable");
+  public static final Key<StructStackMapTableAttribute> ATTRIBUTE_STACK_MAP_TABLE = Key.of("StackMapTable");
   public static final Key<StructConstantValueAttribute> ATTRIBUTE_CONSTANT_VALUE = Key.of("ConstantValue");
   public static final Key<StructBootstrapMethodsAttribute> ATTRIBUTE_BOOTSTRAP_METHODS = Key.of("BootstrapMethods");
   public static final Key<StructGeneralAttribute> ATTRIBUTE_SYNTHETIC = Key.of("Synthetic");
@@ -72,6 +73,7 @@ public class StructGeneralAttribute {
     ClassAttributeRegistry.register(ATTRIBUTE_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS, StructTypeAnnotationAttribute::new);
     ClassAttributeRegistry.register(ATTRIBUTE_LOCAL_VARIABLE_TABLE, StructLocalVariableTableAttribute::new);
     ClassAttributeRegistry.register(ATTRIBUTE_LOCAL_VARIABLE_TYPE_TABLE, StructLocalVariableTypeTableAttribute::new);
+    ClassAttributeRegistry.register(ATTRIBUTE_STACK_MAP_TABLE, StructStackMapTableAttribute::new);
     ClassAttributeRegistry.register(ATTRIBUTE_BOOTSTRAP_METHODS, StructBootstrapMethodsAttribute::new);
     ClassAttributeRegistry.register(ATTRIBUTE_SYNTHETIC, StructGeneralAttribute::new);
     ClassAttributeRegistry.register(ATTRIBUTE_DEPRECATED, StructGeneralAttribute::new);

@@ -320,6 +320,39 @@ public class SwitchStatement extends Statement {
       ? defaultEdge.getDestination() : null;
     Statement caseJoinArm = caseJoinArm(yields, switchEnd);
 
+    // A default arm whose body the tree left as the statements after the switch: the switch's
+    // default edge reaches an empty block, and the target's stack map proves the switch's own
+    // scope still covered the following code — a synthetic local stored inside the switch (a
+    // string switch's hash and index slots) is held where that code begins and dropped at the
+    // frame that marks the source's closing brace. The statements up to that frame print as the
+    // `default:` arm, and the sequence holding them skips its own print.
+    List<Statement> defaultBody = new ArrayList<>();
+    if (defaultIsJoin && defaultEdge != null && defaultEdge.getDestination() != null
+        && RoundTrip.firstOffset(defaultEdge.getDestination()) < 0
+        && getParent() instanceof SequenceStatement parent) {
+      int at = parent.getStats().indexOf(this);
+      int start = RoundTrip.firstOffset(this);
+      int scopeEnd = start >= 0 && start < switchEnd ? RoundTrip.tempScopeEnd(start, switchEnd) : -1;
+      if (at >= 0 && scopeEnd > 0) {
+        for (int k = at + 1; k < parent.getStats().size(); k++) {
+          Statement next = parent.getStats().get(k);
+          int first = RoundTrip.statementOffset(next);
+          if (defaultBody.isEmpty()) {
+            if (first != switchEnd) {
+              break;
+            }
+          } else if (first < switchEnd) {
+            break;
+          }
+          int end = RoundTrip.blockEnd(next);
+          if (end < 0 || end > scopeEnd) {
+            break;
+          }
+          defaultBody.add(next);
+        }
+      }
+    }
+
     // An empty `default: break;` group compiles to a jump the table's default target points at.
     // No arm carries that edge when the group holds nothing of its own, so the label is printed
     // where the target's block sits among the arms: at the table's default offset, not at the join
@@ -500,12 +533,15 @@ public class SwitchStatement extends Statement {
       // A braced pattern arm whose table closes an arm local exactly at the break's jump: the
       // source closed the block before the written break, so the break prints after the brace.
       // Another jump onto the same join proves the landing is the switch's end, not the arm's own
-      // fall-through; a pattern variable's row is no scope evidence and is skipped.
+      // fall-through; a pattern variable's row is no scope evidence and is skipped. The arm's own
+      // local ending exactly at the break's jump is the same proof by itself: a brace open across
+      // the break would have carried the local's row through the jump, as the pattern variables'
+      // rows are carried when the arm's code runs into the switch's join.
       if (deferredBreak < 0 && braced.contains(stat) && !breakOutside && !yields && !orderUnknown
           && patternArm && RoundTrip.selector("switchbreak") && breakJump >= 0
           && RoundTrip.jumpTargetAt(breakJump) == switchEnd
           && !declaredScopePast(armRows.get(i), breakJump, RoundTrip.patternVariableSlots(values))
-          && RoundTrip.anotherJumpTo(breakJump, switchEnd)) {
+          && (RoundTrip.anotherJumpTo(breakJump, switchEnd) || rowEndsAt(armRows.get(i), breakJump))) {
         deferredBreak = breakJump;
       }
       // A labelled arm whose label exists only for its own break to the switch's join: the source
@@ -677,6 +713,15 @@ public class SwitchStatement extends Statement {
       buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
       buf.append(breakLine(indent + 2, defaultBreakJump));
       defaultBreakPrinted = true;
+    }
+
+    if (!defaultBody.isEmpty() && !defaultPrinted) {
+      buf.appendIndent(indent + 1).append("default:").appendLineSeparator();
+      for (Statement stat : defaultBody) {
+        buf.append(ExprProcessor.jmpWrapper(stat, indent + 2, false));
+        RoundTrip.markConsumedStatement(stat);
+      }
+      defaultPrinted = true;
     }
 
     // A `default:` the arms never print and whose table entry lands on the join had an empty body
